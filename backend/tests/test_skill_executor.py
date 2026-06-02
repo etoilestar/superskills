@@ -246,3 +246,67 @@ def test_snapshot_excludes_pycache(tmp_path):
     snapshot = _snapshot_skill_files(tmp_path)
     assert "main.py" in snapshot
     assert not any("__pycache__" in p for p in snapshot)
+
+
+def test_build_script_runtime_env_injects_model_variables(tmp_path):
+    from backend.services import skill_executor
+
+    with patch.object(skill_executor.settings, "llm_base_url", "http://llm.test"), \
+         patch.object(skill_executor.settings, "image_base_url", "http://image.test"), \
+         patch.object(skill_executor.settings, "text_model", "text-a"), \
+         patch.object(skill_executor.settings, "image_model", "image-a"), \
+         patch.object(skill_executor.settings, "llm_api_key", "key-a"):
+        env = skill_executor._build_script_runtime_env(tmp_path)
+
+    assert env["LLM_BASE_URL"] == "http://llm.test"
+    assert env["IMAGE_BASE_URL"] == "http://image.test"
+    assert env["TEXT_MODEL"] == "text-a"
+    assert env["IMAGE_MODEL"] == "image-a"
+    assert env["LLM_API_KEY"] == "key-a"
+    assert env["OUTPUT_DIR"] == str(tmp_path / "outputs")
+
+
+def test_missing_python_packages_maps_missing_imports(monkeypatch):
+    from backend.services import skill_executor
+
+    def fake_find_spec(module):
+        if module == "openai":
+            return None
+        return object()
+
+    monkeypatch.setattr(skill_executor.importlib.util, "find_spec", fake_find_spec)
+
+    assert skill_executor._missing_python_packages("import json\nimport openai\n") == ["openai"]
+
+
+def test_run_script_installs_missing_dependencies_before_execution(tmp_path, monkeypatch):
+    from backend.services import skill_executor
+
+    skill_dir = tmp_path / "sk"
+    scripts_dir = skill_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (scripts_dir / "hello.py").write_text("print('hello')", encoding="utf-8")
+
+    monkeypatch.setattr(skill_executor, "_ensure_python_dependencies_for_source", lambda source: ["openai"])
+
+    result = skill_executor._run_script("sk", "hello.py", [], "", skill_dir)
+
+    assert result["success"] is True
+    assert result["installed_packages"] == ["openai"]
+
+
+def test_dependency_source_includes_sibling_scripts(tmp_path):
+    from backend.services import skill_executor
+
+    skill_dir = tmp_path / "sk"
+    scripts_dir = skill_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    main = scripts_dir / "main.py"
+    helper = scripts_dir / "helper.py"
+    main.write_text("import helper\n", encoding="utf-8")
+    helper.write_text("import openai\n", encoding="utf-8")
+
+    source = skill_executor._dependency_source_for_script(main, skill_dir)
+
+    assert "import helper" in source
+    assert "import openai" in source

@@ -957,3 +957,89 @@ def test_kernel_creator_phase_prompts_include_block_runtime_requirements():
     assert "不会触发宿主执行" in phase3_prompt
     assert "不要加入自定义 Runtime Contract JSON" in phase3_prompt
     assert "LLM_BASE_URL + TEXT_MODEL" in phase3_prompt or "LLM_BASE_URL + TEXT_MODEL/IMAGE_MODEL/VISION_MODEL" in phase3_prompt
+
+
+def test_creator_script_prompt_requires_stable_env_and_diffusion_translation():
+    from backend.routers.creator import _build_generate_file_prompt
+
+    messages = _build_generate_file_prompt(
+        file_path="scripts/generate_image.py",
+        skill_name="image-skill",
+        purpose="调用平台 diffusion 生成图片",
+        blueprint_text="需要根据用户输入生成图片",
+        conversation_history=[],
+    )
+    prompt = messages[0]["content"]
+
+    assert "LLM_BASE_URL" in prompt
+    assert "IMAGE_BASE_URL" in prompt
+    assert "LLM_API_KEY" in prompt
+    assert "先调用 TEXT_MODEL" in prompt
+    assert "英文 prompt" in prompt
+    assert "尝试安装缺失的常见 PyPI 依赖" in prompt
+
+
+def test_creator_rejects_image_model_script_without_english_translation():
+    from backend.routers.creator import _validate_script_contract_static
+
+    skill_md = """---
+name: image-skill
+description: 使用图像模型生成图片
+---
+
+执行命令：
+```bash
+python scripts/generate.py '{"prompt":"{{prompt}}"}'
+```
+"""
+    script = """import json
+import os
+import sys
+
+payload = json.loads(sys.argv[1])
+prompt = payload.get('prompt')
+print(os.environ['IMAGE_MODEL'], prompt)
+"""
+
+    with pytest.raises(ValueError, match="翻译成英文"):
+        _validate_script_contract_static(
+            file_path="scripts/generate.py",
+            content=script,
+            skill_md=skill_md,
+        )
+
+
+def test_creator_trial_args_render_skill_md_template():
+    from backend.routers.creator import _trial_args_for_script
+
+    skill_md = """执行命令：
+```bash
+python scripts/generate.py '{"prompt":"{{prompt}}","topic":"{{topic}}"}'
+```
+"""
+    args = _trial_args_for_script(
+        skill_md,
+        "scripts/generate.py",
+        "import json, sys\npayload = json.loads(sys.argv[1])\n",
+    )
+
+    assert len(args) == 1
+    payload = json.loads(args[0][0])
+    assert payload["prompt"] == "a cinematic watercolor cat under a warm sunset"
+    assert payload["topic"] == "system time"
+
+
+def test_creator_repair_sanitizer_accepts_explanatory_python_fence():
+    from backend.routers.creator import _sanitize_repaired_script_content
+
+    repaired = """这里是修复后的脚本：
+```python
+import json
+print(json.dumps({"text": "ok"}))
+```
+"""
+
+    result = _sanitize_repaired_script_content("scripts/generate.py", repaired)
+
+    assert result.startswith("import json")
+    assert "```" not in result

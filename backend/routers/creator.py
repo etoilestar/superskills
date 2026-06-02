@@ -15,6 +15,11 @@ import ast
 import json
 import logging
 import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -24,9 +29,14 @@ from pydantic import BaseModel
 
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
-from ..services.llm_proxy import stream_chat
+from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import route_creator_file_model
-from ..services.skill_executor import run_action
+from ..services.skill_executor import (
+    _build_script_runtime_env,
+    _dependency_source_for_script,
+    _ensure_python_dependencies_for_source,
+    run_action,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +56,8 @@ _SKILL_MD_MARKDOWN_EXECUTION_GUIDE = """
 - 如果需要写文件，用普通 Markdown 说明 assistant 应输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放在紧随其后的 fenced code block。
 - assistant 不得假装脚本已经执行；必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。
 - 禁止在 SKILL.md 中只写“立即调用 `scripts/...`”这种隐式执行描述；应写成“运行时 assistant 输出以下命令块交由宿主执行”，并给出具体命令示例。
-- 如果用户要求使用平台内置模型、图像模型或多模态模型，不要写外部 API key、关键词数据库或假 API；应说明由宿主配置的模型完成相关步骤。任何脚本都必须是有实际功能的实现：要么执行确定性的真实计算/转换/文件处理，要么在需要开放式生成、语义理解、视觉/图像能力时调用宿主注入的 `LLM_BASE_URL`、`TEXT_MODEL`、`IMAGE_MODEL`、`VISION_MODEL`；不能用固定模板、随机词表、ASCII 图或占位文件冒充模型能力。
+- 如果用户要求使用平台内置模型、图像模型或多模态模型，不要写外部 API key、关键词数据库或假 API；应说明由宿主配置的模型完成相关步骤。任何脚本都必须是有实际功能的实现：要么执行确定性的真实计算/转换/文件处理，要么在需要开放式生成、语义理解、视觉/图像能力时调用宿主注入的 `LLM_BASE_URL`、`TEXT_MODEL`、`IMAGE_MODEL`、`VISION_MODEL`、`IMAGE_BASE_URL`、`IMAGE_SIZE`、`LLM_API_KEY`；不能用固定模板、随机词表、ASCII 图或占位文件冒充模型能力。
+- 如果脚本调用 diffusion/图片生成接口，必须先用宿主 `TEXT_MODEL` 把用户输入的中文或任意语言图片提示词翻译/润色为英文，再把英文 prompt 传给 `IMAGE_MODEL` / image generation API。
 """
 
 router = APIRouter(prefix="/api/creator", tags=["creator"])
@@ -60,6 +71,11 @@ _ALLOWED_FOLDERS: frozenset[str] = frozenset({"scripts", "references", "assets"}
 
 # Trailing conversation turns to include in file-generation prompts.
 _MAX_HISTORY_TURNS = 6
+
+# Script generation can repair itself by sending trial-run failures back to the
+# same routed model before returning content to the frontend.
+_MAX_SCRIPT_REPAIR_ATTEMPTS = 2
+_SCRIPT_TRIAL_TIMEOUT_SECONDS = 30
 
 # Human-readable language labels indexed by file extension.
 _LANG_LABELS: dict[str, str] = {
@@ -290,6 +306,8 @@ _CONFIGURED_MODEL_CALL_RE = re.compile(
     r"chat/completions|complete_chat_once|stream_chat|openai",
     re.IGNORECASE,
 )
+_IMAGE_MODEL_USAGE_RE = re.compile(r"IMAGE_MODEL|IMAGE_BASE_URL|/v1/images/generations|images/generations", re.IGNORECASE)
+_DIFFUSION_TRANSLATION_RE = re.compile(r"TEXT_MODEL|translate|translation|english|英文|翻译", re.IGNORECASE)
 
 
 def _reject_custom_skill_md_protocol(content: str) -> None:
@@ -333,6 +351,12 @@ def _script_uses_configured_model(content: str) -> bool:
 
 def _validate_configured_model_usage_static(*, file_path: str, content: str, skill_md: str) -> None:
     """Reject scripts that claim host-model behavior but do not call models."""
+    if _IMAGE_MODEL_USAGE_RE.search(content) and not _DIFFUSION_TRANSLATION_RE.search(content):
+        raise ValueError(
+            f"{file_path} 调用 diffusion/IMAGE_MODEL 前必须先用 TEXT_MODEL 将用户输入的图像提示词翻译成英文，"
+            "再把英文 prompt 传给图片生成接口。"
+        )
+
     if not _requires_configured_model_call(skill_md=skill_md, file_path=file_path):
         return
     if _script_uses_configured_model(content):
@@ -419,6 +443,154 @@ def _validate_script_against_existing_skill_contract(skill_name: str, file_path:
     _validate_script_contract_static(file_path=file_path, content=content, skill_md=skill_md)
 
 
+def _sample_value_for_placeholder(key: str) -> str:
+    """Return realistic trial input; image/diffusion prompts are already English."""
+    lowered = key.lower()
+    if any(token in lowered for token in ("prompt", "diffusion", "image", "picture", "photo", "scene")):
+        return "a cinematic watercolor cat under a warm sunset"
+    if any(token in lowered for token in ("text", "content", "input", "query")):
+        return "测试输入 text sample"
+    if any(token in lowered for token in ("topic", "theme", "subject")):
+        return "system time"
+    return f"sample {key}"
+
+
+def _render_trial_command_args(command: str, script_path: str) -> list[str] | None:
+    """Extract argv for script_path from a SKILL.md command template."""
+    rendered = re.sub(
+        r"{{\s*([a-zA-Z_][\w-]*)\s*}}",
+        lambda m: _sample_value_for_placeholder(m.group(1)),
+        command,
+    )
+    try:
+        parts = shlex.split(rendered)
+    except ValueError:
+        return None
+
+    for idx, part in enumerate(parts):
+        normalized = part.replace("\\", "/")
+        if normalized == script_path or normalized.endswith("/" + script_path):
+            return parts[idx + 1:]
+    return None
+
+
+def _trial_args_for_script(skill_md: str, file_path: str, content: str) -> list[list[str]]:
+    commands = _extract_script_command_templates(skill_md, file_path)
+    arg_sets = [args for cmd in commands if (args := _render_trial_command_args(cmd, file_path)) is not None]
+    if arg_sets:
+        return arg_sets
+    if _script_reads_json_argv(content):
+        return [[json.dumps({
+            "prompt": _sample_value_for_placeholder("prompt"),
+            "text": _sample_value_for_placeholder("text"),
+            "topic": _sample_value_for_placeholder("topic"),
+        }, ensure_ascii=False)]]
+    return [[]]
+
+
+def _format_trial_failure(*, args: list[str], returncode: int, stdout: str, stderr: str) -> str:
+    return (
+        "脚本试运行失败：\n"
+        f"argv={args!r}\n"
+        f"exit_code={returncode}\n"
+        f"stdout={stdout[-4000:]}\n"
+        f"stderr={stderr[-4000:]}"
+    )
+
+
+def _trial_run_generated_script(skill_name: str, file_path: str, content: str) -> None:
+    """Run a generated Python script before accepting it from Creator."""
+    if not file_path.startswith("scripts/") or Path(file_path).suffix.lower() != ".py":
+        return
+
+    skill_md_path = settings.skills_path / skill_name / "SKILL.md"
+    skill_md = skill_md_path.read_text(encoding="utf-8") if skill_md_path.is_file() else ""
+    _validate_script_contract_static(file_path=file_path, content=content, skill_md=skill_md)
+
+    with tempfile.TemporaryDirectory(prefix="creator-script-trial-") as tmp:
+        skill_dir = Path(tmp) / skill_name
+        existing_skill_dir = settings.skills_path / skill_name
+        if existing_skill_dir.exists():
+            shutil.copytree(
+                existing_skill_dir,
+                skill_dir,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("__pycache__", "dist", ".git", "node_modules", ".venv", "venv"),
+            )
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(skill_md or f"---\nname: {skill_name}\ndescription: trial\n---\n", encoding="utf-8")
+        script_path = scripts_dir / Path(file_path).name
+        script_path.write_text(content, encoding="utf-8")
+
+        try:
+            installed_packages = _ensure_python_dependencies_for_source(_dependency_source_for_script(script_path, skill_dir))
+        except Exception as exc:
+            raise ValueError(f"脚本依赖安装失败：{exc}") from exc
+
+        for args in _trial_args_for_script(skill_md, file_path, content):
+            try:
+                proc = subprocess.run(
+                    [sys.executable, str(script_path), *args],
+                    cwd=str(scripts_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=_SCRIPT_TRIAL_TIMEOUT_SECONDS,
+                    env=_build_script_runtime_env(skill_dir),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ValueError(f"脚本试运行超时（超过 {_SCRIPT_TRIAL_TIMEOUT_SECONDS} 秒）：argv={args!r}") from exc
+            if proc.returncode != 0:
+                raise ValueError(_format_trial_failure(
+                    args=args,
+                    returncode=proc.returncode,
+                    stdout=proc.stdout,
+                    stderr=proc.stderr,
+                ))
+            if installed_packages:
+                logger.info("creator script trial installed packages skill=%s file=%s packages=%s", skill_name, file_path, installed_packages)
+
+
+def _sanitize_repaired_script_content(file_path: str, content: str) -> str:
+    """Sanitize repair output, allowing common explanatory fenced-code replies."""
+    try:
+        return _sanitize_generated_file_content(file_path, content)
+    except ValueError:
+        if file_path.startswith("scripts/"):
+            block = _extract_target_file_from_bundle(content, file_path) or _extract_first_fenced_block(content)
+            if block is not None:
+                sanitized = _strip_code_fence(block)
+                _validate_generated_file_content(file_path, sanitized)
+                return sanitized
+        raise
+
+
+async def _repair_generated_script_with_feedback(
+    *,
+    prompt_messages: list[dict],
+    model: str,
+    file_path: str,
+    previous_content: str,
+    validation_error: str,
+) -> str:
+    """Ask the original routed model to fix script content using trial-run feedback."""
+    repair_messages = [*prompt_messages]
+    repair_messages.append({
+        "role": "assistant",
+        "content": previous_content,
+    })
+    repair_messages.append({
+        "role": "user",
+        "content": (
+            f"上一次生成的 {file_path} 没有通过保存前静态校验/试运行。"
+            "请根据以下错误修复，并且只返回完整脚本源码，不要解释，不要 Markdown 代码块。\n\n"
+            f"错误信息：\n{validation_error}"
+        ),
+    })
+    repaired = await complete_chat_once(repair_messages, model)
+    return _sanitize_repaired_script_content(file_path, repaired)
+
+
 def _sanitize_generated_file_content(file_path: str, content: str) -> str:
     """Normalize model output into exactly the requested file content."""
     extracted = _extract_target_file_from_bundle(content, file_path)
@@ -493,10 +665,12 @@ def _build_generate_file_prompt(
             "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图和 SKILL.md 里的 Markdown 命令示例一致。\n"
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须读取 sys.argv[1] 并使用 json.loads 解析。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
-            "6. 如果脚本承担需要模型判断的开放式能力，必须调用宿主注入的 LLM_BASE_URL + TEXT_MODEL/IMAGE_MODEL/VISION_MODEL（OpenAI-compatible /v1/chat/completions），不要用固定模板或随机词表冒充模型能力。\n"
-            "7. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
-            "8. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image\": ...}），不要混入调试说明。\n"
-            "9. 所有导入的第三方库必须真实存在且常见；包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
+            "6. 如果脚本承担需要模型判断的开放式能力，必须调用宿主稳定注入的环境变量：LLM_BASE_URL、TEXT_MODEL、IMAGE_MODEL、VISION_MODEL、IMAGE_BASE_URL、IMAGE_SIZE、LLM_API_KEY（OpenAI-compatible /v1/chat/completions 或 /v1/images/generations），不要硬编码模型名、服务地址或 API key。\n"
+            "7. 如果脚本调用 diffusion/IMAGE_MODEL 生成图片，必须先调用 TEXT_MODEL 将用户输入的图片提示词翻译/润色成英文，再把英文 prompt 传给图片生成接口；不要把中文原文直接传给 diffusion。\n"
+            "8. 平台会在脚本试运行/执行前尝试安装缺失的常见 PyPI 依赖；但仍应优先使用标准库和 backend 已有依赖（尤其用 httpx 调 OpenAI-compatible API），不要导入未生成的本地 helper 模块。\n"
+            "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
+            "10. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image\": ...}），不要混入调试说明。\n"
+            "11. 所有导入的第三方库必须真实存在且常见；包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
             f"以下是已确认的蓝图：\n\n{blueprint_text}"
         )
     elif file_path.startswith("references/"):
@@ -623,6 +797,27 @@ async def generate_file(request: GenerateFileRequest):
                 request.file_path,
                 "".join(generated_chunks),
             )
+
+            if request.file_path.startswith("scripts/"):
+                last_error = ""
+                for attempt in range(_MAX_SCRIPT_REPAIR_ATTEMPTS + 1):
+                    try:
+                        _trial_run_generated_script(skill_name, request.file_path, content)
+                        last_error = ""
+                        break
+                    except ValueError as validation_exc:
+                        last_error = str(validation_exc)
+                        if attempt >= _MAX_SCRIPT_REPAIR_ATTEMPTS:
+                            raise
+                        yield _sse({"validation": {"status": "repairing", "attempt": attempt + 1, "error": last_error}})
+                        content = await _repair_generated_script_with_feedback(
+                            prompt_messages=prompt_messages,
+                            model=model,
+                            file_path=request.file_path,
+                            previous_content=content,
+                            validation_error=last_error,
+                        )
+
             yield _sse({"content": content})
             yield _sse({"done": True})
         except Exception as exc:
@@ -650,6 +845,8 @@ async def write_file(request: WriteFileRequest):
     try:
         content = _sanitize_generated_file_content(request.file_path, request.content)
         _validate_script_against_existing_skill_contract(skill_name, request.file_path, content)
+        if request.file_path.startswith("scripts/"):
+            _trial_run_generated_script(skill_name, request.file_path, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -682,6 +879,21 @@ async def validate_skill(request: SkillActionRequest):
     """Validate SKILL.md format for a Skill package."""
     skill_name = _validate_skill_name(request.skill_name)
     result = run_action({"action": "validate", "name": skill_name})
+    if result["success"]:
+        skill_dir = settings.skills_path / skill_name
+        trial_errors: list[str] = []
+        for script_path in sorted((skill_dir / "scripts").glob("*.py")) if (skill_dir / "scripts").is_dir() else []:
+            rel_path = f"scripts/{script_path.name}"
+            try:
+                _trial_run_generated_script(skill_name, rel_path, script_path.read_text(encoding="utf-8"))
+            except ValueError as exc:
+                trial_errors.append(f"{rel_path}: {exc}")
+        if trial_errors:
+            return SkillActionResponse(
+                success=False,
+                path=None,
+                message="SKILL.md 格式校验通过，但脚本试运行失败：\n" + "\n\n".join(trial_errors),
+            )
     return SkillActionResponse(
         success=result["success"],
         path=result.get("path"),

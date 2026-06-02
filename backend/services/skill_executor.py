@@ -4,6 +4,8 @@ Supported actions: init, write, write_file, validate, package, run_script.
 All return a uniform dict: {action, name, success, message, path}.
 run_script additionally returns: {stdout, stderr, exit_code, filename}.
 """
+import ast
+import importlib.util
 import logging
 import os
 import subprocess
@@ -304,9 +306,102 @@ def _run_write_file(name: str, folder: str, filename: str, content: str, skill_d
 # ---------------------------------------------------------------------------
 
 _SCRIPT_RUN_TIMEOUT = 30   # seconds
+_DEP_INSTALL_TIMEOUT = 180  # seconds
 _MAX_OUTPUT_BYTES = 100 * 1024  # 100 KB per stream
 
 _SNAPSHOT_EXCLUDE_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "venv", "dist"}
+
+_IMPORT_PACKAGE_OVERRIDES = {
+    "PIL": "Pillow",
+    "bs4": "beautifulsoup4",
+    "cv2": "opencv-python",
+    "dotenv": "python-dotenv",
+    "sklearn": "scikit-learn",
+    "yaml": "pyyaml",
+}
+
+
+def _stdlib_module_names() -> set[str]:
+    names = set(getattr(sys, "stdlib_module_names", set()))
+    names.update(sys.builtin_module_names)
+    return names
+
+
+def _extract_top_level_imports(source: str) -> set[str]:
+    """Return top-level imported module names from Python source."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modules.add(alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            modules.add(node.module.split(".", 1)[0])
+    return modules
+
+
+def _missing_python_packages(source: str) -> list[str]:
+    """Return PyPI package names needed for imports missing at runtime."""
+    stdlib = _stdlib_module_names()
+    packages: list[str] = []
+    seen: set[str] = set()
+    for module in sorted(_extract_top_level_imports(source)):
+        if not module or module in stdlib or module.startswith("_"):
+            continue
+        if importlib.util.find_spec(module) is not None:
+            continue
+        package = _IMPORT_PACKAGE_OVERRIDES.get(module, module.replace("_", "-"))
+        if package not in seen:
+            seen.add(package)
+            packages.append(package)
+    return packages
+
+
+def _install_python_packages(packages: list[str]) -> list[str]:
+    """Install missing packages into the current Python environment."""
+    if not packages:
+        return []
+
+    logger.info("Installing generated-script Python dependencies: %s", packages)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pip", "install", *packages],
+        capture_output=True,
+        text=True,
+        timeout=_DEP_INSTALL_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "Python 依赖安装失败："
+            f"packages={packages!r}\n"
+            f"stdout={proc.stdout[-4000:]}\n"
+            f"stderr={proc.stderr[-4000:]}"
+        )
+    return packages
+
+
+def _ensure_python_dependencies_for_source(source: str) -> list[str]:
+    """Install missing third-party imports before executing generated code."""
+    return _install_python_packages(_missing_python_packages(source))
+
+
+def _dependency_source_for_script(script_path: Path, skill_dir: Path) -> str:
+    """Combine a script and sibling scripts for dependency detection."""
+    sources: list[str] = []
+    seen: set[Path] = set()
+    for candidate in [script_path, *sorted((skill_dir / "scripts").glob("*.py"))]:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not candidate.is_file():
+            continue
+        seen.add(resolved)
+        sources.append(candidate.read_text(encoding="utf-8"))
+    return "\n".join(sources)
 
 
 def _snapshot_skill_files(skill_dir: Path) -> set[str]:
@@ -328,6 +423,32 @@ def _snapshot_skill_files(skill_dir: Path) -> set[str]:
             continue
         result.add(rel.as_posix())
     return result
+
+
+def _build_script_runtime_env(skill_dir: Path) -> dict[str, str]:
+    """Return stable environment variables injected into generated scripts.
+
+    The creator prompts generated scripts to use these names instead of
+    hard-coded model IDs or service URLs.  Building this map in one place keeps
+    sandbox script runs and creator validation trial runs consistent.
+    """
+    env = {**os.environ}
+    env.update({
+        "LLM_BASE_URL": settings.llm_base_url,
+        "IMAGE_BASE_URL": settings.image_base_url,
+        "DEFAULT_MODEL": settings.default_model,
+        "TEXT_MODEL": settings.text_model or settings.default_model,
+        "CODE_MODEL": settings.code_model or settings.default_model,
+        "IMAGE_MODEL": settings.image_model or settings.default_model,
+        "VISION_MODEL": settings.vision_model or settings.default_model,
+        "IMAGE_SIZE": settings.image_size,
+        "OUTPUT_DIR": str(skill_dir / "outputs"),
+        "INPUT_DIR": str(skill_dir / "inputs"),
+    })
+    api_key = settings.llm_api_key or settings.openai_api_key or env.get("LLM_API_KEY") or env.get("OPENAI_API_KEY") or "ollama"
+    env["LLM_API_KEY"] = api_key
+    env["OPENAI_API_KEY"] = settings.openai_api_key or api_key
+    return env
 
 
 def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Path) -> dict:
@@ -364,6 +485,14 @@ def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Pat
                 "message": "参数包含非法字符", "path": None, **_empty,
             }
 
+    try:
+        installed_packages = _ensure_python_dependencies_for_source(_dependency_source_for_script(script_path, skill_dir))
+    except Exception as exc:
+        return {
+            "action": "run_script", "name": name, "success": False,
+            "message": f"脚本依赖安装失败: {exc}", "path": str(script_path), **_empty,
+        }
+
     # Snapshot the skill directory before execution to detect new output files.
     pre_snapshot = _snapshot_skill_files(skill_dir)
 
@@ -374,11 +503,7 @@ def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Pat
             capture_output=True,
             timeout=_SCRIPT_RUN_TIMEOUT,
             cwd=str(skill_dir / "scripts"),
-            env={
-                **os.environ,
-                "OUTPUT_DIR": str(skill_dir / "outputs"),
-                "INPUT_DIR": str(skill_dir / "inputs"),
-            },
+            env=_build_script_runtime_env(skill_dir),
         )
         stdout = proc.stdout[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
         stderr = proc.stderr[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
@@ -395,6 +520,8 @@ def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Pat
             "stderr": stderr,
             "exit_code": proc.returncode,
         }
+        if installed_packages:
+            result["installed_packages"] = installed_packages
 
         # Detect newly created files and attach download metadata.
         if success:
