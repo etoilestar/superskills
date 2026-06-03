@@ -830,10 +830,53 @@ def _format_file_validator_feedback(deterministic_error: str, validator_report: 
     )
 
 
+def _is_valid_normalized_script_source(file_path: str, content: str) -> bool:
+    """Return whether content is safe to accept as the requested raw script.
+
+    This helper is intentionally narrower than the full script validator: it only
+    checks that deterministic Markdown/bundle cleanup produced one raw source
+    file.  Full fake-implementation, contract, dependency and trial-run checks
+    still happen in the normal validation pipeline.
+    """
+    stripped = content.strip()
+    if not stripped or "```" in stripped or _MULTI_FILE_MARKER_RE.search(stripped):
+        return False
+
+    if Path(file_path).suffix.lower() == ".py":
+        try:
+            ast.parse(stripped)
+        except SyntaxError:
+            return False
+
+    return True
+
+
+def _extract_single_wrapping_fence(content: str) -> str | None:
+    """Extract a code block only when it wraps the entire model response."""
+    stripped = content.strip()
+    match = re.match(r"^(`{3,}|~{3,})[^\n]*\n([\s\S]*?)\n\1\s*$", stripped)
+    if not match:
+        return None
+    return match.group(2).strip()
+
+
 def _normalize_generated_file_content(file_path: str, content: str) -> str:
-    """Normalize generated non-script content while keeping scripts strict."""
+    """Normalize model output while keeping script extraction conservative."""
     if file_path.startswith("scripts/"):
-        return content.strip()
+        stripped = content.strip()
+
+        # Low-risk deterministic recovery for common coder behavior: accept only
+        # one fenced code block wrapping the entire response.  We deliberately do
+        # not extract scripts from multi-file bundles or prose, because those
+        # responses are ambiguous and should be repaired by the model instead.
+        wrapping_fence = _extract_single_wrapping_fence(stripped)
+        if wrapping_fence is not None:
+            normalized = wrapping_fence.strip()
+            if _is_valid_normalized_script_source(file_path, normalized):
+                return normalized
+
+        return stripped
+
     extracted = _extract_target_file_from_bundle(content, file_path)
     return _strip_code_fence(extracted if extracted is not None else content)
 
