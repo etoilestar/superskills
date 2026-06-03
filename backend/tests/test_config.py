@@ -51,7 +51,7 @@ def test_new_fields_declared():
 def test_planner_model_has_stronger_default():
     from backend.config import settings
 
-    assert settings.planner_model == "qwen3:30b"
+    assert settings.planner_model == "qwen3:30b-instruct"
 
 
 def test_validator_model_has_fast_default():
@@ -65,7 +65,7 @@ def test_capability_models_have_local_defaults():
 
     assert settings.text_model == "qwen3:30b"
     assert settings.code_model == "qwen3-coder:30b"
-    assert settings.image_model == "qwen3-vl:32b"
+    assert settings.image_model == "stable-diffusion-2-1-base"
     assert settings.vision_model == "qwen3-vl:32b"
 
 
@@ -116,6 +116,7 @@ def test_uppercase_env_model_settings_override_defaults(monkeypatch, tmp_path):
     monkeypatch.setenv("PLANNER_MODEL", "qwen-plan")
     monkeypatch.setenv("VALIDATOR_MODEL", "qwen-validate")
     monkeypatch.setenv("IMAGE_MODEL", "qwen-image")
+    monkeypatch.setenv("IMAGE_API_KEY", "image-key")
     monkeypatch.setenv("VISION_MODEL", "qwen-vision")
     monkeypatch.setenv("SKILL_COMMAND_TIMEOUT", "180")
 
@@ -128,6 +129,7 @@ def test_uppercase_env_model_settings_override_defaults(monkeypatch, tmp_path):
     assert s.planner_model == "qwen-plan"
     assert s.validator_model == "qwen-validate"
     assert s.image_model == "qwen-image"
+    assert s.image_api_key == "image-key"
     assert s.vision_model == "qwen-vision"
     assert s.skill_command_timeout == 180
 

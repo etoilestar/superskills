@@ -255,6 +255,7 @@ def test_build_script_runtime_env_injects_model_variables(tmp_path):
          patch.object(skill_executor.settings, "image_base_url", "http://image.test"), \
          patch.object(skill_executor.settings, "text_model", "text-a"), \
          patch.object(skill_executor.settings, "image_model", "image-a"), \
+         patch.object(skill_executor.settings, "image_api_key", "image-key"), \
          patch.object(skill_executor.settings, "llm_api_key", "key-a"):
         env = skill_executor._build_script_runtime_env(tmp_path)
 
@@ -262,5 +263,27 @@ def test_build_script_runtime_env_injects_model_variables(tmp_path):
     assert env["IMAGE_BASE_URL"] == "http://image.test"
     assert env["TEXT_MODEL"] == "text-a"
     assert env["IMAGE_MODEL"] == "image-a"
+    assert env["IMAGE_API_KEY"] == "image-key"
+    assert "PYTHONPATH" in env
     assert env["LLM_API_KEY"] == "key-a"
     assert env["OUTPUT_DIR"] == str(tmp_path / "outputs")
+
+
+def test_skill_runtime_trial_image_helper_writes_output_file(monkeypatch, tmp_path):
+    from backend.services.skill_runtime import generate_stable_diffusion_image
+
+    monkeypatch.setenv("SKILL_TRIAL_RUN", "1")
+    monkeypatch.setenv("IMAGE_MODEL", "stable-diffusion-2-1-base")
+
+    result = generate_stable_diffusion_image(
+        "一只猫",
+        output_dir=tmp_path,
+        filename_prefix="猫 图",
+    )
+
+    image_path = Path(result["image_path"])
+    assert result["model"] == "stable-diffusion-2-1-base"
+    assert result["source"] == "trial"
+    assert image_path.is_file()
+    assert image_path.parent == tmp_path
+    assert image_path.suffix == ".png"

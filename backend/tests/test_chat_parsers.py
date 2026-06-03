@@ -839,8 +839,9 @@ def test_creator_generate_skill_md_prompt_uses_standard_markdown_execution_guida
     assert "只有 assistant 在 Sandbox 当轮回复中输出的 fenced code block" in prompt
     assert "禁止在 SKILL.md 中只写“立即调用 `scripts/...`”" in prompt
     assert "不要引入自定义协议章节" in prompt
-    assert "LLM_BASE_URL" in prompt
-    assert "TEXT_MODEL" in prompt
+    assert "宿主已配置的模型能力" in prompt
+    assert "可按需读取" in prompt
+    assert "不需要额外校验" in prompt
 
 
 def test_creator_rejects_custom_runtime_contract_section():
@@ -1007,10 +1008,12 @@ def test_kernel_creator_phase_prompts_include_block_runtime_requirements():
     assert "生成的 Skill.md Markdown 运行说明" in phase3_prompt
     assert "不会触发宿主执行" in phase3_prompt
     assert "不要加入自定义 Runtime Contract JSON" in phase3_prompt
-    assert "LLM_BASE_URL + TEXT_MODEL" in phase3_prompt or "LLM_BASE_URL + TEXT_MODEL/IMAGE_MODEL/VISION_MODEL" in phase3_prompt
+    assert "LLM_BASE_URL + TEXT_MODEL" in phase3_prompt
+    assert "IMAGE_BASE_URL + IMAGE_MODEL" in phase3_prompt
+    assert "generate_stable_diffusion_image" in phase3_prompt
 
 
-def test_creator_script_prompt_requires_stable_env_and_diffusion_translation():
+def test_creator_script_prompt_requires_platform_image_runtime_helper():
     from backend.routers.creator import _build_generate_file_prompt
 
     messages = _build_generate_file_prompt(
@@ -1024,12 +1027,16 @@ def test_creator_script_prompt_requires_stable_env_and_diffusion_translation():
 
     assert "LLM_BASE_URL" in prompt
     assert "IMAGE_BASE_URL" in prompt
-    assert "LLM_API_KEY" in prompt
-    assert "先调用 TEXT_MODEL" in prompt
-    assert "英文 prompt" in prompt
+    assert "IMAGE_MODEL" in prompt
+    assert "VISION_MODEL" in prompt
+    assert "generate_stable_diffusion_image" in prompt
+    assert "不要在脚本里写中文 prompt 翻译逻辑" in prompt
+    assert "禁止输出 base64 data URI" in prompt
+    assert "可按需读取平台注入的 IMAGE_MODEL" in prompt
+    assert "不需要额外校验它们是否存在" in prompt
 
 
-def test_creator_rejects_image_model_script_without_english_translation():
+def test_creator_rejects_direct_image_api_without_platform_helper():
     from backend.routers.creator import _validate_script_contract_static
 
     skill_md = """---
@@ -1048,16 +1055,78 @@ import sys
 
 payload = json.loads(sys.argv[1])
 prompt = payload.get('prompt')
-print(os.environ['IMAGE_MODEL'], prompt)
+print(os.environ['IMAGE_BASE_URL'], os.environ['IMAGE_MODEL'], prompt)
 """
 
-    with pytest.raises(ValueError, match="翻译成英文"):
+    with pytest.raises(ValueError, match="直接调用图片生成接口"):
         _validate_script_contract_static(
             file_path="scripts/generate.py",
             content=script,
             skill_md=skill_md,
         )
 
+
+
+
+def test_creator_accepts_platform_image_helper_for_image_generation():
+    from backend.routers.creator import _validate_script_contract_static
+
+    skill_md = """---
+name: image-skill
+description: 使用图像模型生成图片
+---
+
+执行命令：
+```bash
+python scripts/generate.py '{"prompt":"{{prompt}}"}'
+```
+"""
+    script = """import json
+import sys
+
+from backend.services.skill_runtime import generate_stable_diffusion_image, print_json
+
+payload = json.loads(sys.argv[1])
+prompt = payload.get('prompt')
+result = generate_stable_diffusion_image(prompt, filename_prefix='generated')
+print_json({"image_path": result["image_path"], "prompt": result["prompt"]})
+"""
+
+    _validate_script_contract_static(
+        file_path="scripts/generate.py",
+        content=script,
+        skill_md=skill_md,
+    )
+
+
+def test_creator_rejects_vision_model_for_image_generation_endpoint():
+    from backend.routers.creator import _validate_script_contract_static
+
+    skill_md = """---
+name: image-skill
+description: 使用图像模型生成图片
+---
+
+执行命令：
+```bash
+python scripts/generate.py '{"prompt":"{{prompt}}"}'
+```
+"""
+    script = """import json
+import os
+import sys
+
+payload = json.loads(sys.argv[1])
+prompt = payload.get('prompt')
+print(os.environ['IMAGE_BASE_URL'], os.environ['VISION_MODEL'], prompt)
+"""
+
+    with pytest.raises(ValueError, match="VISION_MODEL"):
+        _validate_script_contract_static(
+            file_path="scripts/generate.py",
+            content=script,
+            skill_md=skill_md,
+        )
 
 
 def test_creator_trial_run_prepares_python_deps_before_execution(monkeypatch):
@@ -1079,6 +1148,7 @@ def test_creator_trial_run_prepares_python_deps_before_execution(monkeypatch):
     def fake_run(argv, **kwargs):
         prepared["argv"] = argv
         prepared["cwd"] = kwargs.get("cwd")
+        prepared["env"] = kwargs.get("env")
         return SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
     monkeypatch.setattr(creator, "_get_skill_venv_python", fake_get_venv_python)
@@ -1095,6 +1165,8 @@ def test_creator_trial_run_prepares_python_deps_before_execution(monkeypatch):
     assert prepared["venv_python"] == Path("/tmp/fake-skill-venv/bin/python")
     assert prepared["argv"][0] == "/tmp/fake-skill-venv/bin/python"
     assert prepared["argv"][1].endswith("use_dep.py")
+    assert prepared["env"]["SKILL_TRIAL_RUN"] == "1"
+    assert "PYTHONPATH" in prepared["env"]
 
 def test_creator_trial_args_render_skill_md_template():
     from backend.routers.creator import _trial_args_for_script
@@ -1114,3 +1186,61 @@ python scripts/generate.py '{"prompt":"{{prompt}}","topic":"{{topic}}"}'
     payload = json.loads(args[0][0])
     assert payload["prompt"] == "a cinematic watercolor cat under a warm sunset"
     assert payload["topic"] == "system time"
+
+
+def test_run_command_falls_back_when_inferred_skill_root_missing(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from backend.routers.chat_models import ChatRequest
+    from backend.routers import sandbox_chat
+
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    missing_skill_root = skills_root / "my-skill"
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["cwd"] = kwargs.get("cwd")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(sandbox_chat.subprocess, "run", fake_run)
+
+    result, _ = sandbox_chat._execute_single_task(
+        {"action": "run_command", "command": "python -c 'print(1)'"},
+        [],
+        ChatRequest(messages=[]),
+        inferred_skill_root=missing_skill_root,
+    )
+
+    assert result["success"] is True
+    assert captured["cwd"] == str(skills_root)
+
+
+def test_block_planner_retries_invalid_json(monkeypatch):
+    import asyncio
+    import json
+
+    from backend.routers.chat_models import ChatRequest, MarkdownBlock
+    from backend.routers import sandbox_chat
+
+    calls = []
+
+    async def fake_complete_chat_once(messages, model):
+        calls.append(messages)
+        if len(calls) == 1:
+            return ""
+        return json.dumps({"tasks": [], "errors": []})
+
+    monkeypatch.setattr(sandbox_chat, "complete_chat_once", fake_complete_chat_once)
+
+    plan = asyncio.run(sandbox_chat._run_block_planner_round(
+        assistant_text="执行命令：\n```bash\necho ok\n```",
+        blocks=[MarkdownBlock(index=0, lang="bash", code="echo ok", before_context="执行命令：", after_context="")],
+        request=ChatRequest(messages=[]),
+        model="planner-model",
+    ))
+
+    assert plan == {"tasks": [], "errors": []}
+    assert len(calls) == 2
+    assert "只输出 JSON" in calls[1][-1]["content"]

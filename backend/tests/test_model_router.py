@@ -64,17 +64,17 @@ def test_model_routing_json_can_override_creator_path():
     assert "override" in route.reason
 
 
-def test_sandbox_plan_code_action_routes_to_code():
+def test_sandbox_plan_code_action_keeps_final_response_on_text_model():
     from backend.config import settings
     from backend.services.model_router import infer_sandbox_response_task, route_model
 
     plan = {"tasks": [{"action": "run_command", "command": "python scripts/build.py"}]}
     task = infer_sandbox_response_task(body_prompt="", user_text="运行脚本", plan=plan)
-    with patch.object(settings, "code_model", "coder"):
+    with patch.object(settings, "text_model", "text-a"):
         route = route_model(task, requested_model="general", reason="test")
 
-    assert task == "code"
-    assert route.model == "coder"
+    assert task == "text"
+    assert route.model == "text-a"
 
 
 def test_sandbox_image_upload_routes_to_vision_model():

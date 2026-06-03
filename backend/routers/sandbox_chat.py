@@ -17,7 +17,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from ..config import settings
+from ..config import PROJECT_ROOT, settings
 from ..services.kernel_loader import (
     load_child_skill_body_prompt,
     load_skill_body_prompt,
@@ -1158,9 +1158,29 @@ async def _run_block_planner_round(
     try:
         stripped = _strip_markdown_json_fence(planner_text)
         plan = json.loads(stripped)
-    except json.JSONDecodeError as exc:
-        logger.error("Received invalid JSON response from planner: %s", planner_text)
-        raise ValueError(f"规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
+    except json.JSONDecodeError:
+        logger.warning(
+            "Block planner returned non-JSON on first attempt, retrying with correction prompt: %s",
+            planner_text[:300],
+        )
+        retry_messages = messages + [
+            {"role": "assistant", "content": planner_text},
+            {
+                "role": "user",
+                "content": (
+                    "你的上一次回复不是合法 JSON。请把它修正为一个严格 JSON object。\n"
+                    "只输出 JSON，不要 Markdown，不要解释，不要代码块标记。\n"
+                    "格式必须是：{\"tasks\":[...],\"errors\":[...]}。"
+                ),
+            },
+        ]
+        planner_text = await complete_chat_once(retry_messages, model)
+        try:
+            stripped = _strip_markdown_json_fence(planner_text)
+            plan = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            logger.error("Received invalid JSON response from planner after retry: %s", planner_text)
+            raise ValueError(f"规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
 
     if not isinstance(plan, dict):
         raise ValueError("规划模型输出必须是 JSON object")
@@ -1638,6 +1658,14 @@ def _execute_single_task(
             stdin_text = str(stdin_text)
 
         cwd = execution_root or inferred_skill_root
+        if cwd is not None and not cwd.exists():
+            # Creator bootstrap commands may need to create the inferred Skill root.
+            # Run those commands from the nearest existing parent instead of using
+            # a not-yet-created cwd, while keeping later commands in the Skill root
+            # once it exists.
+            fallback_cwd = execution_root or cwd.parent
+            if fallback_cwd.exists():
+                cwd = fallback_cwd
 
         # Per-task snapshot taken *before* execution to detect new output files.
         pre_snapshot: set[str] = _snapshot_dir_files(cwd) if cwd else set()
@@ -1668,6 +1696,7 @@ def _execute_single_task(
             "LLM_BASE_URL": settings.llm_base_url,
             "DEFAULT_MODEL": settings.default_model,
             "IMAGE_BASE_URL": settings.image_base_url,
+            "IMAGE_API_KEY": settings.image_api_key or os.environ.get("IMAGE_API_KEY") or os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or "ollama",
             "IMAGE_SIZE": settings.image_size,
             "TEXT_MODEL": settings.text_model or settings.default_model,
             "CODE_MODEL": settings.code_model or settings.default_model,
@@ -1675,6 +1704,9 @@ def _execute_single_task(
             "VISION_MODEL": settings.vision_model or settings.default_model,
             "PLANNER_MODEL": settings.planner_model or settings.default_model,
             "VALIDATOR_MODEL": settings.validator_model or settings.default_model,
+            "PYTHONPATH": os.pathsep.join(
+                part for part in [str(PROJECT_ROOT), os.environ.get("PYTHONPATH", "")] if part
+            ),
         }
         api_key = (
             settings.llm_api_key

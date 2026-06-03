@@ -18,7 +18,7 @@ services:
       - DEFAULT_MODEL=${DEFAULT_MODEL:-qwen3:30b}
       - TEXT_MODEL=${TEXT_MODEL:-qwen3:30b}
       - CODE_MODEL=${CODE_MODEL:-qwen3-coder:30b}
-      - PLANNER_MODEL=${PLANNER_MODEL:-qwen3:30b}
+      - PLANNER_MODEL=${PLANNER_MODEL:-qwen3:30b-instruct}
       - VALIDATOR_MODEL=${VALIDATOR_MODEL:-qwen3:8b}
       - IMAGE_MODEL=${IMAGE_MODEL:-stable-diffusion-2-1-base}
       - IMAGE_BASE_URL=${IMAGE_BASE_URL:-http://host.docker.internal:11435}

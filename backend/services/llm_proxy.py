@@ -21,6 +21,15 @@ def _resolve_api_key() -> str | None:
     )
 
 
+def _resolve_image_api_key() -> str | None:
+    """Resolve the image-generation API key independently from the LLM key."""
+    return (
+        settings.image_api_key
+        or os.environ.get("IMAGE_API_KEY")
+        or _resolve_api_key()
+    )
+
+
 def _auth_headers() -> dict:
     """Return Authorization header when an OpenAI API key is configured."""
     api_key = _resolve_api_key()
@@ -115,6 +124,13 @@ def _build_headers() -> dict:
     }
 
 
+def _build_image_headers() -> dict:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {_resolve_image_api_key() or 'ollama'}",
+    }
+
+
 async def complete_chat_once(messages: list[dict], model: str) -> str:
     """Non-streaming chat completion.
 
@@ -164,7 +180,7 @@ async def generate_image_once(
 ) -> dict:
     """Call OpenAI-compatible image generation API."""
     url = _build_image_generations_url(settings.image_base_url)
-    headers = _build_headers()
+    headers = _build_image_headers()
     timeout = float(settings.llm_timeout_seconds)
 
     payload = {

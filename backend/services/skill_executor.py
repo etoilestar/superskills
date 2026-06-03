@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ..config import settings
+from ..config import PROJECT_ROOT, settings
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +341,7 @@ def _build_script_runtime_env(skill_dir: Path) -> dict[str, str]:
     env.update({
         "LLM_BASE_URL": settings.llm_base_url,
         "IMAGE_BASE_URL": settings.image_base_url,
+        "IMAGE_API_KEY": settings.image_api_key or env.get("IMAGE_API_KEY") or env.get("LLM_API_KEY") or env.get("OPENAI_API_KEY") or "ollama",
         "DEFAULT_MODEL": settings.default_model,
         "TEXT_MODEL": settings.text_model or settings.default_model,
         "CODE_MODEL": settings.code_model or settings.default_model,
@@ -349,6 +350,9 @@ def _build_script_runtime_env(skill_dir: Path) -> dict[str, str]:
         "IMAGE_SIZE": settings.image_size,
         "OUTPUT_DIR": str(skill_dir / "outputs"),
         "INPUT_DIR": str(skill_dir / "inputs"),
+        "PYTHONPATH": os.pathsep.join(
+            part for part in [str(PROJECT_ROOT), env.get("PYTHONPATH", "")] if part
+        ),
     })
     api_key = settings.llm_api_key or settings.openai_api_key or env.get("LLM_API_KEY") or env.get("OPENAI_API_KEY") or "ollama"
     env["LLM_API_KEY"] = api_key

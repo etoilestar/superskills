@@ -643,8 +643,77 @@ def _compose_creator_loaded_resources_prompt(
     resource_catalog: list,
     selected_handles: list
 ):
-    """Compose loaded resources into a prompt for the LLM."""
-    return ""
+    """Compose loaded creator resources into a prompt for the LLM."""
+    resource_by_handle = {str(item.get("resource_handle")): item for item in resource_catalog}
+    sections: list[str] = []
+
+    for handle in selected_handles:
+        resource = resource_by_handle.get(str(handle))
+        if not resource:
+            continue
+
+        path = str(resource.get("path") or "")
+        try:
+            observation = read_skill_resource_text(
+                skill_name,
+                path,
+                max_chars=settings.skill_resource_max_chars,
+            )
+        except Exception as exc:
+            sections.append(
+                f"### {handle}\n"
+                f"- path: `{path}`\n"
+                f"- load_error: {exc}\n"
+            )
+            continue
+
+        content = observation.get("content", "")
+        truncated = observation.get("truncated", False)
+        sections.append(
+            f"### {handle}\n"
+            f"- kind: {resource.get('kind')}\n"
+            f"- path: `{path}`\n"
+            f"- truncated: {truncated}\n\n"
+            "```text\n"
+            f"{content}\n"
+            "```"
+        )
+
+    if not sections:
+        return ""
+
+    return (
+        "\n\n---\n\n"
+        "## Loaded Creator Resources\n\n"
+        "下面是宿主按需加载的 Creator 资源正文；只能依据已加载内容使用这些资源。\n\n"
+        + "\n\n".join(sections)
+    )
+
+
+def _compose_creator_runtime_contract_prompt() -> str:
+    """Inject non-negotiable platform runtime contracts for generated Skills."""
+    image_model = settings.image_model or settings.default_model
+    text_model = settings.text_model or settings.default_model
+    vision_model = settings.vision_model or settings.default_model
+    return f"""
+
+---
+
+## Platform Runtime Contract for Generated Skills
+
+生成 Skill 时必须遵守以下平台运行时契约：
+
+1. 模型来源必须分离：
+   - 文本、翻译、语义改写：`LLM_BASE_URL` + `TEXT_MODEL`。
+   - 看图理解、OCR、多模态问答：`LLM_BASE_URL` + `VISION_MODEL`。
+   - 生成图片：Stable Diffusion 图片运行时，使用 `IMAGE_BASE_URL` + `IMAGE_MODEL` 与 `IMAGE_SIZE`；不得使用 `VISION_MODEL` 生成图片。
+2. 创建出来的 `SKILL.md` 不要写中文 topic 翻译、TEXT_MODEL 翻译调用、图片接口字段解析等平台细节；只写“使用平台 Stable Diffusion 图片生成能力”。
+3. 生成的 `scripts/*.py` 如果需要图片生成，必须调用：
+   `from backend.services.skill_runtime import generate_stable_diffusion_image, print_json`
+   并把用户 topic 原文传给 `generate_stable_diffusion_image(...)`。平台 helper 会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、`b64_json` 解析、图片写入 `OUTPUT_DIR`。
+4. 图片脚本 stdout 必须输出 JSON，包含 `image_path`；禁止输出 base64 data URI，禁止假设图片接口只返回 `url`。
+5. 模型与认证相关参数由平台运行时注入；生成脚本可按需读取 `IMAGE_MODEL`、`IMAGE_BASE_URL`、`IMAGE_SIZE`、`IMAGE_API_KEY` / `LLM_API_KEY` / `OPENAI_API_KEY` 等环境变量，但不要硬编码这些值，也不需要额外校验它们是否存在。
+"""
 
 
 @_safe_async_generator
@@ -752,6 +821,8 @@ async def _make_stream_creator_generator(
                             resource_catalog=resource_catalog,
                             selected_handles=selected,
                         )
+
+    body_prompt = body_prompt + _compose_creator_runtime_contract_prompt()
 
     if loaded_resources_prompt:
         body_prompt = body_prompt + loaded_resources_prompt

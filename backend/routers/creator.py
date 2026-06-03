@@ -50,8 +50,8 @@ _SKILL_MD_MARKDOWN_EXECUTION_GUIDE = """
 - 如果需要写文件，用普通 Markdown 说明 assistant 应输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放在紧随其后的 fenced code block。
 - assistant 不得假装脚本已经执行；必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。
 - 禁止在 SKILL.md 中只写“立即调用 `scripts/...`”这种隐式执行描述；应写成“运行时 assistant 输出以下命令块交由宿主执行”，并给出具体命令示例。
-- 如果用户要求使用平台内置模型、图像模型或多模态模型，不要写外部 API key、关键词数据库或假 API；应说明由宿主配置的模型完成相关步骤。任何脚本都必须是有实际功能的实现：要么执行确定性的真实计算/转换/文件处理，要么在需要开放式生成、语义理解、视觉/图像能力时调用宿主注入的 `LLM_BASE_URL`、`TEXT_MODEL`、`IMAGE_MODEL`、`VISION_MODEL`、`IMAGE_BASE_URL`、`IMAGE_SIZE`、`LLM_API_KEY`；不能用固定模板、随机词表、ASCII 图或占位文件冒充模型能力。
-- 如果脚本调用 diffusion/图片生成接口，必须先用宿主 `TEXT_MODEL` 把用户输入的中文或任意语言图片提示词翻译/润色为英文，再把英文 prompt 传给 `IMAGE_MODEL` / image generation API。
+- 如果用户要求使用平台内置模型、图像模型或多模态模型，不要写外部 API key、关键词数据库或假 API；应说明由宿主配置的模型完成相关步骤。任何脚本都必须是有实际功能的实现：要么执行确定性的真实计算/转换/文件处理，要么在需要开放式生成、语义理解、视觉/图像能力时使用宿主已配置的模型能力；模型与认证相关参数由平台运行时注入；生成脚本可按需读取 `IMAGE_MODEL`、`IMAGE_BASE_URL`、`IMAGE_SIZE`、`IMAGE_API_KEY` / `LLM_API_KEY` / `OPENAI_API_KEY` 等环境变量，但不要硬编码这些值，也不需要额外校验它们是否存在。
+- 如果需要生成图片，SKILL.md 只描述“使用平台稳定扩散图片生成能力”即可；不要把中文 prompt 翻译、TEXT_MODEL 调用、接口字段解析等平台细节写入创建出来的 Skill 正文。平台运行时会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换。
 """
 
 router = APIRouter(prefix="/api/creator", tags=["creator"])
@@ -297,11 +297,15 @@ _HOST_MODEL_CAPABILITY_RE = re.compile(
 )
 _CONFIGURED_MODEL_CALL_RE = re.compile(
     r"LLM_BASE_URL|TEXT_MODEL|IMAGE_MODEL|VISION_MODEL|/v1/chat/completions|"
-    r"chat/completions|complete_chat_once|stream_chat|openai",
+    r"chat/completions|complete_chat_once|stream_chat|openai|"
+    r"generate_stable_diffusion_image|backend\.services\.skill_runtime",
     re.IGNORECASE,
 )
-_IMAGE_MODEL_USAGE_RE = re.compile(r"IMAGE_MODEL|IMAGE_BASE_URL|/v1/images/generations|images/generations", re.IGNORECASE)
-_DIFFUSION_TRANSLATION_RE = re.compile(r"TEXT_MODEL|translate|translation|english|英文|翻译", re.IGNORECASE)
+_IMAGE_MODEL_USAGE_RE = re.compile(r"IMAGE_MODEL|IMAGE_BASE_URL|/v1/images/generations|images/generations|generate_stable_diffusion_image", re.IGNORECASE)
+_DIRECT_IMAGE_API_RE = re.compile(r"IMAGE_BASE_URL|/v1/images/generations|images/generations", re.IGNORECASE)
+_PLATFORM_IMAGE_HELPER_RE = re.compile(r"generate_stable_diffusion_image|backend\.services\.skill_runtime", re.IGNORECASE)
+_IMAGE_URL_ONLY_RE = re.compile(r'\[0\]\s*\.get\(\s*[\'"]url[\'"]|\[\s*[\'"]url[\'"]\s*\]', re.IGNORECASE)
+_DATA_URI_RE = re.compile(r"data:image/[^;]+;base64", re.IGNORECASE)
 
 
 def _reject_custom_skill_md_protocol(content: str) -> None:
@@ -345,10 +349,30 @@ def _script_uses_configured_model(content: str) -> bool:
 
 def _validate_configured_model_usage_static(*, file_path: str, content: str, skill_md: str) -> None:
     """Reject scripts that claim host-model behavior but do not call models."""
-    if _IMAGE_MODEL_USAGE_RE.search(content) and not _DIFFUSION_TRANSLATION_RE.search(content):
+    if _DIRECT_IMAGE_API_RE.search(content) and "VISION_MODEL" in content:
         raise ValueError(
-            f"{file_path} 调用 diffusion/IMAGE_MODEL 前必须先用 TEXT_MODEL 将用户输入的图像提示词翻译成英文，"
-            "再把英文 prompt 传给图片生成接口。"
+            f"{file_path} 将 VISION_MODEL 与图片生成接口混用。"
+            "生成图片必须使用平台 Stable Diffusion 图片运行时或 IMAGE_MODEL；"
+            "VISION_MODEL 只用于看图理解/OCR/多模态问答。"
+        )
+
+    if _DIRECT_IMAGE_API_RE.search(content) and not _PLATFORM_IMAGE_HELPER_RE.search(content):
+        raise ValueError(
+            f"{file_path} 直接调用图片生成接口。"
+            "Creator 生成的图片脚本必须调用 backend.services.skill_runtime.generate_stable_diffusion_image，"
+            "由平台侧静默完成中文 topic 翻译、Stable Diffusion IMAGE_MODEL 选择、b64_json 解析和图片落盘。"
+        )
+
+    if _IMAGE_MODEL_USAGE_RE.search(content) and _IMAGE_URL_ONLY_RE.search(content) and "b64_json" not in content:
+        raise ValueError(
+            f"{file_path} 假设图片接口只返回 url。"
+            "平台图片运行时默认使用 b64_json，并会落盘为文件路径；请调用平台图片运行时 helper。"
+        )
+
+    if _DATA_URI_RE.search(content):
+        raise ValueError(
+            f"{file_path} 输出 base64 data URI。"
+            "图片结果必须由平台运行时写入 OUTPUT_DIR，并在 stdout JSON 中返回 image_path。"
         )
 
     if not _requires_configured_model_call(skill_md=skill_md, file_path=file_path):
@@ -533,7 +557,7 @@ def _trial_run_generated_script(skill_name: str, file_path: str, content: str) -
                     capture_output=True,
                     text=True,
                     timeout=_SCRIPT_TRIAL_TIMEOUT_SECONDS,
-                    env=_build_script_runtime_env(skill_dir),
+                    env={**_build_script_runtime_env(skill_dir), "SKILL_TRIAL_RUN": "1"},
                 )
             except subprocess.TimeoutExpired as exc:
                 raise ValueError(f"脚本试运行超时（超过 {_SCRIPT_TRIAL_TIMEOUT_SECONDS} 秒）：argv={args!r}") from exc
@@ -646,11 +670,12 @@ def _build_generate_file_prompt(
             "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图和 SKILL.md 里的 Markdown 命令示例一致。\n"
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须读取 sys.argv[1] 并使用 json.loads 解析。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
-            "6. 如果脚本承担需要模型判断的开放式能力，必须调用宿主稳定注入的环境变量：LLM_BASE_URL、TEXT_MODEL、IMAGE_MODEL、VISION_MODEL、IMAGE_BASE_URL、IMAGE_SIZE、LLM_API_KEY（OpenAI-compatible /v1/chat/completions 或 /v1/images/generations），不要硬编码模型名、服务地址或 API key。\n"
-            "7. 如果脚本调用 diffusion/IMAGE_MODEL 生成图片，必须先调用 TEXT_MODEL 将用户输入的图片提示词翻译/润色成英文，再把英文 prompt 传给图片生成接口；不要把中文原文直接传给 diffusion。\n"
-            "8. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
-            "9. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image\": ...}），不要混入调试说明。\n"
-            "10. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
+            "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：文本语义能力使用 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；生成图片使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
+            "7. 如果脚本需要生成图片，不要在脚本里写中文 prompt 翻译逻辑，也不要直接调用 /v1/images/generations；必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`，把用户 topic 原文传入该 helper。平台会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、IMAGE_MODEL 选择、b64_json 解析和 OUTPUT_DIR 图片落盘。\n"
+            "8. 图片脚本 stdout 必须输出结构化 JSON，并返回 helper 结果里的 image_path；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
+            "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
+            "10. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image_path\": ...}），不要混入调试说明。\n"
+            "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
             f"以下是已确认的蓝图：\n\n{blueprint_text}"
         )
     elif file_path.startswith("references/"):

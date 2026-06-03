@@ -363,7 +363,7 @@ def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> None:
     to_install: list[str] = []
     seen: set[str] = set()
     for name in top_level_names:
-        if not name or name.startswith("_") or name in stdlib_names or name in seen:
+        if not name or name.startswith("_") or name == "backend" or name in stdlib_names or name in seen:
             continue
         # Only proceed if the name is a safe identifier (AST-sourced, but be explicit)
         if not name.isidentifier():

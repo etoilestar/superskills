@@ -20,10 +20,12 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = Field(None, validation_alias=AliasChoices("OPENAI_API_KEY", "openai_api_key"))
     # Alternative field name accepted by some deployments
     llm_api_key: Optional[str] = Field(None, validation_alias=AliasChoices("LLM_API_KEY", "llm_api_key"))
+    # Optional key for image-generation backends when they differ from the LLM provider.
+    image_api_key: Optional[str] = Field(None, validation_alias=AliasChoices("IMAGE_API_KEY", "image_api_key"))
 
     # Optional separate model for silent planner rounds (metadata / block / skill planner).
     # Falls back to default_model when unset.
-    planner_model: Optional[str] = Field("qwen3:30b", validation_alias=AliasChoices("PLANNER_MODEL", "planner_model"))
+    planner_model: Optional[str] = Field("qwen3:30b-instruct", validation_alias=AliasChoices("PLANNER_MODEL", "planner_model"))
 
     # Optional separate model used exclusively for output-format validation rounds
     # inside retry_with_validation().  A small/fast model is sufficient here because
