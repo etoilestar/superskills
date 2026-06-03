@@ -1186,3 +1186,61 @@ python scripts/generate.py '{"prompt":"{{prompt}}","topic":"{{topic}}"}'
     payload = json.loads(args[0][0])
     assert payload["prompt"] == "a cinematic watercolor cat under a warm sunset"
     assert payload["topic"] == "system time"
+
+
+def test_run_command_falls_back_when_inferred_skill_root_missing(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from backend.routers.chat_models import ChatRequest
+    from backend.routers import sandbox_chat
+
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    missing_skill_root = skills_root / "my-skill"
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["cwd"] = kwargs.get("cwd")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(sandbox_chat.subprocess, "run", fake_run)
+
+    result, _ = sandbox_chat._execute_single_task(
+        {"action": "run_command", "command": "python -c 'print(1)'"},
+        [],
+        ChatRequest(messages=[]),
+        inferred_skill_root=missing_skill_root,
+    )
+
+    assert result["success"] is True
+    assert captured["cwd"] == str(skills_root)
+
+
+def test_block_planner_retries_invalid_json(monkeypatch):
+    import asyncio
+    import json
+
+    from backend.routers.chat_models import ChatRequest, MarkdownBlock
+    from backend.routers import sandbox_chat
+
+    calls = []
+
+    async def fake_complete_chat_once(messages, model):
+        calls.append(messages)
+        if len(calls) == 1:
+            return ""
+        return json.dumps({"tasks": [], "errors": []})
+
+    monkeypatch.setattr(sandbox_chat, "complete_chat_once", fake_complete_chat_once)
+
+    plan = asyncio.run(sandbox_chat._run_block_planner_round(
+        assistant_text="执行命令：\n```bash\necho ok\n```",
+        blocks=[MarkdownBlock(index=0, lang="bash", code="echo ok", before_context="执行命令：", after_context="")],
+        request=ChatRequest(messages=[]),
+        model="planner-model",
+    ))
+
+    assert plan == {"tasks": [], "errors": []}
+    assert len(calls) == 2
+    assert "只输出 JSON" in calls[1][-1]["content"]

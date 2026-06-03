@@ -1158,9 +1158,29 @@ async def _run_block_planner_round(
     try:
         stripped = _strip_markdown_json_fence(planner_text)
         plan = json.loads(stripped)
-    except json.JSONDecodeError as exc:
-        logger.error("Received invalid JSON response from planner: %s", planner_text)
-        raise ValueError(f"规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
+    except json.JSONDecodeError:
+        logger.warning(
+            "Block planner returned non-JSON on first attempt, retrying with correction prompt: %s",
+            planner_text[:300],
+        )
+        retry_messages = messages + [
+            {"role": "assistant", "content": planner_text},
+            {
+                "role": "user",
+                "content": (
+                    "你的上一次回复不是合法 JSON。请把它修正为一个严格 JSON object。\n"
+                    "只输出 JSON，不要 Markdown，不要解释，不要代码块标记。\n"
+                    "格式必须是：{\"tasks\":[...],\"errors\":[...]}。"
+                ),
+            },
+        ]
+        planner_text = await complete_chat_once(retry_messages, model)
+        try:
+            stripped = _strip_markdown_json_fence(planner_text)
+            plan = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            logger.error("Received invalid JSON response from planner after retry: %s", planner_text)
+            raise ValueError(f"规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
 
     if not isinstance(plan, dict):
         raise ValueError("规划模型输出必须是 JSON object")
@@ -1638,6 +1658,14 @@ def _execute_single_task(
             stdin_text = str(stdin_text)
 
         cwd = execution_root or inferred_skill_root
+        if cwd is not None and not cwd.exists():
+            # Creator bootstrap commands may need to create the inferred Skill root.
+            # Run those commands from the nearest existing parent instead of using
+            # a not-yet-created cwd, while keeping later commands in the Skill root
+            # once it exists.
+            fallback_cwd = execution_root or cwd.parent
+            if fallback_cwd.exists():
+                cwd = fallback_cwd
 
         # Per-task snapshot taken *before* execution to detect new output files.
         pre_snapshot: set[str] = _snapshot_dir_files(cwd) if cwd else set()

@@ -51,7 +51,7 @@ def test_new_fields_declared():
 def test_planner_model_has_stronger_default():
     from backend.config import settings
 
-    assert settings.planner_model == "qwen3:30b"
+    assert settings.planner_model == "qwen3:30b-instruct"
 
 
 def test_validator_model_has_fast_default():

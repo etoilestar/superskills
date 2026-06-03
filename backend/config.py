@@ -25,7 +25,7 @@ class Settings(BaseSettings):
 
     # Optional separate model for silent planner rounds (metadata / block / skill planner).
     # Falls back to default_model when unset.
-    planner_model: Optional[str] = Field("qwen3:30b", validation_alias=AliasChoices("PLANNER_MODEL", "planner_model"))
+    planner_model: Optional[str] = Field("qwen3:30b-instruct", validation_alias=AliasChoices("PLANNER_MODEL", "planner_model"))
 
     # Optional separate model used exclusively for output-format validation rounds
     # inside retry_with_validation().  A small/fast model is sufficient here because
