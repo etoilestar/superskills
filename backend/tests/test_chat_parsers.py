@@ -1594,6 +1594,25 @@ print('target')
     with pytest.raises(ValueError, match="Markdown 代码块"):
         _sanitize_generated_file_content("scripts/main.py", content)
 
+
+def test_creator_sanitize_accepts_single_wrapping_script_fence():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    content = "```python\nprint('ok')\n```"
+
+    assert _sanitize_generated_file_content("scripts/main.py", content) == "print('ok')"
+
+
+def test_creator_sanitize_rejects_invalid_wrapping_script_fence():
+    import pytest
+
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    content = "```python\nprint('unterminated'\n```"
+
+    with pytest.raises(ValueError, match="合法 Python 源码|Markdown 代码块"):
+        _sanitize_generated_file_content("scripts/main.py", content)
+
 def test_creator_script_repair_output_format_error_uses_retry_budget(monkeypatch):
     import asyncio
     import json
@@ -1687,7 +1706,7 @@ python scripts/generate.py '{"prompt":"{{prompt}}"}'
 
     assert [event["attempt"] for event in repair_events] == [1, 2]
     assert "VISION_MODEL" in repair_events[0]["error"]
-    assert "Markdown 代码块" in repair_events[1]["error"]
+    assert "脚本没有调用" in repair_events[1]["error"]
     assert all(event["validator"]["issues"] == ["不要返回 Markdown 代码块或错误模型调用"] for event in repair_events)
     assert len(validator_calls) == 2
     assert len(repair_prompts) == 2
