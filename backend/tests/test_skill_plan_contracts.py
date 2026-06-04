@@ -194,7 +194,7 @@ def test_script_sanitize_strips_orphan_trailing_fences_for_python_node_bash():
 
     py_entry = {
         "path": "scripts/write.py",
-        "role": "text_generator",
+        "role": "generic_script",
         "inputs": ["topic"],
         "outputs": ["text"],
         "language": "python",
@@ -271,3 +271,365 @@ def test_asset_contract_validates_yaml_and_markdown_placeholders():
         _validate_asset_file_contract("assets/config.yaml", "name: [unterminated")
     with pytest.raises(ContractValidationError, match="占位短语"):
         _validate_asset_file_contract("assets/guide.md", "TODO: 待补充内容，需要以后再写。" * 3)
+
+
+
+def test_role_skeletons_inject_platform_calls_for_python_node_bash():
+    from backend.services.skill_plan import build_skill_plan_entry
+    from backend.routers.creator import _script_generation_skeleton
+
+    text_entry = build_skill_plan_entry(file_path="scripts/write.py", purpose="role: text_generator inputs: topic")
+    image_entry = build_skill_plan_entry(file_path="scripts/render.js", purpose="role: image_generator inputs: topic")
+    pdf_entry = build_skill_plan_entry(file_path="scripts/pdf.sh", purpose="role: pdf_builder inputs: text runtime: bash")
+
+    assert "generate_text_with_llm" in _script_generation_skeleton("scripts/write.py", "", "", skill_plan_entry=text_entry.__dict__)
+    image_skeleton = _script_generation_skeleton("scripts/render.js", "", "", skill_plan_entry=image_entry.__dict__)
+    assert "process.argv[2]" in image_skeleton
+    assert "generate_stable_diffusion_image" in image_skeleton
+    pdf_skeleton = _script_generation_skeleton("scripts/pdf.sh", "", "", skill_plan_entry=pdf_entry.__dict__)
+    assert "$1" in pdf_skeleton
+    assert "pdf_path" in pdf_skeleton
+
+
+def test_required_capability_contract_rejects_empty_text_generator_shell():
+    from backend.routers.creator import _check_script_file_contract
+
+    entry = {
+        "path": "scripts/write.py",
+        "role": "text_generator",
+        "inputs": ["topic"],
+        "outputs": ["text"],
+        "required_capabilities": ["text_generation"],
+        "language": "python",
+        "runtime": "python",
+    }
+    fixed_template = """import json
+import sys
+
+def main():
+    payload = json.loads(sys.argv[1])
+    print(json.dumps({'text': payload.get('topic', '')}))
+
+if __name__ == '__main__':
+    main()
+"""
+    real_call = """import json
+import sys
+from backend.services.skill_runtime import generate_text_with_llm
+
+def main():
+    payload = json.loads(sys.argv[1])
+    prompt = payload.get('topic', '')
+    print(json.dumps({'text': generate_text_with_llm(prompt)}))
+
+if __name__ == '__main__':
+    main()
+"""
+
+    bad_failed = {result.id for result in _check_script_file_contract("scripts/write.py", fixed_template, skill_plan_entry=entry) if not result.passed}
+    good_failed = {result.id for result in _check_script_file_contract("scripts/write.py", real_call, skill_plan_entry=entry) if not result.passed}
+
+    assert "script.required_capabilities.called" in bad_failed
+    assert "script.required_capabilities.called" not in good_failed
+
+
+def test_sanitize_trims_prose_from_node_entrypoint_to_stdout():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    entry = {
+        "path": "scripts/write.js",
+        "role": "generic_script",
+        "inputs": ["topic"],
+        "outputs": ["text"],
+        "language": "javascript",
+        "runtime": "node",
+    }
+    raw = """下面是 scripts/write.js：
+const payload = JSON.parse(process.argv[2] || '{}');
+console.log(JSON.stringify({ text: payload.topic || '' }));
+这是一段说明文字，不应保存。
+```"""
+    sanitized = _sanitize_generated_file_content("scripts/write.js", raw, skill_plan_entry=entry)
+
+    assert sanitized.startswith("const payload")
+    assert sanitized.endswith("));")
+    assert "说明文字" not in sanitized
+    assert "```" not in sanitized
+
+
+def test_image_and_text_named_script_is_promoted_to_composite_generator_contract():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: fairy-images
+- scripts/: `scripts/generate_fairy_tale_with_images.py` 负责根据 topic 和 custom_character 生成童话配图，调用平台图片能力。
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/generate_fairy_tale_with_images.py")
+
+    assert entry.role == "composite_generator"
+    assert entry.required_capabilities == ["text_generation", "image_generation"]
+    assert "text_generation" not in entry.forbidden_capabilities
+    assert "pdf_generation" in entry.forbidden_capabilities
+    assert "custom_character" in entry.inputs
+    assert "text_with_image_prompts" in entry.outputs
+    assert entry.command_template.startswith("python scripts/generate_fairy_tale_with_images.py")
+
+
+def test_main_script_with_ambiguous_image_pdf_wording_stays_generic():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: vague-skill
+- scripts/: `scripts/main.py` 生成图片和 PDF，但未声明 role
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/main.py")
+
+    assert entry.role == "generic_script"
+    assert "image_generation" not in entry.required_capabilities
+
+
+def test_image_generator_contract_requires_helper_without_strict_skillplan_entry():
+    from backend.routers.creator import _check_script_file_contract
+
+    no_helper = """import json
+import sys
+
+def main():
+    payload = json.loads(sys.argv[1])
+    print(json.dumps({'image_paths': [payload.get('topic', '')]}))
+
+if __name__ == '__main__':
+    main()
+"""
+    failed = {
+        result.id
+        for result in _check_script_file_contract("scripts/render_images.py", no_helper, role="image_generator")
+        if not result.passed
+    }
+
+    assert "script.required_capabilities.called" in failed
+
+
+def test_generic_script_forbids_image_helper_and_repair_guidance_keeps_role_context():
+    from backend.routers.creator import _check_script_file_contract, _targeted_generated_file_repair_instructions
+
+    entry = {
+        "path": "scripts/main.py",
+        "role": "generic_script",
+        "inputs": ["topic"],
+        "outputs": ["text"],
+        "language": "python",
+        "runtime": "python",
+    }
+    content = """import json
+import sys
+from backend.services.skill_runtime import generate_stable_diffusion_image
+
+def main():
+    payload = json.loads(sys.argv[1])
+    result = generate_stable_diffusion_image(payload.get('topic', 'cat'))
+    print(json.dumps({'text': result.get('image_path')}))
+
+if __name__ == '__main__':
+    main()
+"""
+    failed = {
+        result.id
+        for result in _check_script_file_contract("scripts/main.py", content, skill_plan_entry=entry)
+        if not result.passed
+    }
+    guidance = _targeted_generated_file_repair_instructions(
+        file_path="scripts/main.py",
+        deterministic_error="script.capability.forbidden_image_generation: forbidden_capabilities 禁止但脚本调用了图片生成 helper",
+    )
+
+    assert "script.capability.forbidden_image_generation" in failed
+    assert "不要删除真实图片 helper" in guidance
+    assert "role=image_generator" in guidance or "role=composite_generator" in guidance
+
+
+def test_composite_generator_can_call_text_and_image_helpers():
+    from backend.routers.creator import _check_script_file_contract, _script_generation_skeleton
+
+    entry = {
+        "path": "scripts/generate_fairy_tale_with_images.py",
+        "role": "composite_generator",
+        "inputs": ["topic", "custom_character"],
+        "outputs": ["text", "image_paths", "images", "text_with_image_prompts"],
+        "required_capabilities": ["text_generation", "image_generation"],
+        "forbidden_capabilities": ["pdf_generation"],
+        "language": "python",
+        "runtime": "python",
+    }
+    source = """import json
+import sys
+from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image
+
+def main():
+    payload = json.loads(sys.argv[1])
+    prompt = payload.get('topic', '') + payload.get('custom_character', '')
+    text = generate_text_with_llm(prompt)
+    result = generate_stable_diffusion_image(text, filename_prefix='generated')
+    print(json.dumps({'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': text}], 'image_paths': [result.get('image_path')], 'images': [result]}))
+
+if __name__ == '__main__':
+    main()
+"""
+    failed = {result.id for result in _check_script_file_contract("scripts/generate_fairy_tale_with_images.py", source, skill_plan_entry=entry) if not result.passed}
+    skeleton = _script_generation_skeleton("scripts/generate_fairy_tale_with_images.py", "", "", skill_plan_entry=entry)
+
+    assert "script.required_capabilities.called" not in failed
+    assert "script.capability.forbidden_image_generation" not in failed
+    assert "generate_text_with_llm" in skeleton
+    assert "generate_stable_diffusion_image" in skeleton
+
+
+def test_explicit_composite_role_overrides_blueprint_and_command_contract():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: composite-skill
+- scripts/: `scripts/main.py`
+  scripts/main.py
+  role: composite_generator
+  inputs: topic, custom_character
+  outputs: text, image_paths, images, text_with_image_prompts
+  required_capabilities: text_generation, image_generation
+  forbidden_capabilities: pdf_generation
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/main.py")
+
+    assert entry.role == "composite_generator"
+    assert entry.inputs == ["topic", "custom_character"]
+    assert entry.required_capabilities == ["text_generation", "image_generation"]
+    assert "image_generation" not in entry.forbidden_capabilities
+    assert "text_generation" not in entry.forbidden_capabilities
+    assert entry.command_template == 'python scripts/main.py \'{"topic":"{{topic}}","custom_character":"{{custom_character}}"}\''
+
+
+def test_creator_prompt_injects_kernel_references_for_scripts():
+    from backend.routers.creator import _build_generate_file_prompt
+
+    entry = {
+        "path": "scripts/write.py",
+        "role": "text_generator",
+        "inputs": ["topic"],
+        "outputs": ["text"],
+        "required_capabilities": ["text_generation"],
+        "language": "python",
+        "runtime": "python",
+    }
+    messages = _build_generate_file_prompt(
+        "scripts/write.py",
+        "demo-skill",
+        "生成文本",
+        "scripts/write.py role: text_generator inputs: topic",
+        [],
+        skill_plan_entry=entry,
+    )
+    prompt = messages[-1]["content"]
+
+    assert "Creator internal-only kernel guidance" in prompt
+    assert "INTERNAL-ONLY kernel/references/best-practices.md" in prompt
+    assert "kernel/references/output-patterns.md" in prompt
+
+
+def test_reference_contract_requires_capability_mentions_for_composite_commands():
+    from backend.routers.creator import _check_reference_file_contract
+
+    content = """
+## 输入输出
+inputs: topic
+outputs: text, image_paths
+
+## 执行步骤
+```bash
+python scripts/composite_images.py '{"topic":"{{topic}}"}'
+```
+
+## 角色与能力边界
+role: composite_generator，required_capabilities: text_generation, image_generation，禁止 PDF。
+
+## 规范
+先生成文本，再将文本传递给图片生成 helper，保持 JSON stdout。
+
+## 示例
+输入 topic=猫，输出 text 和 image_paths。
+
+## 反例
+不要输出固定模板，不要省略 image_generation。
+
+## 约束
+JSON argv keys 必须与 SkillPlan inputs 对齐，text 输出可作为 image prompt 跨能力传递。
+"""
+    results = _check_reference_file_contract(
+        "references/composite.md",
+        content,
+        purpose="scripts/composite_images.py role: composite_generator inputs: topic outputs: text, image_paths required_capabilities: text_generation, image_generation",
+    )
+    failed = {result.id for result in results if not result.passed}
+
+    assert "reference.required_capabilities.mentioned" not in failed
+
+
+def test_skill_md_rejects_kernel_reference_leak_not_declared_in_blueprint():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: no-kernel-leak
+- scripts/: `scripts/run.py`
+  scripts/run.py role: text_generator inputs: topic outputs: text
+"""
+    skill_md = """---
+name: no-kernel-leak
+description: demo
+---
+# Demo
+
+## 执行
+```bash
+python scripts/run.py '{"topic":"{{topic}}"}'
+```
+
+## 参考资料
+- `references/workflows.md`: 内部 workflow 参考。
+- `references/output-patterns.md`: 内部输出模式。
+"""
+    failed = {result.id for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
+
+    assert "skill_md.resource.local_declared" in failed
+
+
+def test_skill_md_allows_declared_local_reference_and_script():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: local-ok
+- scripts/: `scripts/run.py`
+  scripts/run.py role: text_generator inputs: topic outputs: text
+- references/: `references/guide.md`
+"""
+    skill_md = """---
+name: local-ok
+description: demo
+---
+# Demo
+
+读取 `references/guide.md` 中的执行步骤。
+
+```bash
+python scripts/run.py '{"topic":"{{topic}}"}'
+```
+"""
+    failed = {result.id for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
+
+    assert "skill_md.resource.local_declared" not in failed
+    assert "skill_md.reference.mentioned" not in failed

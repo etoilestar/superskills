@@ -2540,3 +2540,53 @@ def test_creator_pdf_builder_skeleton_uses_real_fpdf_not_fake_pdf_bytes():
     assert "from fpdf import FPDF" in skeleton
     assert "pdf.output" in skeleton
     assert "write_bytes(b'%PDF-1.4" not in skeleton
+
+
+def test_runtime_resource_catalog_filters_missing_kernel_references(tmp_path):
+    from backend.routers.sandbox_chat import _extract_runtime_resource_catalog
+
+    skill_root = tmp_path / "skill"
+    (skill_root / "references").mkdir(parents=True)
+    (skill_root / "scripts").mkdir()
+    (skill_root / "references" / "guide.md").write_text("local guide", encoding="utf-8")
+    (skill_root / "scripts" / "run.py").write_text("print('ok')", encoding="utf-8")
+    body = """
+Use `references/guide.md`.
+Do not expose missing kernel refs like `references/workflows.md` or `references/output-patterns.md`.
+Run `scripts/run.py`.
+"""
+
+    catalog = _extract_runtime_resource_catalog(body, execution_root=skill_root)
+    paths = {item["path"] for item in catalog}
+
+    assert "references/guide.md" in paths
+    assert "scripts/run.py" in paths
+    assert "references/workflows.md" not in paths
+    assert "references/output-patterns.md" not in paths
+
+
+def test_normalize_runtime_plan_marks_stale_resource_handle_missing(tmp_path):
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
+
+    skill_root = tmp_path / "skill"
+    skill_root.mkdir()
+    catalog = [
+        {
+            "resource_handle": "resource:0",
+            "path": "references/missing.md",
+            "kind": "references",
+            "allowed_actions": ["read_resource"],
+        }
+    ]
+    plan = {
+        "mode": "execute",
+        "actions": [{"action": "read_resource", "resource_handle": "resource:0"}],
+        "errors": [],
+        "missing": [],
+    }
+
+    result = _normalize_skill_runtime_plan(plan, resource_catalog=catalog, execution_root=skill_root)
+
+    assert result["tasks"] == []
+    assert result["missing"]
+    assert result["missing"][0]["path"] == "references/missing.md"

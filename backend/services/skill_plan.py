@@ -15,8 +15,8 @@ from typing import Literal
 
 FileType = Literal["skill", "script", "reference", "asset", "skill_md"]
 Language = Literal["python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"]
-Runtime = Literal["python", "node", "bash", "none"]
-ScriptRole = Literal["text_generator", "image_generator", "pdf_builder", "generic_script"]
+Runtime = Literal["python", "node", "bash", "shell", "generic", "none"]
+ScriptRole = Literal["text_generator", "image_generator", "pdf_builder", "composite_generator", "generic_script"]
 ResourceRole = Literal["skill_overview", "reference", "asset"]
 FileRole = ScriptRole | ResourceRole
 
@@ -24,6 +24,7 @@ SCRIPT_ROLES: frozenset[str] = frozenset({
     "text_generator",
     "image_generator",
     "pdf_builder",
+    "composite_generator",
     "generic_script",
 })
 RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
@@ -53,6 +54,8 @@ class SkillPlanEntry:
     required_capabilities: list[str] = field(default_factory=list)
     forbidden_capabilities: list[str] = field(default_factory=list)
     reference_files: list[str] = field(default_factory=list)
+    skill_local_references: list[str] = field(default_factory=list)
+    creator_internal_references: list[str] = field(default_factory=list)
     language: Language = "text"
     runtime: Runtime = "none"
     entrypoint: str = ""
@@ -75,8 +78,10 @@ class SkillPlan:
 
 _IMAGE_RE = re.compile(r"图片|图像|绘图|海报|插画|image|photo|poster|illustration|stable\s*diffusion", re.I)
 _PDF_RE = re.compile(r"pdf|报告|排版|layout|document|report", re.I)
-_TEXT_RE = re.compile(r"文本|文案|故事|谜语|摘要|写作|text|story|riddle|summary|copy", re.I)
+_TEXT_RE = re.compile(r"文本|文案|故事|童话|剧本|谜语|摘要|写作|text|story|tale|fairy|riddle|summary|copy", re.I)
 _MODEL_RE = re.compile(r"模型|llm|大语言|多模态|vision|image_model|text_model", re.I)
+_IMAGE_SCRIPT_NAME_RE = re.compile(r"(?:^|[_/-])(images|imgs|render|illustration|poster|picture|photo|visuals)(?:[_.-]|$)|配图|插画|海报|图片", re.I)
+_CUSTOM_CHARACTER_RE = re.compile(r"custom_character|character|角色|主角", re.I)
 
 
 def file_type_for_path(path: str) -> FileType:
@@ -138,7 +143,7 @@ def runtime_for_language(language: str, file_type: FileType) -> Runtime:
         return "node"
     if language == "bash":
         return "bash"
-    return "none"
+    return "generic"
 
 
 def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -> str:
@@ -150,12 +155,14 @@ def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -
         return f"node {path} '{payload}'"
     if runtime == "bash":
         return f"bash {path} '{payload}'"
+    if runtime == "shell":
+        return f"sh {path} '{payload}'"
     return f"{path} '{payload}'"
 
 
 
 _EXPLICIT_ROLE_RE = re.compile(
-    r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|pdf_builder|generic_script)",
+    r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|pdf_builder|composite_generator|generic_script)",
     re.I,
 )
 
@@ -169,7 +176,7 @@ def _normalize_role(value: str) -> FileRole | None:
 
 def _segment_for_file(file_path: str, *texts: str) -> str:
     """Return nearby plan text for a file path, stopping before the next file block."""
-    next_path_re = r"(?:scripts|references|assets)/[A-Za-z0-9_./-]+|SKILL\.md"
+    next_path_re = r"(?m)^\s*(?:[-*]\s*)?(?:scripts|references|assets)/[A-Za-z0-9_./-]+|^\s*SKILL\.md"
     best = ""
     for text in texts:
         text = text or ""
@@ -237,7 +244,7 @@ def _explicit_role_from_plan_text(*, file_path: str, purpose: str = "", blueprin
     appears on one line and ``role: ...`` appears in the following indented
     contract lines.
     """
-    next_path_re = r"(?:scripts|references|assets)/[A-Za-z0-9_./-]+|SKILL\.md"
+    next_path_re = r"(?m)^\s*(?:[-*]\s*)?(?:scripts|references|assets)/[A-Za-z0-9_./-]+|^\s*SKILL\.md"
 
     def segment_after_path(text: str) -> str:
         if file_path not in text:
@@ -277,6 +284,31 @@ def _explicit_role_from_plan_text(*, file_path: str, purpose: str = "", blueprin
     return None
 
 
+
+def _should_promote_image_script_role(file_path: str, purpose: str = "", blueprint_summary: str = "") -> bool:
+    """Return True for scripts whose local contract clearly names image generation.
+
+    Generic prose such as "this skill generates images and PDFs" remains
+    conservative.  Promotion requires both image-generation wording and an
+    image-oriented script path/name so `scripts/main.py` in an ambiguous
+    composite blueprint still falls back to `generic_script` unless role is
+    explicitly declared.
+    """
+    if file_type_for_path(file_path) != "script":
+        return False
+    text = f"{file_path}\n{purpose}\n{blueprint_summary}"
+    if not _IMAGE_RE.search(text):
+        return False
+    return bool(_IMAGE_SCRIPT_NAME_RE.search(file_path))
+
+
+def _augment_inputs_for_role(role: FileRole, inputs: list[str], *, purpose: str = "", blueprint_summary: str = "") -> list[str]:
+    augmented = list(inputs)
+    text = f"{purpose}\n{blueprint_summary}"
+    if role in {"image_generator", "composite_generator"} and _CUSTOM_CHARACTER_RE.search(text) and "custom_character" not in augmented:
+        augmented.append("custom_character")
+    return augmented
+
 def file_role_classifier(
     *,
     file_path: str,
@@ -310,6 +342,25 @@ def file_role_classifier(
     if explicit_role in SCRIPT_ROLES:
         return RoleClassification(explicit_role, 0.95, "explicit role declared by SkillPlan/blueprint", signals)
 
+    if _should_promote_image_script_role(file_path, purpose, blueprint_summary):
+        if "inferred_image_script_role" not in signals:
+            signals.append("inferred_image_script_role")
+        if _TEXT_RE.search(f"{file_path}\n{purpose}\n{blueprint_summary}"):
+            if "inferred_composite_script_role" not in signals:
+                signals.append("inferred_composite_script_role")
+            return RoleClassification(
+                "composite_generator",
+                0.84,
+                "image-oriented script also requires text_generation capability",
+                signals,
+            )
+        return RoleClassification(
+            "image_generator",
+            0.82,
+            "image-oriented script path/purpose requires image_generation capability",
+            signals,
+        )
+
     return RoleClassification(
         "generic_script",
         0.45,
@@ -322,7 +373,9 @@ def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
     if role == "text_generator":
         return ["topic", "prompt", "text"], ["text"]
     if role == "image_generator":
-        return ["topic", "prompt", "text"], ["image_paths", "images"]
+        return ["topic", "prompt", "text"], ["image_paths", "images", "text_with_image_prompts"]
+    if role == "composite_generator":
+        return ["topic", "prompt", "text"], ["text", "image_paths", "images", "text_with_image_prompts"]
     if role == "pdf_builder":
         return ["text", "image_paths", "template_path"], ["pdf_path", "file_paths"]
     if role == "reference":
@@ -338,7 +391,9 @@ def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:
     if role == "text_generator":
         return ["text_generation"], ["image_generation", "pdf_generation"]
     if role == "image_generator":
-        return ["image_generation"], ["pdf_generation"]
+        return ["image_generation"], ["text_generation", "pdf_generation"]
+    if role == "composite_generator":
+        return ["text_generation", "image_generation"], ["pdf_generation"]
     if role == "pdf_builder":
         return ["pdf_generation", "file_output"], ["image_generation"]
     if role == "reference":
@@ -347,7 +402,7 @@ def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:
         return ["static_resource"], ["runtime_execution", "image_generation"]
     if role == "skill_overview":
         return ["workflow_overview"], ["hidden_runtime_protocol"]
-    return ["deterministic_execution"], []
+    return ["deterministic_execution"], ["text_generation", "image_generation", "pdf_generation"]
 
 
 def build_skill_plan_entry(
@@ -366,18 +421,20 @@ def build_skill_plan_entry(
     )
     default_inputs, default_outputs = default_io_for_role(classification.role)
     inputs = _explicit_list_field("inputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_inputs
+    inputs = _augment_inputs_for_role(classification.role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
     outputs = _explicit_list_field("outputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_outputs
     dependencies = _explicit_list_field("dependencies", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or list(reference_files or [])
     default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(classification.role)
     required_capabilities = _explicit_list_field("required_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_required_capabilities
     forbidden_capabilities = _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_forbidden_capabilities
+    forbidden_capabilities = [capability for capability in forbidden_capabilities if capability not in required_capabilities]
     file_type = file_type_for_path(file_path)
     detected_language = language_for_path(file_path)
     explicit_language = _explicit_scalar_field("language", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     language = explicit_language if explicit_language in {"python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"} else detected_language
     detected_runtime = runtime_for_language(language, file_type)
     explicit_runtime = _explicit_scalar_field("runtime", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-    runtime = explicit_runtime if explicit_runtime in {"python", "node", "bash", "none"} else detected_runtime
+    runtime = explicit_runtime if explicit_runtime in {"python", "node", "bash", "shell", "generic", "none"} else detected_runtime
     return SkillPlanEntry(
         path=file_path,
         file_type=file_type,
@@ -389,6 +446,8 @@ def build_skill_plan_entry(
         required_capabilities=required_capabilities,
         forbidden_capabilities=forbidden_capabilities,
         reference_files=list(reference_files or []),
+        skill_local_references=[ref for ref in list(reference_files or []) if ref.startswith(("references/", "assets/", "scripts/"))],
+        creator_internal_references=["kernel/references/best-practices.md", "kernel/references/workflows.md", "kernel/references/output-patterns.md"],
         language=language,
         runtime=runtime,
         entrypoint=file_path if file_type == "script" else "",

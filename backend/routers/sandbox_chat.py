@@ -214,10 +214,19 @@ def _extract_runtime_resource_catalog(body_prompt: str, *, execution_root: "Path
     )
 
     def _add_entry(path: str, title: str = "") -> None:
+        path = path.strip().lstrip("./").replace("\\", "/")
         if path in seen:
             return
-        seen.add(path)
         kind = path.split("/", 1)[0]
+        if kind not in {"references", "assets", "scripts"}:
+            return
+        if execution_root is not None:
+            root = execution_root.resolve()
+            candidate = (root / path).resolve()
+            if not _is_within_sandbox(candidate, root) or not candidate.is_file():
+                logger.info("skip missing/non-local skill resource from catalog: root=%s path=%s", root, path)
+                return
+        seen.add(path)
         if kind == "references":
             allowed_actions = ["read_resource"]
             usage_hint = "参考资料，可在任务需要领域知识、示例、规范时读取。"
@@ -1105,7 +1114,7 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "resource_catalog、available_scripts 和用户请求判断本轮是否需要先让主模型输出显式可执行块。\n\n"
         "核心原则：\n"
         "1. Loaded SKILL.md 是当前 Skill 的执行规范。\n"
-        "2. resource_catalog 和 available_scripts 只是宿主提供的真实资源树，用于安全校验候选动作是否可能存在；"
+        "2. resource_catalog 和 available_scripts 只包含当前业务 Skill 目录内真实存在的 skill-local resources；kernel references 不会暴露给运行时，不能读取或引用。\n"
         "不能用它们推导、补全或发明命令参数。\n"
         "3. 是否执行命令，必须由后续主模型回复里的显式可执行 fenced code block 触发；"
         "不要因为磁盘上存在脚本就直接规划 run_command，也不要让主模型临时拼接 Skill.md 中没有声明的命令。\n"
@@ -1227,6 +1236,18 @@ def _normalize_skill_runtime_plan(
                     "available_resource_handles": sorted(resource_by_handle.keys()),
                 })
                 continue
+
+            if execution_root is not None:
+                root = execution_root.resolve()
+                rel_path = str(resource.get("path") or "").strip()
+                resource_path = (root / rel_path).resolve()
+                if not _is_within_sandbox(resource_path, root) or not resource_path.is_file():
+                    missing.append({
+                        "resource_handle": resource_handle,
+                        "path": rel_path,
+                        "reason": "resource_catalog entry no longer exists in current skill",
+                    })
+                    continue
 
             allowed_actions = set(resource.get("allowed_actions") or [])
             if "read_resource" not in allowed_actions:
@@ -1955,9 +1976,12 @@ def _execute_single_task(
             raise ValueError("read_resource 任务缺少 path")
         if not skill_name:
             raise ValueError("read_resource 任务缺少 skill_name，无法确定读取哪个 Skill 的资源")
+        resource_root = execution_root.resolve() if execution_root is not None else _skill_root_for_name(skill_name)
+        resource_path = (resource_root / rel_path).resolve()
+        if not _is_within_sandbox(resource_path, resource_root) or not resource_path.is_file():
+            raise FileNotFoundError(f"read_resource resource does not exist in current skill: {rel_path}")
         if rel_path.startswith("assets/"):
-            asset_root = execution_root.resolve() if execution_root is not None else _skill_root_for_name(skill_name)
-            _validate_runtime_asset_contract((asset_root / rel_path).resolve(), root=asset_root)
+            _validate_runtime_asset_contract(resource_path, root=resource_root)
         observation = read_skill_resource_text(
             skill_name, rel_path, max_chars=settings.skill_resource_max_chars
         )
@@ -2698,7 +2722,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         )
 
             if enable_resource_preload:
-                resource_catalog = _extract_runtime_resource_catalog(body_prompt)
+                resource_catalog = _extract_runtime_resource_catalog(body_prompt, execution_root=execution_root)
                 if resource_catalog:
                     yield _sse({"status": {"phase": "loading_resources", "message": "按需加载资源…"}})
                 resource_decision = await _run_resource_selection_round(
