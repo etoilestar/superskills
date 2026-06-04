@@ -194,7 +194,7 @@ def test_script_sanitize_strips_orphan_trailing_fences_for_python_node_bash():
 
     py_entry = {
         "path": "scripts/write.py",
-        "role": "text_generator",
+        "role": "generic_script",
         "inputs": ["topic"],
         "outputs": ["text"],
         "language": "python",
@@ -271,3 +271,87 @@ def test_asset_contract_validates_yaml_and_markdown_placeholders():
         _validate_asset_file_contract("assets/config.yaml", "name: [unterminated")
     with pytest.raises(ContractValidationError, match="占位短语"):
         _validate_asset_file_contract("assets/guide.md", "TODO: 待补充内容，需要以后再写。" * 3)
+
+
+
+def test_role_skeletons_inject_platform_calls_for_python_node_bash():
+    from backend.services.skill_plan import build_skill_plan_entry
+    from backend.routers.creator import _script_generation_skeleton
+
+    text_entry = build_skill_plan_entry(file_path="scripts/write.py", purpose="role: text_generator inputs: topic")
+    image_entry = build_skill_plan_entry(file_path="scripts/render.js", purpose="role: image_generator inputs: topic")
+    pdf_entry = build_skill_plan_entry(file_path="scripts/pdf.sh", purpose="role: pdf_builder inputs: text runtime: bash")
+
+    assert "generate_text_with_llm" in _script_generation_skeleton("scripts/write.py", "", "", skill_plan_entry=text_entry.__dict__)
+    image_skeleton = _script_generation_skeleton("scripts/render.js", "", "", skill_plan_entry=image_entry.__dict__)
+    assert "process.argv[2]" in image_skeleton
+    assert "generate_stable_diffusion_image" in image_skeleton
+    pdf_skeleton = _script_generation_skeleton("scripts/pdf.sh", "", "", skill_plan_entry=pdf_entry.__dict__)
+    assert "$1" in pdf_skeleton
+    assert "pdf_path" in pdf_skeleton
+
+
+def test_required_capability_contract_rejects_empty_text_generator_shell():
+    from backend.routers.creator import _check_script_file_contract
+
+    entry = {
+        "path": "scripts/write.py",
+        "role": "text_generator",
+        "inputs": ["topic"],
+        "outputs": ["text"],
+        "required_capabilities": ["text_generation"],
+        "language": "python",
+        "runtime": "python",
+    }
+    fixed_template = """import json
+import sys
+
+def main():
+    payload = json.loads(sys.argv[1])
+    print(json.dumps({'text': payload.get('topic', '')}))
+
+if __name__ == '__main__':
+    main()
+"""
+    real_call = """import json
+import sys
+from backend.services.skill_runtime import generate_text_with_llm
+
+def main():
+    payload = json.loads(sys.argv[1])
+    prompt = payload.get('topic', '')
+    print(json.dumps({'text': generate_text_with_llm(prompt)}))
+
+if __name__ == '__main__':
+    main()
+"""
+
+    bad_failed = {result.id for result in _check_script_file_contract("scripts/write.py", fixed_template, skill_plan_entry=entry) if not result.passed}
+    good_failed = {result.id for result in _check_script_file_contract("scripts/write.py", real_call, skill_plan_entry=entry) if not result.passed}
+
+    assert "script.required_capabilities.called" in bad_failed
+    assert "script.required_capabilities.called" not in good_failed
+
+
+def test_sanitize_trims_prose_from_node_entrypoint_to_stdout():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    entry = {
+        "path": "scripts/write.js",
+        "role": "generic_script",
+        "inputs": ["topic"],
+        "outputs": ["text"],
+        "language": "javascript",
+        "runtime": "node",
+    }
+    raw = """下面是 scripts/write.js：
+const payload = JSON.parse(process.argv[2] || '{}');
+console.log(JSON.stringify({ text: payload.topic || '' }));
+这是一段说明文字，不应保存。
+```"""
+    sanitized = _sanitize_generated_file_content("scripts/write.js", raw, skill_plan_entry=entry)
+
+    assert sanitized.startswith("const payload")
+    assert sanitized.endswith("));")
+    assert "说明文字" not in sanitized
+    assert "```" not in sanitized
