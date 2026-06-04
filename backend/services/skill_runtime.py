@@ -196,6 +196,41 @@ def _decode_image_response(data: dict[str, Any]) -> tuple[bytes, str]:
     raise ValueError(f"Image API did not return b64_json: {data}")
 
 
+
+def generate_text_with_llm(prompt: str, *, system: str = "", temperature: float = 0.7) -> str:
+    """Generate text with the platform configured LLM/TEXT_MODEL.
+
+    Generated Skill scripts use this helper instead of embedding API details.
+    During Creator trial runs it returns deterministic non-empty text so script
+    validation can verify plumbing without network access.
+    """
+    prompt = str(prompt or "").strip()
+    if not prompt:
+        raise ValueError("text generation prompt is empty")
+
+    if os.environ.get("SKILL_TRIAL_RUN") == "1":
+        return f"Generated text for: {prompt}"
+
+    url = _build_chat_completions_url(_required_env("LLM_BASE_URL"))
+    payload = {
+        "model": _required_env("TEXT_MODEL"),
+        "stream": False,
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": system or "You are a helpful writing assistant."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    data = _post_json(url, payload=payload, headers=_headers(_llm_api_key()))
+    choices = data.get("choices") or []
+    if not choices:
+        raise ValueError("TEXT_MODEL returned no choices")
+    message = choices[0].get("message") or {}
+    text = _strip_model_text(message.get("content") or choices[0].get("text") or "")
+    if not text:
+        raise ValueError("TEXT_MODEL returned empty text")
+    return text
+
 def generate_stable_diffusion_image(
     topic: str,
     *,

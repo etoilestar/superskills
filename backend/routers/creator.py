@@ -115,7 +115,7 @@ _MAX_HISTORY_TURNS = 6
 
 # Generated files can repair themselves by sending validator/static/trial-run
 # failures back to the same routed model before returning content to the frontend.
-_MAX_FILE_REPAIR_ATTEMPTS = 8
+_MAX_FILE_REPAIR_ATTEMPTS = 10
 _SCRIPT_TRIAL_TIMEOUT_SECONDS = 30
 
 # Human-readable language labels indexed by file extension.
@@ -465,7 +465,7 @@ _HOST_MODEL_CAPABILITY_RE = re.compile(
 _CONFIGURED_MODEL_CALL_RE = re.compile(
     r"LLM_BASE_URL|TEXT_MODEL|IMAGE_MODEL|VISION_MODEL|/v1/chat/completions|"
     r"chat/completions|complete_chat_once|stream_chat|openai|"
-    r"generate_stable_diffusion_image|backend\.services\.skill_runtime",
+    r"generate_text_with_llm|generate_stable_diffusion_image|backend\.services\.skill_runtime",
     re.IGNORECASE,
 )
 _CREATOR_FLOW_LEAK_RE = re.compile(
@@ -479,7 +479,7 @@ _SKILL_FILE_PATH_RE = re.compile(r"(?<![\w./-])((?:scripts|references|assets)/[A
 
 _IMAGE_MODEL_USAGE_RE = re.compile(r"IMAGE_MODEL|IMAGE_BASE_URL|/v1/images/generations|images/generations|generate_stable_diffusion_image", re.IGNORECASE)
 _DIRECT_IMAGE_API_RE = re.compile(r"IMAGE_BASE_URL|/v1/images/generations|images/generations", re.IGNORECASE)
-_PLATFORM_IMAGE_HELPER_RE = re.compile(r"generate_stable_diffusion_image|backend\.services\.skill_runtime", re.IGNORECASE)
+_PLATFORM_IMAGE_HELPER_RE = re.compile(r"generate_stable_diffusion_image", re.IGNORECASE)
 _IMAGE_URL_ONLY_RE = re.compile(r'\[0\]\s*\.get\(\s*[\'"]url[\'"]|\[\s*[\'"]url[\'"]\s*\]', re.IGNORECASE)
 _DATA_URI_RE = re.compile(r"data:image/[^;]+;base64", re.IGNORECASE)
 _REFERENCE_PLACEHOLDER_RE = re.compile(r"placeholder|TODO|待补充|将要生成|仅为示例|空壳|占位", re.IGNORECASE)
@@ -564,6 +564,8 @@ def _script_command_template(script_path: str, blueprint_text: str, entry: Skill
         return f"node {script_path} '{payload}'"
     if runtime == "bash":
         return f"bash {script_path} '{payload}'"
+    if runtime == "shell":
+        return f"sh {script_path} '{payload}'"
     if runtime == "python":
         return f"python {script_path} '{payload}'"
     return f"{script_path} '{payload}'"
@@ -606,6 +608,8 @@ def _command_runtime_matches(command: str, script_path: str, entry: SkillPlanEnt
                 return Path(runner).name == "node"
             if entry.runtime == "bash":
                 return Path(runner).name in {"bash", "sh"}
+            if entry.runtime == "shell":
+                return Path(runner).name in {"sh", "bash"}
             return True
     return False
 
@@ -1263,6 +1267,23 @@ def _validate_asset_file_contract(file_path: str, content: str) -> None:
         raise ContractValidationError(_format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"), results)
 
 
+
+def _script_satisfies_required_capability(content: str, capability: str) -> bool:
+    capability = capability.lower()
+    if capability == "text_generation":
+        return bool(re.search(r"generate_text_with_llm|LLM_BASE_URL|TEXT_MODEL|chat/completions|complete_chat_once|stream_chat", content, re.IGNORECASE))
+    if capability == "image_generation":
+        return bool(_PLATFORM_IMAGE_HELPER_RE.search(content))
+    if capability == "pdf_generation":
+        return bool(re.search(r"FPDF|reportlab|PdfWriter|%PDF-|pdf_path|file_paths|build_pdf", content, re.IGNORECASE))
+    if capability == "file_output":
+        return bool(re.search(r"write_text|write_bytes|open\s*\(|fs\.writeFile|pdf_path|file_paths", content, re.IGNORECASE))
+    return True
+
+
+def _script_required_capability_failures(content: str, capabilities: list[str]) -> list[str]:
+    return [capability for capability in capabilities if not _script_satisfies_required_capability(content, capability)]
+
 def _check_script_file_contract(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> list[ContractCheckResult]:
     plan_entry = _skill_plan_entry_for_file(file_path=file_path, role=role, skill_plan_entry=skill_plan_entry)
     strict_interface = skill_plan_entry is not None
@@ -1355,6 +1376,21 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                 message=("脚本包含 runtime 入口与 stdout 输出。" if has_entry else f"{file_path} 缺少 {plan_entry.runtime} 入口或 stdout 输出。"),
                 expected="脚本包含对应 runtime 的入口函数/语句，并向 stdout 输出 JSON。",
                 minimal_edit="补齐 main/入口调用和 JSON stdout 输出。",
+            )
+        )
+        missing_capabilities = _script_required_capability_failures(stripped, list(plan_entry.required_capabilities or []))
+        results.append(
+            ContractCheckResult(
+                id="script.required_capabilities.called",
+                passed=not missing_capabilities,
+                target=file_path,
+                message=(
+                    "脚本调用了 role.required_capabilities 对应的平台/文件能力。"
+                    if not missing_capabilities
+                    else f"脚本未调用这些 required_capabilities 对应接口：{', '.join(missing_capabilities)}。"
+                ),
+                expected="text_generation 调用 generate_text_with_llm/平台 LLM；image_generation 调用 generate_stable_diffusion_image；pdf_generation 使用 reportlab/fpdf/PDF 构建；file_output 写入声明文件。",
+                minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
             )
         )
 
@@ -1585,7 +1621,7 @@ def _command_uses_json_argv(command: str) -> bool:
 def _script_reads_json_argv(content: str, runtime: str = "python") -> bool:
     if runtime == "node":
         return "JSON.parse" in content and "process.argv" in content
-    if runtime == "bash":
+    if runtime in {"bash", "shell"}:
         return "$1" in content or "${1" in content or "jq" in content
     return "json.loads" in content and "sys.argv" in content
 
@@ -1600,7 +1636,7 @@ def _script_has_main_entry(content: str, runtime: str) -> bool:
         return "def main" in content and "__main__" in content
     if runtime == "node":
         return "process.argv" in content and "console.log" in content
-    if runtime == "bash":
+    if runtime in {"bash", "shell"}:
         return ("$1" in content or "${1" in content) and ("echo" in content or "printf" in content or "print(json.dumps" in content)
     return True
 
@@ -1921,6 +1957,7 @@ async def _repair_generated_file_with_feedback(
     passed_checks_text: str = "",
     failed_checks_text: str = "",
     repair_mode: str = "minimal_edit",
+    skill_plan_entry: dict[str, Any] | None = None,
 ) -> str:
     """Ask the routed generation model to fix one file using validator feedback.
 
@@ -1931,12 +1968,14 @@ async def _repair_generated_file_with_feedback(
     so Markdown-wrapped failures are not reinforced as the desired answer shape.
     """
     is_script = file_path.startswith("scripts/")
-    repair_language = language_for_path(file_path)
-    repair_runtime = runtime_for_language(repair_language, file_type_for_path(file_path))
+    plan_entry = _skill_plan_entry_for_file(file_path=file_path, skill_plan_entry=skill_plan_entry) if is_script else None
+    repair_language = plan_entry.language if plan_entry is not None else language_for_path(file_path)
+    repair_runtime = plan_entry.runtime if plan_entry is not None else runtime_for_language(repair_language, file_type_for_path(file_path))
     runtime_rule = {
         "python": "Python: parse sys.argv[1] as JSON，保留 main() 入口并 print JSON。",
         "node": "Node: parse process.argv[2] as JSON，并 console.log(JSON.stringify(...))。",
         "bash": "Bash: parse $1 as JSON，并向 stdout 输出 JSON 或声明的文件产物。",
+        "shell": "Shell: parse $1 as JSON，并向 stdout 输出 JSON 或声明的文件产物。",
     }.get(repair_runtime, "只输出该文件类型的原始内容；不得包含 Markdown fence。")
     output_contract = (
         f"Rewrite as raw {repair_language} source. Remove any fenced code blocks or file labels. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Align JSON argv keys exactly with SkillPlan inputs. {runtime_rule}"
@@ -2449,9 +2488,49 @@ def _normalize_generated_file_content(file_path: str, content: str) -> str:
     return _strip_code_fence(extracted if extracted is not None else content)
 
 
+
+def _trim_source_to_runtime_entrypoint(file_path: str, content: str, skill_plan_entry: dict[str, Any] | None = None) -> str:
+    """Drop leading/trailing prose around a probable runtime source entrypoint."""
+    if not file_path.startswith("scripts/"):
+        return content.strip()
+    plan_entry = _skill_plan_entry_for_file(file_path=file_path, skill_plan_entry=skill_plan_entry)
+    text = _strip_orphan_trailing_fence(content.strip().lstrip("\ufeff"))
+    lines = text.splitlines()
+
+    start_patterns: list[str]
+    end_patterns: list[str]
+    if plan_entry.runtime == "node":
+        start_patterns = [r"^\s*(?:const|let|var)\s+", r"^\s*function\s+", r"^\s*#!/usr/bin/env\s+node"]
+        end_patterns = [r"console\.log\s*\("]
+    elif plan_entry.runtime in {"bash", "shell"}:
+        start_patterns = [r"^\s*#!/", r"^\s*set\s+-", r"^\s*payload_json=", r"^\s*[A-Za-z_][A-Za-z0-9_]*="]
+        end_patterns = [r"^\s*(?:echo|printf|python\s+-c)\b"]
+    else:
+        start_patterns = [r"^\s*(?:import\s+|from\s+|def\s+|class\s+|#!/usr/bin/env\s+python)"]
+        end_patterns = [r"main\s*\(\s*\)"]
+
+    start_idx = 0
+    for idx, line in enumerate(lines):
+        if any(re.search(pattern, line) for pattern in start_patterns):
+            start_idx = idx
+            break
+    trimmed = lines[start_idx:]
+
+    end_idx = len(trimmed)
+    for idx in range(len(trimmed) - 1, -1, -1):
+        line = trimmed[idx]
+        if any(re.search(pattern, line) for pattern in end_patterns):
+            end_idx = idx + 1
+            break
+    return "\n".join(trimmed[:end_idx]).strip()
+
 def _sanitize_generated_file_content(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> str:
     """Normalize model output into exactly the requested file content."""
-    sanitized = _normalize_generated_file_content(file_path, content)
+    if file_path.startswith("scripts/") and _MULTI_FILE_MARKER_RE.search(content) and _extract_only_fenced_block(content) is None:
+        sanitized = content.strip()
+    else:
+        sanitized = _normalize_generated_file_content(file_path, content)
+        sanitized = _trim_source_to_runtime_entrypoint(file_path, sanitized, skill_plan_entry=skill_plan_entry)
     _validate_generated_file_content(file_path, sanitized, role=role, skill_plan_entry=skill_plan_entry)
     return sanitized
 
@@ -2488,7 +2567,7 @@ def _script_generation_skeleton(
     role: str | None = None,
     skill_plan_entry: dict[str, Any] | None = None,
 ) -> str:
-    """Return a fixed script scaffold selected by SkillPlan role and runtime."""
+    """Return a runtime-aware scaffold selected by SkillPlan role/runtime."""
     plan_entry = _skill_plan_entry_for_file(
         file_path=file_path,
         purpose=purpose,
@@ -2499,9 +2578,61 @@ def _script_generation_skeleton(
     input_keys = list(plan_entry.inputs or ["payload"])
     py_value_expr = " or ".join(f"payload.get({key!r})" for key in input_keys) + " or ''"
     js_value_expr = " || ".join(f"payload[{json.dumps(key)}]" for key in input_keys) + " || ''"
-    bash_py_expr = " or ".join(f'p.get({key!r})' for key in input_keys) + " or ''"
+    bash_py_expr = " or ".join(f"p.get({key!r})" for key in input_keys) + " or ''"
 
     if plan_entry.runtime == "node":
+        if plan_entry.role == "image_generator":
+            return (
+                "必须使用下面的 node image_generator skeleton；通过 Python 平台 helper 生成图片，stdout 只能 console.log JSON 字符串：\n"
+                "const { spawnSync } = require('child_process');\n"
+                "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
+                "function run(payload) {\n"
+                f"  const desc = String({js_value_expr}).trim();\n"
+                "  const helper = `from backend.services.skill_runtime import generate_stable_diffusion_image\\nimport json,sys\\nresult = generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated')\\nprint(json.dumps(result, ensure_ascii=False))`;\n"
+                "  const proc = spawnSync(process.env.PYTHON || 'python', ['-c', helper, desc], { encoding: 'utf8' });\n"
+                "  if (proc.status !== 0) throw new Error(proc.stderr || 'generate_stable_diffusion_image failed');\n"
+                "  const result = JSON.parse(proc.stdout);\n"
+                "  const image_paths = [];\n"
+                "  const images = [];\n"
+                "  image_paths.push(result.image_path);\n"
+                "  images.push(result);\n"
+                "  return { image_paths: image_paths.filter(Boolean), images };\n"
+                "}\n"
+                "console.log(JSON.stringify(run(payload)));"
+            )
+        if plan_entry.role == "pdf_builder":
+            return (
+                "必须使用下面的 node pdf_builder skeleton；消费 text/image_paths/template/assets 构建 PDF，不生成图片：\n"
+                "const fs = require('fs');\n"
+                "const path = require('path');\n"
+                "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
+                "function escapePdfText(value) { return String(value).replace(/[\\\\()]/g, '\\\\$&').slice(0, 1800); }\n"
+                "function run(payload) {\n"
+                f"  const text = String({js_value_expr}).trim() || 'Generated PDF';\n"
+                "  const outputDir = path.resolve(payload.output_dir || '.');\n"
+                "  fs.mkdirSync(outputDir, { recursive: true });\n"
+                "  const pdfPath = path.join(outputDir, 'output.pdf');\n"
+                "  const body = escapePdfText(text);\n"
+                "  const pdf = `%PDF-1.4\\n1 0 obj<<>>endobj\\n2 0 obj<< /Length 44 >>stream\\nBT /F1 12 Tf 50 760 Td (${body}) Tj ET\\nendstream endobj\\n3 0 obj<< /Type /Page /Parent 4 0 R /Contents 2 0 R /Resources << /Font << /F1 5 0 R >> >> >>endobj\\n4 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>endobj\\n5 0 obj<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>endobj\\n6 0 obj<< /Type /Catalog /Pages 4 0 R >>endobj\\ntrailer<< /Root 6 0 R >>\\n%%EOF\\n`;\n"
+                "  fs.writeFileSync(pdfPath, pdf);\n"
+                "  return { pdf_path: pdfPath, file_paths: [pdfPath] };\n"
+                "}\n"
+                "console.log(JSON.stringify(run(payload)));"
+            )
+        if plan_entry.role == "text_generator":
+            return (
+                "必须使用下面的 node text_generator skeleton；调用平台 generate_text_with_llm helper，stdout JSON 包含非空 text：\n"
+                "const { spawnSync } = require('child_process');\n"
+                "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
+                "function run(payload) {\n"
+                f"  const prompt = String({js_value_expr}).trim();\n"
+                "  const helper = `from backend.services.skill_runtime import generate_text_with_llm\\nimport json,sys\\nprint(json.dumps({'text': generate_text_with_llm(sys.argv[1])}, ensure_ascii=False))`;\n"
+                "  const proc = spawnSync(process.env.PYTHON || 'python', ['-c', helper, prompt], { encoding: 'utf8' });\n"
+                "  if (proc.status !== 0) throw new Error(proc.stderr || 'generate_text_with_llm failed');\n"
+                "  return JSON.parse(proc.stdout);\n"
+                "}\n"
+                "console.log(JSON.stringify(run(payload)));"
+            )
         return (
             "必须使用下面的 node_skeleton；解析 process.argv[2] JSON，stdout 只能 console.log JSON 字符串：\n"
             "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
@@ -2512,20 +2643,26 @@ def _script_generation_skeleton(
             "console.log(JSON.stringify(run(payload)));"
         )
 
-    if plan_entry.runtime == "bash":
+    if plan_entry.runtime in {"bash", "shell"}:
+        if plan_entry.role == "image_generator":
+            helper = "from backend.services.skill_runtime import generate_stable_diffusion_image; import json,sys; result=generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated'); print(json.dumps({'image_paths':[result.get('image_path')], 'images':[result]}, ensure_ascii=False))"
+        elif plan_entry.role == "pdf_builder":
+            helper = "import json,sys; from pathlib import Path; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + " or 'Generated PDF'); out=Path(p.get('output_dir') or '.').resolve(); out.mkdir(parents=True, exist_ok=True); pdf=out/'output.pdf'; pdf.write_text('%PDF-1.4\\nBT ('+text[:1000].replace('(',' ').replace(')',' ') +') Tj ET\\n%%EOF\\n', encoding='latin1'); print(json.dumps({'pdf_path':str(pdf),'file_paths':[str(pdf)]}, ensure_ascii=False))"
+        elif plan_entry.role == "text_generator":
+            helper = "from backend.services.skill_runtime import generate_text_with_llm; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); print(json.dumps({'text': generate_text_with_llm(prompt)}, ensure_ascii=False))"
+        else:
+            helper = "import json,sys; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + "); print(json.dumps({'text': text, 'file_paths': []}, ensure_ascii=False))"
         return (
-            '必须使用下面的 shell_skeleton；从 $1 读取 JSON argv，并向 stdout 输出 JSON：\n'
-            '#!/usr/bin/env bash\n'
-            'set -euo pipefail\n'
+            "必须使用下面的 shell_skeleton；从 $1 读取 JSON argv，并向 stdout 输出 JSON：\n"
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
             "payload_json=${1:-'{}'}\n"
-            f'text=$(python -c \'import json,sys; p=json.loads(sys.argv[1]); print({bash_py_expr})\' "$payload_json")\n'
-            'python -c \'import json,sys; print(json.dumps({"text": sys.argv[1], "file_paths": []}, ensure_ascii=False))\' "$text"'
+            f"python -c {shlex.quote(helper)} \"$payload_json\""
         )
 
     if plan_entry.role == "image_generator":
         return (
-            "必须使用下面的 image_generator 脚本骨架；不要改变 import/helper/main/JSON stdout 结构，只填充 build_image_prompt() "
-            "中的业务 prompt 组装逻辑，必要时补充返回字段：\n"
+            "必须使用下面的 image_generator 脚本骨架；不要改变 import/helper/main/JSON stdout 结构，只填充 build_image_prompt() 中的业务 prompt 组装逻辑，必要时补充返回字段：\n"
             "import json\n"
             "import sys\n"
             "from backend.services.skill_runtime import generate_stable_diffusion_image\n\n"
@@ -2534,9 +2671,8 @@ def _script_generation_skeleton(
             "        return {}\n"
             "    return json.loads(sys.argv[1])\n\n"
             "def build_image_prompt(payload: dict) -> str:\n"
-            "    # Derive a concrete prompt from payload keys required by the SkillPlan.\n"
             f"    topic = str({py_value_expr}).strip()\n"
-            "    return topic or 'helpful generated illustration'\n\n"
+            "    return topic\n\n"
             "def run(payload: dict) -> dict:\n"
             "    desc = build_image_prompt(payload)\n"
             "    image_paths = []\n"
@@ -2564,7 +2700,6 @@ def _script_generation_skeleton(
             "        return {}\n"
             "    return json.loads(sys.argv[1])\n\n"
             "def build_pdf(payload: dict) -> dict:\n"
-            "    # Build or transform real files using payload text/image_paths/template_path.\n"
             "    output_dir = Path(payload.get('output_dir') or '.').resolve()\n"
             "    output_dir.mkdir(parents=True, exist_ok=True)\n"
             "    pdf_path = output_dir / 'output.pdf'\n"
@@ -2585,16 +2720,17 @@ def _script_generation_skeleton(
 
     if plan_entry.role == "text_generator":
         return (
-            "必须使用下面的 text_generator 脚本骨架；stdout JSON 必须包含非空 text，不要生成图片或 PDF：\n"
+            "必须使用下面的 text_generator 脚本骨架；调用平台 generate_text_with_llm，stdout JSON 必须包含非空 text，不要生成图片或 PDF：\n"
             "import json\n"
-            "import sys\n\n"
+            "import sys\n"
+            "from backend.services.skill_runtime import generate_text_with_llm\n\n"
             "def parse_args() -> dict:\n"
             "    if len(sys.argv) < 2:\n"
             "        return {}\n"
             "    return json.loads(sys.argv[1])\n\n"
             "def generate_text(payload: dict) -> str:\n"
-            f"    topic = str({py_value_expr}).strip()\n"
-            "    return topic\n\n"
+            f"    prompt = str({py_value_expr}).strip()\n"
+            "    return generate_text_with_llm(prompt)\n\n"
             "def run(payload: dict) -> dict:\n"
             "    text = generate_text(payload).strip()\n"
             "    return {'text': text}\n\n"
@@ -2606,8 +2742,7 @@ def _script_generation_skeleton(
         )
 
     return (
-        "必须使用下面的 generic_script 脚本骨架；不要改变 import/parse_args/main/JSON stdout 结构，只填充 run() "
-        "中的真实业务逻辑并按 SkillPlan 使用 payload 字段：\n"
+        "必须使用下面的 generic_script 脚本骨架；不要改变 import/parse_args/main/JSON stdout 结构，只填充 run() 中的真实业务逻辑并按 SkillPlan 使用 payload 字段：\n"
         "import json\n"
         "import sys\n\n"
         "def parse_args() -> dict:\n"
@@ -2615,7 +2750,6 @@ def _script_generation_skeleton(
         "        return {}\n"
         "    return json.loads(sys.argv[1])\n\n"
         "def run(payload: dict) -> dict:\n"
-        "    # Implement the real deterministic business logic required by the SkillPlan.\n"
         f"    text = str({py_value_expr}).strip()\n"
         "    return {'text': text, 'file_paths': []}\n\n"
         "def main() -> None:\n"
@@ -3014,6 +3148,7 @@ async def generate_file(request: GenerateFileRequest):
                             passed_checks_text=passed_checks_text,
                             failed_checks_text=failed_checks_text,
                             repair_mode=repair_mode,
+                            skill_plan_entry=request.skill_plan_entry,
                         )
             else:
                 content = _sanitize_generated_file_content(request.file_path, raw_content, role=request.role, skill_plan_entry=request.skill_plan_entry)

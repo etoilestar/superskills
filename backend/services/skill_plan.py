@@ -15,7 +15,7 @@ from typing import Literal
 
 FileType = Literal["skill", "script", "reference", "asset", "skill_md"]
 Language = Literal["python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"]
-Runtime = Literal["python", "node", "bash", "none"]
+Runtime = Literal["python", "node", "bash", "shell", "generic", "none"]
 ScriptRole = Literal["text_generator", "image_generator", "pdf_builder", "generic_script"]
 ResourceRole = Literal["skill_overview", "reference", "asset"]
 FileRole = ScriptRole | ResourceRole
@@ -138,7 +138,7 @@ def runtime_for_language(language: str, file_type: FileType) -> Runtime:
         return "node"
     if language == "bash":
         return "bash"
-    return "none"
+    return "generic"
 
 
 def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -> str:
@@ -150,6 +150,8 @@ def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -
         return f"node {path} '{payload}'"
     if runtime == "bash":
         return f"bash {path} '{payload}'"
+    if runtime == "shell":
+        return f"sh {path} '{payload}'"
     return f"{path} '{payload}'"
 
 
@@ -377,7 +379,7 @@ def build_skill_plan_entry(
     language = explicit_language if explicit_language in {"python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"} else detected_language
     detected_runtime = runtime_for_language(language, file_type)
     explicit_runtime = _explicit_scalar_field("runtime", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-    runtime = explicit_runtime if explicit_runtime in {"python", "node", "bash", "none"} else detected_runtime
+    runtime = explicit_runtime if explicit_runtime in {"python", "node", "bash", "shell", "generic", "none"} else detected_runtime
     return SkillPlanEntry(
         path=file_path,
         file_type=file_type,
