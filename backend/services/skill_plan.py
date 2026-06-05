@@ -16,7 +16,7 @@ from typing import Literal
 FileType = Literal["skill", "script", "reference", "asset", "skill_md"]
 Language = Literal["python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"]
 Runtime = Literal["python", "node", "bash", "shell", "generic", "none"]
-ScriptRole = Literal["text_generator", "image_generator", "pdf_builder", "html_asset_builder", "asset_builder", "composite_generator", "generic_script"]
+ScriptRole = Literal["text_generator", "image_generator", "composite_generator", "pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder", "generic_script"]
 ResourceRole = Literal["skill_overview", "reference", "asset"]
 FileRole = ScriptRole | ResourceRole
 
@@ -24,6 +24,8 @@ SCRIPT_ROLES: frozenset[str] = frozenset({
     "text_generator",
     "image_generator",
     "pdf_builder",
+    "docx_builder",
+    "pptx_builder",
     "html_asset_builder",
     "asset_builder",
     "composite_generator",
@@ -164,7 +166,7 @@ def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -
 
 
 _EXPLICIT_ROLE_RE = re.compile(
-    r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|pdf_builder|html_asset_builder|asset_builder|composite_generator|generic_script)",
+    r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|composite_generator|pdf_builder|docx_builder|pptx_builder|html_asset_builder|asset_builder|generic_script)",
     re.I,
 )
 
@@ -374,15 +376,19 @@ def file_role_classifier(
 
 def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
     if role == "text_generator":
-        return ["topic", "prompt", "text"], ["text"]
+        return ["topic", "prompt", "text"], ["story_text"]
     if role == "image_generator":
-        return ["topic", "prompt", "text"], ["image_paths", "images", "text_with_image_prompts"]
+        return ["topic", "prompt", "story_text"], ["image_paths", "images", "text_with_image_prompts"]
     if role == "composite_generator":
-        return ["topic", "prompt", "text"], ["text", "image_paths", "images", "text_with_image_prompts"]
+        return ["topic", "prompt", "text"], ["story_text", "image_paths", "images", "text_with_image_prompts"]
     if role == "pdf_builder":
-        return ["text", "image_paths", "template_path"], ["pdf_path", "file_paths"]
+        return ["story_text", "image_paths", "previous_stdout", "template_path"], ["pdf_path"]
+    if role == "docx_builder":
+        return ["story_text", "image_paths", "previous_stdout", "template_path"], ["docx_path"]
+    if role == "pptx_builder":
+        return ["story_text", "image_paths", "previous_stdout", "template_path"], ["pptx_path"]
     if role in {"html_asset_builder", "asset_builder"}:
-        return ["topic", "text", "html"], ["html_path", "asset_paths"]
+        return ["story_text", "image_paths", "previous_stdout", "html"], ["html_path"]
     if role == "reference":
         return [], ["non_empty_markdown", "required_sections"]
     if role == "asset":
@@ -401,6 +407,10 @@ def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:
         return ["text_generation", "image_generation"], ["pdf_generation"]
     if role == "pdf_builder":
         return ["pdf_generation", "file_output"], ["image_generation"]
+    if role == "docx_builder":
+        return ["docx_generation", "file_output"], ["image_generation", "pdf_generation"]
+    if role == "pptx_builder":
+        return ["pptx_generation", "file_output"], ["image_generation", "pdf_generation"]
     if role in {"html_asset_builder", "asset_builder"}:
         return ["html_generation", "file_output"], ["image_generation", "pdf_generation"]
     if role == "reference":

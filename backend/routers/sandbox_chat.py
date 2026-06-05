@@ -851,10 +851,10 @@ _HOST_COMMAND_INSTRUCTION_RE = re.compile(
 
 _SKILL_LOCAL_RESOURCE_RE = re.compile(r"(?<![\w./-])(?P<path>(?:scripts|references|assets)/[A-Za-z0-9_./-]+)")
 _ACTION_SCHEMA_FIELD_RE = re.compile(r"(?:{field})\s*[：:=]\s*\[?([^\]\n;]+)\]?", re.I)
-_ACTION_SCHEMA_ROLE_RE = re.compile(r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|pdf_builder|composite_generator|html_asset_builder|asset_builder|generic_script)", re.I)
+_ACTION_SCHEMA_ROLE_RE = re.compile(r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|composite_generator|pdf_builder|docx_builder|pptx_builder|html_asset_builder|asset_builder|generic_script)", re.I)
 _RUNTIME_PLACEHOLDER_RE = re.compile(r"{{\s*([A-Za-z_][\w-]*)\s*}}")
-_SCRIPT_ROLES = {"text_generator", "image_generator", "pdf_builder", "composite_generator", "html_asset_builder", "asset_builder", "generic_script"}
-_HIGH_IMPACT_CAPABILITIES = {"image_generation", "pdf_generation", "html_generation"}
+_SCRIPT_ROLES = {"text_generator", "image_generator", "composite_generator", "pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder", "generic_script"}
+_HIGH_IMPACT_CAPABILITIES = {"image_generation", "pdf_generation", "docx_generation", "pptx_generation", "html_generation"}
 
 
 def _extract_script_path_from_command(command: str) -> str | None:
@@ -1020,13 +1020,13 @@ def _validate_action_schema_entries(entries: list[dict]) -> tuple[list[dict], li
             })
         if role == "generic_script" and set(entry.get("required_capabilities") or []) & _HIGH_IMPACT_CAPABILITIES:
             errors.append({
-                "error": "generic_script 不允许声明高风险能力，必须显式声明 image_generator、pdf_builder、html_asset_builder 或 composite_generator role",
+                "error": "generic_script 不允许声明高风险能力，必须显式声明 image_generator、pdf_builder、docx_builder、pptx_builder、html_asset_builder 或 composite_generator role",
                 "script_path": entry.get("script_path"),
                 "required_capabilities": entry.get("required_capabilities"),
             })
         if role == "generic_script":
             warnings.append({
-                "warning": "低置信度/未显式 role 的 generic_script runtime fallback；不会自动启用图片/PDF/HTML 等高风险能力",
+                "warning": "低置信度/未显式 role 的 generic_script runtime fallback；不会自动启用图片/PDF/Word/PPT/HTML 等高风险能力",
                 "script_path": entry.get("script_path"),
                 "source_path": entry.get("source_path"),
             })
@@ -1138,7 +1138,7 @@ def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> No
     try:
         payload = json.loads(stripped)
     except json.JSONDecodeError:
-        if str(entry.get("role")) in {"text_generator", "image_generator", "pdf_builder", "html_asset_builder", "asset_builder", "composite_generator"}:
+        if str(entry.get("role")) in {"text_generator", "image_generator", "composite_generator", "pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}:
             raise ValueError("角色脚本 stdout 必须是 JSON object")
         return
     if not isinstance(payload, dict):
@@ -1154,19 +1154,22 @@ def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> No
             raise ValueError("composite_generator stdout JSON 缺少声明的 image_path/image_paths/images 输出")
         if ("pdf_generation" in required_capabilities or {"pdf_path", "file_paths"} & outputs) and not _payload_has_file_field(payload, "pdf_path", "file_paths"):
             raise ValueError("composite_generator stdout JSON 缺少声明的 pdf_path/file_paths 输出")
+        if ("docx_generation" in required_capabilities or {"docx_path"} & outputs) and not _payload_has_file_field(payload, "docx_path", "file_paths"):
+            raise ValueError("composite_generator stdout JSON 缺少声明的 docx_path/file_paths 输出")
+        if ("pptx_generation" in required_capabilities or {"pptx_path"} & outputs) and not _payload_has_file_field(payload, "pptx_path", "file_paths"):
+            raise ValueError("composite_generator stdout JSON 缺少声明的 pptx_path/file_paths 输出")
         if ("html_generation" in required_capabilities or {"html_path", "asset_paths"} & outputs) and not _payload_has_file_field(payload, "html_path", "asset_paths"):
             raise ValueError("composite_generator stdout JSON 缺少声明的 html_path/asset_paths 输出")
     if role == "text_generator" and not str(payload.get("text") or payload.get("story_text") or payload.get("markdown") or "").strip():
         raise ValueError("text_generator stdout JSON 必须包含非空 text/markdown")
     if role == "image_generator" and not _payload_image_paths(payload):
         raise ValueError("image_generator stdout JSON 必须包含 image_path/image_paths/images")
-    if role == "pdf_builder":
-        pdf_path = payload.get("pdf_path")
-        file_paths = payload.get("file_paths")
-        has_file = isinstance(pdf_path, str) and pdf_path.strip()
-        has_file = has_file or (isinstance(file_paths, list) and any(isinstance(p, str) and p.strip() for p in file_paths))
-        if not has_file:
-            raise ValueError("pdf_builder stdout JSON 必须包含 pdf_path 或 file_paths")
+    if role == "pdf_builder" and not _payload_has_file_field(payload, "pdf_path", "file_paths"):
+        raise ValueError("pdf_builder stdout JSON 必须包含 pdf_path 或 file_paths")
+    if role == "docx_builder" and not _payload_has_file_field(payload, "docx_path", "file_paths"):
+        raise ValueError("docx_builder stdout JSON 必须包含 docx_path 或 file_paths")
+    if role == "pptx_builder" and not _payload_has_file_field(payload, "pptx_path", "file_paths"):
+        raise ValueError("pptx_builder stdout JSON 必须包含 pptx_path 或 file_paths")
     if role in {"html_asset_builder", "asset_builder"}:
         html_path = payload.get("html_path")
         asset_paths = payload.get("asset_paths")
@@ -2351,11 +2354,11 @@ def _output_files_from_stdout_json(stdout: str, *, cwd: Path | None, skill_name:
     if not isinstance(payload, dict):
         return []
     raw_paths: list[str] = []
-    for key in ("html_path", "asset_path", "image_path", "image"):
+    for key in ("html_path", "asset_path", "image_path", "image", "pdf_path", "docx_path", "pptx_path"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             raw_paths.append(value.strip())
-    for key in ("asset_paths", "html_paths", "image_paths"):
+    for key in ("asset_paths", "html_paths", "image_paths", "file_paths"):
         value = payload.get(key)
         if isinstance(value, list):
             raw_paths.extend(item.strip() for item in value if isinstance(item, str) and item.strip())
@@ -2367,22 +2370,20 @@ def _output_files_from_stdout_json(stdout: str, *, cwd: Path | None, skill_name:
                 if isinstance(image_path, str) and image_path.strip():
                     raw_paths.append(image_path.strip())
     root = cwd.resolve()
-    generated_root = (root / "assets" / "generated").resolve()
+    allowed_roots = [(root / "assets" / "generated").resolve(), (root / "outputs").resolve()]
     output_files: list[dict] = []
     seen: set[str] = set()
     for raw in raw_paths:
         candidate = Path(raw)
         normalized_raw = raw.replace("\\", "/")
         if not candidate.is_absolute():
-            if normalized_raw.startswith("assets/"):
+            if normalized_raw.startswith(("assets/", "outputs/")):
                 candidate = (root / candidate).resolve()
             else:
                 candidate = (root / "scripts" / candidate).resolve()
-        try:
-            candidate.relative_to(generated_root)
-            rel = candidate.relative_to(root).as_posix()
-        except ValueError:
+        if not any(_is_within_sandbox(candidate, allowed_root) for allowed_root in allowed_roots):
             continue
+        rel = candidate.relative_to(root).as_posix()
         if rel in seen or not candidate.is_file():
             continue
         seen.add(rel)
@@ -2895,16 +2896,18 @@ def _validate_structured_stdout_payload(payload: dict) -> None:
             if "image_path" in image and not isinstance(image.get("image_path"), str):
                 raise ValueError("stdout JSON 字段 images[].image_path 必须是字符串")
 
-    if "html_path" in payload and not isinstance(payload.get("html_path"), str):
-        raise ValueError("stdout JSON 字段 html_path 必须是字符串")
+    for file_key in ("html_path", "pdf_path", "docx_path", "pptx_path"):
+        if file_key in payload and not isinstance(payload.get(file_key), str):
+            raise ValueError(f"stdout JSON 字段 {file_key} 必须是字符串")
 
-    if "asset_paths" in payload:
-        asset_paths = payload.get("asset_paths")
-        if not isinstance(asset_paths, list):
-            raise ValueError("stdout JSON 字段 asset_paths 必须是 list[str]")
-        for path in asset_paths:
-            if not isinstance(path, str):
-                raise ValueError("stdout JSON 字段 asset_paths 的每一项都必须是字符串")
+    for list_key in ("asset_paths", "file_paths"):
+        if list_key in payload:
+            paths = payload.get(list_key)
+            if not isinstance(paths, list):
+                raise ValueError(f"stdout JSON 字段 {list_key} 必须是 list[str]")
+            for path in paths:
+                if not isinstance(path, str):
+                    raise ValueError(f"stdout JSON 字段 {list_key} 的每一项都必须是字符串")
 
 
 def _validate_success_stdout_json_if_structured(stdout: str) -> None:
@@ -2920,7 +2923,7 @@ def _validate_success_stdout_json_if_structured(stdout: str) -> None:
         return
     if "error" in payload:
         raise ValueError("stdout JSON 不得包含 error 字段")
-    if any(key in payload for key in ("text", "story_text", "image_paths", "images")):
+    if any(key in payload for key in ("text", "story_text", "image_paths", "images", "pdf_path", "docx_path", "pptx_path", "html_path", "asset_paths", "file_paths")):
         _validate_structured_stdout_payload(payload)
 
 
