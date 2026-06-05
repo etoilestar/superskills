@@ -329,7 +329,11 @@ def _skill_plan_entry_for_file(
             required_capabilities = list(
                 skill_plan_entry.get("required_capabilities") or capabilities_for_role(explicit_role)[0]
             )
-            if {"text_generation", "image_generation"}.issubset(set(required_capabilities)) and file_type_for_path(file_path) == "script":
+            if (
+                {"text_generation", "image_generation"}.issubset(set(required_capabilities))
+                and file_type_for_path(file_path) == "script"
+                and explicit_role not in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}
+            ):
                 explicit_role = "composite_generator"
             inputs = list(skill_plan_entry.get("inputs") or default_io_for_role(explicit_role)[0])
             outputs = list(skill_plan_entry.get("outputs") or default_io_for_role(explicit_role)[1])
@@ -1637,6 +1641,26 @@ def _script_has_real_file_creation_logic(content: str, *, outputs: list[str], ca
     )) and not has_writer
     return has_writer and not returns_only_paths
 
+_MODEL_CAPABILITIES = {"text_generation", "image_generation"}
+_DETERMINISTIC_BUILDER_ROLES = {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}
+
+
+def _effective_required_capabilities_for_script(plan_entry: SkillPlanEntry) -> list[str]:
+    """Return capabilities that this script source must visibly exercise.
+
+    File builders/exporters are deterministic by default.  If a global
+    SKILL.md/blueprint model declaration was accidentally copied into a
+    builder's required_capabilities, do not turn that into a requirement for
+    ``build_pdf.py`` (or sibling exporters) to call LLM/IMAGE_MODEL.  Model
+    scripts keep their text/image requirements through their own generator
+    roles, while builders are validated for real artifact creation.
+    """
+    capabilities = list(plan_entry.required_capabilities or [])
+    if plan_entry.role in _DETERMINISTIC_BUILDER_ROLES:
+        capabilities = [capability for capability in capabilities if capability not in _MODEL_CAPABILITIES]
+    return capabilities
+
+
 def _script_required_capability_failures(content: str, capabilities: list[str]) -> list[str]:
     return [capability for capability in capabilities if not _script_satisfies_required_capability(content, capability)]
 
@@ -1644,6 +1668,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
     plan_entry = _skill_plan_entry_for_file(file_path=file_path, role=role, skill_plan_entry=skill_plan_entry)
     strict_interface = skill_plan_entry is not None
     stripped = content.strip()
+    effective_required_capabilities = _effective_required_capabilities_for_script(plan_entry)
     has_markdown_or_bundle = "```" in stripped or "~~~" in stripped or bool(_MULTI_FILE_MARKER_RE.search(stripped))
     raw_ok = bool(stripped) and not has_markdown_or_bundle
     results = [
@@ -1734,7 +1759,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                 minimal_edit="补齐 main/入口调用和 JSON stdout 输出。",
             )
         )
-        missing_capabilities = _script_required_capability_failures(stripped, list(plan_entry.required_capabilities or []))
+        missing_capabilities = _script_required_capability_failures(stripped, effective_required_capabilities)
         results.append(
             ContractCheckResult(
                 id="script.required_capabilities.called",
@@ -1750,7 +1775,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
             )
         )
 
-    missing_capabilities = _script_required_capability_failures(stripped, list(plan_entry.required_capabilities or []))
+    missing_capabilities = _script_required_capability_failures(stripped, effective_required_capabilities)
     results.append(
         ContractCheckResult(
             id="script.required_capabilities.called",
@@ -1766,7 +1791,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
         )
     )
 
-    missing_capabilities = _script_required_capability_failures(stripped, list(plan_entry.required_capabilities or []))
+    missing_capabilities = _script_required_capability_failures(stripped, effective_required_capabilities)
     results.append(
         ContractCheckResult(
             id="script.required_capabilities.called",
@@ -1782,7 +1807,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
         )
     )
 
-    missing_capabilities = _script_required_capability_failures(stripped, list(plan_entry.required_capabilities or []))
+    missing_capabilities = _script_required_capability_failures(stripped, effective_required_capabilities)
     results.append(
         ContractCheckResult(
             id="script.required_capabilities.called",
@@ -1798,7 +1823,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
         )
     )
 
-    missing_capabilities = _script_required_capability_failures(stripped, list(plan_entry.required_capabilities or []))
+    missing_capabilities = _script_required_capability_failures(stripped, effective_required_capabilities)
     results.append(
         ContractCheckResult(
             id="script.required_capabilities.called",
@@ -1814,11 +1839,11 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
         )
     )
 
-    enforce_artifact_outputs = strict_interface or bool(_ARTIFACT_CAPABILITIES & set(plan_entry.required_capabilities or []))
+    enforce_artifact_outputs = strict_interface or bool(_ARTIFACT_CAPABILITIES & set(effective_required_capabilities))
     has_real_file_output = _script_has_real_file_creation_logic(
         stripped,
         outputs=list(plan_entry.outputs or []) if enforce_artifact_outputs else [],
-        capabilities=list(plan_entry.required_capabilities or []) if enforce_artifact_outputs else [],
+        capabilities=effective_required_capabilities if enforce_artifact_outputs else [],
     )
     results.append(
         ContractCheckResult(
@@ -1879,7 +1904,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                     else f"{file_path} 的 SkillPlan forbidden_capabilities 包含 image_generation，但脚本调用了图片生成 helper。"
                 ),
                 expected="只有 required_capabilities 包含 image_generation 且未被 forbidden_capabilities 禁止时，脚本才可调用 generate_stable_diffusion_image。",
-                minimal_edit="若脚本确实需要图片能力，请修正 SkillPlan required_capabilities/forbidden_capabilities；否则移除图片 helper 调用。",
+                minimal_edit="蓝图和 SKILL.md 确定后不要修改能力声明；修当前脚本：移除图片 helper 调用，只保留与当前 role/required_capabilities 一致的逻辑。",
             )
         )
 
@@ -1896,7 +1921,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                     else f"{file_path} 的 SkillPlan forbidden_capabilities 包含 text_generation，但脚本调用了文本生成 helper/LLM。"
                 ),
                 expected="只有 required_capabilities 包含 text_generation 且未被 forbidden_capabilities 禁止时，脚本才可调用 generate_text_with_llm 或平台文本模型。",
-                minimal_edit="若脚本确实需要文本生成能力，请修正 SkillPlan required_capabilities/forbidden_capabilities；否则移除文本模型调用。",
+                minimal_edit="蓝图和 SKILL.md 确定后不要修改能力声明；修当前脚本：移除文本模型调用，只保留与当前 role/required_capabilities 一致的逻辑。",
             )
         )
 
@@ -1913,7 +1938,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                     else f"{file_path} 的 SkillPlan forbidden_capabilities 包含 pdf_generation，但源码包含 PDF 生成/输出逻辑。"
                 ),
                 expected="只有 required_capabilities 包含 pdf_generation 且未被 forbidden_capabilities 禁止时，脚本才可构建 PDF。",
-                minimal_edit="若脚本确实需要 PDF 能力，请修正 SkillPlan required_capabilities/forbidden_capabilities；否则移除 PDF 生成逻辑。",
+                minimal_edit="蓝图和 SKILL.md 确定后不要修改能力声明；修当前脚本：若当前脚本禁止 PDF 能力则移除 PDF 生成逻辑。",
             )
         )
 
@@ -1996,7 +2021,7 @@ def _requires_configured_model_call(*, plan_entry: SkillPlanEntry | None) -> boo
     """
     if plan_entry is None:
         return False
-    return bool({"text_generation", "image_generation"} & set(plan_entry.required_capabilities or []))
+    return bool({"text_generation", "image_generation"} & set(_effective_required_capabilities_for_script(plan_entry)))
 
 
 def _script_uses_configured_model(content: str) -> bool:
@@ -2039,18 +2064,23 @@ def _validate_configured_model_usage_static(*, file_path: str, content: str, ski
             "再执行 image_paths.append(result.get(\"image_path\")) 和 images.append(result)。"
         )
 
-    if plan_entry and plan_entry.role in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"} and not ({"text_generation", "image_generation"} & set(plan_entry.required_capabilities or [])):
+    effective_required_capabilities = _effective_required_capabilities_for_script(plan_entry) if plan_entry else []
+    if plan_entry and plan_entry.role in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"} and not ({"text_generation", "image_generation"} & set(effective_required_capabilities)):
         return
     skill_md_declares_model = bool(re.search(r"宿主|内置|配置模型|LLM|大语言|文本模型|图像模型|vision|TEXT_MODEL|IMAGE_MODEL", skill_md or "", re.IGNORECASE))
-    if not _requires_configured_model_call(plan_entry=plan_entry) and not skill_md_declares_model:
-        return
+    if not _requires_configured_model_call(plan_entry=plan_entry):
+        # Keep backward compatibility for legacy generic scripts whose SKILL.md
+        # has no local SkillPlan block but clearly says the script is model-backed.
+        # Deterministic builders/exporters returned above, so global model prose
+        # still cannot force build_pdf.py to call LLM/IMAGE_MODEL.
+        if not (plan_entry and plan_entry.role == "generic_script" and skill_md_declares_model):
+            return
     if _script_uses_configured_model(content):
         return
     raise ValueError(
-        f"{file_path} 的 SKILL.md 声明需要使用宿主/内置/配置模型，但脚本没有调用这些模型。"
+        f"{file_path} 的当前脚本职责/SkillPlan.required_capabilities 声明需要使用宿主/内置/配置模型，但脚本没有调用这些模型。"
         "脚本不能用固定模板、随机词表或 ASCII 图替代模型能力；"
-        "请通过 LLM_BASE_URL + TEXT_MODEL 调用文本模型，需要图像/视觉能力时使用 IMAGE_MODEL/VISION_MODEL，"
-        "或者把该 Skill 设计为无需 scripts/ 的模型直接回答。"
+        "请通过 LLM_BASE_URL + TEXT_MODEL 调用文本模型，需要图像/视觉能力时使用 IMAGE_MODEL/VISION_MODEL。"
     )
 
 def _validate_generated_file_content(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> None:
@@ -2119,11 +2149,11 @@ def _validate_script_contract_static(*, file_path: str, content: str, skill_md: 
         return
 
     # Backward compatibility for existing SKILL.md files that predate explicit
-    # SkillPlan inputs: keep generic_script conservative capabilities, but treat
+    # SkillPlan inputs: when the local file block did not declare inputs, treat
     # the JSON argv command itself as the declared interface for static script
-    # validation.  New Creator generation still emits command blocks from
-    # SkillPlan inputs via _check_skill_md_contract.
-    if plan_entry.role == "generic_script" and plan_entry.inputs == ["payload"]:
+    # validation.  This remains local to the current script command and does not
+    # mine global SKILL.md prose for capabilities.
+    if plan_entry.inputs == ["payload"]:
         command_keys: set[str] = set()
         for command in commands:
             keys = _command_payload_keys(command, file_path)
@@ -2546,7 +2576,7 @@ async def _repair_generated_file_with_feedback(
         elif plan_entry is not None and plan_entry.role == "text_generator":
             role_rule = "role=text_generator：必须调用 generate_text_with_llm 或平台 LLM，禁止调用图片 helper 或输出固定 template-only 文本。"
         elif plan_entry is not None and plan_entry.role == "pdf_builder":
-            role_rule = "role=pdf_builder：必须真实构建文件，并在 stdout JSON 的任意业务字段中返回实际存在的路径；禁止调用图片 helper。"
+            role_rule = "role=pdf_builder：默认是纯文件合并/排版/PDF 构建脚本，只需真实构建文件并在 stdout JSON 返回实际存在路径；不要因为全局 SKILL.md 提到模型就调用 LLM/IMAGE_MODEL，除非当前脚本的有效 required_capabilities 明确要求模型。"
         elif plan_entry is not None and plan_entry.role == "generic_script":
             role_rule = "role=generic_script：只能调用 SkillPlan.required_capabilities 声明的能力；若现有 SkillPlan.required_capabilities 已要求文本+图片，只能修当前脚本实现以匹配，禁止修改蓝图或 SKILL.md。"
         extra_rules = (
@@ -2736,9 +2766,9 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             )
         if "script.required_capabilities.called" in deterministic_error or "未调用这些 required_capabilities" in deterministic_error or "没有调用这些 required_capabilities" in deterministic_error:
             return (
-                "按 SkillPlan role + required_capabilities 补齐真实平台能力调用：包含 image_generation 必须调用 generate_stable_diffusion_image；"
-                "包含 text_generation 必须调用 generate_text_with_llm 或平台 LLM；文件构建脚本必须真实创建文件，并在 stdout JSON 任意业务字段中返回路径。"
-                "禁止返回固定 f-string/template-only 文本或 placeholder。"
+                "按当前脚本的 SkillPlan role + 有效 required_capabilities 补齐真实能力调用：包含 image_generation 必须调用 generate_stable_diffusion_image；"
+                "包含 text_generation 必须调用 generate_text_with_llm 或平台 LLM；pdf_builder/exporter 默认只需真实创建文件，并在 stdout JSON 任意业务字段中返回路径，不要因 SKILL.md 全局模型说明而补模型调用。"
+                "禁止返回固定 f-string/template-only 文本或 placeholder；蓝图和 SKILL.md 确定后只能修当前脚本。"
             )
         if "试运行" in deterministic_error or "JSON 参数" in deterministic_error or "合法 Python" in deterministic_error:
             return (
@@ -3217,12 +3247,13 @@ def _script_generation_skeleton(
         skill_plan_entry=skill_plan_entry,
     )
     input_keys = list(plan_entry.inputs or ["payload"])
+    effective_required_capabilities = _effective_required_capabilities_for_script(plan_entry)
     py_value_expr = " or ".join(f"payload.get({key!r})" for key in input_keys) + " or ''"
     js_value_expr = " || ".join(f"payload[{json.dumps(key)}]" for key in input_keys) + " || ''"
     bash_py_expr = " or ".join(f"p.get({key!r})" for key in input_keys) + " or ''"
 
     if plan_entry.runtime == "node":
-        if {"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or []):
+        if {"text_generation", "image_generation"} <= set(effective_required_capabilities):
             return (
                 "必须使用下面的 node composite_generator skeleton；先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout 只能 console.log JSON 字符串：\n"
                 "const { spawnSync } = require('child_process');\n"
@@ -3262,7 +3293,7 @@ def _script_generation_skeleton(
                 "}\n"
                 "console.log(JSON.stringify(run(payload)));"
             )
-        if plan_entry.role == "pdf_builder" or "pdf_generation" in set(plan_entry.required_capabilities or []):
+        if plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
             return (
                 "必须使用下面的 node pdf_builder skeleton；消费 text/image_paths/template/assets 构建 PDF，不生成图片：\n"
                 "const fs = require('fs');\n"
@@ -3306,11 +3337,11 @@ def _script_generation_skeleton(
         )
 
     if plan_entry.runtime in {"bash", "shell"}:
-        if {"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or []):
+        if {"text_generation", "image_generation"} <= set(effective_required_capabilities):
             helper = "from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); text=generate_text_with_llm(prompt); result=generate_stable_diffusion_image(text or prompt, filename_prefix='generated'); print(json.dumps({'story_text': text, 'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': text or prompt}], 'image_paths':[result.get('image_path')], 'images':[result]}, ensure_ascii=False))"
         elif plan_entry.role == "image_generator":
             helper = "from backend.services.skill_runtime import generate_stable_diffusion_image; import json,sys; result=generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated'); print(json.dumps({'image_paths':[result.get('image_path')], 'images':[result]}, ensure_ascii=False))"
-        elif plan_entry.role == "pdf_builder" or "pdf_generation" in set(plan_entry.required_capabilities or []):
+        elif plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
             helper = "import json,sys; from pathlib import Path; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + " or 'Generated PDF'); out=Path(p.get('output_dir') or 'assets/generated').resolve(); out.mkdir(parents=True, exist_ok=True); pdf=out/'output.pdf'; pdf.write_text('%PDF-1.4\\nBT ('+text[:1000].replace('(',' ').replace(')',' ') +') Tj ET\\n%%EOF\\n', encoding='latin1'); print(json.dumps({'pdf_path':str(pdf),'file_paths':[str(pdf)]}, ensure_ascii=False))"
         elif plan_entry.role == "text_generator":
             helper = "from backend.services.skill_runtime import generate_text_with_llm; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); print(json.dumps({'text': generate_text_with_llm(prompt)}, ensure_ascii=False))"
@@ -3325,7 +3356,7 @@ def _script_generation_skeleton(
         )
 
 
-    if plan_entry.role == "docx_builder" or "docx_generation" in set(plan_entry.required_capabilities or []):
+    if plan_entry.role == "docx_builder" or "docx_generation" in set(effective_required_capabilities):
         return (
             "必须使用下面的 docx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths 并生成 Word；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
             "import json\n"
@@ -3364,7 +3395,7 @@ def _script_generation_skeleton(
             "    main()"
         )
 
-    if plan_entry.role == "pptx_builder" or "pptx_generation" in set(plan_entry.required_capabilities or []):
+    if plan_entry.role == "pptx_builder" or "pptx_generation" in set(effective_required_capabilities):
         return (
             "必须使用下面的 pptx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths 并生成 PPT；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
             "import json\n"
@@ -3392,7 +3423,7 @@ def _script_generation_skeleton(
             "    main()"
         )
 
-    if plan_entry.role in {"html_asset_builder", "asset_builder"} or ({"html_generation", "html_asset_generation"} & set(plan_entry.required_capabilities or [])):
+    if plan_entry.role in {"html_asset_builder", "asset_builder"} or ({"html_generation", "html_asset_generation"} & set(effective_required_capabilities)):
         return (
             "必须使用下面的 html_asset_builder Python 脚本骨架；只能在当前 Skill 的 assets/generated/ 下写入 HTML，并在 stdout JSON 返回 html_path 与 asset_paths：\n"
             "import html\n"
@@ -3429,7 +3460,7 @@ def _script_generation_skeleton(
             "    main()"
         )
 
-    if {"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or []):
+    if {"text_generation", "image_generation"} <= set(effective_required_capabilities):
         return (
             "必须使用下面的 composite_generator 脚本骨架；先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout JSON 包含 text 与 image_paths/images：\n"
             "import json\n"
@@ -3490,7 +3521,7 @@ def _script_generation_skeleton(
             "    main()"
         )
 
-    if plan_entry.role == "pdf_builder" or "pdf_generation" in set(plan_entry.required_capabilities or []):
+    if plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
         return (
             "必须使用下面的 pdf_builder 脚本骨架；默认只负责读取已有内容并构建 PDF/Word/PPT/HTML 文件；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
             "import json\n"
