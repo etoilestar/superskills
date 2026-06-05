@@ -885,3 +885,44 @@ def test_html_asset_builder_plan_skeleton_and_trial_validation(tmp_path):
         skill_plan_entry=entry.__dict__,
         skill_dir=skill_dir,
     )
+
+
+def test_multifunction_roles_have_unified_optional_output_contracts():
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    composite = build_skill_plan_entry(
+        file_path="scripts/create_story_and_images.py",
+        purpose="role: composite_generator inputs: topic outputs: story_text, image_paths required_capabilities: text_generation, image_generation",
+    )
+    text = build_skill_plan_entry(file_path="scripts/write_story.py", purpose="role: text_generator inputs: topic")
+    image = build_skill_plan_entry(file_path="scripts/render_images.py", purpose="role: image_generator inputs: story_text")
+    docx = build_skill_plan_entry(file_path="scripts/export_docx.py", purpose="role: docx_builder inputs: previous_stdout outputs: docx_path")
+    pptx = build_skill_plan_entry(file_path="scripts/export_pptx.py", purpose="role: pptx_builder inputs: previous_stdout outputs: pptx_path")
+
+    assert composite.outputs == ["story_text", "image_paths"]
+    assert {"text_generation", "image_generation"} <= set(composite.required_capabilities)
+    assert text.outputs == ["story_text"]
+    assert "image_paths" in image.outputs
+    assert docx.outputs == ["docx_path"]
+    assert pptx.outputs == ["pptx_path"]
+    assert docx.command_template == 'python scripts/export_docx.py \'{"previous_stdout":"{{previous_stdout}}"}\''
+    assert pptx.command_template == 'python scripts/export_pptx.py \'{"previous_stdout":"{{previous_stdout}}"}\''
+
+
+def test_export_builder_skeletons_consume_previous_stdout_without_generation_helpers():
+    from backend.routers.creator import _script_generation_skeleton
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    docx_entry = build_skill_plan_entry(file_path="scripts/export_docx.py", purpose="role: docx_builder inputs: previous_stdout outputs: docx_path")
+    pptx_entry = build_skill_plan_entry(file_path="scripts/export_pptx.py", purpose="role: pptx_builder inputs: story_text outputs: pptx_path")
+
+    docx_skeleton = _script_generation_skeleton("scripts/export_docx.py", "", "", skill_plan_entry=docx_entry.__dict__)
+    pptx_skeleton = _script_generation_skeleton("scripts/export_pptx.py", "", "", skill_plan_entry=pptx_entry.__dict__)
+
+    assert "previous_stdout" in docx_skeleton
+    assert "docx_path" in docx_skeleton
+    assert "pptx_path" in pptx_skeleton
+    assert "generate_text_with_llm" not in docx_skeleton
+    assert "generate_stable_diffusion_image" not in docx_skeleton
+    assert "generate_text_with_llm" not in pptx_skeleton
+    assert "generate_stable_diffusion_image" not in pptx_skeleton

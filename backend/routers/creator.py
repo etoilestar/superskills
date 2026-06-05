@@ -321,7 +321,7 @@ def _skill_plan_entry_for_file(
     """
     if skill_plan_entry and skill_plan_entry.get("path") == file_path:
         explicit_role = str(skill_plan_entry.get("role") or role or "").strip()
-        allowed_roles = {"text_generator", "image_generator", "pdf_builder", "html_asset_builder", "asset_builder", "composite_generator", "generic_script", "skill_overview", "reference", "asset"}
+        allowed_roles = {"text_generator", "image_generator", "composite_generator", "pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder", "generic_script", "skill_overview", "reference", "asset"}
         if explicit_role in allowed_roles:
             required_capabilities = list(
                 skill_plan_entry.get("required_capabilities") or capabilities_for_role(explicit_role)[0]
@@ -372,7 +372,7 @@ def _skill_plan_entry_for_file(
             purpose=purpose,
             blueprint_summary=blueprint_text[:4000],
         )
-        if role in {"text_generator", "image_generator", "pdf_builder", "html_asset_builder", "asset_builder", "composite_generator", "generic_script", "skill_overview", "reference", "asset"}:
+        if role in {"text_generator", "image_generator", "composite_generator", "pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder", "generic_script", "skill_overview", "reference", "asset"}:
             inputs, outputs = default_io_for_role(role)
             required_capabilities, forbidden_capabilities = capabilities_for_role(role)
             forbidden_capabilities = [capability for capability in forbidden_capabilities if capability not in required_capabilities]
@@ -1005,12 +1005,12 @@ def _build_script_file_contract_text(
     ]
     if entry.role == "text_generator":
         lines.extend([
-            "- stdout 必须输出 JSON object，且 text 字段为非空字符串。",
+            "- stdout 必须输出 JSON object，且 story_text 或 text 字段为非空字符串。",
             "- 能力边界由 required_capabilities/forbidden_capabilities 决定；若 required_capabilities 额外包含 image_generation，则必须调用图片 helper。",
         ])
     elif entry.role == "composite_generator":
         lines.extend([
-            "- stdout 必须输出 JSON object，且 text 字段非空，同时 image_paths 或 images 至少一个非空。",
+            "- stdout 必须输出 JSON object，且 story_text 或 text 字段非空，同时 image_paths 或 images 至少一个非空。",
             "- 必须同时调用 generate_text_with_llm 与 generate_stable_diffusion_image；不得用固定 f-string/template-only 文本或占位图片替代。",
             "- 上一步 text 可作为 image prompt，输出 text_with_image_prompts 说明 text → image 的跨能力数据流。",
         ])
@@ -1024,7 +1024,17 @@ def _build_script_file_contract_text(
         lines.extend([
             "- stdout 必须输出 JSON object，且 pdf_path 或 file_paths 至少一个指向真实生成文件。",
             "- forbidden_capabilities 生效：PDF 构建脚本不得生成图片或调用 generate_stable_diffusion_image。",
-            "- 只能消费已有 text/image_paths/template/assets 并构建 PDF/文件。",
+            "- 只能消费已有 story_text/text/image_paths/previous_stdout/template/assets 并构建 PDF/文件。",
+        ])
+    elif entry.role == "docx_builder":
+        lines.extend([
+            "- stdout 必须输出 JSON object，且 docx_path 或 file_paths 至少一个指向真实生成文件。",
+            "- 只能消费上一步 stdout JSON、story_text/text、image_paths 或模板；不得生成新文本或图片。",
+        ])
+    elif entry.role == "pptx_builder":
+        lines.extend([
+            "- stdout 必须输出 JSON object，且 pptx_path 或 file_paths 至少一个指向真实生成文件。",
+            "- 只能消费上一步 stdout JSON、story_text/text、image_paths 或模板；不得生成新文本或图片。",
         ])
     else:
         lines.extend([
@@ -1181,7 +1191,7 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
         "execution": bool(re.search(r"(?im)^#{1,3}.*(执行|命令|步骤|Execution|Commands?)", stripped)) or "```bash" in stripped,
         "role_constraints": bool(re.search(r"(?im)^#{1,3}.*(角色|能力|禁止|Role|Capabilities?)", stripped)),
     }
-    role_section_required = bool(re.search(r"子任务|脚本|script|SkillPlan|text_generator|image_generator|pdf_builder|html_asset_builder|asset_builder|composite_generator|generic_script|命令模板|执行参考", purpose, re.I))
+    role_section_required = bool(re.search(r"子任务|脚本|script|SkillPlan|text_generator|image_generator|composite_generator|pdf_builder|docx_builder|pptx_builder|html_asset_builder|asset_builder|generic_script|命令模板|执行参考", purpose, re.I))
     role_sections_ok = (not role_section_required) or all(role_sections.values())
     missing_role_sections = [name for name, present in role_sections.items() if not present]
     results.append(ContractCheckResult(
@@ -1269,7 +1279,7 @@ def _declared_list_in_text(field_name: str, content: str) -> list[str] | None:
 
 
 def _declared_role_in_text(content: str) -> str | None:
-    match = re.search(r"(?:^|\b)role\s*[：:=]\s*(text_generator|image_generator|pdf_builder|html_asset_builder|asset_builder|composite_generator|generic_script)", content or "", re.I | re.M)
+    match = re.search(r"(?:^|\b)role\s*[：:=]\s*(text_generator|image_generator|composite_generator|pdf_builder|docx_builder|pptx_builder|html_asset_builder|asset_builder|generic_script)", content or "", re.I | re.M)
     return match.group(1) if match else None
 
 
@@ -1506,6 +1516,10 @@ def _script_satisfies_required_capability(content: str, capability: str) -> bool
         return bool(_PLATFORM_IMAGE_HELPER_RE.search(content) or _DIRECT_IMAGE_API_RE.search(content))
     if capability == "pdf_generation":
         return bool(re.search(r"FPDF|reportlab|PdfWriter|%PDF-|pdf_path|file_paths|build_pdf", content, re.IGNORECASE))
+    if capability == "docx_generation":
+        return bool(re.search(r"docx_path|Document\(|python-docx|word/document.xml|build_docx", content, re.IGNORECASE))
+    if capability == "pptx_generation":
+        return bool(re.search(r"pptx_path|Presentation\(|python-pptx|ppt/presentation.xml|build_pptx", content, re.IGNORECASE))
     if capability == "html_generation":
         return bool(re.search(r"html_path|asset_paths|<html|<!DOCTYPE html|assets/generated", content, re.IGNORECASE))
     if capability == "file_output":
@@ -2181,7 +2195,10 @@ _LEGACY_OUTPUT_ALIASES: dict[str, tuple[str, ...]] = {
     "image_paths": ("image_path", "images"),
     "images": ("image_path", "image_paths"),
     "pdf_path": ("file_path", "file_paths"),
-    "file_paths": ("file_path", "pdf_path"),
+    "docx_path": ("file_path", "file_paths"),
+    "pptx_path": ("file_path", "file_paths"),
+    "html_path": ("file_path", "asset_paths"),
+    "file_paths": ("file_path", "pdf_path", "docx_path", "pptx_path"),
 }
 
 
@@ -3054,7 +3071,7 @@ def _script_generation_skeleton(
                 "function escapePdfText(value) { return String(value).replace(/[\\\\()]/g, '\\\\$&').slice(0, 1800); }\n"
                 "function run(payload) {\n"
                 f"  const text = String({js_value_expr}).trim() || 'Generated PDF';\n"
-                "  const outputDir = path.resolve(payload.output_dir || '.');\n"
+                "  const outputDir = path.resolve(payload.output_dir || 'assets/generated');\n"
                 "  fs.mkdirSync(outputDir, { recursive: true });\n"
                 "  const pdfPath = path.join(outputDir, 'output.pdf');\n"
                 "  const body = escapePdfText(text);\n"
@@ -3090,11 +3107,11 @@ def _script_generation_skeleton(
 
     if plan_entry.runtime in {"bash", "shell"}:
         if {"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or []):
-            helper = "from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); text=generate_text_with_llm(prompt); result=generate_stable_diffusion_image(text or prompt, filename_prefix='generated'); print(json.dumps({'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': text or prompt}], 'image_paths':[result.get('image_path')], 'images':[result]}, ensure_ascii=False))"
+            helper = "from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); text=generate_text_with_llm(prompt); result=generate_stable_diffusion_image(text or prompt, filename_prefix='generated'); print(json.dumps({'story_text': text, 'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': text or prompt}], 'image_paths':[result.get('image_path')], 'images':[result]}, ensure_ascii=False))"
         elif plan_entry.role == "image_generator":
             helper = "from backend.services.skill_runtime import generate_stable_diffusion_image; import json,sys; result=generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated'); print(json.dumps({'image_paths':[result.get('image_path')], 'images':[result]}, ensure_ascii=False))"
         elif plan_entry.role == "pdf_builder" or "pdf_generation" in set(plan_entry.required_capabilities or []):
-            helper = "import json,sys; from pathlib import Path; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + " or 'Generated PDF'); out=Path(p.get('output_dir') or '.').resolve(); out.mkdir(parents=True, exist_ok=True); pdf=out/'output.pdf'; pdf.write_text('%PDF-1.4\\nBT ('+text[:1000].replace('(',' ').replace(')',' ') +') Tj ET\\n%%EOF\\n', encoding='latin1'); print(json.dumps({'pdf_path':str(pdf),'file_paths':[str(pdf)]}, ensure_ascii=False))"
+            helper = "import json,sys; from pathlib import Path; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + " or 'Generated PDF'); out=Path(p.get('output_dir') or 'assets/generated').resolve(); out.mkdir(parents=True, exist_ok=True); pdf=out/'output.pdf'; pdf.write_text('%PDF-1.4\\nBT ('+text[:1000].replace('(',' ').replace(')',' ') +') Tj ET\\n%%EOF\\n', encoding='latin1'); print(json.dumps({'pdf_path':str(pdf),'file_paths':[str(pdf)]}, ensure_ascii=False))"
         elif plan_entry.role == "text_generator":
             helper = "from backend.services.skill_runtime import generate_text_with_llm; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); print(json.dumps({'text': generate_text_with_llm(prompt)}, ensure_ascii=False))"
         else:
@@ -3107,6 +3124,73 @@ def _script_generation_skeleton(
             f"python -c {shlex.quote(helper)} \"$payload_json\""
         )
 
+
+    if plan_entry.role == "docx_builder" or "docx_generation" in set(plan_entry.required_capabilities or []):
+        return (
+            "必须使用下面的 docx_builder 脚本骨架；只消费上一步 stdout JSON/text/image_paths，按需生成 Word，不生成文本或图片：\n"
+            "import json\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from zipfile import ZipFile, ZIP_DEFLATED\n\n"
+            "def parse_args() -> dict:\n"
+            "    if len(sys.argv) < 2:\n"
+            "        return {}\n"
+            "    return json.loads(sys.argv[1])\n\n"
+            "def previous_payload(payload: dict) -> dict:\n"
+            "    raw = payload.get('previous_stdout') or payload.get('stdout_json') or '{}'\n"
+            "    if isinstance(raw, dict):\n"
+            "        return raw\n"
+            "    try:\n"
+            "        data = json.loads(str(raw))\n"
+            "        return data if isinstance(data, dict) else {}\n"
+            "    except json.JSONDecodeError:\n"
+            "        return {}\n\n"
+            "def build_docx(payload: dict) -> dict:\n"
+            "    prev = previous_payload(payload)\n"
+            f"    text = str(payload.get('story_text') or payload.get('text') or prev.get('story_text') or prev.get('text') or {py_value_expr} or 'Generated document').strip()\n"
+            "    out_dir = Path(payload.get('output_dir') or 'assets/generated').resolve()\n"
+            "    out_dir.mkdir(parents=True, exist_ok=True)\n"
+            "    docx_path = out_dir / 'output.docx'\n"
+            "    body = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')\n"
+            "    document_xml = '<?xml version=\"1.0\" encoding=\"UTF-8\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>' + body + '</w:t></w:r></w:p></w:body></w:document>'\n"
+            "    with ZipFile(docx_path, 'w', ZIP_DEFLATED) as zf:\n"
+            "        zf.writestr('[Content_Types].xml', '<?xml version=\"1.0\" encoding=\"UTF-8\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/></Types>')\n"
+            "        zf.writestr('_rels/.rels', '<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>')\n"
+            "        zf.writestr('word/document.xml', document_xml)\n"
+            "    return {'docx_path': str(docx_path), 'file_paths': [str(docx_path)]}\n\n"
+            "def main() -> None:\n"
+            "    print(json.dumps(build_docx(parse_args()), ensure_ascii=False))\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()"
+        )
+
+    if plan_entry.role == "pptx_builder" or "pptx_generation" in set(plan_entry.required_capabilities or []):
+        return (
+            "必须使用下面的 pptx_builder 脚本骨架；只消费上一步 stdout JSON/text/image_paths，按需生成 PPT，不生成文本或图片：\n"
+            "import json\n"
+            "import sys\n"
+            "from pathlib import Path\n\n"
+            "def parse_args() -> dict:\n"
+            "    if len(sys.argv) < 2:\n"
+            "        return {}\n"
+            "    return json.loads(sys.argv[1])\n\n"
+            "def build_pptx(payload: dict) -> dict:\n"
+            f"    text = str(payload.get('story_text') or payload.get('text') or {py_value_expr} or 'Generated presentation').strip()\n"
+            "    out_dir = Path(payload.get('output_dir') or 'assets/generated').resolve()\n"
+            "    out_dir.mkdir(parents=True, exist_ok=True)\n"
+            "    pptx_path = out_dir / 'output.pptx'\n"
+            "    from pptx import Presentation\n"
+            "    prs = Presentation()\n"
+            "    slide = prs.slides.add_slide(prs.slide_layouts[1])\n"
+            "    slide.shapes.title.text = 'Generated'\n"
+            "    slide.placeholders[1].text = text[:2000]\n"
+            "    prs.save(pptx_path)\n"
+            "    return {'pptx_path': str(pptx_path), 'file_paths': [str(pptx_path)]}\n\n"
+            "def main() -> None:\n"
+            "    print(json.dumps(build_pptx(parse_args()), ensure_ascii=False))\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()"
+        )
 
     if plan_entry.role in {"html_asset_builder", "asset_builder"} or "html_generation" in set(plan_entry.required_capabilities or []):
         return (
@@ -3164,7 +3248,7 @@ def _script_generation_skeleton(
             "    result = generate_stable_diffusion_image(image_prompt, filename_prefix='generated')\n"
             "    image_paths = [result.get('image_path')]\n"
             "    image_paths = [p for p in image_paths if isinstance(p, str) and p]\n"
-            "    return {'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': image_prompt}], 'image_paths': image_paths, 'images': [result]}\n\n"
+            "    return {'story_text': text, 'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': image_prompt}], 'image_paths': image_paths, 'images': [result]}\n\n"
             "def main() -> None:\n"
             "    payload = parse_args()\n"
             "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
@@ -3203,7 +3287,7 @@ def _script_generation_skeleton(
 
     if plan_entry.role == "pdf_builder" or "pdf_generation" in set(plan_entry.required_capabilities or []):
         return (
-            "必须使用下面的 pdf_builder 脚本骨架；该角色只负责 PDF/文件构建，禁止生成图片：\n"
+            "必须使用下面的 pdf_builder 脚本骨架；该角色只负责 PDF/Word/PPT/HTML 文件构建，禁止生成图片：\n"
             "import json\n"
             "import sys\n"
             "from pathlib import Path\n\n"
@@ -3212,7 +3296,7 @@ def _script_generation_skeleton(
             "        return {}\n"
             "    return json.loads(sys.argv[1])\n\n"
             "def build_pdf(payload: dict) -> dict:\n"
-            "    output_dir = Path(payload.get('output_dir') or '.').resolve()\n"
+            "    output_dir = Path(payload.get('output_dir') or 'assets/generated').resolve()\n"
             "    output_dir.mkdir(parents=True, exist_ok=True)\n"
             "    pdf_path = output_dir / 'output.pdf'\n"
             "    from fpdf import FPDF\n"
@@ -3245,7 +3329,7 @@ def _script_generation_skeleton(
             "    return generate_text_with_llm(prompt)\n\n"
             "def run(payload: dict) -> dict:\n"
             "    text = generate_text(payload).strip()\n"
-            "    return {'text': text}\n\n"
+            "    return {'story_text': text, 'text': text}\n\n"
             "def main() -> None:\n"
             "    payload = parse_args()\n"
             "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
@@ -3355,7 +3439,7 @@ def _build_generate_file_prompt(
             "---\n"
             "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
             "4. SKILL.md 必须作为复合任务 orchestrator：描述执行顺序、上一步 outputs 如何传给下一步 inputs、每步 expected outputs、失败/跳过条件，以及何时读取 references/assets。\n"
-            "5. SKILL.md 只写总流程和调用顺序；子任务详细规则必须引用 references/*.md，不要把 text/image/pdf 子任务规范混在 SKILL.md 中。\n"
+            "5. SKILL.md 只写总流程和调用顺序；子任务详细规则必须引用 references/*.md，不要把 text/image/pdf/docx/pptx/html 子任务规范混在 SKILL.md 中。\n"
             "6. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个可执行的 ```bash fenced code block，命令参数必须与脚本接口一致。\n"
             "7. 如果蓝图包含 references/ 资源，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个 references/ 路径，并说明何时读取。\n"
             "8. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含示例 ```bash fenced code block。\n"

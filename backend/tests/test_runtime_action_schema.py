@@ -357,3 +357,54 @@ def test_structured_stdout_accepts_story_text_alias():
 
     _validate_stdout_against_action_entry(stdout, entry)
     assert "A real story" in _render_success_stdout_payload({"results": [{"success": True, "stdout": stdout}]})
+
+
+def test_runtime_stdout_validation_accepts_multifunction_export_fields():
+    from backend.routers.sandbox_chat import _validate_stdout_against_action_entry
+
+    _validate_stdout_against_action_entry(
+        json.dumps({"story_text": "once", "image_paths": ["outputs/img.png"]}),
+        {"role": "composite_generator", "outputs": ["story_text", "image_paths"]},
+    )
+    _validate_stdout_against_action_entry(
+        json.dumps({"docx_path": "assets/generated/story.docx"}),
+        {"role": "docx_builder", "outputs": ["docx_path"]},
+    )
+    _validate_stdout_against_action_entry(
+        json.dumps({"pptx_path": "assets/generated/story.pptx"}),
+        {"role": "pptx_builder", "outputs": ["pptx_path"]},
+    )
+
+
+def test_output_files_from_stdout_json_collects_all_artifact_fields(tmp_path):
+    from backend.routers.sandbox_chat import _output_files_from_stdout_json
+
+    skill_dir = tmp_path / "schema-skill"
+    generated = skill_dir / "assets" / "generated"
+    outputs = skill_dir / "outputs"
+    generated.mkdir(parents=True)
+    outputs.mkdir(parents=True)
+    for rel in ("assets/generated/story.pdf", "assets/generated/story.docx", "assets/generated/story.pptx", "assets/generated/story.html", "outputs/img.png"):
+        path = skill_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"data")
+
+    files = _output_files_from_stdout_json(
+        json.dumps({
+            "pdf_path": "assets/generated/story.pdf",
+            "docx_path": "assets/generated/story.docx",
+            "pptx_path": "assets/generated/story.pptx",
+            "html_path": "assets/generated/story.html",
+            "image_paths": ["outputs/img.png"],
+        }),
+        cwd=skill_dir,
+        skill_name="schema-skill",
+    )
+
+    assert {item["path"] for item in files} == {
+        "assets/generated/story.pdf",
+        "assets/generated/story.docx",
+        "assets/generated/story.pptx",
+        "assets/generated/story.html",
+        "outputs/img.png",
+    }
