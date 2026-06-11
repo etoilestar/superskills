@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
-from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language
+from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language, normalize_required_capabilities
 from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
@@ -536,17 +536,24 @@ def _skill_plan_entry_for_file(
         data["file_type"] = data.get("file_type") or "skill"
         data["runtime"] = data.get("runtime") or "none"
 
-    # Recompute capability defaults only when caller did not provide them.
+    # Recompute capability defaults only when caller did not provide them, then
+    # normalize even explicit frontend/model payloads so resource/meta files and
+    # over-broad SkillPlan capabilities do not leak into runtime warnings.
     required = list(data.get("required_capabilities") or [])
     forbidden = list(data.get("forbidden_capabilities") or [])
     if not required and not forbidden:
         required, forbidden = capabilities_for_role(data["role"])
-        data["required_capabilities"] = list(required or [])
-        data["forbidden_capabilities"] = list(forbidden or [])
 
+    required = normalize_required_capabilities(
+        role=str(data.get("role") or ""),
+        path=file_path,
+        required_capabilities=list(required or []),
+        user_blueprint_text=blueprint_text or purpose or "",
+    )
+    data["required_capabilities"] = required
     data["forbidden_capabilities"] = [
-        cap for cap in list(data.get("forbidden_capabilities") or [])
-        if cap not in set(data.get("required_capabilities") or [])
+        cap for cap in list(forbidden or data.get("forbidden_capabilities") or [])
+        if cap not in set(required)
     ]
 
     if not data.get("inputs") or not data.get("outputs"):
@@ -5676,6 +5683,12 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         is_asset = path.startswith("assets/")
 
         required_capabilities, forbidden_capabilities = capabilities_for_role(role or "generic_script")
+        required_capabilities = normalize_required_capabilities(
+            role=role or "generic_script",
+            path=path,
+            required_capabilities=list(required_capabilities or []),
+            user_blueprint_text=blueprint_text,
+        )
         inputs, outputs = default_io_for_role(role or "generic_script")
 
         files_out.append(
@@ -5723,7 +5736,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     warnings = list(plan.warnings)
     for capability_name in sorted(required_tool_names):
         cap = get_tool_capability(capability_name)
-        if not cap:
+        if not cap or cap.category == "resource":
             continue
         status = tool_status(cap)
         missing_runtime_helpers = status.get("missing_runtime_helpers") or []

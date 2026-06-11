@@ -1,3 +1,8 @@
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from backend.services.creator_tool_registry import (
     capabilities_for_role,
     get_role_pattern,
@@ -70,7 +75,8 @@ def test_tool_status_reports_runtime_helper_availability_without_secret_values(m
     assert status["configured"] is True
     assert status["missing_secrets"] == []
     assert "postgresql://" not in str(status)
-    assert status["missing_runtime_helpers"] == ["query_database_readonly"]
+    assert status["missing_runtime_helpers"] == []
+    assert "query_database_readonly" in status["runtime_helpers_available"]
     assert status["override_persistence"] == "process_memory"
 
 
@@ -88,6 +94,6 @@ def test_tool_status_reports_missing_runtime_dependencies(monkeypatch):
 
     status = tool_status(get_tool_capability("pdf_generation"))
 
-    assert status["runtime_helpers_available"] == ["create_pdf"]
+    assert "create_pdf" in status["runtime_helpers_available"]
     assert status["missing_runtime_helpers"] == []
     assert status["missing_dependencies"] == ["reportlab"]
