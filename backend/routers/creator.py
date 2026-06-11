@@ -886,8 +886,8 @@ def _check_command_block_contract(script_path: str, commands: list[str], entry: 
     """Validate command blocks as workflow-local execution contracts.
 
     - Enforce parseable JSON argv and runtime consistency.
-    - JSON argv field names remain skill-specific, but each command must exactly
-      match that script's SkillPlan.inputs.
+    - Do not enforce cross-step dataflow or exact SkillPlan input-key matching;
+      E2E workflow validation owns argv/stdout handoff checks.
     """
     results: list[ContractCheckResult] = []
 
@@ -929,31 +929,9 @@ def _check_command_block_contract(script_path: str, commands: list[str], entry: 
             minimal_edit="确保 JSON 可解析；不要自行发明参数名。",
         ))
 
-        declared_inputs = set(entry.inputs or [])
-        if declared_inputs and keys is not None:
-            missing = sorted(declared_inputs - keys)
-            extra = sorted(keys - declared_inputs)
-            results.append(ContractCheckResult(
-                id="command_block.skillplan_inputs.exact",
-                passed=not missing and not extra,
-                target=target,
-                message=(
-                    "命令 JSON keys 与当前脚本 SkillPlan.inputs 一致。"
-                    if not missing and not extra
-                    else "命令 JSON keys 必须与当前脚本在 SkillPlan 中声明的 inputs 一致；平台不固定业务字段名。"
-                ),
-                expected="字段名由该 Skill 的 SkillPlan 决定；命令 JSON object keys 必须逐字等于 SkillPlan.inputs。",
-                minimal_edit="只修改该命令 JSON object：删除 extra_keys，补齐 missing_keys，保留 runner 和 script path。",
-                details={
-                    "target_script": script_path,
-                    "expected_keys": sorted(declared_inputs),
-                    "actual_keys": sorted(keys),
-                    "missing_keys": missing,
-                    "extra_keys": extra,
-                    "expected_payload_shape": {key: f"{{{{{key}}}}}" for key in sorted(declared_inputs)},
-                    "upstream_available_outputs": [],
-                },
-            ))
+        # First-round file contracts stop at command syntax/runtime/JSON shape.
+        # Exact argv key alignment with SkillPlan inputs is a workflow dataflow
+        # concern and is validated during second-round E2E execution.
 
     return results
 
@@ -1432,7 +1410,9 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
         blueprint_text=blueprint_text,
         required_script_paths=None,
     ))
-    results.extend(_check_skill_md_command_dataflow(content, blueprint_text))
+    # Cross-script input/output closure is intentionally excluded from the
+    # first-round SKILL.md static contract. Second-round E2E validation owns
+    # workflow dataflow checks after all scripts and stdout shapes exist.
 
     return results
 
@@ -3734,37 +3714,9 @@ def _validate_command_is_single_shell_json_invocation(
             exc,
         )
 
-    # JSON argv keys are the local protocol between SKILL.md and this script.
-    # They are flexible across skills, but inside one Skill they must be exactly
-    # the current script's SkillPlan.inputs.
-    declared_inputs = set(entry.inputs or [])
-    actual_keys = set(keys or []) if keys is not None else set()
-    exact_inputs = bool(declared_inputs) and actual_keys == declared_inputs
-    if declared_inputs:
-        missing = sorted(declared_inputs - actual_keys)
-        extra = sorted(actual_keys - declared_inputs)
-        upstream = sorted(upstream_available_outputs or set())
-        results.append(ContractCheckResult(
-            id="command_block.skillplan_inputs.exact",
-            passed=exact_inputs,
-            target=target,
-            message=(
-                f"{script_path} 命令 JSON keys 与 SkillPlan inputs 一致。"
-                if exact_inputs
-                else f"{script_path} 命令 JSON keys 与 SkillPlan inputs 不一致。"
-            ),
-            expected="命令 JSON keys 必须与当前脚本在 SkillPlan 中声明的 inputs 一致。平台不要求固定字段名；字段名由该 Skill 的 SkillPlan 决定。",
-            minimal_edit="只修改该命令 JSON object；删除 extra_keys；补齐 missing_keys；保留脚本路径和 runner；value 使用用户输入或前序 stdout placeholder；不要改 SkillPlan 除非 SkillPlan 本身被判定错误。",
-            details={
-                "target_script": script_path,
-                "expected_keys": sorted(declared_inputs),
-                "actual_keys": sorted(actual_keys),
-                "missing_keys": missing,
-                "extra_keys": extra,
-                "expected_payload_shape": {key: f"{{{{{key}}}}}" for key in sorted(declared_inputs)},
-                "upstream_available_outputs": upstream,
-            },
-        ))
+    # First-round SKILL.md command validation only checks local command shape.
+    # Field-level argv/dataflow alignment belongs to second-round E2E, where
+    # upstream stdout and downstream parser behavior are known.
 
     if not runtime_matches:
         logger.info(
@@ -6928,7 +6880,7 @@ def _render_e2e_command_payload(
         raise ValueError(
             _e2e_error(
                 target=command.source_path,
-                layer="dataflow_missing_input",
+                layer="e2e_dataflow",
                 message=(
                     f"第 {command.ordinal} 步 {command.script_path} 的命令模板引用了当前 payload 中不存在的字段："
                     f"{', '.join(unique_missing)}。\n"
@@ -7153,6 +7105,7 @@ def _validate_e2e_command_static(
     command: E2EWorkflowCommand,
     trial_skill_dir: Path,
     skill_md: str,
+    available_payload_keys: set[str] | None = None,
 ) -> SkillPlanEntry:
     source_path = trial_skill_dir / command.script_path
     if not source_path.is_file():
@@ -7186,22 +7139,22 @@ def _validate_e2e_command_static(
         details = {
             "code": "command_block.skillplan_inputs.exact",
             "target_script": command.script_path,
-            "expected_keys": sorted(expected_keys),
-            "actual_keys": sorted(actual_keys),
+            "expected_inputs": sorted(expected_keys),
+            "expected_runtime_fields": sorted(expected_keys),
+            "actual_payload_keys": sorted(actual_keys),
             "missing_keys": missing,
             "extra_keys": extra,
-            "expected_payload_shape": {key: f"{{{{{key}}}}}" for key in sorted(expected_keys)},
-            "upstream_available_outputs": [],
-            "minimal_edit": "只修改该命令 JSON object；删除 extra_keys；补齐 missing_keys；保留脚本路径和 runner。",
+            "available_upstream_outputs": sorted(available_payload_keys or set()),
+            "minimal_edit": "在第二轮 E2E 中局部修复该命令 JSON object 或目标脚本 parse_args/run 兼容字段。",
         }
         raise ValueError(
             _e2e_error(
                 target=command.source_path,
-                layer="skill_md_contract",
+                layer="e2e_dataflow",
                 message=(
                     "command_block.skillplan_inputs.exact\n"
-                    "命令 JSON keys 必须与当前脚本在 SkillPlan 中声明的 inputs 一致。"
-                    "平台不要求固定字段名；字段名由该 Skill 的 SkillPlan 决定。\n"
+                    "第二轮 E2E 检测到命令 payload 与目标脚本运行时输入声明不一致。"
+                    "这属于 workflow dataflow 串联问题，不属于第一轮 SKILL.md 静态合同。\n"
                     f"structured_error={json.dumps(details, ensure_ascii=False, sort_keys=True)}\n"
                     f"原始命令：{command.raw_command}"
                 ),
@@ -7342,6 +7295,7 @@ def _run_skill_workflow_e2e_once(skill_name: str) -> list[str]:
                     command=command,
                     trial_skill_dir=trial_skill_dir,
                     skill_md=trial_skill_md,
+                    available_payload_keys=set(payload.keys()),
                 )
 
                 content = (trial_skill_dir / command.script_path).read_text(encoding="utf-8")
