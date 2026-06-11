@@ -14,3 +14,7 @@ python-docx
 python-pptx
 pypdf
 openpyxl
+sqlalchemy
+pymysql
+psycopg2-binary
+Pillow

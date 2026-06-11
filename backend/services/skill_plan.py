@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import re
 from typing import Literal
-from .creator_tool_registry import get_role_pattern, get_script_roles, is_resource_role, is_script_role
+from .creator_tool_registry import get_role_pattern, get_script_roles, get_tool_capability, is_resource_role, is_script_role
 from .creator_tool_registry import capabilities_for_role as registry_capabilities_for_role
 from .skill_dataflow import parse_schema_input_item
 
@@ -25,6 +25,106 @@ ResourceRole = Literal["skill_overview", "reference", "asset"]
 FileRole = str
 
 SCRIPT_ROLES: frozenset[str] = frozenset(get_script_roles())
+
+ROLE_ALLOWED_CAPABILITIES: dict[str, frozenset[str]] = {
+    "text_generator": frozenset({"text_generation", "file_output"}),
+    "image_generator": frozenset({"image_generation", "file_output"}),
+    "composite_generator": frozenset({
+        "text_generation",
+        "image_generation",
+        "pdf_generation",
+        "docx_generation",
+        "pptx_generation",
+        "file_output",
+    }),
+    "pdf_builder": frozenset({"pdf_generation", "file_output"}),
+    "docx_builder": frozenset({"docx_generation", "file_output"}),
+    "pptx_builder": frozenset({"pptx_generation", "file_output"}),
+    "pdf_parser": frozenset({"pdf_parsing", "file_output"}),
+    "docx_parser": frozenset({"docx_parsing", "file_output"}),
+    "pptx_parser": frozenset({"pptx_parsing", "file_output"}),
+    "spreadsheet_reader": frozenset({"spreadsheet_read", "file_output"}),
+    "vision_analyzer": frozenset({"vision_understanding", "file_output"}),
+    "search_reader": frozenset({"web_search", "text_generation", "file_output"}),
+    "database_reader": frozenset({"database_read", "text_generation", "file_output"}),
+    "wechat_draft_creator": frozenset({"wechat_draft", "file_output"}),
+    "wechat_publisher": frozenset({"wechat_publish", "file_output"}),
+    "html_asset_builder": frozenset({"html_asset_generation", "file_output"}),
+    "asset_builder": frozenset({"asset_generation", "file_output"}),
+    "generic_script": frozenset({"deterministic_execution", "file_output"}),
+}
+
+_HIGH_RISK_EXPLICIT_HINTS: dict[str, re.Pattern[str]] = {
+    "web_search": re.compile(r"联网|网页搜索|网络搜索|搜索网页|web[-_ ]?search|internet|search engine|searchxng|searxng", re.I),
+    "database_read": re.compile(r"数据库|SQL|业务表|数据表|database|readonly|read[-_ ]?only|query_database", re.I),
+    "vision_understanding": re.compile(r"看图|识图|OCR|截图理解|图片内容分析|视觉理解|vision|analy[sz]e image|image understanding", re.I),
+    "wechat_publish": re.compile(r"直接发布|推送到公众号|发布到公众号|wechat_publish|publish_wechat", re.I),
+}
+
+def _dedupe_capabilities(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values or []:
+        name = re.sub(r"[^A-Za-z0-9_-]", "", str(value or "").strip())
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        result.append(name)
+    return result
+
+
+def normalize_required_capabilities(
+    *,
+    role: str,
+    path: str,
+    required_capabilities: list[str],
+    user_blueprint_text: str = "",
+) -> list[str]:
+    """Keep SkillPlan runtime capabilities scoped to the file's real role.
+
+    Model-written blueprints sometimes copy every platform capability into
+    ``required_capabilities``.  This normalization is intentionally stricter:
+    resource/meta files never expose runtime capabilities, resource-category
+    capabilities are dropped, and script roles only keep capabilities that the
+    role can actually use.  High-risk retrieval/vision/publish capabilities are
+    only kept when the role is their dedicated role (or the blueprint explicitly
+    asks for that operation).
+    """
+    normalized_role = (role or "").strip()
+    normalized_path = (path or "").strip().replace("\\", "/")
+    if is_resource_role(normalized_role) or normalized_path == "SKILL.md" or normalized_path.startswith(("references/", "assets/")):
+        return []
+
+    allowed = ROLE_ALLOWED_CAPABILITIES.get(normalized_role)
+    requested = _dedupe_capabilities(required_capabilities)
+    if allowed is not None:
+        requested = [capability for capability in requested if capability in allowed]
+
+    runtime_only: list[str] = []
+    for capability in requested:
+        cap = get_tool_capability(capability)
+        if cap and cap.category == "resource":
+            continue
+        runtime_only.append(capability)
+
+    blueprint_text = user_blueprint_text or ""
+    guarded_roles = {
+        "web_search": "search_reader",
+        "database_read": "database_reader",
+        "vision_understanding": "vision_analyzer",
+        "wechat_publish": "wechat_publisher",
+    }
+    guarded: list[str] = []
+    for capability in runtime_only:
+        dedicated_role = guarded_roles.get(capability)
+        if dedicated_role and normalized_role != dedicated_role:
+            pattern = _HIGH_RISK_EXPLICIT_HINTS.get(capability)
+            if not (pattern and pattern.search(blueprint_text)):
+                continue
+        guarded.append(capability)
+
+    return guarded
+
 RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
 _CREATOR_INTERNAL_REFERENCE_PATHS: tuple[str, ...] = (
     "kernel/references/best-practices.md",
@@ -479,7 +579,15 @@ def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
 
 
 def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:
-    return registry_capabilities_for_role(str(role))
+    required, forbidden = registry_capabilities_for_role(str(role))
+    required = normalize_required_capabilities(
+        role=str(role),
+        path="",
+        required_capabilities=list(required or []),
+        user_blueprint_text="",
+    )
+    forbidden = [capability for capability in list(forbidden or []) if capability not in set(required)]
+    return required, forbidden
 
 
 def build_skill_plan_entry(
@@ -527,6 +635,12 @@ def build_skill_plan_entry(
     dependencies = _dedupe_paths([ref for ref in (explicit_dependencies or skill_local_references) if _is_skill_local_reference(ref)])
     default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
     required_capabilities = explicit_required_capabilities or default_required_capabilities
+    required_capabilities = normalize_required_capabilities(
+        role=role,
+        path=file_path,
+        required_capabilities=required_capabilities,
+        user_blueprint_text=f"{purpose}\n{blueprint_summary}",
+    )
     if (
         file_type == "script"
         and {"text_generation", "image_generation"}.issubset(set(required_capabilities))
@@ -536,6 +650,12 @@ def build_skill_plan_entry(
         default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
         if not explicit_required_capabilities:
             required_capabilities = default_required_capabilities
+        required_capabilities = normalize_required_capabilities(
+            role=role,
+            path=file_path,
+            required_capabilities=required_capabilities,
+            user_blueprint_text=f"{purpose}\n{blueprint_summary}",
+        )
         inputs = explicit_inputs or default_io_for_role(role)[0]
         inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
         outputs = explicit_outputs or default_io_for_role(role)[1]

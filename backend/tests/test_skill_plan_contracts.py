@@ -942,3 +942,74 @@ def test_skill_plan_separates_creator_internal_from_skill_local_references():
     assert entry.skill_local_references == ["references/workflows.md"]
     assert "kernel/references/workflows.md" in entry.creator_internal_references
     assert "kernel/references/workflows.md" not in entry.dependencies
+
+
+def test_social_card_blueprint_capabilities_are_normalized_to_runtime_needs():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: topic-social-card
+- path: `SKILL.md`
+  role: skill_overview
+  required_capabilities: [workflow_overview]
+- path: `scripts/analyze_topic.py`
+  role: text_generator
+  inputs: [topic_name]
+  outputs: [structured_topic_data]
+  dependencies: [references/topic_sources.md]
+  required_capabilities: [text_generation, web_search, database_read]
+- path: `scripts/generate_illustrated_story.py`
+  role: image_generator
+  inputs: [topic_data]
+  outputs: [story_text, image_paths]
+  required_capabilities: [text_generation, image_generation, vision_understanding]
+- references/: `references/topic_sources.md`
+  references/topic_sources.md
+  role: reference
+  required_capabilities: [reference_guidance]
+- assets/: `assets/placeholder.jpg`
+  assets/placeholder.jpg
+  role: asset
+  required_capabilities: [static_resource]
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entries = {entry.path: entry for entry in plan.skill_plan.files}
+
+    assert entries["SKILL.md"].required_capabilities == []
+    assert entries["references/topic_sources.md"].required_capabilities == []
+    assert entries["assets/placeholder.jpg"].required_capabilities == []
+    assert entries["scripts/analyze_topic.py"].required_capabilities == ["text_generation"]
+    assert entries["scripts/generate_illustrated_story.py"].role == "composite_generator"
+    assert entries["scripts/generate_illustrated_story.py"].required_capabilities == ["text_generation", "image_generation"]
+
+
+def test_role_capability_allowlist_keeps_high_risk_tools_on_dedicated_roles():
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    text = build_skill_plan_entry(
+        file_path="scripts/write.py",
+        purpose="role: text_generator required_capabilities: [text_generation, web_search, database_read]",
+    )
+    image = build_skill_plan_entry(
+        file_path="scripts/render.py",
+        purpose="role: image_generator required_capabilities: [image_generation, vision_understanding]",
+    )
+    search = build_skill_plan_entry(
+        file_path="scripts/search.py",
+        purpose="role: search_reader required_capabilities: [web_search, text_generation]",
+    )
+    database = build_skill_plan_entry(
+        file_path="scripts/db.py",
+        purpose="role: database_reader required_capabilities: [database_read, text_generation]",
+    )
+    vision = build_skill_plan_entry(
+        file_path="scripts/vision.py",
+        purpose="role: vision_analyzer required_capabilities: [vision_understanding]",
+    )
+
+    assert text.required_capabilities == ["text_generation"]
+    assert image.required_capabilities == ["image_generation"]
+    assert "web_search" in search.required_capabilities
+    assert "database_read" in database.required_capabilities
+    assert "vision_understanding" in vision.required_capabilities

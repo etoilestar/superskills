@@ -58,6 +58,12 @@ def _coerce_lines(text: str | Iterable[Any]) -> list[str]:
     return [line if line else " " for line in lines] or ["Generated document"]
 
 
+
+def _write_minimal_trial_pdf(path: Path) -> dict[str, Any]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Count 0>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n")
+    return {"pdf_path": str(path), "file_paths": [str(path)], "file_outputs": [str(path)]}
+
 def create_pdf(
     text: str | Iterable[Any],
     *,
@@ -74,6 +80,8 @@ def create_pdf(
     returned dict (or include its paths) as stdout JSON.
     """
     pdf_path = _output_path(output_path=output_path, output_dir=output_dir, filename=filename)
+    if _trial():
+        return _write_minimal_trial_pdf(pdf_path)
 
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfbase import pdfmetrics
@@ -165,3 +173,132 @@ def extract_pdf_text(path: str | os.PathLike[str], *, max_pages: int | None = No
         "page_count": len(reader.pages),
         "pdf_path": str(pdf_path),
     }
+
+_MAX_INPUT_BYTES = 25 * 1024 * 1024
+_MAX_INPUT_FILES = 50
+
+
+def _trial() -> bool:
+    return os.environ.get("SKILL_TRIAL_RUN") == "1"
+
+
+def _allowed_input_roots() -> list[Path]:
+    roots = [Path.cwd()]
+    for name in ("SKILL_WORKDIR", "SKILL_DIR", "INPUT_DIR", "UPLOAD_DIR", "OUTPUT_DIR"):
+        if os.environ.get(name):
+            roots.append(Path(os.environ[name]))
+    roots.extend([Path.cwd() / "inputs", Path.cwd() / "assets", Path.cwd() / "uploads"])
+    return [root.expanduser().resolve() for root in roots]
+
+
+def _safe_input_path(path: str | os.PathLike[str], suffixes: set[str]) -> Path:
+    resolved = Path(path).expanduser().resolve()
+    if resolved.suffix.lower() not in suffixes:
+        raise ValueError(f"unsupported file type: {resolved.suffix}")
+    if not resolved.is_file():
+        raise FileNotFoundError("input file does not exist")
+    if resolved.stat().st_size > _MAX_INPUT_BYTES:
+        raise ValueError("input file is too large")
+    if not any(resolved == root or resolved.is_relative_to(root) for root in _allowed_input_roots()):
+        raise ValueError("input path must stay under the skill workdir, inputs, assets, uploads, or OUTPUT_DIR")
+    return resolved
+
+
+def read_docx_text(docx_path: str | os.PathLike[str]) -> dict[str, Any]:
+    """Read text from a Word document."""
+    if _trial():
+        return {"text": "Mock DOCX text during SKILL_TRIAL_RUN.", "paragraphs": ["Mock DOCX text during SKILL_TRIAL_RUN."], "source_path": str(docx_path)}
+    path = _safe_input_path(docx_path, {".docx"})
+    from docx import Document
+
+    document = Document(str(path))
+    paragraphs = [paragraph.text for paragraph in document.paragraphs if paragraph.text]
+    return {"text": "\n".join(paragraphs), "paragraphs": paragraphs, "source_path": str(path)}
+
+
+def read_pptx_text(pptx_path: str | os.PathLike[str]) -> dict[str, Any]:
+    """Read text from a PowerPoint deck."""
+    if _trial():
+        return {"text": "Mock PPTX text during SKILL_TRIAL_RUN.", "paragraphs": ["Mock PPTX text during SKILL_TRIAL_RUN."], "source_path": str(pptx_path)}
+    path = _safe_input_path(pptx_path, {".pptx"})
+    from pptx import Presentation
+
+    paragraphs: list[str] = []
+    for slide in Presentation(str(path)).slides:
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text:
+                paragraphs.append(str(shape.text))
+    return {"text": "\n".join(paragraphs), "paragraphs": paragraphs, "source_path": str(path)}
+
+
+def read_spreadsheet(path: str | os.PathLike[str], sheet_name: str | None = None, max_rows: int = 500) -> dict[str, Any]:
+    """Read rows from an Excel spreadsheet."""
+    max_rows = max(1, min(int(max_rows or 500), 5000))
+    if _trial():
+        return {"sheets": [sheet_name or "Sheet1"], "columns": ["A", "B"], "rows": [{"A": "mock", "B": "value"}], "row_count": 1, "truncated": False}
+    safe_path = _safe_input_path(path, {".xlsx", ".xlsm"})
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(str(safe_path), read_only=True, data_only=True)
+    worksheet = workbook[sheet_name] if sheet_name else workbook[workbook.sheetnames[0]]
+    rows_iter = worksheet.iter_rows(values_only=True)
+    header_values = next(rows_iter, None) or []
+    columns = [str(value) if value not in (None, "") else f"Column{index}" for index, value in enumerate(header_values, start=1)]
+    rows: list[dict[str, Any]] = []
+    truncated = False
+    for index, values in enumerate(rows_iter, start=1):
+        if index > max_rows:
+            truncated = True
+            break
+        rows.append({columns[i] if i < len(columns) else f"Column{i+1}": value for i, value in enumerate(values)})
+    return {"sheets": workbook.sheetnames, "columns": columns, "rows": rows, "row_count": len(rows), "truncated": truncated, "source_path": str(safe_path)}
+
+
+def merge_pdfs(pdf_paths: list[str], output_path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+    """Merge PDFs into a PDF under OUTPUT_DIR."""
+    if not pdf_paths or len(pdf_paths) > _MAX_INPUT_FILES:
+        raise ValueError("pdf_paths must contain 1 to 50 files")
+    out_path = _output_path(output_path=output_path, output_dir=None, filename="merged.pdf")
+    if _trial():
+        return _write_minimal_trial_pdf(out_path)
+    from pypdf import PdfReader, PdfWriter
+
+    writer = PdfWriter()
+    for raw_path in pdf_paths:
+        reader = PdfReader(str(_safe_input_path(raw_path, {".pdf"})))
+        for page in reader.pages:
+            writer.add_page(page)
+    with out_path.open("wb") as file_obj:
+        writer.write(file_obj)
+    return {"pdf_path": str(out_path), "file_paths": [str(out_path)], "file_outputs": [str(out_path)]}
+
+
+def images_to_pdf(image_paths: list[str], output_path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+    """Convert images to one PDF under OUTPUT_DIR."""
+    if not image_paths or len(image_paths) > _MAX_INPUT_FILES:
+        raise ValueError("image_paths must contain 1 to 50 files")
+    out_path = _output_path(output_path=output_path, output_dir=None, filename="images.pdf")
+    if _trial():
+        return _write_minimal_trial_pdf(out_path)
+    from PIL import Image
+
+    images = []
+    for raw_path in image_paths:
+        image = Image.open(_safe_input_path(raw_path, {".png", ".jpg", ".jpeg", ".webp"})).convert("RGB")
+        images.append(image)
+    first, rest = images[0], images[1:]
+    first.save(str(out_path), save_all=True, append_images=rest)
+    return {"pdf_path": str(out_path), "file_paths": [str(out_path)], "file_outputs": [str(out_path)]}
+
+
+def build_pdf_report(title: str, sections: list[dict], image_paths: list[str] | None = None) -> dict[str, Any]:
+    """Build a simple PDF report from text sections and optional image references."""
+    lines = [str(title or "Report"), ""]
+    for section in sections or []:
+        lines.append(str(section.get("title") or "Section"))
+        lines.extend(_coerce_lines(str(section.get("text") or section.get("content") or "")))
+        lines.append("")
+    if image_paths:
+        lines.append("Images:")
+        lines.extend(str(_safe_input_path(path, {".png", ".jpg", ".jpeg", ".webp"})) for path in image_paths[:_MAX_INPUT_FILES])
+    return create_pdf(lines, filename="report.pdf", title=title or "Report")

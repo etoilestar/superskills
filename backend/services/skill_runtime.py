@@ -19,7 +19,30 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .runtime_tools import create_docx, create_pdf, create_pptx, extract_pdf_text
+from .runtime_tools import (
+    analyze_image_with_vision,
+    api_get,
+    api_post,
+    build_pdf_report,
+    create_docx,
+    create_pdf,
+    create_pptx,
+    create_wechat_draft,
+    describe_database_table,
+    extract_pdf_text,
+    fetch_url_text,
+    images_to_pdf,
+    list_database_tables,
+    merge_pdfs,
+    ocr_image,
+    publish_wechat_draft,
+    query_database_readonly,
+    read_docx_text,
+    read_pptx_text,
+    read_spreadsheet,
+    upload_wechat_media,
+    web_search,
+)
 
 
 logger = logging.getLogger(__name__)
