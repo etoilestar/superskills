@@ -50,7 +50,7 @@ def test_low_confidence_script_falls_back_to_generic_with_warning():
     assert "image_generation" not in entry.required_capabilities
 
 
-def test_skill_md_command_block_must_match_skillplan_inputs():
+def test_first_round_skill_md_command_block_allows_non_exact_skillplan_inputs():
     from backend.routers.creator import _check_skill_md_contract
 
     blueprint = """
@@ -73,7 +73,8 @@ python scripts/write.py '{"topic":"{{topic}}","extra":"{{extra}}"}'
     results = _check_skill_md_contract(skill_md, blueprint)
     failed_ids = {result.id for result in results if not result.passed}
 
-    assert "command_block.skillplan_inputs.exact" in failed_ids
+    assert "skill_md.command_block.json_argv_object" not in failed_ids
+    assert "command_block.skillplan_inputs.exact" not in failed_ids
 
 
 def test_skill_md_can_delegate_script_command_to_reference():
@@ -100,9 +101,10 @@ description: delegated
 - `references/text-generation.md`: 定义 text_generator 的命令、输入输出和约束。
 """
     results = _check_skill_md_contract(skill_md, blueprint)
-    execution_result = next(result for result in results if result.id == "skill_md.script_command.exists")
+    execution_result = next(result for result in results if result.id == "skill_md.command_block.fenced_exists")
 
-    assert execution_result.passed
+    assert not execution_result.passed
+    assert execution_result.target == "scripts/write.py"
 
 
 def test_reference_contract_requires_subtask_contract_sections():
@@ -124,7 +126,7 @@ def test_reference_contract_requires_subtask_contract_sections():
     results = _check_reference_file_contract("references/text-generation.md", content, purpose="text_generator 子任务执行参考")
     failed_ids = {result.id for result in results if not result.passed}
 
-    assert "reference.subtask_contract_sections" in failed_ids
+    assert "reference.role_sections" in failed_ids
 
 
 def test_skill_plan_runtime_defaults_python_and_supports_node_bash():
@@ -258,7 +260,8 @@ JSON argv keys 必须与 SkillPlan inputs 对齐，文档内容足够长，可�
     results = _check_reference_file_contract("references/text-generation.md", content, purpose="scripts/write.py role: text_generator runtime: python inputs: topic outputs: text")
     failed_ids = {result.id for result in results if not result.passed}
 
-    assert "command_block.runtime.matches_skillplan" in failed_ids
+    assert "reference.no_executable_script_blocks" in failed_ids
+    assert "command_block.runtime.matches_skillplan" not in failed_ids
 
 
 def test_asset_contract_validates_yaml_and_markdown_placeholders():
@@ -604,7 +607,7 @@ python scripts/run.py '{"topic":"{{topic}}"}'
 """
     failed = {result.id for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
 
-    assert "skill_md.resource.local_declared" in failed
+    assert "skill_md.resource.local_declared" not in failed
 
 
 def test_skill_md_allows_declared_local_reference_and_script():
@@ -659,8 +662,9 @@ python scripts/generate_fable.py '{"payload":{"topic":"{{topic}}"}}'
 """
     failed = {r.id for r in _check_reference_file_contract("references/best-practices.md", content, purpose=purpose) if not r.passed}
 
-    assert "command_block.command_template.equivalent" in failed
-    assert "command_block.skillplan_inputs.exact" in failed
+    assert "reference.no_executable_script_blocks" in failed
+    assert "command_block.command_template.equivalent" not in failed
+    assert "command_block.skillplan_inputs.exact" not in failed
 
 
 def test_reference_redefined_role_is_rejected_against_skillplan():
@@ -685,7 +689,8 @@ required_capabilities: text_generation
 """
     failed = {r.id for r in _check_reference_file_contract("references/best-practices.md", content, purpose=purpose) if not r.passed}
 
-    assert "reference.role.matches_skillplan" in failed
+    assert "reference.role_sections" in failed
+    assert "reference.role.matches_skillplan" not in failed
 
 
 def test_reference_cannot_put_skillplan_command_in_anti_example():
@@ -710,7 +715,8 @@ python scripts/generate_fable.py '{"topic":"{{topic}}"}'
 """
     failed = {r.id for r in _check_reference_file_contract("references/best-practices.md", content, purpose=purpose) if not r.passed}
 
-    assert "reference.anti_example.not_skillplan_command" in failed
+    assert "reference.no_executable_script_blocks" in failed
+    assert "reference.anti_example.not_skillplan_command" not in failed
 
 
 def test_required_text_and_image_capabilities_normalize_to_composite_generator():
@@ -797,7 +803,8 @@ python scripts/generate_fable.py '{"topic":"{{topic}}"}'
 """
     failed = {r.id for r in _check_reference_file_contract("references/best-practices.md", content, purpose=skill_md) if not r.passed}
 
-    assert "reference.command_block.not_duplicate_skill_md" in failed
+    assert "reference.no_executable_script_blocks" in failed
+    assert "reference.command_block.not_duplicate_skill_md" not in failed
 
 
 def test_trial_stdout_outputs_allow_limited_legacy_aliases():
@@ -1102,7 +1109,7 @@ python scripts/export.py '{"outline":"{{user_request}}"}'
 """
     failed = {result.id for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
 
-    assert "skill_md.dataflow.input_available" in failed
+    assert "skill_md.dataflow.input_available" not in failed
 
 
 def test_dependency_output_directory_is_cleaned_from_skillplan():
@@ -1165,35 +1172,48 @@ def test_skillplan_dataflow_allows_arbitrary_business_field_names():
     assert '"structured_payload":"{{structured_payload}}"' in second.command_template
 
 
-def test_command_key_mismatch_exposes_structured_diff():
-    from backend.routers.creator import _check_skill_md_contract
+def test_second_round_e2e_command_key_mismatch_exposes_structured_diff(tmp_path):
+    from backend.routers.creator import _parse_e2e_workflow_command, _validate_e2e_command_static
 
-    blueprint = """
-📋 Skill 架构蓝图
-- **Skill 名称**: generic-skill
-- scripts/: `scripts/step.py`
-  scripts/step.py role: generic_script inputs: source_value, desired_value outputs: result_value
-"""
     skill_md = """---
 name: generic-skill
 description: generic
 ---
 # generic-skill
 
+- scripts/: `scripts/step.py`
+  scripts/step.py role: generic_script inputs: source_value, desired_value outputs: result_value
+
 ```bash
 python scripts/step.py '{"source_value":"{{source_value}}","unexpected_value":"{{unexpected_value}}"}'
 ```
 """
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    (script_dir / "step.py").write_text("print('{}')", encoding="utf-8")
+    command = _parse_e2e_workflow_command(
+        command="python scripts/step.py '{\"source_value\":\"{{source_value}}\",\"unexpected_value\":\"{{unexpected_value}}\"}'",
+        ordinal=1,
+        source_path="SKILL.md",
+    )
 
-    failed = [r for r in _check_skill_md_contract(skill_md, blueprint) if r.id == "command_block.skillplan_inputs.exact" and not r.passed]
+    with pytest.raises(ValueError) as excinfo:
+        _validate_e2e_command_static(
+            command=command,
+            trial_skill_dir=tmp_path,
+            skill_md=skill_md,
+            available_payload_keys={"source_value"},
+        )
 
-    assert failed
-    details = failed[0].details
-    assert details["target_script"] == "scripts/step.py"
-    assert details["expected_keys"] == ["desired_value", "source_value"]
-    assert details["actual_keys"] == ["source_value", "unexpected_value"]
-    assert details["missing_keys"] == ["desired_value"]
-    assert details["extra_keys"] == ["unexpected_value"]
+    message = str(excinfo.value)
+    assert "E2E_LAYER=e2e_dataflow" in message
+    assert "command_block.skillplan_inputs.exact" in message
+    assert '"target_script": "scripts/step.py"' in message
+    assert '"expected_inputs": ["payload"]' in message
+    assert '"actual_payload_keys": ["source_value", "unexpected_value"]' in message
+    assert '"missing_keys": ["payload"]' in message
+    assert '"extra_keys": ["source_value", "unexpected_value"]' in message
+    assert '"available_upstream_outputs": ["source_value"]' in message
 
 
 def test_deterministic_patch_replaces_command_json_keys_and_preserves_invocation():
@@ -1287,7 +1307,7 @@ python scripts/second.py '{"missing_value":"{{missing_value}}"}'
 
     failed = {r.id for r in _check_skill_md_contract(skill_md, blueprint) if not r.passed}
 
-    assert "skill_plan.dataflow_unresolved" in failed
+    assert "skill_plan.dataflow_unresolved" not in failed
     assert "command_block.skillplan_inputs.exact" not in failed
 
 
