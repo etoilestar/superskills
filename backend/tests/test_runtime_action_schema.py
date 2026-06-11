@@ -202,7 +202,7 @@ import sys
 from pathlib import Path
 
 payload = json.loads(sys.argv[1])
-out = Path('assets/generated/story.png')
+out = Path('outputs/story.png')
 out.parent.mkdir(parents=True, exist_ok=True)
 out.write_bytes(b'fake-png')
 print(json.dumps({
@@ -258,11 +258,11 @@ python scripts/generate.py '{"topic":"狐狸"}'
     )
     assert run_result["success"] is True
     assert run_result["action"] == "run_command"
-    assert json.loads(run_result["stdout"])["image_paths"] == ["assets/generated/story.png"]
+    assert json.loads(run_result["stdout"])["image_paths"] == ["outputs/story.png"]
     assert run_result["output_files"] == [
         {
-            "path": "assets/generated/story.png",
-            "url": "/api/skills/story-skill/files/assets/generated/story.png",
+            "path": "outputs/story.png",
+            "url": "/api/skills/story-skill/files/outputs/story.png",
         }
     ]
 
@@ -271,7 +271,7 @@ python scripts/generate.py '{"topic":"狐狸"}'
     answer = _finalize_answer_output_file_links(answer, exec_result["output_files"])
 
     assert "Story about 狐狸" in answer
-    assert "/api/skills/story-skill/files/assets/generated/story.png" in answer
+    assert "/api/skills/story-skill/files/outputs/story.png" in answer
 
 
 def test_final_instruction_accepts_plain_single_line_command():
@@ -367,11 +367,11 @@ def test_runtime_stdout_validation_accepts_multifunction_export_fields():
         {"role": "composite_generator", "outputs": ["story_text", "image_paths"]},
     )
     _validate_stdout_against_action_entry(
-        json.dumps({"docx_path": "assets/generated/story.docx"}),
+        json.dumps({"docx_path": "outputs/story.docx"}),
         {"role": "docx_builder", "outputs": ["docx_path"]},
     )
     _validate_stdout_against_action_entry(
-        json.dumps({"pptx_path": "assets/generated/story.pptx"}),
+        json.dumps({"pptx_path": "outputs/story.pptx"}),
         {"role": "pptx_builder", "outputs": ["pptx_path"]},
     )
 
@@ -380,25 +380,23 @@ def test_output_files_from_stdout_json_collects_all_artifact_fields(tmp_path):
     from backend.routers.sandbox_chat import _output_files_from_stdout_json
 
     skill_dir = tmp_path / "schema-skill"
-    generated = skill_dir / "assets" / "generated"
     outputs = skill_dir / "outputs"
-    generated.mkdir(parents=True)
     outputs.mkdir(parents=True)
     from zipfile import ZipFile, ZIP_DEFLATED
-    (skill_dir / "assets/generated/story.pdf").write_bytes(b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n")
-    with ZipFile(skill_dir / "assets/generated/story.docx", "w", ZIP_DEFLATED) as zf:
+    (skill_dir / "outputs/story.pdf").write_bytes(b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n")
+    with ZipFile(skill_dir / "outputs/story.docx", "w", ZIP_DEFLATED) as zf:
         zf.writestr("word/document.xml", "<w:document/>")
-    with ZipFile(skill_dir / "assets/generated/story.pptx", "w", ZIP_DEFLATED) as zf:
+    with ZipFile(skill_dir / "outputs/story.pptx", "w", ZIP_DEFLATED) as zf:
         zf.writestr("ppt/presentation.xml", "<p:presentation/>")
-    (skill_dir / "assets/generated/story.html").write_text("<!doctype html><html></html>", encoding="utf-8")
+    (skill_dir / "outputs/story.html").write_text("<!doctype html><html></html>", encoding="utf-8")
     (skill_dir / "outputs/img.png").write_bytes(b"data")
 
     files = _output_files_from_stdout_json(
         json.dumps({
-            "pdf_path": "assets/generated/story.pdf",
-            "docx_path": "assets/generated/story.docx",
-            "pptx_path": "assets/generated/story.pptx",
-            "html_path": "assets/generated/story.html",
+            "pdf_path": "outputs/story.pdf",
+            "docx_path": "outputs/story.docx",
+            "pptx_path": "outputs/story.pptx",
+            "html_path": "outputs/story.html",
             "image_paths": ["outputs/img.png"],
         }),
         cwd=skill_dir,
@@ -406,10 +404,10 @@ def test_output_files_from_stdout_json_collects_all_artifact_fields(tmp_path):
     )
 
     assert {item["path"] for item in files} == {
-        "assets/generated/story.pdf",
-        "assets/generated/story.docx",
-        "assets/generated/story.pptx",
-        "assets/generated/story.html",
+        "outputs/story.pdf",
+        "outputs/story.docx",
+        "outputs/story.pptx",
+        "outputs/story.html",
         "outputs/img.png",
     }
 
@@ -418,18 +416,18 @@ def test_file_output_validation_accepts_arbitrary_field_names(tmp_path):
     from backend.services.artifact_validator import validate_stdout_file_outputs
 
     skill_dir = tmp_path / "schema-skill"
-    generated = skill_dir / "assets" / "generated"
-    generated.mkdir(parents=True)
-    report = generated / "custom-report.pdf"
+    outputs = skill_dir / "outputs"
+    outputs.mkdir(parents=True)
+    report = outputs / "custom-report.pdf"
     report.write_bytes(b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n")
 
-    stdout = json.dumps({"business_report": "assets/generated/custom-report.pdf"})
+    stdout = json.dumps({"business_report": "outputs/custom-report.pdf"})
 
     assert validate_stdout_file_outputs(stdout, skill_dir=skill_dir, cwd=skill_dir / "scripts") == [
-        {"path": "assets/generated/custom-report.pdf"}
+        {"path": "outputs/custom-report.pdf"}
     ]
     assert _output_files_from_stdout_json(stdout, cwd=skill_dir, skill_name="schema-skill") == [
-        {"path": "assets/generated/custom-report.pdf", "url": "/api/skills/schema-skill/files/assets/generated/custom-report.pdf"}
+        {"path": "outputs/custom-report.pdf", "url": "/api/skills/schema-skill/files/outputs/custom-report.pdf"}
     ]
 
 

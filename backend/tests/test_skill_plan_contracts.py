@@ -375,7 +375,8 @@ def test_image_and_text_named_script_is_promoted_to_composite_generator_contract
     assert entry.required_capabilities == ["text_generation", "image_generation"]
     assert "text_generation" not in entry.forbidden_capabilities
     assert "pdf_generation" in entry.forbidden_capabilities
-    assert "custom_character" in entry.inputs
+    assert entry.inputs == ["payload"]
+    assert "custom_character" not in entry.inputs
     assert entry.outputs == []
     assert entry.command_template.startswith("python scripts/generate_fairy_tale_with_images.py")
 
@@ -748,9 +749,10 @@ def test_command_template_can_be_parsed_for_sandbox_trial_args():
 def test_composite_trial_stdout_accepts_text_and_image_paths(tmp_path):
     from backend.routers.creator import _validate_trial_stdout_json
 
-    image_path = tmp_path / "image.png"
+    image_path = tmp_path / "outputs" / "image.png"
+    image_path.parent.mkdir(parents=True)
     image_path.write_bytes(b"fake")
-    payload = {"text": "story", "image_paths": [str(image_path)], "images": [{"image_path": str(image_path)}]}
+    payload = {"text": "story", "image_paths": ["outputs/image.png"]}
 
     _validate_trial_stdout_json(
         stdout=__import__("json").dumps(payload),
@@ -871,22 +873,23 @@ def test_html_asset_builder_plan_skeleton_and_trial_validation(tmp_path):
 
     entry = build_skill_plan_entry(
         file_path="scripts/build_html.py",
-        purpose="role: html_asset_builder inputs: topic outputs: html_path, asset_paths required_capabilities: html_generation, file_output",
+        purpose="role: html_asset_builder inputs: topic outputs: html_path, file_paths, file_outputs required_capabilities: html_generation, file_output",
     )
     skeleton = _script_generation_skeleton("scripts/build_html.py", "", "", skill_plan_entry=entry.__dict__)
 
     assert entry.role == "html_asset_builder"
-    assert entry.outputs == ["html_path", "asset_paths"]
-    assert "assets/generated" in skeleton
+    assert entry.outputs == ["html_path", "file_paths", "file_outputs"]
+    assert "outputs" in skeleton
+    assert "assets/generated" not in skeleton
     assert "html_path" in skeleton
 
     skill_dir = tmp_path / "html-skill"
-    html_file = skill_dir / "assets" / "generated" / "demo.html"
+    html_file = skill_dir / "outputs" / "demo.html"
     html_file.parent.mkdir(parents=True)
     html_file.write_text("<!doctype html><html><body>demo</body></html>", encoding="utf-8")
     _validate_trial_stdout_json(
-        stdout=__import__("json").dumps({"html_path": "assets/generated/demo.html", "asset_paths": ["assets/generated/demo.html"]}),
-        content="html_path = 'assets/generated/demo.html'\nPath('assets/generated/demo.html').write_text('<html></html>')",
+        stdout=__import__("json").dumps({"html_path": "outputs/demo.html", "file_paths": ["outputs/demo.html"], "file_outputs": ["outputs/demo.html"]}),
+        content="html_path = 'outputs/demo.html'\nPath('outputs/demo.html').write_text('<html></html>')",
         args=['{"topic":"demo"}'],
         role="html_asset_builder",
         skill_plan_entry=entry.__dict__,

@@ -38,6 +38,7 @@ from ..services.creator_tool_registry import get_tool_capability, list_tool_capa
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
 from ..services.skill_executor import _build_script_runtime_env, run_action
+from ..services.skill_creator_dry_run import build_creator_external_input_context
 from ..services.artifact_validator import validate_stdout_file_outputs, FileOutputValidationError
 from .chat_utils import _get_skill_venv_python, _scan_and_install_python_deps
 
@@ -247,6 +248,10 @@ class SkillActionRequest(BaseModel):
     model: Optional[str] = None
     auto_repair: bool = True
     max_e2e_repair_attempts: int = 5
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    input_files: list[dict[str, Any]] = Field(default_factory=list)
+    fields: dict[str, Any] = Field(default_factory=dict)
+    options: dict[str, Any] = Field(default_factory=dict)
 
 class PackageSkillRequest(SkillActionRequest):
     validate_before_package: bool = True
@@ -961,7 +966,7 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "- 命令必须直接调用真实 scripts/ 路径。",
         "- 脚本路径后应传入一个 json.loads 可解析的 JSON object argv。",
         "- 动态占位符必须作为 JSON 字符串值出现，例如 \"theme\":\"{{theme}}\"。",
-        "- 禁止裸占位符，例如禁止 \"scene_count\":{{scene_count}}。",
+        "- 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。",
         "",
         "D. workflow:",
         "- SKILL.md 必须描述完整 workflow、脚本顺序、输入输出数据流和最终产物。",
@@ -1002,18 +1007,18 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "- 每个 scripts/ 文件必须且只能有一个主要可执行 bash fenced code block。",
         "- 命令块使用标准 Markdown 独立 fence；不要把 ```bash 缩进在列表项内部。",
         "- fence 内只放一条命令，不写解释、不写循环说明、不写多条命令。",
-        "- 命令必须形如：python scripts/name.py '{\"key\":\"{{key}}\"}'。",
+        "- 命令必须形如：python scripts/name.py '{\"user_request\":\"{{user_request}}\"}'，或引用 external envelope / 上游 stdout 中真实存在的字段。",
         "- JSON argv keys 必须由当前 scripts/ 文件的 SkillPlanEntry.inputs 直接决定；不要自行发明、翻译或猜测参数名。",
         "- 字段名以当前 SkillPlan.inputs / outputs 为准；平台不固定业务字段名，但同一 Skill 内部必须自洽。",
-        "- JSON argv 必须先能被 json.loads 解析；所有 {{placeholder}} 都必须放在 JSON 字符串里，禁止裸写 {{count}}、{{scene_count}}。",
-        "- 若需要数值默认值，直接写固定 JSON 数字，例如 \"scene_count\":3，而不是 \"scene_count\":{{scene_count}}。",
+        "- JSON argv 必须先能被 json.loads 解析；所有动态 {{placeholder}} 都必须放在 JSON 字符串里，禁止裸写动态数值占位符。",
+        "- 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。",
         "",
         "B. 线性数据流:",
-        "- E2E 只按 SKILL.md/reference 中的命令块顺序逐条执行；不会理解“每幕一次/循环三次/对每个场景调用”等自然语言循环。",
-        "- 多场景、多图片、多页 PDF 等循环必须在对应脚本内部完成，SKILL.md 只写一次脚本调用。",
-        "- 第一条命令可以使用用户输入 placeholder；后续命令只能使用之前脚本 stdout JSON 已输出的字段。",
-        "- 禁止发明 image_path_1/image_path_2/image_path_3 等编号字段，除非上游脚本 stdout 明确输出这些字段。",
-        "- 列表/对象字段必须用整值占位符传递，例如 \"image_paths\":\"{{image_paths}}\"，不要写 [\"{{image_path_1}}\", \"{{image_path_2}}\"]。",
+        "- E2E 只按 SKILL.md/reference 中的命令块顺序逐条执行；不会把自然语言描述转换成隐式循环。",
+        "- 批量处理、列表处理或多文件处理必须在对应脚本内部完成，SKILL.md 只写一次脚本调用。",
+        "- 第一条命令只能引用 external envelope 中确定存在的字段：user_request、input、text、input_files、files、fields、options，或显式 fields/default_values/input_binding 提供的字段。",
+        "- 禁止发明无来源编号字段或业务字段，除非 external envelope 或上游脚本 stdout 明确输出这些字段。",
+        "- 列表/对象字段必须用整值占位符传递；不要把不存在的拆分字段拼成列表。",
         "- 每个脚本说明中必须写清 stdout JSON 输出字段，且下游命令 placeholder 必须与这些字段逐字一致。",
         "",
         "C. 推荐线性命令顺序与接口:",
@@ -1035,7 +1040,7 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         ])
 
         if idx == 1:
-            lines.append("   placeholder rule: 第一条命令可以从用户输入提取这些 inputs。")
+            lines.append("   placeholder rule: 第一条命令只能引用 external envelope 中确定存在的通用字段或显式结构化字段；如需业务字段，请第一脚本从 user_request 自行解析并在 stdout JSON 输出。")
         else:
             available_text = ", ".join(sorted(available_after_previous)) or "（暂无上游字段）"
             lines.append(
@@ -1058,9 +1063,9 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "",
         "E. 对多场景/多图片/PDF 任务的固定策略:",
         "- 文本脚本一次生成完整结构化文本，并输出 script_text 或 text。",
-        "- 图片脚本一次接收完整 script_text/text，内部拆分场景并生成多张图，stdout 输出 image_paths/images。",
+        "- 图片脚本一次接收完整 script_text/text，内部拆分场景并生成多张图，stdout 输出 image_paths。",
         "- PDF 脚本一次接收 script_text/text 和 image_paths，内部完成排版和文件生成，stdout 输出 pdf_path/file_paths。",
-        "- SKILL.md 不写三条图片命令，不写 image_path_1/2/3，不写自然语言循环。",
+        "- 列表/对象字段必须用整值占位符传递；不要把不存在的拆分字段拼成列表。",
     ])
 
     return "\n".join(lines)
@@ -2826,7 +2831,7 @@ def _script_satisfies_required_capability(content: str, capability: str) -> bool
     if capability == "pptx_generation":
         return bool(re.search(r"Presentation\(|python-pptx|ppt/presentation.xml|ZipFile\(|build_pptx", content, re.IGNORECASE))
     if capability in {"html_generation", "html_asset_generation"}:
-        return bool(re.search(r"write_text|open\s*\(|<html|<!DOCTYPE html|assets/generated|build_html", content, re.IGNORECASE))
+        return bool(re.search(r"write_text|open\s*\(|<html|<!DOCTYPE html|outputs|build_html", content, re.IGNORECASE))
     if capability == "file_output":
         return bool(re.search(r"write_text|write_bytes|open\s*\(|fs\.writeFile|pdf\.output|prs\.save|ZipFile\(|build_(?:pdf|docx|pptx|html)", content, re.IGNORECASE))
     cap = get_tool_capability(capability)
@@ -3365,8 +3370,8 @@ def _check_script_file_contract(
                     if not pdf_only and not writes_pdf
                     else f"{file_path} 是 image_generator，但源码包含 PDF-only 输出或 PDF 生成逻辑。"
                 ),
-                expected="image_generator 必须输出 image_paths/images，不得写 PDF 或只输出 pdf_path/file_paths；需要文本+图片时请使用 composite_generator。",
-                minimal_edit="返回 image_paths/images 并删除 PDF 写入逻辑；若要同时生成文本和图片，请将 role/required_capabilities 改为 composite_generator + text_generation/image_generation。",
+                expected="image_generator 必须输出 image_paths，不得写 PDF 或只输出 pdf_path/file_paths；需要文本+图片时请使用 composite_generator。",
+                minimal_edit="返回 image_paths 并删除 PDF 写入逻辑；若要同时生成文本和图片，请将 role/required_capabilities 改为 composite_generator + text_generation/image_generation。",
             )
         )
 
@@ -3511,14 +3516,14 @@ def _validate_configured_model_usage_static(*, file_path: str, content: str, ski
     if _DATA_URI_RE.search(content):
         raise ValueError(
             f"{file_path} 输出 base64 data URI。"
-            "图片结果必须由平台运行时写入 OUTPUT_DIR，并在 stdout JSON 中返回 image_paths/images。"
+            "图片结果必须由平台运行时写入 OUTPUT_DIR，并在 stdout JSON 中返回 image_paths。"
         )
 
     if re.search(r"(?m)^\s*image_path\s*=\s*generate_stable_diffusion_image\s*\(", content):
         raise ValueError(
             f"{file_path} 将 helper 返回 dict 直接赋给 image_path。"
             "图片脚本必须先保存 result = generate_stable_diffusion_image(desc)，"
-            "再执行 image_paths.append(result.get(\"image_path\")) 和 images.append(result)。"
+            "再执行 image_paths.append(result.get(\"image_path\"))。"
         )
 
     effective_required_capabilities = _effective_required_capabilities_for_script(plan_entry) if plan_entry else []
@@ -4082,14 +4087,6 @@ def _validate_image_payload_shape(payload: dict[str, Any]) -> bool:
     if isinstance(image_paths, list) and image_paths and all(isinstance(p, str) and p.strip() for p in image_paths):
         return True
 
-    images = payload.get("images")
-    if (
-        isinstance(images, list)
-        and images
-        and all(isinstance(item, dict) and isinstance(item.get("image_path"), str) and item.get("image_path").strip() for item in images)
-    ):
-        return True
-
     return False
 
 
@@ -4099,9 +4096,10 @@ def _html_output_candidates(payload: dict[str, Any]) -> list[str]:
     html_path = payload.get("html_path")
     if isinstance(html_path, str) and html_path.strip():
         candidates.append(html_path.strip())
-    asset_paths = payload.get("asset_paths")
-    if isinstance(asset_paths, list):
-        candidates.extend(path.strip() for path in asset_paths if isinstance(path, str) and path.strip())
+    for key in ("file_paths", "file_outputs"):
+        paths = payload.get(key)
+        if isinstance(paths, list):
+            candidates.extend(path.strip() for path in paths if isinstance(path, str) and path.strip())
     return candidates
 
 
@@ -4110,18 +4108,18 @@ def _validate_html_trial_outputs(payload: dict[str, Any], *, skill_dir: Path | N
     for candidate in _html_output_candidates(payload):
         candidate_path = Path(candidate)
         if not candidate_path.is_absolute() and skill_dir is not None:
-            if candidate.startswith("assets/"):
+            if candidate.startswith("outputs/"):
                 candidate_path = (skill_dir / candidate_path).resolve()
             else:
                 candidate_path = (skill_dir / "scripts" / candidate_path).resolve()
         checked.append(candidate_path)
         if skill_dir is not None:
-            generated_root = (skill_dir / "assets" / "generated").resolve()
+            generated_root = (skill_dir / "outputs").resolve()
             try:
                 candidate_path.relative_to(generated_root)
             except ValueError:
                 raise ValueError(
-                    "html_asset_builder 输出路径必须位于当前 Skill 的 assets/generated/ 下："
+                    "html_asset_builder 输出路径必须位于当前 Skill 的 OUTPUT_DIR/outputs 下："
                     f"argv={args!r} stdout={stdout[-4000:]} checked={candidate_path}"
                 )
         if candidate_path.is_file() and candidate_path.suffix.lower() in {".html", ".htm"}:
@@ -4129,7 +4127,7 @@ def _validate_html_trial_outputs(payload: dict[str, Any], *, skill_dir: Path | N
             if "<html" in text or "<!doctype html" in text:
                 return
     raise ValueError(
-        "html_asset_builder 试运行必须输出 html_path 或 asset_paths，并生成真实 HTML 文件："
+        "html_asset_builder 试运行必须输出 html_path 或 file_paths/file_outputs，并生成真实 HTML 文件："
         f"argv={args!r} stdout={stdout[-4000:]} checked={[str(p) for p in checked]}"
     )
 
@@ -4153,7 +4151,7 @@ _LEGACY_OUTPUT_ALIASES: dict[str, tuple[str, ...]] = {
     "pdf_path": ("file_path", "file_paths"),
     "docx_path": ("file_path", "file_paths"),
     "pptx_path": ("file_path", "file_paths"),
-    "html_path": ("file_path", "asset_paths"),
+    "html_path": ("file_path", "file_outputs"),
     "file_paths": ("file_path", "pdf_path", "docx_path", "pptx_path"),
 }
 
@@ -4624,7 +4622,7 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "4. 保留 sys.argv[1] JSON 输入协议，继续读取现有 SkillPlan inputs，不要改 SKILL.md 或蓝图；\n"
                 "5. stdout 必须输出真实存在的 pdf_path/file_paths，且文件必须是合法 PDF；\n"
                 "6. 不允许通过 try/except 输出 {'error': ...}、{}、{'pdf_path': ''} 或空 file_paths 来绕过试运行；\n"
-                "7. 修复目标是让包含中文的 article_text/story_text/text/content 能成功写入 PDF。"
+                "7. 修复目标是让包含中文的 text/content 能成功写入 PDF。"
             )
 
         if (
@@ -5240,7 +5238,7 @@ def _script_generation_skeleton(
                 "  const imagePrompt = textResult.text || prompt;\n"
                 "  const imageCode = `from backend.services.skill_runtime import generate_stable_diffusion_image\\nimport json,sys\\nresult = generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated')\\nprint(json.dumps(result, ensure_ascii=False))`;\n"
                 "  const imageResult = pyEval(imageCode, imagePrompt);\n"
-                "  return { text: textResult.text, text_with_image_prompts: [{ text: textResult.text, image_prompt: imagePrompt }], image_paths: [imageResult.image_path].filter(Boolean), images: [imageResult] };\n"
+                "  return { text: textResult.text, image_paths: [imageResult.image_path].filter(Boolean) };\n"
                 "}\n"
                 "console.log(JSON.stringify(run(payload)));"
             )
@@ -5256,10 +5254,8 @@ def _script_generation_skeleton(
                 "  if (proc.status !== 0) throw new Error(proc.stderr || 'generate_stable_diffusion_image failed');\n"
                 "  const result = JSON.parse(proc.stdout);\n"
                 "  const image_paths = [];\n"
-                "  const images = [];\n"
                 "  image_paths.push(result.image_path);\n"
-                "  images.push(result);\n"
-                "  return { image_paths: image_paths.filter(Boolean), images };\n"
+                "  return { image_paths: image_paths.filter(Boolean) };\n"
                 "}\n"
                 "console.log(JSON.stringify(run(payload)));"
             )
@@ -5300,11 +5296,11 @@ def _script_generation_skeleton(
 
     if plan_entry.runtime in {"bash", "shell"}:
         if {"text_generation", "image_generation"} <= set(effective_required_capabilities):
-            helper = "from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); text=generate_text_with_llm(prompt); result=generate_stable_diffusion_image(text or prompt, filename_prefix='generated'); print(json.dumps({'story_text': text, 'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': text or prompt}], 'image_paths':[result.get('image_path')], 'images':[result]}, ensure_ascii=False))"
+            helper = "from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); text=generate_text_with_llm(prompt); result=generate_stable_diffusion_image(text or prompt, filename_prefix='generated'); print(json.dumps({'text': text, 'image_paths':[result.get('image_path')]}, ensure_ascii=False))"
         elif plan_entry.role == "image_generator":
-            helper = "from backend.services.skill_runtime import generate_stable_diffusion_image; import json,sys; result=generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated'); print(json.dumps({'image_paths':[result.get('image_path')], 'images':[result]}, ensure_ascii=False))"
+            helper = "from backend.services.skill_runtime import generate_stable_diffusion_image; import json,sys; result=generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated'); print(json.dumps({'image_paths':[result.get('image_path')]}, ensure_ascii=False))"
         elif plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
-            helper = "from backend.services.skill_runtime import create_pdf; import json,sys; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + " or 'Generated PDF'); print(json.dumps(create_pdf(text, output_dir=p.get('output_dir') or 'assets/generated'), ensure_ascii=False))"
+            helper = "from backend.services.skill_runtime import create_pdf; import json,sys; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + " or 'Generated PDF'); print(json.dumps(create_pdf(text, output_dir=p.get('output_dir') or 'outputs'), ensure_ascii=False))"
         elif plan_entry.role == "text_generator":
             helper = "from backend.services.skill_runtime import generate_text_with_llm; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); print(json.dumps({'text': generate_text_with_llm(prompt)}, ensure_ascii=False))"
         else:
@@ -5339,7 +5335,7 @@ def _script_generation_skeleton(
             "        return {}\n\n"
             "def run(payload: dict) -> dict:\n"
             "    prev = previous_payload(payload)\n"
-            f"    text = str(payload.get('story_text') or payload.get('text') or prev.get('story_text') or prev.get('text') or {py_value_expr} or 'Generated document').strip()\n"
+            f"    text = str(payload.get('text') or prev.get('text') or {py_value_expr} or 'Generated document').strip()\n"
             "    return create_docx(text, filename='output.docx')\n\n"
             "def main() -> None:\n"
             "    print_json(run(parse_args()))\n\n"
@@ -5358,7 +5354,7 @@ def _script_generation_skeleton(
             "        return {}\n"
             "    return json.loads(sys.argv[1])\n\n"
             "def run(payload: dict) -> dict:\n"
-            f"    text = str(payload.get('story_text') or payload.get('text') or {py_value_expr} or 'Generated presentation').strip()\n"
+            f"    text = str(payload.get('text') or {py_value_expr} or 'Generated presentation').strip()\n"
             "    return create_pptx(text, filename='output.pptx')\n\n"
             "def main() -> None:\n"
             "    print_json(run(parse_args()))\n\n"
@@ -5368,7 +5364,7 @@ def _script_generation_skeleton(
 
     if plan_entry.role in {"html_asset_builder", "asset_builder"} or ({"html_generation", "html_asset_generation"} & set(effective_required_capabilities)):
         return (
-            "必须使用下面的 html_asset_builder Python 脚本骨架；只能在当前 Skill 的 assets/generated/ 下写入 HTML，并在 stdout JSON 返回 html_path 与 asset_paths：\n"
+            "必须使用下面的 html_asset_builder Python 脚本骨架；只能在当前 Skill 的 OUTPUT_DIR/outputs 下写入 HTML，并在 stdout JSON 返回 html_path、file_paths 与 file_outputs：\n"
             "import html\n"
             "import json\n"
             "import re\n"
@@ -5388,14 +5384,14 @@ def _script_generation_skeleton(
             "def run(payload: dict) -> dict:\n"
             f"    title = str({py_value_expr} or 'generated').strip()\n"
             "    skill_root = Path(__file__).resolve().parents[1]\n"
-            "    out_dir = (skill_root / 'assets' / 'generated').resolve()\n"
-            "    required_root = (skill_root / 'assets' / 'generated').resolve()\n"
+            "    out_dir = (skill_root / 'outputs').resolve()\n"
+            "    required_root = (skill_root / 'outputs').resolve()\n"
             "    out_dir.mkdir(parents=True, exist_ok=True)\n"
             "    html_path = (out_dir / (slugify(title) + '.html')).resolve()\n"
             "    html_path.relative_to(required_root)\n"
             "    html_path.write_text(build_html(payload), encoding='utf-8')\n"
             "    rel = html_path.relative_to(skill_root).as_posix()\n"
-            "    return {'html_path': rel, 'asset_paths': [rel]}\n\n"
+            "    return {'html_path': rel, 'file_paths': [rel], 'file_outputs': [rel]}\n\n"
             "def main() -> None:\n"
             "    payload = parse_args()\n"
             "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
@@ -5405,7 +5401,7 @@ def _script_generation_skeleton(
 
     if {"text_generation", "image_generation"} <= set(effective_required_capabilities):
         return (
-            "必须使用下面的 composite_generator 脚本骨架；先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout JSON 包含 text 与 image_paths/images：\n"
+            "必须使用下面的 composite_generator 脚本骨架；先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout JSON 包含 text 与 image_paths：\n"
             "import json\n"
             "import sys\n"
             "from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image\n\n"
@@ -5417,7 +5413,7 @@ def _script_generation_skeleton(
             f"    return str({py_value_expr}).strip()\n\n"
             "def generate_text(prompt: str) -> str:\n"
             "    return generate_text_with_llm(prompt).strip()\n\n"
-            "def generate_images(text: str, prompt: str) -> tuple[list[str], list[dict]]:\n"
+            "def generate_images(text: str, prompt: str) -> list[str]:\n"
             "    image_prompt = text or prompt\n"
             "    result = generate_stable_diffusion_image(image_prompt, filename_prefix='generated')\n"
             "    image_paths = [result.get('image_path')]\n"
@@ -5426,8 +5422,8 @@ def _script_generation_skeleton(
             "def run(payload: dict) -> dict:\n"
             "    prompt = build_prompt(payload)\n"
             "    text = generate_text(prompt)\n"
-            "    image_paths, images = generate_images(text, prompt)\n"
-            "    return {'story_text': text, 'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': text or prompt}], 'image_paths': image_paths, 'images': images}\n\n"
+            "    image_paths = generate_images(text, prompt)\n"
+            "    return {'text': text, 'image_paths': image_paths}\n\n"
             "def main() -> None:\n"
             "    payload = parse_args()\n"
             "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
@@ -5451,12 +5447,10 @@ def _script_generation_skeleton(
             "def run(payload: dict) -> dict:\n"
             "    desc = build_image_prompt(payload)\n"
             "    image_paths = []\n"
-            "    images = []\n"
             "    result = generate_stable_diffusion_image(desc, filename_prefix='generated')\n"
             "    image_paths.append(result.get('image_path'))\n"
-            "    images.append(result)\n"
             "    image_paths = [p for p in image_paths if isinstance(p, str) and p]\n"
-            "    return {'image_paths': image_paths, 'images': images}\n\n"
+            "    return {'image_paths': image_paths}\n\n"
             "def main() -> None:\n"
             "    payload = parse_args()\n"
             "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
@@ -5475,7 +5469,7 @@ def _script_generation_skeleton(
             "        return {}\n"
             "    return json.loads(sys.argv[1])\n\n"
             "def run(payload: dict) -> dict:\n"
-            f"    text = str({py_value_expr} or payload.get('story_text') or payload.get('content') or 'Generated PDF').strip()\n"
+            f"    text = str({py_value_expr} or payload.get('text') or payload.get('content') or 'Generated PDF').strip()\n"
             "    return create_pdf(text, filename='output.pdf')\n\n"
             "def main() -> None:\n"
             "    print_json(run(parse_args()))\n\n"
@@ -5498,7 +5492,7 @@ def _script_generation_skeleton(
             "    return generate_text_with_llm(prompt)\n\n"
             "def run(payload: dict) -> dict:\n"
             "    text = generate_text(payload).strip()\n"
-            "    return {'story_text': text, 'text': text}\n\n"
+            "    return {'text': text}\n\n"
             "def main() -> None:\n"
             "    payload = parse_args()\n"
             "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
@@ -5615,23 +5609,25 @@ def _build_generate_file_prompt(
             "4. SKILL.md 必须生成成 E2E 可试运行的线性 workflow，不允许依赖后续人工修产物文件。\n"
             "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个标准、独立、无缩进的 ```bash fenced code block。\n"
             "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径，并在脚本路径后传入一个 JSON object argv。\n"
-            "7. JSON argv 必须是 json.loads 可解析的模板；所有动态占位符必须是字符串值，例如 \"theme\":\"{{theme}}\"；禁止裸写 \"scene_count\":{{scene_count}}。\n"
-            "8. 若需要默认数字，直接写 JSON 数字，例如 \"scene_count\":3；不要把数字 placeholder 裸露在 JSON 中。\n"
-            "9. E2E 不理解自然语言循环；禁止写“每幕一次/共3次/对每个场景调用一次”作为执行协议。多场景循环必须由脚本内部完成，SKILL.md 只写一次脚本调用。\n"
-            "10. 后续步骤只能引用前序脚本 stdout JSON 中真实输出的字段；禁止发明 image_path_1/image_path_2/image_path_3 等编号字段。\n"
-            "11. 列表或对象字段必须通过整值占位符传递，例如 \"image_paths\":\"{{image_paths}}\"，不要写成 [\"{{image_path_1}}\",\"{{image_path_2}}\"]。\n"
-            "12. 如果蓝图包含 references/ 资源，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个 references/ 路径，并说明何时读取。\n"
-            "13. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含标准 ```bash fenced code block。\n"
-            "14. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
-            "15. 禁止复制 Creator 界面流程、确认清单、‘点击开始创建/开始生成’、系统将自动创建文件等平台创建流程文案。\n"
-            "16. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
-            "17. 后续脚本命令中，JSON key 是当前脚本读取的 argv 字段；{{placeholder}} 是上游 stdout 字段。脚本源码只需要读取 JSON key，不需要出现 placeholder 名称。\n"
-            "18. 禁止为下游脚本添加没有上游来源的额外 placeholder，例如禁止 custom_character:\"{{character}}\"，除非前序 stdout 明确输出 character。\n"
-            "19. 对图片生成脚本，若上一步输出 script_content，则推荐命令为：python scripts/generate_images.py '{\"scene_text\":\"{{script_content}}\"}'，不要额外添加 custom_character。\n"
-            "20. SKILL.md 必须覆盖蓝图真实规划的任务、workflow、脚本顺序、输入输出数据流、资源使用和最终产物。\n"
-            "21. 真实文件计划需要结合蓝图语境判断：目录结构、SkillPlan path、dependencies、references 字段通常是真实文件计划。\n"
-            "22. 如果蓝图在“禁止隐式执行/示例/反例/例如/比如”语境中提到某个 scripts/*.py、references/*.md 或 assets/*，它只是解释性示例，不应进入最终 SKILL.md，除非它同时出现在目录结构或 SkillPlan path 中。\n"
-            "23. 不要为了满足格式而新增蓝图外脚本；只为蓝图真实规划脚本提供命令块。\n"
+            "7. 第一条脚本命令只能引用 external envelope 中确定存在的通用字段：user_request、input、text、input_files、files、fields、options，或显式结构化来源提供的字段。\n"
+            "8. 如果 Skill 需要业务字段，第一脚本必须从 user_request/input/text 或 fields 中自行解析，并通过 stdout JSON 输出；平台不会根据自然语言猜字段。\n"
+            "9. 后续脚本命令只能引用当前 context 或前序 stdout JSON 中真实存在的字段；字段名由该 Skill 自己的 stdout 和命令决定。\n"
+            "10. JSON argv 必须是 json.loads 可解析的模板；所有动态 placeholder 必须是字符串值；禁止裸写动态数值 placeholder。\n"
+            "11. 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。\n"
+            "12. E2E 不理解自然语言循环；批量处理、列表处理或多文件处理必须在对应脚本内部完成，SKILL.md 只写一次脚本调用。\n"
+            "13. 列表或对象字段必须通过整值占位符传递；不要写成由无来源拆分字段拼接的列表。\n"
+            "14. 如果蓝图包含 references/ 资源，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个 references/ 路径，并说明何时读取。\n"
+            "15. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含标准 ```bash fenced code block。\n"
+            "16. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
+            "17. 禁止复制 Creator 界面流程、确认清单、‘点击开始创建/开始生成’、系统将自动创建文件等平台创建流程文案。\n"
+            "18. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
+            "19. 后续脚本命令中，JSON key 是当前脚本读取的 argv 字段；{{placeholder}} 是 external envelope、显式 fields/defaults/input binding、或上游 stdout 字段。脚本源码只需要读取 JSON key，不需要出现 placeholder 名称。\n"
+            "20. 禁止为下游脚本添加没有上游来源的额外 placeholder；不要在平台 prompt 中固定中间字段名。\n"
+            "21. 最后一步 stdout 必须包含平台标准输出字段，例如 text、markdown、image_path、image_paths、pdf_path、docx_path、pptx_path、html_path、file_paths 或 file_outputs。\n"
+            "22. SKILL.md 必须覆盖蓝图真实规划的任务、workflow、脚本顺序、输入输出数据流、资源使用和最终产物。\n"
+            "23. 真实文件计划需要结合蓝图语境判断：目录结构、SkillPlan path、dependencies、references 字段通常是真实文件计划。\n"
+            "24. 如果蓝图在“禁止隐式执行/示例/反例/例如/比如”语境中提到某个 scripts/*.py、references/*.md 或 assets/*，它只是解释性示例，不应进入最终 SKILL.md，除非它同时出现在目录结构或 SkillPlan path 中。\n"
+            "25. 不要为了满足格式而新增蓝图外脚本；只为蓝图真实规划脚本提供命令块。\n"
             f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n\n"
             "以下 E2E workflow authoring guide 是强制生成策略，最终 SKILL.md 必须按它组织命令和数据流：\n"
             f"{skill_md_e2e_authoring_guide}\n\n"
@@ -5654,9 +5650,9 @@ def _build_generate_file_prompt(
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
             "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：text_generation 使用 generate_text_with_llm 或 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；image_generation 使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
             "7. 是否必须调用文本/图片模型只由当前脚本 SkillPlan.required_capabilities 决定：包含 image_generation 时必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`；builder/exporter 默认是确定性文件构建脚本，不要因为整个 Skill.md 提到模型就强制 builder 调模型；若 builder 需要模型辅助，用 optional_capabilities/allowed_capabilities 或显式 required_capabilities 表达。\n"
-            "8. image_generation stdout 输出结构化 JSON，并返回 helper 结果里的 image_paths/images；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\"))、images.append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
+            "8. image_generation stdout 输出结构化 JSON，并返回 helper 结果里的 image_paths；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\")).append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
-            "10. stdout 输出结构化 JSON，字段必须以 SkillPlan.outputs 为准；允许极少数 legacy alias 仅用于兼容旧 Skill，新生成 Skill 必须统一字段命名，不要混用 text/text_content/story_text 等别名；composite_generator 只表示多能力组合，具体输出由 outputs/required_capabilities 决定。\n"
+            "10. stdout 输出结构化 JSON，字段必须以 SkillPlan.outputs 为准；允许极少数 legacy alias 仅用于兼容旧 Skill，新生成 Skill 必须统一字段命名，不要混用 text/text_content 等别名；composite_generator 只表示多能力组合，具体输出由 outputs/required_capabilities 决定。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
             "12. 必须基于下方固定骨架生成：默认优先 Python；若 SkillPlan.runtime 为 node/bash，则使用对应骨架并保留入口、参数解析和 JSON stdout。\n"
             f"13. 最终响应必须是单个 {plan_entry.language} 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
@@ -6459,17 +6455,15 @@ def _format_json_shape(obj: dict[str, Any]) -> str:
 
 _SANDBOX_TERMINAL_OUTPUT_KEYS = {
     "text",
-    "story_text",
     "markdown",
     "image_path",
     "image_paths",
-    "images",
     "pdf_path",
     "docx_path",
     "pptx_path",
     "html_path",
-    "asset_paths",
     "file_paths",
+    "file_outputs",
 }
 
 
@@ -6497,7 +6491,7 @@ def _has_sandbox_terminal_output(payload: dict[str, Any]) -> bool:
 
     这里校验的是平台与 Skill 交互的最终输出协议，不校验中间步骤。
     """
-    for key in ("text", "story_text", "markdown"):
+    for key in ("text", "markdown"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return True
@@ -6507,7 +6501,7 @@ def _has_sandbox_terminal_output(payload: dict[str, Any]) -> bool:
         if isinstance(value, str) and value.strip():
             return True
 
-    for key in ("image_paths", "asset_paths", "file_paths"):
+    for key in ("image_paths", "file_paths", "file_outputs"):
         value = payload.get(key)
         if (
             isinstance(value, list)
@@ -6515,12 +6509,6 @@ def _has_sandbox_terminal_output(payload: dict[str, Any]) -> bool:
             and all(isinstance(item, str) and item.strip() for item in value)
         ):
             return True
-
-    images = payload.get("images")
-    if isinstance(images, list) and images:
-        for item in images:
-            if isinstance(item, dict) and isinstance(item.get("image_path"), str) and item["image_path"].strip():
-                return True
 
     return False
 
@@ -6549,8 +6537,8 @@ def _validate_final_platform_output_contract(
                 f"当前 stdout 字段：{sorted(stdout_json.keys())}\n"
                 f"平台允许的最终输出字段：{sorted(_SANDBOX_TERMINAL_OUTPUT_KEYS)}\n\n"
                 "注意：中间步骤可以使用任意内部字段名，不需要对齐平台协议；"
-                "但最后一步必须输出平台字段，例如 text、markdown、image_paths、images、"
-                "pdf_path、docx_path、pptx_path、html_path、asset_paths 或 file_paths。\n\n"
+                "但最后一步必须输出平台字段，例如 text、markdown、image_paths、"
+                "pdf_path、docx_path、pptx_path、html_path、file_paths 或 file_outputs。\n\n"
                 "已成功执行的前序边界 trace：\n"
                 f"{_format_e2e_trace(traces)}"
             ),
@@ -6880,9 +6868,11 @@ def _render_e2e_command_payload(
         raise ValueError(
             _e2e_error(
                 target=command.source_path,
-                layer="e2e_dataflow",
+                layer="external_input_missing" if command.ordinal == 1 else "e2e_dataflow_missing",
                 message=(
-                    f"第 {command.ordinal} 步 {command.script_path} 的命令模板引用了当前 payload 中不存在的字段："
+                    ("平台外部输入缺失，第一条命令不能引用无确定来源字段。" if command.ordinal == 1 else "Skill 内部 dataflow 缺失，后续命令只能引用已有 context 或前序 stdout 字段。")
+                    + "\n"
+                    + f"第 {command.ordinal} 步 {command.script_path} 的命令模板引用了当前 payload 中不存在的字段："
                     f"{', '.join(unique_missing)}。\n"
                     f"当前可用字段：{', '.join(available) or '(无)'}。\n"
                     f"命令来源：{command.source_path}\n"
@@ -6900,22 +6890,19 @@ def _render_e2e_command_payload(
     return rendered
 
 
-def _seed_initial_e2e_payload(commands: list[E2EWorkflowCommand]) -> dict[str, Any]:
-    """Seed only the first command's user-facing placeholders.
+def _seed_initial_e2e_payload(
+    commands: list[E2EWorkflowCommand],
+    *,
+    external_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Seed Creator E2E with the same generic external input envelope as runtime.
 
-    This simulates runtime user input extraction, but does not seed downstream
-    placeholders. Therefore if later steps require fields not produced by upstream
-    stdout, E2E validation will fail strictly.
+    The platform never invents business fields for the first command.  Free-form
+    text is available only through user_request/input/text; structured values are
+    available only when supplied through JSON/key-value fields, explicit fields,
+    input files, defaults, or options.
     """
-    if not commands:
-        return {}
-
-    seed: dict[str, Any] = {}
-    for key in sorted(_collect_placeholders_from_payload_template(commands[0].argv_template)):
-        seed[key] = _sample_value_for_placeholder(key)
-
-    # Also expose common aliases only if the first command actually uses them.
-    return seed
+    return dict(external_context or build_creator_external_input_context(messages=[]))
 
 
 def _e2e_error(*, target: str, layer: str, message: str) -> str:
@@ -7180,7 +7167,7 @@ def _validate_e2e_command_static(
     return entry
 
 
-def _run_skill_workflow_e2e_once(skill_name: str) -> list[str]:
+def _run_skill_workflow_e2e_once(skill_name: str, *, external_context: dict[str, Any] | None = None) -> list[str]:
     """Run SKILL.md workflow once with soft internal dataflow validation.
 
     规则：
@@ -7262,7 +7249,7 @@ def _run_skill_workflow_e2e_once(skill_name: str) -> list[str]:
         tmp_handle, trial_skill_dir = _copy_skill_dir_for_e2e(skill_name)
         trial_skill_md = (trial_skill_dir / "SKILL.md").read_text(encoding="utf-8")
 
-        payload: dict[str, Any] = _seed_initial_e2e_payload(commands)
+        payload: dict[str, Any] = _seed_initial_e2e_payload(commands, external_context=external_context)
         traces: list[E2EStepTrace] = []
 
         venv_python: Path | None = None
@@ -7625,8 +7612,8 @@ async def _repair_existing_file_for_e2e_failure(
             "并在 stdout 输出合法 JSON object。"
             "中间脚本 stdout 可以使用内部字段名；"
             "如果这是最后一步，stdout 必须包含 sandbox 平台可消费的最终字段："
-            "text、story_text、markdown、image_path、image_paths、images、"
-            "pdf_path、docx_path、pptx_path、html_path、asset_paths 或 file_paths。"
+            "text、markdown、image_path、image_paths、"
+            "pdf_path、docx_path、pptx_path、html_path、file_paths 或 file_outputs。"
             "如果后续步骤需要某个字段，当前脚本 stdout JSON 必须真实输出该字段。"
             "错误信息中的“已成功执行的前序边界 trace”代表前序步骤已通过，不要改变前序字段名。"
             "不要输出 Markdown，不要输出 error 字段，不要 mock/placeholder。"
@@ -7762,14 +7749,23 @@ def _is_shell_fence_info(info: str) -> bool:
     first = normalized.split()[0]
     return first in {"bash", "sh", "shell", "zsh"}
 
-def _validate_skill_package_smoke(skill_name: str, *, mode: str = "trial") -> list[str]:
+def _validate_skill_package_smoke(skill_name: str, *, mode: str = "trial", external_context: dict[str, Any] | None = None) -> list[str]:
     """Strict end-to-end workflow validation.
 
     This replaces the old per-script smoke test with a real SKILL.md workflow run:
     upstream stdout JSON is parsed and merged into payload, then used to render
     downstream JSON argv placeholders.
     """
-    return _run_skill_workflow_e2e_once(skill_name)
+    return _run_skill_workflow_e2e_once(skill_name, external_context=external_context)
+
+def _external_context_from_skill_action_request(request: SkillActionRequest) -> dict[str, Any]:
+    return build_creator_external_input_context(
+        messages=request.messages,
+        input_files=request.input_files,
+        fields=request.fields,
+        options=request.options,
+    )
+
 
 @router.post("/validate-skill", response_model=SkillActionResponse)
 async def validate_skill(request: SkillActionRequest):
@@ -7796,7 +7792,8 @@ async def validate_skill(request: SkillActionRequest):
     repair_logs: list[str] = []
 
     while True:
-        e2e_errors = _validate_skill_package_smoke(skill_name, mode="trial")
+        external_context = _external_context_from_skill_action_request(request)
+        e2e_errors = _run_skill_workflow_e2e_once(skill_name, external_context=external_context)
         if not e2e_errors:
             suffix = ""
             if repair_logs:
@@ -7871,7 +7868,8 @@ async def package_skill(request: PackageSkillRequest):
     skill_name = _validate_skill_name(request.skill_name)
 
     if request.validate_before_package:
-        e2e_errors = _validate_skill_package_smoke(skill_name, mode="trial")
+        external_context = _external_context_from_skill_action_request(request)
+        e2e_errors = _validate_skill_package_smoke(skill_name, mode="trial", external_context=external_context)
         if e2e_errors:
             return SkillActionResponse(
                 success=False,

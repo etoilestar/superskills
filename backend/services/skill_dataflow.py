@@ -245,7 +245,10 @@ def initial_context_from_entries(entries: Iterable[dict[str, Any]], *, user_text
     text = (user_text or "").strip()
     if text:
         context.update({"user_request": text, "input": text, "text": text})
-        context.update(extract_inline_context_values(text))
+        structured_fields = extract_inline_context_values(text)
+        if structured_fields:
+            context.setdefault("fields", {}).update(structured_fields)
+            context.update(structured_fields)
 
     context.update(user_context or {})
     return context
@@ -677,32 +680,52 @@ def materialize_step_contexts_from_plan(
     loop = step_plan.get("loop")
     collection_path = workflow_loop_collection_path(loop)
 
-    if isinstance(loop, dict) and loop and collection_path not in {"", "auto"}:
-        try:
-            collection = resolve_context_value(context, collection_path)
-        except KeyError as exc:
-            raise LoopExpansionError([collection_path], message=f"循环集合不存在: {collection_path}") from exc
+    if isinstance(loop, dict) and loop:
+        if collection_path == "auto":
+            mapping = step_plan.get("input_mapping") or {}
+            needed = {_source_path_for_error(source) or str(key) for key, source in mapping.items()}
+            collection = None
+            collection_name = "auto"
+            for key, value in context.items():
+                if not isinstance(value, list) or not value:
+                    continue
+                if all(isinstance(item, dict) and needed.intersection(item.keys()) for item in value):
+                    collection = value
+                    collection_name = str(key)
+                    break
+            if collection is None:
+                raise LoopExpansionError(sorted(needed), message="自动循环集合不存在或无法满足输入映射")
+        elif collection_path:
+            try:
+                collection = resolve_context_value(context, collection_path)
+                collection_name = collection_path
+            except KeyError as exc:
+                raise LoopExpansionError([collection_path], message=f"循环集合不存在: {collection_path}") from exc
+        else:
+            collection = None
+            collection_name = collection_path
 
-        if not isinstance(collection, list) or not collection:
-            raise LoopExpansionError(
-                [collection_path],
-                message=f"循环集合不是非空列表: {collection_path}; {_preview_value_for_error(collection)}",
-            )
+        if collection is not None:
+            if not isinstance(collection, list) or not collection:
+                raise LoopExpansionError(
+                    [collection_name],
+                    message=f"循环集合不是非空列表: {collection_name}; {_preview_value_for_error(collection)}",
+                )
 
-        item_name = str(loop.get("item_name") or "loop_item")
-        contexts: list[dict] = []
+            item_name = str(loop.get("item_name") or "loop_item")
+            contexts: list[dict] = []
 
-        for index, item in enumerate(collection):
-            child = dict(context)
-            child[item_name] = item
-            child["loop_item"] = item
-            child["loop_index"] = index
-            if isinstance(item, dict):
-                child.update(item)
-            child.update(resolve_input_mapping(step_plan.get("input_mapping") or {}, child))
-            contexts.append(child)
+            for index, item in enumerate(collection):
+                child = dict(context)
+                child[item_name] = item
+                child["loop_item"] = item
+                child["loop_index"] = index
+                if isinstance(item, dict):
+                    child.update(item)
+                child.update(resolve_input_mapping(step_plan.get("input_mapping") or {}, child))
+                contexts.append(child)
 
-        return contexts
+            return contexts
 
     # 非循环步骤
     mapped = resolve_input_mapping(step_plan.get("input_mapping") or {}, context)

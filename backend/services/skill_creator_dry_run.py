@@ -84,7 +84,8 @@ def build_creator_external_input_context(
     user_text = _last_user_message_text(messages or [])
     input_files = list(input_files or [])
     inline_fields = extract_inline_context_values(user_text) if user_text else {}
-    merged_fields = {**inline_fields, **(fields or {})}
+    merged_fields = _non_secret_mapping({**inline_fields, **(fields or {})})
+    safe_options = _non_secret_mapping(options or {})
     files = _simplify_input_files(input_files)
     context: dict[str, Any] = {
         "user_request": user_text,
@@ -93,7 +94,7 @@ def build_creator_external_input_context(
         "input_files": input_files,
         "files": files,
         "fields": merged_fields,
-        "options": dict(options or {}),
+        "options": safe_options,
     }
     context.update(merged_fields)
     return context
@@ -397,10 +398,14 @@ def _context_from_chat_request(chat_request: Any) -> dict[str, Any]:
     if isinstance(chat_request, dict):
         messages = chat_request.get("messages") or []
         input_files = chat_request.get("input_files") or []
+        fields = chat_request.get("fields") or {}
+        options = chat_request.get("options") or {}
     else:
         messages = getattr(chat_request, "messages", []) or []
         input_files = getattr(chat_request, "input_files", []) or []
-    return build_creator_external_input_context(messages=messages, input_files=input_files)
+        fields = getattr(chat_request, "fields", {}) or {}
+        options = getattr(chat_request, "options", {}) or {}
+    return build_creator_external_input_context(messages=messages, input_files=input_files, fields=fields, options=options)
 
 
 def _last_user_message_text(messages: list[Any]) -> str:
@@ -429,7 +434,7 @@ def _simplify_input_files(input_files: list[dict[str, Any]]) -> dict[str, str]:
 
 
 def _missing_input_issue(exc: Exception, *, step: StepContract, first_step: bool) -> ContractIssue:
-    code = "external_input_missing" if first_step else "missing_variables"
+    code = "external_input_missing" if first_step else "e2e_dataflow_missing"
     message = str(exc)
     if isinstance(exc, KeyError) and exc.args:
         message = f"缺少确定来源变量: {exc.args[0]}"
@@ -443,3 +448,13 @@ def _missing_input_issue(exc: Exception, *, step: StepContract, first_step: bool
         step_id=step.id,
         script_path=step.script_path,
     )
+
+
+def _non_secret_mapping(values: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key, value in dict(values or {}).items():
+        lowered = str(key).lower()
+        if any(token in lowered for token in ("secret", "password", "token", "api_key", "apikey")):
+            continue
+        safe[str(key)] = value
+    return safe

@@ -209,7 +209,6 @@ _TEXT_RE = re.compile(r"文本|文案|故事|童话|剧本|谜语|摘要|写作|
 _MODEL_RE = re.compile(r"模型|llm|大语言|多模态|vision|image_model|text_model", re.I)
 _IMAGE_SCRIPT_NAME_RE = re.compile(r"(?:^|[_/-])(images|imgs|render|illustration|poster|picture|photo|visuals)(?:[_.-]|$)|配图|插画|海报|图片", re.I)
 _PDF_SCRIPT_NAME_RE = re.compile(r"(?:^|[_/-])(?:build|export|create|make|render|combine|merge)?_?pdf(?:[_.-]|$)|(?:^|[_/-])(?:pdf_builder|build_pdf|export_pdf|combine_to_pdf|merge_to_pdf)(?:[_.-]|$)|合并.*pdf|pdf.*合并", re.I)
-_CUSTOM_CHARACTER_RE = re.compile(r"custom_character|character|角色|主角", re.I)
 
 
 def file_type_for_path(path: str) -> FileType:
@@ -508,11 +507,8 @@ def _should_promote_image_script_role(file_path: str, purpose: str = "", bluepri
 
 
 def _augment_inputs_for_role(role: FileRole, inputs: list[str], *, purpose: str = "", blueprint_summary: str = "") -> list[str]:
-    augmented = list(inputs)
-    text = f"{purpose}\n{blueprint_summary}"
-    if role in {"image_generator", "composite_generator"} and _CUSTOM_CHARACTER_RE.search(text) and "custom_character" not in augmented:
-        augmented.append("custom_character")
-    return augmented
+    """Return declared inputs without platform-invented business fields."""
+    return list(inputs)
 
 def file_role_classifier(
     *,

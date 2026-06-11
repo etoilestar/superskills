@@ -12,10 +12,11 @@ _ARTIFACT_FIELD_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "docx_path": (".docx",),
     "pptx_path": (".pptx",),
     "html_path": (".html", ".htm"),
+    "image_path": (".png", ".jpg", ".jpeg", ".gif", ".webp"),
 }
-_ARTIFACT_KEYS = ("pdf_path", "docx_path", "pptx_path", "html_path", "file_paths")
+_ARTIFACT_KEYS = ("image_path", "image_paths", "pdf_path", "docx_path", "pptx_path", "html_path", "file_paths", "file_outputs")
 _ARTIFACT_SUFFIXES = (".pdf", ".docx", ".pptx", ".html", ".htm", ".png", ".jpg", ".jpeg", ".gif", ".webp")
-_PATH_PREFIXES = ("assets/", "outputs/", "scripts/")
+_PATH_PREFIXES = ("outputs/",)
 
 
 class FileOutputValidationError(ValueError):
@@ -45,7 +46,7 @@ def _looks_like_artifact_path(value: str) -> bool:
 
 def _walk_artifact_values(value: Any, *, field: str) -> list[tuple[str, str]]:
     declared: list[tuple[str, str]] = []
-    if isinstance(value, str) and _looks_like_artifact_path(value):
+    if isinstance(value, str) and (field in _ARTIFACT_KEYS or _looks_like_artifact_path(value)):
         declared.append((field, value.strip()))
     elif isinstance(value, list):
         for item in value:
@@ -100,12 +101,15 @@ def resolve_declared_artifact_path(raw_path: str, *, skill_dir: Path, cwd: Path 
     else:
         normalized = raw_path.replace("\\", "/").lstrip("./")
         root = skill_dir.resolve()
-        if normalized.startswith(("assets/", "outputs/", "scripts/")):
+        if normalized.startswith("outputs/"):
             candidate = (root / path).resolve()
         else:
             candidate = ((cwd or skill_dir).resolve() / path).resolve()
     if not _is_within(candidate, skill_dir.resolve()):
         raise FileOutputValidationError(f"file_output_missing: 输出路径越界或不在安全目录内: {raw_path}")
+    outputs_root = (skill_dir.resolve() / "outputs").resolve()
+    if not _is_within(candidate, outputs_root):
+        raise FileOutputValidationError(f"file_output_missing: 输出路径必须位于 OUTPUT_DIR/outputs 下，不能使用 assets/scripts 或其他目录: {raw_path}")
     return candidate
 
 

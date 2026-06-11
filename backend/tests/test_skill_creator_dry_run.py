@@ -169,3 +169,124 @@ def test_creator_external_input_does_not_guess_business_fields(tmp_path: Path):
     assert result.issues[0]["code"] == "external_input_missing"
     assert "required_business_field" in result.issues[0]["message"]
     assert "不能由模型猜字段" in result.issues[0]["message"]
+
+
+def test_creator_external_input_accepts_determined_structured_sources(tmp_path: Path):
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "echo.py").write_text(
+        "import json, sys\np=json.loads(sys.argv[1])\nprint(json.dumps({'text': p['named_value'], 'field_value': p['field_value'], 'option_value': p['option_value']}, ensure_ascii=False))\n",
+        encoding="utf-8",
+    )
+    contract = WorkflowContract.from_raw({
+        "skill_name": "structured-sources-fixture",
+        "steps": [{
+            "id": "echo",
+            "script_path": "scripts/echo.py",
+            "inputs": {},
+            "outputs": {"text": "string"},
+            "command_template": "python scripts/echo.py '{\"named_value\":\"{{named_value}}\",\"field_value\":\"{{fields.field_value}}\",\"option_value\":\"{{options.option_value}}\"}'",
+        }],
+    })
+
+    result = run_creator_workflow_dry_run(
+        skill_dir=tmp_path,
+        contract=contract,
+        chat_request={
+            "messages": [{"role": "user", "content": '{"named_value":"from-json"}'}],
+            "fields": {"field_value": "from-fields", "secret_token": "must-not-leak"},
+            "options": {"option_value": "from-options", "api_key": "must-not-leak"},
+        },
+    )
+
+    assert result.ok, result.issues
+    assert result.context["named_value"] == "from-json"
+    assert result.context["fields"] == {"named_value": "from-json", "field_value": "from-fields"}
+    assert result.context["options"] == {"option_value": "from-options"}
+    assert result.traces[0].payload == {"text": "from-json", "field_value": "from-fields", "option_value": "from-options"}
+
+
+def test_creator_internal_missing_placeholder_reports_e2e_dataflow_missing(tmp_path: Path):
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "first.py").write_text(
+        "import json\nprint(json.dumps({'actual_internal_name':'ok'}))\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "scripts" / "second.py").write_text(
+        "import json\nprint(json.dumps({'text':'ok'}))\n",
+        encoding="utf-8",
+    )
+    contract = WorkflowContract.from_raw({
+        "skill_name": "dataflow-negative-fixture",
+        "steps": [
+            {
+                "id": "first",
+                "script_path": "scripts/first.py",
+                "inputs": {},
+                "outputs": {"actual_internal_name": "string"},
+                "command_template": "python scripts/first.py '{}'",
+            },
+            {
+                "id": "second",
+                "script_path": "scripts/second.py",
+                "inputs": {},
+                "outputs": {"text": "string"},
+                "command_template": "python scripts/second.py '{\"missing\":\"{{missing_internal_name}}\"}'",
+            },
+        ],
+    })
+
+    result = run_creator_workflow_dry_run(skill_dir=tmp_path, contract=contract, chat_request={"messages": []})
+
+    assert not result.ok
+    assert result.issues[0]["code"] == "e2e_dataflow_missing"
+    assert "missing_internal_name" in result.issues[0]["message"]
+
+
+def test_creator_artifact_outputs_must_not_be_assets(tmp_path: Path):
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "runtime.txt").write_text("runtime artifact in wrong dir", encoding="utf-8")
+    (tmp_path / "scripts" / "bad_artifact.py").write_text(
+        "import json\nprint(json.dumps({'file_paths':['assets/runtime.txt']}))\n",
+        encoding="utf-8",
+    )
+    contract = WorkflowContract.from_raw({
+        "skill_name": "artifact-negative-fixture",
+        "steps": [{
+            "id": "bad_artifact",
+            "script_path": "scripts/bad_artifact.py",
+            "inputs": {},
+            "outputs": {"file_paths": {"type": "file_paths", "path_must_exist": True}},
+            "command_template": "python scripts/bad_artifact.py '{}'",
+        }],
+    })
+
+    result = run_creator_workflow_dry_run(skill_dir=tmp_path, contract=contract, chat_request={"messages": []})
+
+    assert not result.ok
+    assert result.issues[0]["code"] == "file_output_missing"
+    assert "OUTPUT_DIR/outputs" in result.issues[0]["message"]
+
+
+def test_skill_action_and_package_requests_build_same_external_context():
+    from backend.routers.creator import (
+        PackageSkillRequest,
+        SkillActionRequest,
+        _external_context_from_skill_action_request,
+    )
+
+    payload = {
+        "skill_name": "same-envelope-fixture",
+        "messages": [{"role": "user", "content": '{"declared":"json"}'}],
+        "input_files": [{"path": "inputs/session/data.txt", "filename": "data.txt"}],
+        "fields": {"explicit": "field"},
+        "options": {"safe_option": "value"},
+    }
+
+    validate_context = _external_context_from_skill_action_request(SkillActionRequest(**payload))
+    package_context = _external_context_from_skill_action_request(PackageSkillRequest(**payload))
+
+    assert package_context == validate_context
+    assert package_context["user_request"] == '{"declared":"json"}'
+    assert package_context["files"] == {"data.txt": "inputs/session/data.txt"}
+    assert package_context["fields"] == {"declared": "json", "explicit": "field"}
