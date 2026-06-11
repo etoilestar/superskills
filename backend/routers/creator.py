@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
-from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders
+from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan
 from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
@@ -749,6 +749,7 @@ class ContractCheckResult:
     expected: str
     minimal_edit: str
     matched_paths: list[str] = field(default_factory=list)
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 class ContractValidationError(ValueError):
@@ -771,22 +772,9 @@ def _infer_script_input_keys_from_blueprint(script_path: str, blueprint_text: st
 
 def _script_command_template(script_path: str, blueprint_text: str, entry: SkillPlanEntry | None = None) -> str:
     """Render the command template from SkillPlanEntry, the sole execution contract."""
-    if entry is not None and entry.command_template:
-        return entry.command_template
-    keys = list(entry.inputs) if entry is not None else _infer_script_input_keys_from_blueprint(script_path, blueprint_text)
-    if not keys:
-        keys = ["payload"]
-    payload = json.dumps({key: f"{{{{{key}}}}}" for key in keys}, ensure_ascii=False)
-    runtime = entry.runtime if entry is not None else runtime_for_language(language_for_path(script_path), file_type_for_path(script_path))
-    if runtime == "node":
-        return f"node {script_path} '{payload}'"
-    if runtime == "bash":
-        return f"bash {script_path} '{payload}'"
-    if runtime == "shell":
-        return f"sh {script_path} '{payload}'"
-    if runtime == "python":
-        return f"python {script_path} '{payload}'"
-    return f"{script_path} '{payload}'"
+    if entry is None:
+        entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
+    return render_script_command_from_skill_plan(entry)
 
 
 
@@ -843,26 +831,35 @@ def _command_template_equivalent(command: str, script_path: str, entry: SkillPla
         return False
     return command_sig["placeholders"] == template_sig["placeholders"]
 
-def _command_payload_keys(command: str, script_path: str) -> set[str] | None:
-    """Return JSON argv keys passed to script_path, or None if unparsable/non-JSON."""
+
+
+def _command_payload_object(command: str, script_path: str) -> dict[str, Any] | None:
+    """Return the JSON argv object passed to script_path, or None if unparsable."""
     try:
-        parts = shlex.split(command)
+        parts = shlex.split(command or "")
     except ValueError:
         return None
+    expected = script_path.replace("\\", "/")
     for idx, part in enumerate(parts):
         normalized = part.replace("\\", "/")
-        if normalized == script_path or normalized.endswith("/" + script_path):
+        if normalized == expected or normalized.endswith("/" + expected):
             if idx + 1 >= len(parts):
-                return set()
+                return {}
             try:
                 payload = json.loads(parts[idx + 1])
             except json.JSONDecodeError:
                 return None
             if not isinstance(payload, dict):
                 return None
-            return {str(key) for key in payload.keys()}
+            return {str(key): value for key, value in payload.items()}
     return None
 
+def _command_payload_keys(command: str, script_path: str) -> set[str] | None:
+    """Return JSON argv keys passed to script_path, or None if unparsable/non-JSON."""
+    payload = _command_payload_object(command, script_path)
+    if payload is None:
+        return None
+    return set(payload.keys())
 
 
 def _command_runtime_matches(command: str, script_path: str, entry: SkillPlanEntry) -> bool:
@@ -888,8 +885,9 @@ def _command_runtime_matches(command: str, script_path: str, entry: SkillPlanEnt
 def _check_command_block_contract(script_path: str, commands: list[str], entry: SkillPlanEntry) -> list[ContractCheckResult]:
     """Validate command blocks as workflow-local execution contracts.
 
-    - Only enforce parseable JSON argv and runtime consistency.
-    - Internal workflow fields are flexible; do not force exact equality with SkillPlan inputs.
+    - Enforce parseable JSON argv and runtime consistency.
+    - JSON argv field names remain skill-specific, but each command must exactly
+      match that script's SkillPlan.inputs.
     """
     results: list[ContractCheckResult] = []
 
@@ -916,8 +914,8 @@ def _check_command_block_contract(script_path: str, commands: list[str], entry: 
             passed=runtime_matches,
             target=target,
             message="命令块 runner 与脚本 runtime 一致。" if runtime_matches else f"命令块 runner 与脚本 runtime={entry.runtime} 不一致。",
-            expected="Python 用 python，Node 用 node，Bash/Shell 用 bash/sh；内部 JSON keys 不由 SkillPlan 强制。",
-            minimal_edit="修正 runner 或脚本路径，不要改内部 workflow 字段名。",
+            expected="Python 用 python，Node 用 node，Bash/Shell 用 bash/sh；JSON keys 由当前脚本 SkillPlan.inputs 决定。",
+            minimal_edit="修正 runner 或脚本路径；不要自行发明 JSON 参数名。",
         ))
 
         keys = _command_payload_keys(command, script_path)
@@ -927,9 +925,35 @@ def _check_command_block_contract(script_path: str, commands: list[str], entry: 
             passed=json_ok,
             target=target,
             message="命令块使用可解析 JSON argv。" if json_ok else f"{script_path} 命令块必须在脚本路径后传入 JSON object argv。",
-            expected="脚本路径后跟一个 JSON object argv；JSON keys 由 workflow 自行决定。",
-            minimal_edit="确保 JSON 可解析；不要强制改成 SkillPlan inputs。",
+            expected="脚本路径后跟一个 JSON object argv；JSON keys 由当前脚本 SkillPlan.inputs 决定。",
+            minimal_edit="确保 JSON 可解析；不要自行发明参数名。",
         ))
+
+        declared_inputs = set(entry.inputs or [])
+        if declared_inputs and keys is not None:
+            missing = sorted(declared_inputs - keys)
+            extra = sorted(keys - declared_inputs)
+            results.append(ContractCheckResult(
+                id="command_block.skillplan_inputs.exact",
+                passed=not missing and not extra,
+                target=target,
+                message=(
+                    "命令 JSON keys 与当前脚本 SkillPlan.inputs 一致。"
+                    if not missing and not extra
+                    else "命令 JSON keys 必须与当前脚本在 SkillPlan 中声明的 inputs 一致；平台不固定业务字段名。"
+                ),
+                expected="字段名由该 Skill 的 SkillPlan 决定；命令 JSON object keys 必须逐字等于 SkillPlan.inputs。",
+                minimal_edit="只修改该命令 JSON object：删除 extra_keys，补齐 missing_keys，保留 runner 和 script path。",
+                details={
+                    "target_script": script_path,
+                    "expected_keys": sorted(declared_inputs),
+                    "actual_keys": sorted(keys),
+                    "missing_keys": missing,
+                    "extra_keys": extra,
+                    "expected_payload_shape": {key: f"{{{{{key}}}}}" for key in sorted(declared_inputs)},
+                    "upstream_available_outputs": [],
+                },
+            ))
 
     return results
 
@@ -964,7 +988,7 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "D. workflow:",
         "- SKILL.md 必须描述完整 workflow、脚本顺序、输入输出数据流和最终产物。",
         "- 第一条命令可以使用用户输入 placeholder。",
-        "- 后续命令 placeholder 必须来自前序脚本 stdout JSON 字段。",
+        "- 后续命令 placeholder 必须来自前序脚本 stdout JSON 字段；如果无法找到某个 input 的来源，不要猜字段名，应报告 SkillPlan dataflow 不完整。",
         "- 多场景、多图片、多页 PDF 等循环必须在脚本内部完成；SKILL.md 只写一次脚本调用。",
         "",
         "E. references/assets:",
@@ -1001,6 +1025,8 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "- 命令块使用标准 Markdown 独立 fence；不要把 ```bash 缩进在列表项内部。",
         "- fence 内只放一条命令，不写解释、不写循环说明、不写多条命令。",
         "- 命令必须形如：python scripts/name.py '{\"key\":\"{{key}}\"}'。",
+        "- JSON argv keys 必须由当前 scripts/ 文件的 SkillPlanEntry.inputs 直接决定；不要自行发明、翻译或猜测参数名。",
+        "- 字段名以当前 SkillPlan.inputs / outputs 为准；平台不固定业务字段名，但同一 Skill 内部必须自洽。",
         "- JSON argv 必须先能被 json.loads 解析；所有 {{placeholder}} 都必须放在 JSON 字符串里，禁止裸写 {{count}}、{{scene_count}}。",
         "- 若需要数值默认值，直接写固定 JSON 数字，例如 \"scene_count\":3，而不是 \"scene_count\":{{scene_count}}。",
         "",
@@ -1228,6 +1254,8 @@ def _check_skill_md_command_dataflow(content: str, blueprint_text: str) -> list[
     results: list[ContractCheckResult] = []
     produced: set[str] = set()
     consumed: set[str] = set()
+    initial_user_inputs: set[str] = set(entries[0].inputs or []) if entries else set()
+    available_values: set[str] = set(initial_user_inputs)
 
     for idx, entry in enumerate(entries, start=1):
         commands = _extract_script_command_templates(content, entry.path)
@@ -1265,10 +1293,35 @@ def _check_skill_md_command_dataflow(content: str, blueprint_text: str) -> list[
                     f"为 {entry.path} 的 JSON argv 补齐 {input_name}；"
                     "如果该字段来自前序 stdout，请直接引用对应 stdout 字段 placeholder。"
                 ),
+                details={
+                    "target_script": entry.path,
+                    "input_name": input_name,
+                    "placeholder": placeholder,
+                    "upstream_available_outputs": sorted(produced),
+                    "available_values": sorted(available_values),
+                },
             ))
             if placeholder in produced:
                 consumed.add(placeholder)
+
+            unresolved_plan_input = idx > 1 and input_name not in available_values and (placeholder not in available_values if placeholder else True)
+            if unresolved_plan_input:
+                results.append(ContractCheckResult(
+                    id="skill_plan.dataflow_unresolved",
+                    passed=False,
+                    target=f"{entry.path}:{input_name}",
+                    message=f"{entry.path} 的 SkillPlan input {input_name} 无法从初始用户输入或前序 outputs 解析。",
+                    expected="SkillPlan.inputs 必须来自 user_request/首步用户字段、references/assets 静态资源或前序 SkillPlan.outputs；后续 inputs/outputs 命名不能断链。",
+                    minimal_edit="修 SkillPlan 或重新生成蓝图/文件计划；不要反复只修 SKILL.md 命令块。",
+                    details={
+                        "target_script": entry.path,
+                        "input_name": input_name,
+                        "available_values": sorted(available_values),
+                        "upstream_available_outputs": sorted(produced),
+                    },
+                ))
         produced.update(entry.outputs or [])
+        available_values.update(entry.outputs or [])
 
     final_outputs = set(entries[-1].outputs or []) if entries else set()
     for output in sorted(produced - consumed - final_outputs):
@@ -1391,11 +1444,16 @@ def _format_contract_checks(results: list[ContractCheckResult], *, passed: bool)
     lines: list[str] = []
     for result in selected:
         matched = f"\n  matched_paths: {', '.join(result.matched_paths)}" if result.matched_paths else ""
+        details = (
+            "\n  details: " + json.dumps(result.details, ensure_ascii=False, sort_keys=True)
+            if result.details else ""
+        )
         lines.append(
             f"- {result.id} target={result.target}: {result.message}\n"
             f"  expected: {result.expected}\n"
             f"  minimal_edit: {result.minimal_edit}"
             f"{matched}"
+            f"{details}"
         )
     return "\n".join(lines)
 
@@ -3570,6 +3628,7 @@ def _validate_command_is_single_shell_json_invocation(
     command: str,
     script_path: str,
     entry: SkillPlanEntry,
+    upstream_available_outputs: set[str] | None = None,
 ) -> list[ContractCheckResult]:
     """Validate one shell fenced command.
 
@@ -3675,13 +3734,16 @@ def _validate_command_is_single_shell_json_invocation(
             exc,
         )
 
-    # Backward-compatible field-level check plus dataflow guard: JSON argv keys
-    # must cover the declared SkillPlan inputs, and extra keys are not allowed in
-    # the primary command contract.
+    # JSON argv keys are the local protocol between SKILL.md and this script.
+    # They are flexible across skills, but inside one Skill they must be exactly
+    # the current script's SkillPlan.inputs.
     declared_inputs = set(entry.inputs or [])
     actual_keys = set(keys or []) if keys is not None else set()
     exact_inputs = bool(declared_inputs) and actual_keys == declared_inputs
     if declared_inputs:
+        missing = sorted(declared_inputs - actual_keys)
+        extra = sorted(actual_keys - declared_inputs)
+        upstream = sorted(upstream_available_outputs or set())
         results.append(ContractCheckResult(
             id="command_block.skillplan_inputs.exact",
             passed=exact_inputs,
@@ -3691,8 +3753,17 @@ def _validate_command_is_single_shell_json_invocation(
                 if exact_inputs
                 else f"{script_path} 命令 JSON keys 与 SkillPlan inputs 不一致。"
             ),
-            expected="命令 JSON object 的 keys 应与该脚本 inputs 对齐；后续数据来源由 {{placeholder}} 表示。",
-            minimal_edit="删除多余 key，补齐缺失 input key，并让 value 引用用户输入或前序 stdout 字段。",
+            expected="命令 JSON keys 必须与当前脚本在 SkillPlan 中声明的 inputs 一致。平台不要求固定字段名；字段名由该 Skill 的 SkillPlan 决定。",
+            minimal_edit="只修改该命令 JSON object；删除 extra_keys；补齐 missing_keys；保留脚本路径和 runner；value 使用用户输入或前序 stdout placeholder；不要改 SkillPlan 除非 SkillPlan 本身被判定错误。",
+            details={
+                "target_script": script_path,
+                "expected_keys": sorted(declared_inputs),
+                "actual_keys": sorted(actual_keys),
+                "missing_keys": missing,
+                "extra_keys": extra,
+                "expected_payload_shape": {key: f"{{{{{key}}}}}" for key in sorted(declared_inputs)},
+                "upstream_available_outputs": upstream,
+            },
         ))
 
     if not runtime_matches:
@@ -3744,6 +3815,11 @@ def _check_skill_md_fenced_command_contracts(
             }
     except Exception as exc:
         logger.warning("[Creator][skill_md] failed to parse blueprint SkillPlan for command validation: %s", exc)
+
+    if entries_by_path:
+        scripts_to_check = [entry.path for entry in entries_by_path.values() if entry.path in scripts_to_check]
+
+    prior_outputs: set[str] = set()
 
     for script_path in scripts_to_check:
         try:
@@ -3814,6 +3890,7 @@ def _check_skill_md_fenced_command_contracts(
                     command=command,
                     script_path=script_path,
                     entry=entry,
+                    upstream_available_outputs=prior_outputs,
                 ))
             except Exception as exc:
                 logger.exception(
@@ -3832,6 +3909,8 @@ def _check_skill_md_fenced_command_contracts(
                         f"```bash\npython {script_path} '{{\"payload\":\"{{{{user_request}}}}\"}}'\n```"
                     ),
                 ))
+
+        prior_outputs.update(entry.outputs or [])
 
     return results
 
@@ -7099,6 +7178,36 @@ def _validate_e2e_command_static(
             )
         )
 
+    expected_keys = set(entry.inputs or [])
+    actual_keys = {str(key) for key in command.argv_template.keys()}
+    if expected_keys and actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        extra = sorted(actual_keys - expected_keys)
+        details = {
+            "code": "command_block.skillplan_inputs.exact",
+            "target_script": command.script_path,
+            "expected_keys": sorted(expected_keys),
+            "actual_keys": sorted(actual_keys),
+            "missing_keys": missing,
+            "extra_keys": extra,
+            "expected_payload_shape": {key: f"{{{{{key}}}}}" for key in sorted(expected_keys)},
+            "upstream_available_outputs": [],
+            "minimal_edit": "只修改该命令 JSON object；删除 extra_keys；补齐 missing_keys；保留脚本路径和 runner。",
+        }
+        raise ValueError(
+            _e2e_error(
+                target=command.source_path,
+                layer="skill_md_contract",
+                message=(
+                    "command_block.skillplan_inputs.exact\n"
+                    "命令 JSON keys 必须与当前脚本在 SkillPlan 中声明的 inputs 一致。"
+                    "平台不要求固定字段名；字段名由该 Skill 的 SkillPlan 决定。\n"
+                    f"structured_error={json.dumps(details, ensure_ascii=False, sort_keys=True)}\n"
+                    f"原始命令：{command.raw_command}"
+                ),
+            )
+        )
+
     content = source_path.read_text(encoding="utf-8")
     try:
         _validate_script_contract_static(
@@ -7343,6 +7452,111 @@ def _run_skill_workflow_e2e_once(skill_name: str) -> list[str]:
     return errors
 
 
+
+def _placeholder_root_name(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"\{\{\s*([A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*)\s*\}\}", value.strip())
+    if not match:
+        return None
+    return match.group(1).split(".", 1)[0]
+
+
+def _values_for_skill_plan_command(
+    *,
+    entry: SkillPlanEntry,
+    existing_payload: dict[str, Any] | None,
+    available_values: set[str],
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    existing_payload = existing_payload or {}
+    reusable_by_root: dict[str, str] = {}
+    for value in existing_payload.values():
+        root = _placeholder_root_name(value)
+        if root:
+            reusable_by_root[root] = value
+
+    for input_name in entry.inputs or ["payload"]:
+        current = existing_payload.get(input_name)
+        if isinstance(current, str) and _placeholder_root_name(current) in available_values:
+            values[input_name] = current
+        elif input_name in reusable_by_root and input_name in available_values:
+            values[input_name] = reusable_by_root[input_name]
+        else:
+            values[input_name] = f"{{{{{input_name}}}}}"
+    return values
+
+
+def _patch_skill_md_command_payloads_from_skill_plan(content: str, blueprint_text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Deterministically align SKILL.md command JSON argv with SkillPlan inputs.
+
+    This patcher is deliberately generic: it never maps business field names or
+    branches on script names.  The only source of truth for keys is each
+    SkillPlanEntry.inputs; outputs only update the placeholder dataflow context.
+    """
+    parsed = parse_blueprint([{"role": "assistant", "content": blueprint_text}])
+    entries = [entry for entry in (parsed.skill_plan.files if parsed.skill_plan else []) if entry.file_type == "script"]
+    if not entries:
+        return content, []
+
+    entry_by_path = {entry.path: entry for entry in entries}
+    available_values: set[str] = set(entries[0].inputs or [])
+    patched: list[dict[str, Any]] = []
+    lines = (content or "").splitlines(keepends=True)
+    output: list[str] = []
+    in_shell_fence = False
+    fence_char = "`"
+    fence_len = 3
+
+    for raw_line in lines:
+        stripped = raw_line.lstrip()
+        fence_open = re.match(r"(`{3,}|~{3,})([^\n`]*)\n?$", stripped.rstrip("\n"))
+        if fence_open:
+            fence = fence_open.group(1)
+            info = (fence_open.group(2) or "").strip()
+            if not in_shell_fence:
+                in_shell_fence = _is_shell_fence_info(info)
+                fence_char = fence[0]
+                fence_len = len(fence)
+            else:
+                close_match = re.match(rf"{re.escape(fence_char)}{{{fence_len},}}\s*$", stripped.rstrip("\n"))
+                if close_match:
+                    in_shell_fence = False
+            output.append(raw_line)
+            continue
+
+        line_body = raw_line.rstrip("\r\n")
+        line_ending = raw_line[len(line_body):]
+        replacement = line_body
+        if in_shell_fence and line_body.strip():
+            for script_path, entry in entry_by_path.items():
+                payload = _command_payload_object(line_body.strip(), script_path)
+                if payload is None:
+                    continue
+                actual_keys = set(payload.keys())
+                expected_keys = set(entry.inputs or [])
+                if expected_keys and actual_keys != expected_keys:
+                    values = _values_for_skill_plan_command(
+                        entry=entry,
+                        existing_payload=payload,
+                        available_values=available_values | set(entry.inputs or []),
+                    )
+                    replacement = render_script_command_from_skill_plan(entry, values)
+                    patched.append({
+                        "target_script": script_path,
+                        "expected_keys": sorted(expected_keys),
+                        "actual_keys": sorted(actual_keys),
+                        "missing_keys": sorted(expected_keys - actual_keys),
+                        "extra_keys": sorted(actual_keys - expected_keys),
+                        "expected_payload_shape": {key: values[key] for key in sorted(expected_keys)},
+                        "upstream_available_outputs": sorted(available_values),
+                    })
+                available_values.update(entry.outputs or [])
+                break
+        output.append(replacement + line_ending)
+
+    return "".join(output), patched
+
 async def _repair_existing_file_for_e2e_failure(
     *,
     skill_name: str,
@@ -7413,6 +7627,21 @@ async def _repair_existing_file_for_e2e_failure(
     )
 
     deterministic_error = "\n\n".join(e2e_errors)[-12000:]
+
+    if target_path == "SKILL.md" and "command_block.skillplan_inputs.exact" in deterministic_error:
+        patched_content, patch_details = _patch_skill_md_command_payloads_from_skill_plan(
+            current_content,
+            skill_md or current_content,
+        )
+        if patch_details and patched_content != current_content:
+            _validate_skill_md_against_existing_files(skill_name, patched_content)
+            target_file.write_text(patched_content, encoding="utf-8")
+            logger.info(
+                "[Creator][E2E] deterministic SKILL.md command payload patch skill=%s details=%s",
+                skill_name,
+                json.dumps(patch_details, ensure_ascii=False),
+            )
+            return target_path
 
     contract_text = _build_generated_file_contract_text(
         target_path,
