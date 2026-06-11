@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+import json
 import re
 from typing import Literal
 from .creator_tool_registry import get_role_pattern, get_script_roles, get_tool_capability, is_resource_role, is_script_role
@@ -273,18 +274,43 @@ def runtime_for_language(language: str, file_type: FileType) -> Runtime:
     return "generic"
 
 
+def _runner_for_runtime(runtime: Runtime) -> str:
+    if runtime == "python":
+        return "python"
+    if runtime == "node":
+        return "node"
+    if runtime == "bash":
+        return "bash"
+    if runtime == "shell":
+        return "sh"
+    return ""
+
+
 def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -> str:
     keys = inputs or ["payload"]
     payload = "{" + ",".join(f'"{key}":"{{{{{key}}}}}"' for key in keys) + "}"
-    if runtime == "python":
-        return f"python {path} '{payload}'"
-    if runtime == "node":
-        return f"node {path} '{payload}'"
-    if runtime == "bash":
-        return f"bash {path} '{payload}'"
-    if runtime == "shell":
-        return f"sh {path} '{payload}'"
+    runner = _runner_for_runtime(runtime)
+    if runner:
+        return f"{runner} {path} '{payload}'"
     return f"{path} '{payload}'"
+
+
+def render_script_command_from_skill_plan(entry: SkillPlanEntry, values: dict[str, str] | None = None) -> str:
+    """Render a SKILL.md script command directly from one SkillPlan entry.
+
+    The JSON argv key set is determined solely by ``entry.inputs``.  ``values``
+    may provide placeholder/value expressions for those keys, but it cannot add
+    extra keys.  Missing values fall back to the same-named placeholder so the
+    command remains a generic, self-consistent contract rather than a
+    business-specific guess.
+    """
+    payload_keys = list(entry.inputs or ["payload"])
+    payload = {key: (values or {}).get(key, f"{{{{{key}}}}}") for key in payload_keys}
+    rendered_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    runner = _runner_for_runtime(entry.runtime)
+    if runner:
+        return f"{runner} {entry.path} '{rendered_payload}'"
+    return f"{entry.path} '{rendered_payload}'"
 
 
 
@@ -766,22 +792,7 @@ def dependency_is_output_semantic(dep: str, prior_outputs: set[str] | None = Non
 
 
 def _command_template_for_entry_with_values(entry: SkillPlanEntry) -> str:
-    payload_keys = list(entry.inputs or ["payload"])
-    payload: dict[str, str] = {}
-    for key in payload_keys:
-        # The placeholder name is the dataflow edge.  For downstream scripts this
-        # resolves from prior stdout JSON when the same field was produced upstream.
-        payload[key] = f"{{{{{key}}}}}"
-    rendered = "{" + ",".join(f'"{key}":"{value}"' for key, value in payload.items()) + "}"
-    if entry.runtime == "python":
-        return f"python {entry.path} '{rendered}'"
-    if entry.runtime == "node":
-        return f"node {entry.path} '{rendered}'"
-    if entry.runtime == "bash":
-        return f"bash {entry.path} '{rendered}'"
-    if entry.runtime == "shell":
-        return f"sh {entry.path} '{rendered}'"
-    return f"{entry.path} '{rendered}'"
+    return render_script_command_from_skill_plan(entry)
 
 
 def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:

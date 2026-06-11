@@ -1163,3 +1163,151 @@ def test_skillplan_dataflow_allows_arbitrary_business_field_names():
     assert "brand_palette" not in warnings
     assert '"customer_brief":"{{customer_brief}}"' in first.command_template
     assert '"structured_payload":"{{structured_payload}}"' in second.command_template
+
+
+def test_command_key_mismatch_exposes_structured_diff():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: generic-skill
+- scripts/: `scripts/step.py`
+  scripts/step.py role: generic_script inputs: source_value, desired_value outputs: result_value
+"""
+    skill_md = """---
+name: generic-skill
+description: generic
+---
+# generic-skill
+
+```bash
+python scripts/step.py '{"source_value":"{{source_value}}","unexpected_value":"{{unexpected_value}}"}'
+```
+"""
+
+    failed = [r for r in _check_skill_md_contract(skill_md, blueprint) if r.id == "command_block.skillplan_inputs.exact" and not r.passed]
+
+    assert failed
+    details = failed[0].details
+    assert details["target_script"] == "scripts/step.py"
+    assert details["expected_keys"] == ["desired_value", "source_value"]
+    assert details["actual_keys"] == ["source_value", "unexpected_value"]
+    assert details["missing_keys"] == ["desired_value"]
+    assert details["extra_keys"] == ["unexpected_value"]
+
+
+def test_deterministic_patch_replaces_command_json_keys_and_preserves_invocation():
+    from backend.routers.creator import _patch_skill_md_command_payloads_from_skill_plan
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: generic-skill
+- scripts/: `scripts/step.py`
+  scripts/step.py role: generic_script inputs: alpha, beta outputs: gamma
+"""
+    skill_md = """---
+name: generic-skill
+description: generic
+---
+# generic-skill
+
+```bash
+python scripts/step.py '{"alpha":"{{alpha}}","legacy":"{{legacy}}"}'
+```
+"""
+
+    patched, details = _patch_skill_md_command_payloads_from_skill_plan(skill_md, blueprint)
+
+    assert details
+    assert "python scripts/step.py" in patched
+    assert "legacy" not in patched
+    assert "'" in patched
+    assert '{"alpha":"{{alpha}}","beta":"{{beta}}"}' in patched
+
+
+def test_deterministic_patch_uses_upstream_output_placeholder_for_downstream_input():
+    from backend.routers.creator import _patch_skill_md_command_payloads_from_skill_plan
+    from backend.services.skill_plan import command_payload_placeholders
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: chain-skill
+- scripts/: `scripts/first.py`
+  scripts/first.py role: generic_script inputs: seed_value outputs: shared_value
+- scripts/: `scripts/second.py`
+  scripts/second.py role: generic_script inputs: shared_value outputs: final_value
+"""
+    skill_md = """---
+name: chain-skill
+description: chain
+---
+# chain-skill
+
+```bash
+python scripts/first.py '{"seed_value":"{{seed_value}}"}'
+```
+
+```bash
+python scripts/second.py '{"wrong_key":"{{seed_value}}"}'
+```
+"""
+
+    patched, _ = _patch_skill_md_command_payloads_from_skill_plan(skill_md, blueprint)
+    commands = [line.strip() for line in patched.splitlines() if line.strip().startswith("python scripts/second.py")]
+
+    assert commands
+    assert command_payload_placeholders(commands[0], "scripts/second.py") == {"shared_value": "shared_value"}
+
+
+def test_skill_plan_dataflow_unresolved_reports_plan_not_skill_md_loop():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: broken-chain
+- scripts/: `scripts/first.py`
+  scripts/first.py role: generic_script inputs: seed_value outputs: produced_value
+- scripts/: `scripts/second.py`
+  scripts/second.py role: generic_script inputs: missing_value outputs: final_value
+"""
+    skill_md = """---
+name: broken-chain
+description: broken
+---
+# broken-chain
+
+```bash
+python scripts/first.py '{"seed_value":"{{seed_value}}"}'
+```
+
+```bash
+python scripts/second.py '{"missing_value":"{{missing_value}}"}'
+```
+"""
+
+    failed = {r.id for r in _check_skill_md_contract(skill_md, blueprint) if not r.passed}
+
+    assert "skill_plan.dataflow_unresolved" in failed
+    assert "command_block.skillplan_inputs.exact" not in failed
+
+
+def test_render_script_command_from_skill_plan_uses_only_entry_inputs():
+    from backend.services.skill_plan import SkillPlanEntry, render_script_command_from_skill_plan, command_payload_placeholders
+
+    entry = SkillPlanEntry(
+        path="scripts/run.py",
+        file_type="script",
+        role="generic_script",
+        purpose="generic",
+        runtime="python",
+        inputs=["free_name", "another_name"],
+        outputs=["result_name"],
+    )
+
+    command = render_script_command_from_skill_plan(entry, {"free_name": "{{free_name}}", "ignored": "{{ignored}}"})
+
+    assert command.startswith("python scripts/run.py")
+    assert command_payload_placeholders(command, "scripts/run.py") == {
+        "free_name": "free_name",
+        "another_name": "another_name",
+    }
