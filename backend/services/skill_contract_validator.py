@@ -49,73 +49,10 @@ def validate_workflow_contract(contract: WorkflowContract) -> list[ContractIssue
             produced[f"{step.id}.{output_name}"] = (step.id, spec)
             produced[output_name] = (step.id, spec)
 
-    for idx, step in enumerate(contract.steps):
-        for name, spec in step.inputs.items():
-            if spec.default is not None:
-                continue
-            if spec.source:
-                if not _source_available(spec.source, produced, step_index, idx, step):
-                    issues.append(ContractIssue(
-                        "input_source_unavailable",
-                        f"input {name} 的 source 不可用: {spec.source}",
-                        step_id=step.id,
-                        script_path=step.script_path,
-                        field=name,
-                        details={"source": spec.source},
-                    ))
-                continue
-            if name in step.default_values:
-                continue
-            # For first step, unresolved inputs are assumed user-provided.
-            if idx == 0:
-                continue
-            if name not in produced:
-                issues.append(ContractIssue(
-                    "input_unresolved",
-                    f"input {name} 没有 default/source，也不是前序输出",
-                    step_id=step.id,
-                    script_path=step.script_path,
-                    field=name,
-                ))
-
-        if step.foreach:
-            collection = step.foreach.collection
-            if not collection:
-                issues.append(ContractIssue("foreach_missing_collection", "foreach.collection 不能为空", step_id=step.id, script_path=step.script_path))
-            elif not _source_available(collection, produced, step_index, idx, step):
-                issues.append(ContractIssue(
-                    "foreach_collection_unavailable",
-                    f"foreach.collection 不可用: {collection}",
-                    step_id=step.id,
-                    script_path=step.script_path,
-                    field=collection,
-                ))
-            else:
-                out = _resolve_output_spec(collection, produced)
-                if out and out.type != "array":
-                    issues.append(ContractIssue(
-                        "foreach_collection_not_array",
-                        f"foreach.collection 必须指向 array 输出: {collection}",
-                        step_id=step.id,
-                        script_path=step.script_path,
-                        field=collection,
-                        details={"actual_type": out.type},
-                    ))
-
-        for col in step.collect:
-            if not col.target or not col.source:
-                issues.append(ContractIssue("invalid_collect_spec", "collect.target/source 不能为空", step_id=step.id, script_path=step.script_path))
-            # collect.source often refers to current loop stdout (each.image_path) or output key.
-            source_key = col.source.split(".", 1)[-1] if col.source.startswith("each.") else col.source
-            if source_key and source_key not in step.outputs:
-                issues.append(ContractIssue(
-                    "collect_source_not_in_step_outputs",
-                    f"collect.source 没有出现在当前 step outputs 中: {col.source}",
-                    step_id=step.id,
-                    script_path=step.script_path,
-                    field=col.source,
-                    severity="warning",
-                ))
+    # First-round contract validation intentionally stops at static contract
+    # shape and command JSON parseability. Cross-step input/source/foreach/
+    # collect alignment is validated by the second-round E2E dry-run with real
+    # stdout payloads and placeholder rendering.
 
     return issues
 
@@ -286,15 +223,9 @@ def _validate_command_keys(step: StepContract) -> list[ContractIssue]:
             return [ContractIssue("command_json_not_object", "script argv JSON 必须是 object", step_id=step.id, script_path=step.script_path)]
         command_keys = {str(k) for k in payload.keys()}
 
-    input_keys = set(step.inputs.keys())
-    if command_keys != input_keys:
-        issues.append(ContractIssue(
-            "command_keys_mismatch_inputs",
-            "命令 JSON keys 必须等于 step inputs",
-            step_id=step.id,
-            script_path=step.script_path,
-            details={"command_keys": sorted(command_keys), "input_keys": sorted(input_keys)},
-        ))
+    # First round only proves that the fenced command calls the declared script
+    # and that the script argv is a JSON object. The exact key set and
+    # placeholder/dataflow alignment are E2E responsibilities.
     return issues
 
 

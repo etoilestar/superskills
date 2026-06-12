@@ -99,7 +99,7 @@ def test_tool_status_reports_missing_runtime_dependencies(monkeypatch):
     assert status["missing_dependencies"] == ["reportlab"]
 
 
-def test_resolve_tools_for_pdf_builder_uses_registry_helpers_only():
+def test_resolve_tools_for_pdf_builder_exposes_preferred_helpers_without_forcing_them():
     from backend.services.creator_tool_registry import resolve_tools_for_skill_plan_entry
 
     entry = {
@@ -112,10 +112,10 @@ def test_resolve_tools_for_pdf_builder_uses_registry_helpers_only():
     assert "pdf_generation" in resolved.allowed_tools
     assert "create_pdf" in resolved.allowed_helper_imports
     assert "build_pdf_report" in resolved.allowed_helper_imports
-    assert "reportlab" in resolved.forbidden_imports
-    assert "fpdf" in resolved.forbidden_imports
+    assert resolved.forbidden_imports == []
     assert "create_pdf" in resolved.tool_usage_prompt
-    assert "禁止直接" in resolved.tool_usage_prompt
+    assert "usage_policy=helper_preferred" in resolved.tool_usage_prompt
+    assert "不强制实现方式" in resolved.tool_usage_prompt
 
 
 def test_resolve_tools_excludes_disabled_tool_from_prompt():
@@ -154,6 +154,7 @@ def test_registered_tool_resolve_uses_registered_helper_and_trial_dispatch(monke
             trial_mode="mock",
             prompt_guidance="调用 registered_tool_call('fake_registered_lookup', payload)，不要直接 requests.post 未知 API。",
             forbidden_direct_imports=["requests.post", "urllib.request"],
+            usage_policy="helper_required",
         ))
 
         resolved = resolve_tools_for_skill_plan_entry({
