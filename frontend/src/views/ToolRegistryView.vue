@@ -14,6 +14,7 @@
         <div class="step-title"><span>1</span><h2>自然语言描述工具</h2></div>
         <label>工具名称<input v-model="form.tool_name" placeholder="markdown_to_pdf" /></label>
         <label>工具用途描述<textarea v-model="form.description" rows="4" placeholder="我想注册一个工具，用来把 markdown 转成 PDF..." /></label>
+        <label>可选：粘贴已有 Python 代码<textarea v-model="optionalCodeBlock" class="code" rows="7" spellcheck="false" placeholder="def save_markdown(payload): ..." /></label>
         <div class="form-row">
           <label>工具类型<select v-model="form.tool_type"><option v-for="type in toolTypes" :key="type" :value="type">{{ type }}</option></select></label>
           <label>允许角色<input v-model="allowedRolesText" placeholder="pdf_builder,document_generator" /></label>
@@ -26,11 +27,18 @@
           <label><input v-model="form.generates_file" type="checkbox" /> 生成文件</label>
           <label><input v-model="form.high_risk" type="checkbox" /> 高风险</label>
         </div>
-        <button class="btn-primary" :disabled="busy" @click="draftManifest">生成工具定义</button>
+        <div class="actions">
+          <button class="btn-primary" :disabled="busy" @click="authorDraft">智能生成工具草稿</button>
+          <button class="btn-ghost" :disabled="busy" @click="draftManifest">旧版规则草稿</button>
+        </div>
       </div>
 
       <div class="card step-card">
-        <div class="step-title"><span>2</span><h2>规划模型总结 / Manifest 草稿</h2></div>
+        <div class="step-title"><span>2</span><h2>Planner 结果 / Manifest 草稿</h2></div>
+        <div v-if="clarificationQuestions.length" class="validation bad">
+          <strong>需要补充信息</strong>
+          <ul><li v-for="question in clarificationQuestions" :key="question">{{ question }}</li></ul>
+        </div>
         <textarea v-model="manifestText" class="code" rows="23" spellcheck="false" />
       </div>
     </section>
@@ -38,8 +46,11 @@
     <section class="grid two">
       <div class="card step-card">
         <div class="step-title"><span>3</span><h2>工具实现</h2></div>
-        <p class="muted small">可点击生成 adapter，也可以直接粘贴 Python helper 代码。上线前必须验证。</p>
-        <button class="btn-ghost" :disabled="busy || !parsedManifest" @click="generateCode">生成实现代码</button>
+        <p class="muted small">统一 author 链路会根据可选代码块自动生成或规范化 adapter。上线前必须先确认代码，再生成 snippet。</p>
+        <div class="actions">
+          <button class="btn-ghost" :disabled="busy || !parsedManifest" @click="generateCode">旧版生成实现</button>
+          <button class="btn-primary" :disabled="busy || !parsedManifest || !adapterCode" @click="finalizeAuthoring">确认代码 → 生成 snippet</button>
+        </div>
         <textarea v-model="adapterCode" class="code" rows="22" spellcheck="false" placeholder="Python adapter code" />
       </div>
 
@@ -48,13 +59,14 @@
         <label>Sample input<textarea v-model="sampleInputText" class="code" rows="7" spellcheck="false" /></label>
         <div class="actions">
           <button class="btn-primary" :disabled="busy || !parsedManifest" @click="validateTool">运行验证</button>
-          <button class="btn-primary" :disabled="busy || !lastValidation?.success" @click="registerTool">注册工具</button>
+          <button class="btn-primary" :disabled="busy || !lastValidation?.success" @click="registerTool">确认 snippet 并注册</button>
         </div>
         <div v-if="lastValidation" class="validation" :class="lastValidation.success ? 'ok' : 'bad'">
           <strong>{{ lastValidation.success ? '验证通过' : '验证失败' }}</strong>
           <ul><li v-for="err in lastValidation.errors" :key="err">{{ err }}</li></ul>
           <p v-for="warn in lastValidation.warnings" :key="warn" class="warn">{{ warn }}</p>
         </div>
+        <label>生成的 Snippet<textarea v-model="snippetText" class="code" rows="10" spellcheck="false" placeholder="确认代码后生成 snippet" /></label>
         <pre class="tool-card">{{ cardPreview }}</pre>
       </div>
     </section>
@@ -123,7 +135,7 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
-import { createCreatorToolSnippet, draftCreatorTool, generateCreatorToolCode, listCreatorToolSnippets, listCreatorTools, registerCreatorTool, testCreatorToolSnippet, updateCreatorToolSnippet, validateCreatorTool } from '../composables/useCreator.js'
+import { authorCreatorTool, createCreatorToolSnippet, draftCreatorTool, generateCreatorToolCode, listCreatorToolSnippets, listCreatorTools, registerCreatorTool, testCreatorToolSnippet, updateCreatorToolSnippet, validateCreatorTool } from '../composables/useCreator.js'
 
 const toolTypes = ['python_helper', 'http_api', 'local_command', 'database_query', 'file_converter', 'document_generator', 'image_generator', 'custom_adapter']
 const snippetKinds = ['minimal_usage', 'multi_input_usage', 'file_output_usage', 'batch_usage', 'error_repair_usage', 'anti_pattern', 'trial_run_usage']
@@ -133,6 +145,10 @@ const tools = ref([])
 const allowedRolesText = ref('')
 const manifestText = ref('')
 const adapterCode = ref('')
+const optionalCodeBlock = ref('')
+const snippetText = ref('{}')
+const clarificationQuestions = ref([])
+const authorStage = ref('draft')
 const sampleInputText = ref('{\n  "payload": {}\n}')
 const lastValidation = ref(null)
 const selectedToolName = ref('')
@@ -155,7 +171,10 @@ const snippetPreview = computed(() => snippets.value.map(snippet => snippet.form
 async function run(task) { busy.value = true; error.value = ''; try { await task() } catch (e) { error.value = e.message || String(e) } finally { busy.value = false } }
 async function loadTools() { const data = await listCreatorTools(); tools.value = data.tools || [] }
 function payload() { return { ...form, allowed_roles: allowedRolesText.value.split(',').map(s => s.trim()).filter(Boolean) } }
-function draftManifest() { return run(async () => { const data = await draftCreatorTool(payload()); manifestText.value = JSON.stringify(data.manifest, null, 2); lastValidation.value = null }) }
+function authorPayload(stage) { return { ...payload(), stage, code_block: optionalCodeBlock.value || (stage === 'draft' ? adapterCode.value : undefined), adapter_code: adapterCode.value, sample_input: parsedSample.value, manifest: parsedManifest.value, validation: lastValidation.value } }
+function draftManifest() { return run(async () => { const data = await draftCreatorTool(payload()); manifestText.value = JSON.stringify(data.manifest, null, 2); lastValidation.value = null; clarificationQuestions.value = [] }) }
+function authorDraft() { return run(async () => { const data = await authorCreatorTool(authorPayload('draft')); authorStage.value = 'draft'; clarificationQuestions.value = data.questions || []; manifestText.value = JSON.stringify(data.manifest || {}, null, 2); sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || null; snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value }) }
+function finalizeAuthoring() { return run(async () => { const data = await authorCreatorTool(authorPayload('finalize')); authorStage.value = 'finalize'; lastValidation.value = data.validation || lastValidation.value; snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value; if (data.snippet && parsedManifest.value) { const manifest = { ...parsedManifest.value, snippets: [data.snippet] }; manifestText.value = JSON.stringify(manifest, null, 2) } }) }
 function generateCode() { return run(async () => { const data = await generateCreatorToolCode({ manifest: parsedManifest.value }); adapterCode.value = data.adapter_code }) }
 function validateTool() { return run(async () => { lastValidation.value = await validateCreatorTool({ manifest: parsedManifest.value, adapter_code: adapterCode.value, sample_input: parsedSample.value, dynamic: true }) }) }
 function registerTool() { return run(async () => { await registerCreatorTool({ manifest: parsedManifest.value, adapter_code: adapterCode.value, sample_input: parsedSample.value, dynamic: true, enable: true }); await loadTools() }) }
