@@ -20,6 +20,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 
+UsagePolicy = Literal["helper_required", "helper_preferred", "self_implementation_allowed"]
+
+
 @dataclass(frozen=True)
 class ToolCapability:
     name: str
@@ -32,6 +35,11 @@ class ToolCapability:
     allow_external_side_effect: bool = False
 
     helper_imports: list[str] = field(default_factory=list)
+    allowed_roles: list[str] = field(default_factory=list)
+    required_capabilities: list[str] = field(default_factory=list)
+    optional_capabilities: list[str] = field(default_factory=list)
+    forbidden_capabilities: list[str] = field(default_factory=list)
+    usage_policy: UsagePolicy = "self_implementation_allowed"
     required_env: list[str] = field(default_factory=list)
     required_secrets: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
@@ -68,7 +76,8 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         input_schema={"type": "object", "properties": {"prompt": {"type": "string"}}},
         output_schema={"type": "object", "properties": {"text": {"type": "string"}}},
         validator_kind="helper_import",
-        prompt_guidance="需要文本生成时，只能通过 backend.services.skill_runtime.generate_text_with_llm 调用平台 LLM。",
+        usage_policy="helper_preferred",
+        prompt_guidance="需要文本生成时，可优先使用 backend.services.skill_runtime.generate_text_with_llm；也可在声明能力边界内自实现。",
     ),
     "image_generation": ToolCapability(
         name="image_generation",
@@ -79,7 +88,8 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         output_schema={"type": "object", "properties": {"image_path": {"type": "string"}}},
         trial_mode="minimal_file",
         validator_kind="helper_import",
-        prompt_guidance="需要图片生成时，只能通过 generate_stable_diffusion_image；SKILL_TRIAL_RUN=1 时必须返回测试图片。",
+        usage_policy="helper_preferred",
+        prompt_guidance="需要图片生成时，可优先使用 generate_stable_diffusion_image；也可自实现，但最终 stdout/artifact 必须通过 E2E 校验。",
     ),
     "pdf_generation": ToolCapability(
         name="pdf_generation",
@@ -88,13 +98,13 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         roles=["pdf_builder"],
         helper_imports=["create_pdf", "build_pdf_report", "images_to_pdf", "merge_pdfs"],
         dependencies=["reportlab"],
-        forbidden_direct_imports=["reportlab", "fpdf", "PyPDF2", "pypdf.PdfWriter", "canvas", "pdfmetrics", "UnicodeCIDFont"],
         output_schema={"type": "object", "properties": {"pdf_path": {"type": "string"}}},
         trial_mode="minimal_file",
         validator_kind="file_output",
+        usage_policy="helper_preferred",
         prompt_guidance=(
-            "PDF 生成必须使用平台 helper create_pdf/build_pdf_report/images_to_pdf/merge_pdfs；"
-            "不要在生成脚本中 import reportlab/fpdf/canvas/pdfmetrics/PyPDF2 或手写底层 PDF。"
+            "PDF 生成可优先使用平台 helper create_pdf/build_pdf_report/images_to_pdf/merge_pdfs；"
+            "也可自实现，但最终 PDF 文件、路径和 stdout 字段必须通过 E2E 校验。"
         ),
     ),
     "docx_generation": ToolCapability(
@@ -107,7 +117,8 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         output_schema={"type": "object", "properties": {"docx_path": {"type": "string"}}},
         trial_mode="minimal_file",
         validator_kind="file_output",
-        prompt_guidance="Word 生成应使用平台 helper create_docx，并返回 docx_path/file_outputs。",
+        usage_policy="helper_preferred",
+        prompt_guidance="Word 生成可优先使用平台 helper create_docx；也可自实现，并返回合法 docx_path/file_outputs。",
     ),
     "pptx_generation": ToolCapability(
         name="pptx_generation",
@@ -119,7 +130,8 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         output_schema={"type": "object", "properties": {"pptx_path": {"type": "string"}}},
         trial_mode="minimal_file",
         validator_kind="file_output",
-        prompt_guidance="PPT 生成应使用平台 helper create_pptx，并返回 pptx_path/file_outputs。",
+        usage_policy="helper_preferred",
+        prompt_guidance="PPT 生成可优先使用平台 helper create_pptx；也可自实现，并返回合法 pptx_path/file_outputs。",
     ),
     "html_asset_generation": ToolCapability(
         name="html_asset_generation",
@@ -156,7 +168,8 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         helper_imports=["extract_pdf_text"],
         dependencies=["pypdf"],
         validator_kind="helper_import",
-        prompt_guidance="PDF 解析应使用 extract_pdf_text，不要在生成脚本中自行调用不受控解析链路。",
+        usage_policy="helper_preferred",
+        prompt_guidance="PDF 解析可优先使用 extract_pdf_text；也可自实现。",
     ),
     "docx_parsing": ToolCapability(
         name="docx_parsing",
@@ -166,7 +179,8 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         helper_imports=["read_docx_text"],
         dependencies=["python-docx"],
         validator_kind="helper_import",
-        prompt_guidance="Word 解析应使用 read_docx_text。",
+        usage_policy="helper_preferred",
+        prompt_guidance="Word 解析可优先使用 read_docx_text；也可自实现。",
     ),
     "pptx_parsing": ToolCapability(
         name="pptx_parsing",
@@ -176,7 +190,8 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         helper_imports=["read_pptx_text"],
         dependencies=["python-pptx"],
         validator_kind="helper_import",
-        prompt_guidance="PPT 解析应使用 read_pptx_text。",
+        usage_policy="helper_preferred",
+        prompt_guidance="PPT 解析可优先使用 read_pptx_text；也可自实现。",
     ),
     "spreadsheet_read": ToolCapability(
         name="spreadsheet_read",
@@ -196,7 +211,8 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         helper_imports=["analyze_image_with_vision", "ocr_image"],
         required_env=["VISION_MODEL"],
         validator_kind="helper_import",
-        prompt_guidance="视觉理解必须通过 analyze_image_with_vision 或 ocr_image；试运行时返回 mock 结果。",
+        usage_policy="helper_preferred",
+        prompt_guidance="视觉理解可优先使用 analyze_image_with_vision 或 ocr_image；试运行时可返回 mock 结果。",
     ),
     "web_search": ToolCapability(
         name="web_search",
@@ -206,7 +222,8 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         helper_imports=["web_search", "fetch_url_text"],
         required_env=["SEARCHXNG_BASE_URL"],
         validator_kind="helper_import",
-        prompt_guidance="网页搜索必须通过 web_search；不要在生成脚本里直接请求任意搜索 API。",
+        usage_policy="helper_preferred",
+        prompt_guidance="网页搜索可优先使用 web_search/fetch_url_text；也可在能力声明边界内自实现。",
     ),
     "database_read": ToolCapability(
         name="database_read",
@@ -214,6 +231,7 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         category="retrieval",
         roles=["database_reader"],
         helper_imports=["query_database_readonly", "list_database_tables", "describe_database_table"],
+        usage_policy="helper_required",
         required_secrets=["DATABASE_URL"],
         validator_kind="database_readonly",
         prompt_guidance="数据库能力只允许 SELECT/WITH 只读查询，必须通过 query_database_readonly，禁止 INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/CREATE。",
@@ -226,6 +244,7 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         helper_imports=["create_wechat_draft", "upload_wechat_media"],
         required_secrets=["WECHAT_APP_ID", "WECHAT_APP_SECRET"],
         validator_kind="helper_import",
+        usage_policy="helper_required",
         prompt_guidance="默认只能创建微信公众号草稿，不得自动发布。使用 create_wechat_draft 并返回 draft_id。",
     ),
     "wechat_publish": ToolCapability(
@@ -238,6 +257,7 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         helper_imports=["publish_wechat_draft"],
         required_secrets=["WECHAT_APP_ID", "WECHAT_APP_SECRET"],
         validator_kind="external_side_effect",
+        usage_policy="helper_required",
         prompt_guidance="除非用户明确要求直接发布，否则只能创建草稿；发布必须通过 publish_wechat_draft。",
     ),
     "deterministic_execution": ToolCapability(
@@ -409,13 +429,14 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
         if status["missing_env"] or status["missing_secrets"]:
             warnings.append(f"tool {cap.name} is not configured: missing env/secret")
             continue
-        if cap.helper_imports and status["missing_runtime_helpers"]:
-            warnings.append(f"tool {cap.name} missing runtime helpers: {', '.join(status['missing_runtime_helpers'])}")
+        if cap.helper_imports and status["missing_runtime_helpers"] and cap.usage_policy == "helper_required":
+            warnings.append(f"tool {cap.name} missing required runtime helpers: {', '.join(status['missing_runtime_helpers'])}")
             continue
         allowed_tools.append(cap.name)
         allowed_helper_imports.extend(status["runtime_helpers_available"] or cap.helper_imports)
         required_dependencies.extend(cap.dependencies)
-        forbidden_imports.extend(cap.forbidden_direct_imports)
+        if cap.usage_policy == "helper_required":
+            forbidden_imports.extend(cap.forbidden_direct_imports)
         if cap.prompt_guidance:
             guidance.append(f"- {cap.name}: {cap.prompt_guidance}")
 
@@ -432,16 +453,28 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
     required_dependencies = dedupe(required_dependencies)
     forbidden_imports = dedupe(forbidden_imports)
     helper_line = (
-        "当前文件只允许从 backend.services.skill_runtime 导入这些 helper: "
+        "可优先使用的 backend.services.skill_runtime helper: "
         + (", ".join(allowed_helper_imports) if allowed_helper_imports else "无")
         + "。"
     )
+    policy_lines = [
+        f"- {cap.name}: usage_policy={cap.usage_policy}; allowed_roles={', '.join(cap.roles) if cap.roles else 'all'}; "
+        f"required_env={', '.join(cap.required_env) if cap.required_env else '无'}; "
+        f"required_secrets={', '.join(cap.required_secrets) if cap.required_secrets else '无'}; "
+        f"dependencies={', '.join(cap.dependencies) if cap.dependencies else '无'}; "
+        f"required_capabilities={', '.join(cap.required_capabilities or [cap.name])}; "
+        f"optional_capabilities={', '.join(cap.optional_capabilities) if cap.optional_capabilities else '无'}; "
+        f"forbidden_capabilities={', '.join(cap.forbidden_capabilities or _ROLE_FORBIDDEN_CAPABILITIES.get(role, [])) if (cap.forbidden_capabilities or _ROLE_FORBIDDEN_CAPABILITIES.get(role, [])) else '无'}"
+        for cap_name in allowed_tools
+        for cap in [get_tool_capability(cap_name)]
+        if cap is not None
+    ]
     forbid_line = (
-        "禁止直接 import/调用底层库或绕过 helper: " + ", ".join(forbidden_imports) + "。"
+        "helper_required 工具禁止直接 import/调用底层库或绕过 helper: " + ", ".join(forbidden_imports) + "。"
         if forbidden_imports else
-        "禁止绕过平台 helper 自行猜测外部 API 或底层实现。"
+        "除 usage_policy=helper_required 的能力外，helper 是可用/推荐工具，不强制实现方式；最终以 E2E stdout/artifact 合同为准。"
     )
-    tool_usage_prompt = "\n".join([helper_line, forbid_line, *guidance])
+    tool_usage_prompt = "\n".join([helper_line, forbid_line, *policy_lines, *guidance])
     return ToolResolveResult(
         allowed_tools=allowed_tools,
         allowed_helper_imports=allowed_helper_imports,
@@ -542,6 +575,7 @@ def tool_status(capability: ToolCapability) -> dict[str, Any]:
     creator_available = capability.enabled_by_default and capability.allow_creator_use
     return {
         **asdict(capability),
+        "allowed_roles": capability.allowed_roles or capability.roles,
         "enabled": capability.enabled_by_default,
         "creator_available": creator_available,
         "configured": not missing_env and not missing_secrets,
