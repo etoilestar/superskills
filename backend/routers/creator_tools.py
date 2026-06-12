@@ -12,6 +12,7 @@ from ..services.creator_tool_registry import (
     TOOL_OVERRIDE_PERSISTENCE,
     ToolCapability,
     ToolSnippet,
+    author_tool,
     build_tool_manifest_draft,
     capabilities_for_role,
     generate_adapter_code,
@@ -69,6 +70,25 @@ class ToolManifestRequest(BaseModel):
     dynamic: bool = True
 
 
+class ToolAuthorRequest(BaseModel):
+    description: str = ""
+    tool_name: str = ""
+    tool_type: str = "python_helper"
+    code_block: str | None = None
+    adapter_code: str | None = None
+    input_description: str = ""
+    output_description: str = ""
+    manifest: dict[str, Any] | None = None
+    sample_input: dict[str, Any] = Field(default_factory=dict)
+    allowed_roles: list[str] = Field(default_factory=list)
+    needs_secret: bool = False
+    needs_external_network: bool = False
+    generates_file: bool = False
+    high_risk: bool = False
+    validation: dict[str, Any] | None = None
+    stage: str = "draft"
+
+
 class ToolRegisterRequest(ToolManifestRequest):
     created_by: str = "user"
     enable: bool = False
@@ -120,6 +140,14 @@ def draft_creator_tool(request: ToolDraftRequest) -> dict[str, Any]:
 def generate_creator_tool_code(request: ToolManifestRequest) -> dict[str, Any]:
     code = generate_adapter_code(request.manifest)
     return {"adapter_code": code, "adapter_path": request.manifest.get("adapter_path"), "requires_validation": True}
+
+
+@router.post("/tools/author")
+async def author_creator_tool(request: ToolAuthorRequest) -> dict[str, Any]:
+    try:
+        return await author_tool(request.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/tools/validate")
