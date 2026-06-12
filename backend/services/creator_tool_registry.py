@@ -12,12 +12,14 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields as dataclasses_fields, replace
 from datetime import datetime, timezone
+import asyncio
 import ast
 import importlib
 import importlib.util
 import json
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
@@ -1092,38 +1094,81 @@ def generate_adapter_code(manifest: dict[str, Any]) -> str:
     cap = _capability_from_dict(manifest)
     fn = cap.functions[0] if cap.functions else _function_from_dict(build_tool_manifest_draft(manifest)["functions"][0])
     output_keys = list((fn.output_schema or {}).keys()) or ["result"]
-    trial_lines = "\n".join([f"        result.setdefault({key!r}, [] if 'paths' in {key!r} or 'outputs' in {key!r} else {{}})" for key in output_keys]) or '        result["result"] = {"ok": True}'
-    return f'''# Generated adapter for registered Creator tool: {cap.name}.
+    input_keys = list((fn.input_schema or {}).keys())
+    return f"""# Generated adapter for registered Creator tool: {cap.name}.
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 
+OUTPUT_KEYS = {output_keys!r}
+INPUT_KEYS = {input_keys!r}
+
+
 def _output_dir() -> Path:
-    root = Path(os.environ.get("OUTPUT_DIR", "outputs")).resolve()
+    root = Path(os.environ.get(\"OUTPUT_DIR\", \"outputs\")).resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
-def {fn.function_name}(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    # {fn.short_description}
-    # Signature: {fn.signature}
-    # Return contract: {fn.return_contract}
-    # Trial mode: {fn.trial_mode_behavior}
-    payload = dict(payload or {{}})
-    result: dict[str, Any] = {{"result": {{"ok": True, "payload_keys": sorted(payload.keys())}}}}
-    if os.environ.get("SKILL_TRIAL_RUN") == "1":
-{trial_lines}
-        return result
-    # TODO: Replace this deterministic scaffold with the real adapter body.
-    # Safety constraints: do not read/write outside OUTPUT_DIR; do not leak secrets;
-    # do not perform undeclared network, database, shell, or publishing side effects.
-    return result
-'''
+def _safe_filename(value: str, default: str = \"result\") -> str:
+    cleaned = \"\".join(ch if ch.isalnum() or ch in (\"-\", \"_\", \".\") else \"_\" for ch in value.strip())
+    return (cleaned or default)[:120]
 
+
+def _build_file(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    output_dir = _output_dir()
+    title = str(payload.get(\"title\") or payload.get(\"name\") or \"result\")
+    suffix = str(payload.get(\"extension\") or payload.get(\"suffix\") or \"txt\").lstrip(\".\") or \"txt\"
+    if suffix not in {{\"txt\", \"md\", \"json\", \"csv\", \"html\"}}:
+        suffix = \"txt\"
+    path = (output_dir / f\"{{_safe_filename(title)}}.{{suffix}}\").resolve()
+    if output_dir not in path.parents and path != output_dir:
+        raise ValueError(\"generated file path must stay under OUTPUT_DIR\")
+    content = payload.get(\"content\") or payload.get(\"markdown\") or payload.get(\"text\") or json.dumps(payload, ensure_ascii=False, indent=2)
+    path.write_text(str(content), encoding=\"utf-8\")
+    return str(path), {{\"path\": str(path), \"mime_type\": \"text/plain\", \"label\": title}}
+
+
+def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    \"\"\"{fn.short_description}\"\"\"
+    payload = dict(payload or {{}})
+    result: dict[str, Any] = {{\"result\": {{\"ok\": True, \"payload_keys\": sorted(payload.keys())}}}}
+    wants_file = any(key in OUTPUT_KEYS for key in (\"file_paths\", \"file_outputs\", \"path\", \"output_path\"))
+    if wants_file:
+        path, file_output = _build_file(payload)
+        result.update({{\"path\": path, \"output_path\": path, \"file_paths\": [path], \"file_outputs\": [file_output]}})
+    for key in OUTPUT_KEYS:
+        if key in result:
+            continue
+        if \"path\" in key:
+            path, _file_output = _build_file(payload)
+            result[key] = path
+        elif key.endswith(\"s\"):
+            result[key] = []
+        else:
+            result[key] = {{\"ok\": True}}
+    return result
+
+
+def {fn.function_name}(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return run(payload)
+
+
+def main() -> None:
+    raw = sys.stdin.read().strip() or \"{{}}\"
+    payload = json.loads(raw)
+    print(json.dumps(run(payload), ensure_ascii=False))
+
+
+if __name__ == \"__main__\":
+    main()
+"""
 
 def _manifest_errors(manifest: dict[str, Any]) -> list[str]:
     errors: list[str] = []
@@ -1216,26 +1261,50 @@ def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None
                     raise ImportError("could not create import spec")
                 module = importlib.util.module_from_spec(spec)
                 old_trial = os.environ.get("SKILL_TRIAL_RUN")
+                old_output_dir = os.environ.get("OUTPUT_DIR")
                 os.environ["SKILL_TRIAL_RUN"] = "1"
-                try:
-                    spec.loader.exec_module(module)
-                    fn = cap.functions[0]
-                    target = getattr(module, fn.function_name)
-                    if not callable(target):
-                        raise TypeError(f"{fn.function_name} is not callable")
-                    payload = sample_input or {}
+                with tempfile.TemporaryDirectory(prefix="creator_tool_trial_") as trial_dir:
+                    os.environ["OUTPUT_DIR"] = trial_dir
+                    trial_root = Path(trial_dir).resolve()
                     try:
-                        value = target(payload)
-                    except TypeError:
-                        value = target(**payload)
-                finally:
-                    if old_trial is None:
-                        os.environ.pop("SKILL_TRIAL_RUN", None)
-                    else:
-                        os.environ["SKILL_TRIAL_RUN"] = old_trial
-                if not isinstance(value, dict):
-                    errors.append("dynamic trial must return a dict")
-                    value = {}
+                        spec.loader.exec_module(module)
+                        fn = cap.functions[0]
+                        target = getattr(module, fn.function_name)
+                        if not callable(target):
+                            raise TypeError(f"{fn.function_name} is not callable")
+                        payload = sample_input or {}
+                        try:
+                            value = target(payload)
+                        except TypeError:
+                            value = target(**payload)
+                    finally:
+                        if old_trial is None:
+                            os.environ.pop("SKILL_TRIAL_RUN", None)
+                        else:
+                            os.environ["SKILL_TRIAL_RUN"] = old_trial
+                        if old_output_dir is None:
+                            os.environ.pop("OUTPUT_DIR", None)
+                        else:
+                            os.environ["OUTPUT_DIR"] = old_output_dir
+                    if not isinstance(value, dict):
+                        errors.append("dynamic trial must return a dict")
+                        value = {}
+                    file_values: list[str] = []
+                    for key in ("path", "output_path"):
+                        if isinstance(value.get(key), str):
+                            file_values.append(value[key])
+                    for key in ("file_paths", "paths"):
+                        if isinstance(value.get(key), list):
+                            file_values.extend(str(item) for item in value[key] if isinstance(item, str))
+                    for item in value.get("file_outputs", []) if isinstance(value.get("file_outputs"), list) else []:
+                        if isinstance(item, dict) and isinstance(item.get("path"), str):
+                            file_values.append(item["path"])
+                    for file_path in file_values:
+                        resolved = Path(file_path).resolve()
+                        if trial_root not in resolved.parents and resolved != trial_root:
+                            errors.append(f"dynamic trial returned file outside OUTPUT_DIR: {file_path}")
+                        elif not resolved.exists():
+                            errors.append(f"dynamic trial returned missing file path: {file_path}")
                 expected = set((cap.functions[0].output_schema or {}).keys())
                 missing = [key for key in expected if key not in value]
                 if missing:
@@ -1256,6 +1325,348 @@ def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None
         "snippet_validations": snippet_validations,
     }
 
+
+def _json_from_model_text(text: str) -> dict[str, Any]:
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    match = re.search(r"\{.*\}", raw, re.S)
+    if match:
+        raw = match.group(0)
+    try:
+        value = json.loads(raw)
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+async def _complete_author_model(task: str, messages: list[dict[str, str]], *, reason: str) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
+    """Call the routed model with a short authoring timeout and JSON parsing."""
+    try:
+        from .llm_proxy import complete_chat_once
+        from .model_router import route_model
+
+        route = route_model(task, reason=reason)
+        text = await asyncio.wait_for(complete_chat_once(messages, route.model), timeout=float(os.environ.get("TOOL_AUTHOR_LLM_TIMEOUT_SECONDS", "2")))
+        parsed = _json_from_model_text(text)
+        if task == "code" and not parsed and (text or "").strip():
+            parsed = {"code": _strip_code_fence(text)}
+        return parsed, route.ack(), None
+    except Exception as exc:
+        return {}, None, str(exc)
+
+
+def _infer_schema_from_code(code: str) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    input_keys: set[str] = set()
+    output_keys: set[str] = set()
+    notes: list[str] = []
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return {}, {}, ["code_block has syntax errors; code_model should repair before trial run"]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get":
+            target = node.func.value
+            if isinstance(target, ast.Name) and target.id in {"payload", "data", "input"} and node.args and isinstance(node.args[0], ast.Constant):
+                if isinstance(node.args[0].value, str):
+                    input_keys.add(node.args[0].value)
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id in {"payload", "data", "input"}:
+            key = node.slice
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                input_keys.add(key.value)
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+            for key in node.value.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    output_keys.add(key.value)
+    input_schema = {key: {"type": "string", "required": False, "description": f"Inferred from code_block field {key}."} for key in sorted(input_keys)}
+    output_schema = {key: {"type": "object", "description": f"Inferred from code_block return field {key}."} for key in sorted(output_keys)}
+    if input_keys:
+        notes.append(f"inferred input fields from code_block: {', '.join(sorted(input_keys))}")
+    if output_keys:
+        notes.append(f"inferred output fields from code_block: {', '.join(sorted(output_keys))}")
+    return input_schema, output_schema, notes
+
+
+def _first_function_name(code: str) -> str:
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return "run"
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_") and node.name not in {"main"}:
+            return node.name
+    return "run"
+
+
+def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
+    code_block = str(request.get("code_block") or "")
+    code_input_schema, code_output_schema, notes = _infer_schema_from_code(code_block) if code_block.strip() else ({}, {}, [])
+    merged = dict(request)
+    if code_input_schema and not merged.get("input_schema"):
+        merged["input_schema"] = code_input_schema
+    if code_output_schema and not merged.get("output_schema"):
+        merged["output_schema"] = code_output_schema
+    if request.get("manifest"):
+        manifest = dict(request["manifest"])
+    else:
+        manifest = build_tool_manifest_draft(merged)
+    description = str(request.get("description") or "").lower()
+    ambiguous_api = ("接口" in description or "api" in description or "http" in description) and not (
+        request.get("needs_external_network") or "http://" in code_block or "https://" in code_block or request.get("required_env") or request.get("required_secrets")
+    )
+    questions = []
+    if ambiguous_api:
+        questions = ["请提供接口地址、认证方式、请求字段和期望输出字段。", "该工具是否允许外部网络访问和 secret？"]
+    sample = request.get("sample_input") if isinstance(request.get("sample_input"), dict) and request.get("sample_input") else {}
+    if not sample:
+        sample = {key: "demo" for key in (code_input_schema or {"payload": {}}).keys()} or {"payload": {}}
+    return {
+        "needs_clarification": bool(questions),
+        "questions": questions,
+        "manifest": manifest,
+        "implementation_plan": "Normalize existing code_block while preserving business logic." if code_block.strip() else "Generate a complete Python adapter from the manifest.",
+        "sample_input": sample,
+        "risk_notes": notes,
+        "model_notes": ["deterministic fallback planner used", *notes],
+    }
+
+
+def _strip_code_fence(text: str) -> str:
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:python)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    return raw
+
+
+def _normalize_existing_code_fallback(code: str, manifest: dict[str, Any]) -> str:
+    cap = _capability_from_dict(manifest)
+    fn = cap.functions[0] if cap.functions else _function_from_dict(build_tool_manifest_draft(manifest)["functions"][0])
+    code = _strip_code_fence(code)
+    if not code.strip():
+        return generate_adapter_code(manifest)
+    try:
+        tree = ast.parse(code)
+        has_run = any(isinstance(node, ast.FunctionDef) and node.name == "run" for node in tree.body)
+        has_main = any(isinstance(node, ast.FunctionDef) and node.name == "main" for node in tree.body)
+        first_fn = _first_function_name(code)
+    except SyntaxError:
+        return generate_adapter_code(manifest)
+    suffix = ""
+    if not has_run:
+        suffix += f'''
+
+
+def run(payload: dict | None = None) -> dict:
+    payload = dict(payload or {{}})
+    value = {first_fn}(payload)
+    if isinstance(value, dict):
+        return value
+    return {{"result": value}}
+'''
+    if fn.function_name not in {"run", first_fn}:
+        suffix += f'''
+
+
+def {fn.function_name}(payload: dict | None = None) -> dict:
+    return run(payload)
+'''
+    if not has_main:
+        suffix += '''
+
+
+def main() -> None:
+    import json
+    import sys
+    raw = sys.stdin.read().strip() or "{}"
+    payload = json.loads(raw)
+    print(json.dumps(run(payload), ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+'''
+    return code.rstrip() + suffix
+
+
+def _author_adapter_static_errors(code: str, manifest: dict[str, Any]) -> list[str]:
+    errors = _code_security_errors(code)
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return errors
+    function_names = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    if "run" not in function_names:
+        errors.append("adapter must define run(payload: dict) -> dict")
+    if "main" not in function_names:
+        errors.append("adapter must define a JSON stdin/stdout main() entrypoint")
+    try:
+        cap = _capability_from_dict(manifest)
+        if cap.functions and cap.functions[0].function_name not in function_names:
+            errors.append(f"adapter must expose manifest function {cap.functions[0].function_name}")
+        tree = ast.parse(code or "")
+        imports: set[str] = set()
+        env_keys: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.add(node.module.split(".")[0])
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr == "getenv" and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    env_keys.add(node.args[0].value)
+                elif node.func.attr == "get" and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    owner = ast.unparse(node.func.value) if hasattr(ast, "unparse") else ""
+                    if owner.endswith("environ"):
+                        env_keys.add(node.args[0].value)
+            elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) and node.value.attr == "environ":
+                key = node.slice
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    env_keys.add(key.value)
+                else:
+                    env_keys.add("<dynamic>")
+        undeclared_env_keys = env_keys - {"OUTPUT_DIR", "SKILL_TRIAL_RUN"} - set(cap.required_env) - set(cap.required_secrets)
+        if imports & {"requests", "httpx", "urllib"} and cap.safety_level not in {"medium", "high"}:
+            errors.append("adapter imports network libraries but manifest does not declare external network access")
+        if undeclared_env_keys:
+            errors.append("adapter reads undeclared environment variables or secrets: " + ", ".join(sorted(undeclared_env_keys)))
+    except Exception:
+        pass
+    return sorted(set(errors))
+
+
+def _validate_author_snippet(snippet: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    required = ["id", "title", "description", "code", "return_rule", "usage_policy", "priority"]
+    for key in required:
+        if snippet.get(key) in (None, ""):
+            errors.append(f"snippet {key} is required")
+    if not isinstance(snippet.get("anti_patterns", []), list) or not all(isinstance(item, str) for item in snippet.get("anti_patterns", [])):
+        errors.append("snippet anti_patterns must be a string array")
+    if snippet.get("usage_policy") not in _ALLOWED_USAGE_POLICIES:
+        errors.append("snippet usage_policy is invalid")
+    try:
+        priority = int(snippet.get("priority", 0))
+        if priority < 0 or priority > 100:
+            warnings.append("snippet priority should be between 0 and 100")
+    except Exception:
+        errors.append("snippet priority must be numeric")
+    try:
+        cap = _capability_from_dict({**manifest, "snippets": [snippet]})
+        if cap.snippets:
+            result = validate_tool_snippet(cap, cap.snippets[0])
+            errors.extend(result["errors"])
+            warnings.extend(result["warnings"])
+    except Exception as exc:
+        errors.append(f"snippet cannot be parsed: {exc}")
+    return {"success": not errors, "errors": sorted(set(errors)), "warnings": sorted(set(warnings))}
+
+
+def _fallback_snippet(manifest: dict[str, Any], sample_input: dict[str, Any]) -> dict[str, Any]:
+    cap = _capability_from_dict(manifest)
+    fn = cap.functions[0]
+    return {
+        "id": f"{cap.name}.minimal_usage",
+        "title": f"Use {cap.display_name}",
+        "kind": "minimal_usage",
+        "applies_to": {"roles": cap.allowed_roles or cap.roles, "capabilities": cap.required_capabilities or [cap.name], "failure_layers": ["helper_call_failed", "artifact_missing"]},
+        "description": fn.when_to_use or fn.short_description,
+        "code": f"from {fn.import_path} import {fn.function_name}\n\npayload = {json.dumps(sample_input or {}, ensure_ascii=False, indent=2)}\nresult = {fn.function_name}(payload)\nreturn result",
+        "expected_input_shape": fn.input_schema or cap.input_schema,
+        "expected_output_shape": fn.output_schema or cap.output_schema,
+        "return_rule": "Return the adapter result directly. If it contains generated file paths, pass those exact OUTPUT_DIR paths to downstream skill steps.",
+        "anti_patterns": ["Do not call this tool before human-confirming the adapter code.", "Do not write or expect files outside OUTPUT_DIR.", "Do not pass secrets unless the manifest explicitly declares them."],
+        "requires": cap.required_capabilities or [cap.name],
+        "usage_policy": cap.usage_policy,
+        "priority": 80,
+    }
+
+
+async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
+    """Unified Tool Authoring pipeline for draft/finalize stages."""
+    stage = str(request.get("stage") or "draft").strip().lower()
+    model_notes: list[str] = []
+    warnings: list[str] = []
+    if stage not in {"draft", "finalize"}:
+        raise ValueError("stage must be 'draft' or 'finalize'")
+
+    if stage == "finalize":
+        manifest = request.get("manifest") if isinstance(request.get("manifest"), dict) else {}
+        adapter_code = str(request.get("adapter_code") or request.get("code_block") or "")
+        validation = validate_tool_manifest(manifest, adapter_code=adapter_code, sample_input=request.get("sample_input") or {}, dynamic=False)
+        static_errors = _author_adapter_static_errors(adapter_code, manifest)
+        if static_errors:
+            validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
+            validation["success"] = False
+            validation["status"] = "failed"
+        snippet = None
+        if validation.get("success"):
+            messages = [{"role": "system", "content": "Generate one strict JSON ToolSnippet for the final Creator tool. No markdown."}, {"role": "user", "content": json.dumps({"manifest": manifest, "sample_input": request.get("sample_input") or {}, "validation": validation, "adapter_code_excerpt": adapter_code[:12000]}, ensure_ascii=False)}]
+            model_json, ack, err = await _complete_author_model("text", messages, reason="creator_tool_author_finalize_snippet")
+            if ack:
+                model_notes.append(f"text_model={ack['model']}")
+            if err:
+                warnings.append(f"text_model unavailable, used fallback snippet: {err}")
+            snippet = model_json if model_json else _fallback_snippet(manifest, request.get("sample_input") or {})
+            snippet_validation = _validate_author_snippet(snippet, manifest)
+            if not snippet_validation["success"]:
+                warnings.extend(snippet_validation["errors"])
+                snippet = _fallback_snippet(manifest, request.get("sample_input") or {})
+                snippet_validation = _validate_author_snippet(snippet, manifest)
+            validation["snippet_validation"] = snippet_validation
+        return {"needs_clarification": False, "questions": [], "manifest": manifest, "adapter_code": adapter_code, "sample_input": request.get("sample_input") or {}, "validation": validation, "snippet": snippet, "model_notes": model_notes, "warnings": warnings, "requires_human_confirmation": True}
+
+    planner_payload = {key: request.get(key) for key in ["description", "tool_name", "tool_type", "code_block", "input_description", "output_description", "manifest", "sample_input", "allowed_roles", "needs_secret", "needs_external_network", "generates_file", "high_risk"]}
+    planner_messages = [{"role": "system", "content": "You are planning a Creator tool. Treat code_block as primary implementation intent when present. Return strict JSON with needs_clarification, questions, manifest, implementation_plan, sample_input, risk_notes."}, {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)}]
+    model_plan, ack, err = await _complete_author_model("planner", planner_messages, reason="creator_tool_author_draft_plan")
+    if ack:
+        model_notes.append(f"planner_model={ack['model']}")
+    if err:
+        warnings.append(f"planner_model unavailable, used deterministic fallback: {err}")
+    plan = model_plan if isinstance(model_plan.get("manifest"), dict) else _author_fallback_plan(request)
+    model_notes.extend(plan.get("model_notes") or [])
+    if plan.get("needs_clarification"):
+        return {"needs_clarification": True, "questions": plan.get("questions") or [], "manifest": plan.get("manifest") or {}, "adapter_code": "", "sample_input": plan.get("sample_input") or {}, "validation": {"success": False, "status": "needs_clarification", "errors": [], "warnings": plan.get("risk_notes") or []}, "snippet": None, "model_notes": model_notes, "warnings": warnings, "requires_human_confirmation": True}
+
+    manifest = plan.get("manifest") or build_tool_manifest_draft(request)
+    sample_input = request.get("sample_input") if isinstance(request.get("sample_input"), dict) and request.get("sample_input") else plan.get("sample_input") or {}
+    code_block = str(request.get("code_block") or "")
+    mode = "normalize_existing_code" if code_block.strip() else "generate_new_adapter"
+    code_messages = [{"role": "system", "content": f"You are code_model in mode={mode}. Return Python code only. Preserve user business logic for normalize_existing_code. Include run(payload), manifest function wrapper, JSON main(), SKILL_TRIAL_RUN/OUTPUT_DIR safety."}, {"role": "user", "content": json.dumps({"manifest": manifest, "implementation_plan": plan.get("implementation_plan"), "sample_input": sample_input, "code_block": code_block}, ensure_ascii=False)}]
+    code_json, code_ack, code_err = await _complete_author_model("code", code_messages, reason=f"creator_tool_author_{mode}")
+    if code_ack:
+        model_notes.append(f"code_model={code_ack['model']}")
+    if code_err:
+        warnings.append(f"code_model unavailable, used deterministic fallback: {code_err}")
+    adapter_code = _strip_code_fence(str(code_json.get("adapter_code") or code_json.get("code") or "")) if code_json else ""
+    if not adapter_code:
+        adapter_code = _normalize_existing_code_fallback(code_block, manifest) if code_block.strip() else generate_adapter_code(manifest)
+
+    repair_log: list[dict[str, Any]] = []
+    validation: dict[str, Any] = {}
+    for attempt in range(3):
+        validation = validate_tool_manifest(manifest, adapter_code=adapter_code, sample_input=sample_input, dynamic=True)
+        static_errors = _author_adapter_static_errors(adapter_code, manifest)
+        if static_errors:
+            validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
+            validation["success"] = False
+            validation["status"] = "failed"
+        if validation.get("success"):
+            break
+        if attempt >= 2:
+            break
+        repair_log.append({"attempt": attempt + 1, "errors": validation.get("errors", []), "warnings": validation.get("warnings", [])})
+        repair_messages = [{"role": "system", "content": "Repair the Python adapter locally. Preserve business logic. Return code only."}, {"role": "user", "content": json.dumps({"manifest": manifest, "sample_input": sample_input, "validation": validation, "adapter_code": adapter_code}, ensure_ascii=False)}]
+        repair_json, _repair_ack, repair_err = await _complete_author_model("code", repair_messages, reason="creator_tool_author_repair")
+        repaired = _strip_code_fence(str(repair_json.get("adapter_code") or repair_json.get("code") or "")) if repair_json else ""
+        if repair_err or not repaired:
+            warnings.append(f"automatic repair stopped; using fallback/local code: {repair_err or 'empty repair'}")
+            break
+        adapter_code = repaired
+    validation["repair_log"] = repair_log
+    return {"needs_clarification": False, "questions": [], "manifest": manifest, "adapter_code": adapter_code, "sample_input": sample_input, "validation": validation, "snippet": None, "model_notes": model_notes, "warnings": warnings, "requires_human_confirmation": True}
 
 def tool_status(capability: ToolCapability) -> dict[str, Any]:
     missing_env = [name for name in capability.required_env if not os.environ.get(name)]

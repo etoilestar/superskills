@@ -286,6 +286,10 @@ export function draftCreatorTool(payload) {
   return postCreatorTool('draft', payload)
 }
 
+export function authorCreatorTool(payload) {
+  return postCreatorTool('author', payload)
+}
+
 export function generateCreatorToolCode(payload) {
   return postCreatorTool('generate-code', payload)
 }
