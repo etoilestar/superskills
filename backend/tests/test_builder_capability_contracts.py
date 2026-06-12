@@ -174,7 +174,7 @@ def test_pdf_builder_ignores_propagated_model_capabilities_during_source_contrac
     )
 
 
-def test_text_and_image_scripts_still_require_model_helpers():
+def test_text_and_image_scripts_allow_self_implementation_until_e2e():
     text_source_without_llm = '''
 import json
 import sys
@@ -203,30 +203,28 @@ def main():
 if __name__ == "__main__":
     main()
 '''
-    with pytest.raises(ContractValidationError, match="text_generation"):
-        _validate_script_file_source_contract(
-            "scripts/generate_story.py",
-            text_source_without_llm,
-            skill_plan_entry={
-                "path": "scripts/generate_story.py",
-                "role": "text_generator",
-                "inputs": ["topic"],
-                "outputs": ["text"],
-                "required_capabilities": ["text_generation"],
-            },
-        )
-    with pytest.raises(ContractValidationError, match="image_generation"):
-        _validate_script_file_source_contract(
-            "scripts/generate_images.py",
-            image_source_without_helper,
-            skill_plan_entry={
-                "path": "scripts/generate_images.py",
-                "role": "image_generator",
-                "inputs": ["topic"],
-                "outputs": ["image_paths"],
-                "required_capabilities": ["image_generation"],
-            },
-        )
+    _validate_script_file_source_contract(
+        "scripts/generate_story.py",
+        text_source_without_llm,
+        skill_plan_entry={
+            "path": "scripts/generate_story.py",
+            "role": "text_generator",
+            "inputs": ["topic"],
+            "outputs": ["text"],
+            "required_capabilities": ["text_generation"],
+        },
+    )
+    _validate_script_file_source_contract(
+        "scripts/generate_images.py",
+        image_source_without_helper,
+        skill_plan_entry={
+            "path": "scripts/generate_images.py",
+            "role": "image_generator",
+            "inputs": ["topic"],
+            "outputs": ["image_paths"],
+            "required_capabilities": ["image_generation"],
+        },
+    )
 
 
 def test_combine_to_pdf_path_is_pdf_builder_without_explicit_role_or_model_call():
@@ -287,7 +285,7 @@ def test_registered_helper_capabilities_are_validated_from_registry():
     assert _script_satisfies_required_capability("print('no search')", "web_search") is False
 
 
-def test_pdf_builder_direct_reportlab_fails_tool_usage_contract():
+def test_pdf_builder_direct_reportlab_allowed_until_e2e_artifact_validation():
     direct_reportlab = '''
 import json
 import sys
@@ -306,17 +304,16 @@ def main():
 if __name__ == "__main__":
     main()
 '''
-    with pytest.raises(ContractValidationError, match="tool_usage_contract"):
-        _validate_script_file_source_contract(
-            "scripts/build_pdf.py",
-            direct_reportlab,
-            role="pdf_builder",
-            skill_plan_entry={
-                "path": "scripts/build_pdf.py",
-                "role": "pdf_builder",
-                "inputs": ["text"],
-                "outputs": ["pdf_path", "file_paths"],
-                "required_capabilities": ["pdf_generation", "file_output"],
-                "forbidden_capabilities": [],
-            },
-        )
+    _validate_script_file_source_contract(
+        "scripts/build_pdf.py",
+        direct_reportlab,
+        role="pdf_builder",
+        skill_plan_entry={
+            "path": "scripts/build_pdf.py",
+            "role": "pdf_builder",
+            "inputs": ["text"],
+            "outputs": ["pdf_path", "file_paths"],
+            "required_capabilities": ["pdf_generation", "file_output"],
+            "forbidden_capabilities": [],
+        },
+    )

@@ -2049,9 +2049,9 @@ def _build_script_file_contract_text(
     ]
 
     if entry.role == "text_generator":
-        lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定；必须调用 text_generation helper。")
+        lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定；可优先调用 text_generation helper，但不强制实现方式。")
     elif entry.role == "image_generator":
-        lines.append("- stdout JSON 至少有一个非空字段；必须调用 generate_stable_diffusion_image helper；字段名由 workflow 决定。")
+        lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定；可优先调用 generate_stable_diffusion_image helper，但不强制实现方式。")
     elif entry.role == "pdf_builder":
         lines.append(
             "- stdout JSON 必须返回真实存在的 PDF 文件路径；禁止调用图片 helper；字段名由 workflow 决定。"
@@ -2065,7 +2065,7 @@ def _build_script_file_contract_text(
         lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定。")
 
     lines.append("D. 能力边界:")
-    lines.append("- required_capabilities 必须真实调用，forbidden_capabilities 禁止调用。")
+    lines.append("- required_capabilities / forbidden_capabilities 只声明能力边界；helper_required 能力必须使用平台 helper，其余能力可优先使用推荐 helper或自实现。")
     lines.append("- 内部 workflow 字段名不强制，但 SKILL.md/reference 与脚本读取必须自洽。")
     lines.append("E. 禁止项:")
     lines.append("- 不输出 placeholder/mock/fake API；不要通过 print {'error':...}、{}、空路径等绕过校验。")
@@ -2845,9 +2845,7 @@ def _script_satisfies_required_capability(content: str, capability: str) -> bool
         # instead of a generic "missing required_capabilities" message.
         return bool(_PLATFORM_IMAGE_HELPER_RE.search(content) or _DIRECT_IMAGE_API_RE.search(content))
     if capability == "pdf_generation":
-        # PDF generation must be satisfied through the platform registry helper
-        # contract, not by hand-written reportlab/fpdf/PyPDF/PDF byte logic.
-        return _script_uses_registry_helpers(content, "pdf_generation")
+        return bool(re.search(r"create_pdf|build_pdf_report|images_to_pdf|merge_pdfs|reportlab|fpdf|PyPDF2|pypdf|PdfWriter|write_bytes\s*\(\s*b?[\']%PDF-", content, re.IGNORECASE))
     if capability == "docx_generation":
         return bool(re.search(r"Document\(|python-docx|word/document.xml|ZipFile\(|build_docx", content, re.IGNORECASE))
     if capability == "pptx_generation":
@@ -3153,9 +3151,14 @@ def _check_script_file_contract(
 
     tool_resolve = resolve_tools_for_skill_plan_entry(plan_entry)
 
+    helper_required_capabilities = [
+        capability
+        for capability in effective_required_capabilities
+        if (get_tool_capability(capability) and get_tool_capability(capability).usage_policy == "helper_required")
+    ]
     missing_capabilities = _script_required_capability_failures(
         stripped,
-        effective_required_capabilities,
+        helper_required_capabilities,
     )
     results.append(
         ContractCheckResult(
@@ -3163,17 +3166,12 @@ def _check_script_file_contract(
             passed=not missing_capabilities,
             target=file_path,
             message=(
-                "脚本调用了 role.required_capabilities 对应的平台/文件能力。"
+                "helper_required 能力已调用对应平台 helper；其他 required_capabilities 只作为声明边界，不强制实现方式。"
                 if not missing_capabilities
-                else f"脚本没有调用这些 required_capabilities 对应接口：{', '.join(missing_capabilities)}。"
+                else f"脚本没有调用这些 helper_required 能力对应接口：{', '.join(missing_capabilities)}。"
             ),
-            expected=(
-                "text_generation 调用 generate_text_with_llm；"
-                "image_generation 调用 generate_stable_diffusion_image；"
-                "pdf_generation 必须调用 create_pdf/build_pdf_report/images_to_pdf/merge_pdfs 平台 helper；"
-                "file_output 写入声明文件。"
-            ),
-            minimal_edit="按 Tool Resolve 结果注入对应平台 helper；PDF 不要手写 reportlab/fpdf/PyPDF/raw %PDF。",
+            expected="第一轮只强制 helper_required 能力调用平台 helper；helper_preferred/self_implementation_allowed 能力由第二轮 E2E 验证 stdout/artifact。",
+            minimal_edit="仅对 usage_policy=helper_required 的能力注入对应平台 helper；其余能力保证最终 stdout/artifact 协议合法。",
         )
     )
 
@@ -3188,15 +3186,15 @@ def _check_script_file_contract(
     results.append(
         ContractCheckResult(
             id="script.file_outputs.real_creation_logic",
-            passed=has_real_file_output,
+            passed=True,
             target=file_path,
             message=(
-                "脚本声明文件输出时包含真实文件创建逻辑。"
+                "第一轮不静态判定文件创建实现；文件产物存在性与格式由第二轮 E2E 校验。"
                 if has_real_file_output
-                else f"{file_path} 声明 pdf/docx/pptx/html/file_paths 输出或文件生成能力，但只返回路径字符串或缺少真实写文件逻辑。"
+                else f"{file_path} 声明文件输出；第一轮仅提示风险，第二轮 E2E 将验证真实产物。"
             ),
-            expected="声明 pdf_path/docx_path/pptx_path/html_path/file_paths 或文件生成 required_capabilities 时，必须真实创建对应文件，禁止只返回路径占位。",
-            minimal_edit="拆出 build_pdf/build_docx/build_pptx/build_html 等函数，在其中写入真实文件并只返回已创建文件路径。",
+            expected="第一轮不检查文件产物存在性；声明 pdf/docx/pptx/html/file_paths 时，第二轮 E2E 必须验证真实文件和格式。",
+            minimal_edit="如 E2E 失败，再修脚本确保写入 OUTPUT_DIR/outputs 并返回平台字段。",
         )
     )
 
@@ -3391,19 +3389,18 @@ def _check_script_file_contract(
         uses_pdf_helper = _script_uses_registry_helpers(stripped, "pdf_generation")
         results.append(
             ContractCheckResult(
-                id="tool_usage_contract.pdf_helper_required",
-                passed=uses_pdf_helper,
+                id="tool_usage_contract.pdf_helper_preferred",
+                passed=True,
                 target=file_path,
                 message=(
                     "pdf_builder 已调用工具注册表允许的 PDF helper。"
                     if uses_pdf_helper
-                    else f"{file_path} 是 pdf_builder 或声明 pdf_generation，但未调用 create_pdf/build_pdf_report/images_to_pdf/merge_pdfs。"
+                    else f"{file_path} 是 pdf_builder 或声明 pdf_generation；PDF helper 为推荐项，允许自实现，最终由 E2E 校验产物。"
                 ),
-                expected="PDF builder 必须调用 create_pdf/build_pdf_report/images_to_pdf/merge_pdfs 之一；底层 reportlab/fpdf/PyPDF 只允许存在于平台 helper 内部。",
+                expected="PDF builder 可优先调用 create_pdf/build_pdf_report/images_to_pdf/merge_pdfs；也可自实现，最终 PDF 产物与 stdout 字段必须通过 E2E。",
                 minimal_edit=(
-                    "修当前脚本：删除底层 PDF 实现；保留 parse_args/run/main/print_json；"
-                    "改为 from backend.services.skill_runtime import create_pdf 或 build_pdf_report；"
-                    "stdout 直接返回 helper 结果，且包含 pdf_path/file_paths/file_outputs。"
+                    "若使用 helper，可 from backend.services.skill_runtime import create_pdf 或 build_pdf_report；"
+                    "若自实现，确保 stdout 返回真实存在的 pdf_path/file_paths/file_outputs。"
                 ),
             )
         )
@@ -4013,7 +4010,7 @@ def _validate_script_contract_static(*, file_path: str, content: str, skill_md: 
     json_argv_commands = [c for c in commands if _command_uses_json_argv(c)]
     if json_argv_commands and not _script_reads_json_argv(content, plan_entry.runtime):
         raise ValueError(
-            f"{file_path} SKILL.md 命令传入 JSON argv，但脚本未按 runtime 读取 JSON argv。"
+            f"{file_path} SKILL.md 命令传入 JSON argv，但脚本未按 runtime 读取 JSON argv（例如 Python json.loads(sys.argv[1])）。"
         )
 
 
@@ -4039,13 +4036,13 @@ def _sample_value_for_placeholder(key: str) -> str:
     lowered = key.lower()
 
     if any(token in lowered for token in ("prompt", "diffusion", "image", "picture", "photo", "scene")):
-        return "一只会飞的橘猫在暖色夕阳下看着古城，cinematic watercolor style"
+        return "sample visual prompt for artifact generation"
 
     if any(token in lowered for token in ("text", "content", "input", "query", "article", "story", "body", "summary")):
-        return "测试输入：这是包含中文、English words 和标点符号的正文，用于验证 UTF-8/PDF 生成。"
+        return "测试输入：包含中文、English words 和标点符号的正文，用于验证 UTF-8 与文件生成。"
 
     if any(token in lowered for token in ("topic", "theme", "subject", "title", "name")):
-        return "中文主题：会飞的猫与古代小镇"
+        return "中文主题：示例主题"
     return f"sample {key}"
 
 
@@ -4468,15 +4465,15 @@ async def _repair_generated_file_with_feedback(
             caps = set(plan_entry.required_capabilities or [])
             role_rule = "role=composite_generator：表示多能力组合脚本；具体 helper 由 SkillPlan.required_capabilities 决定；stdout 字段名由现有 SKILL.md 后续变量引用/业务语义决定，不要把 composite 固定理解为 text+image。"
             if {"text_generation", "image_generation"} <= caps:
-                role_rule += " 当前合同同时要求文本和图片能力，必须保留 generate_text_with_llm 与 generate_stable_diffusion_image。"
+                role_rule += " 当前合同同时声明文本和图片能力，可优先保留 generate_text_with_llm 与 generate_stable_diffusion_image，也可自实现；最终由 E2E 验证。"
         elif plan_entry is not None and plan_entry.role == "image_generator":
-            role_rule = "role=image_generator：必须保留并调用 generate_stable_diffusion_image；stdout 输出非空 JSON，并使用现有 SKILL.md/脚本链路会消费的字段名；禁止占位图片或删除真实 helper。"
+            role_rule = "role=image_generator：可优先调用 generate_stable_diffusion_image；stdout 输出非空 JSON，并使用现有 SKILL.md/脚本链路会消费的字段名；禁止占位图片。"
         elif plan_entry is not None and plan_entry.role == "text_generator":
-            role_rule = "role=text_generator：必须调用 generate_text_with_llm 或平台 LLM，禁止调用图片 helper 或输出固定 template-only 文本。"
+            role_rule = "role=text_generator：可优先调用 generate_text_with_llm 或平台 LLM，也可自实现；禁止调用图片 helper 或输出固定 template-only 文本。"
         elif plan_entry is not None and plan_entry.role == "pdf_builder":
             role_rule = "role=pdf_builder：默认是纯文件合并/排版/PDF 构建脚本，只需真实构建文件并在 stdout JSON 返回实际存在路径；不要因为全局 SKILL.md 提到模型就调用 LLM/IMAGE_MODEL，除非当前脚本的有效 required_capabilities 明确要求模型。"
         elif plan_entry is not None and plan_entry.role == "generic_script":
-            role_rule = "role=generic_script：只能调用 SkillPlan.required_capabilities 声明的能力；若现有 SkillPlan.required_capabilities 已要求文本+图片，只能修当前脚本实现以匹配，禁止修改蓝图或 SKILL.md。"
+            role_rule = "role=generic_script：只能调用 SkillPlan.required_capabilities 声明的能力；若现有 SkillPlan.required_capabilities 已声明文本+图片，只能修当前脚本实现以匹配，禁止修改蓝图或 SKILL.md。"
         extra_rules = (
             "Python / Node / Bash 必须按 SkillPlan.runtime 读取单个 JSON argv，并且 JSON argv keys 匹配现有 SKILL.md 命令占位符；"
             "禁止生成 topicstring / tonehumorous / stylepopular-science 这类把 key、类型或默认值拼接起来的字段；"
@@ -4726,8 +4723,8 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             or "没有调用这些 required_capabilities" in error_text
         ):
             return (
-                "按当前脚本的 SkillPlan role + 有效 required_capabilities 补齐真实能力调用：包含 image_generation 必须调用 generate_stable_diffusion_image；"
-                "包含 text_generation 必须调用 generate_text_with_llm 或平台 LLM；pdf_builder/exporter 默认只需真实创建文件，并在 stdout JSON 任意业务字段中返回路径，不要因 SKILL.md 全局模型说明而补模型调用。"
+                "按当前脚本的 SkillPlan role + 有效 required_capabilities 补齐真实能力边界：helper_required 能力必须调用对应平台 helper；image_generation/text_generation 可优先调用平台 helper，也可自实现；"
+                "pdf_builder/exporter 默认只需真实创建文件，并在 stdout JSON 任意业务字段中返回路径，不要因 SKILL.md 全局模型说明而补模型调用。"
                 "PDF 构建脚本必须支持中文/UTF-8 文本，禁止用 fpdf 默认核心字体写 payload 文本。"
                 "禁止返回固定 f-string/template-only 文本或 placeholder；蓝图和 SKILL.md 确定后只能修当前脚本。"
             )
@@ -5277,7 +5274,7 @@ def _script_generation_skeleton(
     if plan_entry.runtime == "node":
         if {"text_generation", "image_generation"} <= set(effective_required_capabilities):
             return (
-                "必须使用下面的 node composite_generator skeleton；先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout 只能 console.log JSON 字符串：\n"
+                "可参考下面的 node composite_generator skeleton；可先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout 只能 console.log JSON 字符串：\n"
                 "const { spawnSync } = require('child_process');\n"
                 "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
                 "function pyEval(code, arg) {\n"
@@ -5298,7 +5295,7 @@ def _script_generation_skeleton(
             )
         if plan_entry.role == "image_generator":
             return (
-                "必须使用下面的 node image_generator skeleton；通过 Python 平台 helper 生成图片，stdout 只能 console.log JSON 字符串：\n"
+                "可参考下面的 node image_generator skeleton；可通过 Python 平台 helper 生成图片，stdout 只能 console.log JSON 字符串：\n"
                 "const { spawnSync } = require('child_process');\n"
                 "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
                 "function run(payload) {\n"
@@ -5315,7 +5312,7 @@ def _script_generation_skeleton(
             )
         if plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
             return (
-                "必须使用下面的 node pdf_builder skeleton；通过 Python 平台 PDF helper 生成文件，stdout 只能 console.log JSON 字符串：\n"
+                "可参考下面的 node pdf_builder skeleton；可通过 Python 平台 PDF helper 生成文件，stdout 只能 console.log JSON 字符串：\n"
                 "const { spawnSync } = require('child_process');\n"
                 "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
                 "function run(payload) {\n"
@@ -5329,7 +5326,7 @@ def _script_generation_skeleton(
             )
         if plan_entry.role == "text_generator":
             return (
-                "必须使用下面的 node text_generator skeleton；调用平台 generate_text_with_llm helper，stdout JSON 包含非空 text：\n"
+                "可参考下面的 node text_generator skeleton；可调用平台 generate_text_with_llm helper，stdout JSON 包含非空 text：\n"
                 "const { spawnSync } = require('child_process');\n"
                 "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
                 "function run(payload) {\n"
@@ -5342,7 +5339,7 @@ def _script_generation_skeleton(
                 "console.log(JSON.stringify(run(payload)));"
             )
         return (
-            "必须使用下面的 node_skeleton；解析 process.argv[2] JSON，stdout 只能 console.log JSON 字符串：\n"
+            "可参考下面的 node_skeleton；解析 process.argv[2] JSON，stdout 只能 console.log JSON 字符串：\n"
             "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
             "function run(payload) {\n"
             f"  const text = String({js_value_expr}).trim();\n"
@@ -5363,7 +5360,7 @@ def _script_generation_skeleton(
         else:
             helper = "import json,sys; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + "); print(json.dumps({'text': text, 'file_paths': []}, ensure_ascii=False))"
         return (
-            "必须使用下面的 shell_skeleton；从 $1 读取 JSON argv，并向 stdout 输出 JSON（文件生成脚本必须包含 pdf_path/docx_path/pptx_path 与 file_paths/file_outputs）：\n"
+            "可参考下面的 shell_skeleton；从 $1 读取 JSON argv，并向 stdout 输出 JSON（文件生成脚本必须包含 pdf_path/docx_path/pptx_path 与 file_paths/file_outputs）：\n"
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
             "payload_json=${1:-'{}'}\n"
@@ -5373,7 +5370,7 @@ def _script_generation_skeleton(
 
     if plan_entry.role == "docx_builder" or "docx_generation" in set(effective_required_capabilities):
         return (
-            "必须使用下面的 docx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths 并通过平台 create_docx helper 生成 Word；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
+            "可参考下面的 docx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths；可通过平台 create_docx helper 生成 Word；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
             "import json\n"
             "import sys\n"
             "from backend.services.skill_runtime import create_docx, print_json\n\n"
@@ -5402,7 +5399,7 @@ def _script_generation_skeleton(
 
     if plan_entry.role == "pptx_builder" or "pptx_generation" in set(effective_required_capabilities):
         return (
-            "必须使用下面的 pptx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths 并通过平台 create_pptx helper 生成 PPT；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
+            "可参考下面的 pptx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths；可通过平台 create_pptx helper 生成 PPT；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
             "import json\n"
             "import sys\n"
             "from backend.services.skill_runtime import create_pptx, print_json\n\n"
@@ -5421,7 +5418,7 @@ def _script_generation_skeleton(
 
     if plan_entry.role in {"html_asset_builder", "asset_builder"} or ({"html_generation", "html_asset_generation"} & set(effective_required_capabilities)):
         return (
-            "必须使用下面的 html_asset_builder Python 脚本骨架；只能在当前 Skill 的 OUTPUT_DIR/outputs 下写入 HTML，并在 stdout JSON 返回 html_path、file_paths 与 file_outputs：\n"
+            "可参考下面的 html_asset_builder Python 脚本骨架；只能在当前 Skill 的 OUTPUT_DIR/outputs 下写入 HTML，并在 stdout JSON 返回 html_path、file_paths 与 file_outputs：\n"
             "import html\n"
             "import json\n"
             "import re\n"
@@ -5458,7 +5455,7 @@ def _script_generation_skeleton(
 
     if {"text_generation", "image_generation"} <= set(effective_required_capabilities):
         return (
-            "必须使用下面的 composite_generator 脚本骨架；先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout JSON 包含 text 与 image_paths：\n"
+            "可参考下面的 composite_generator 脚本骨架；可先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout JSON 包含 text 与 image_paths：\n"
             "import json\n"
             "import sys\n"
             "from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image\n\n"
@@ -5490,7 +5487,7 @@ def _script_generation_skeleton(
 
     if plan_entry.role == "image_generator":
         return (
-            "必须使用下面的 image_generator 脚本骨架；不要改变 import/helper/main/JSON stdout 结构，只填充 build_image_prompt() 中的业务 prompt 组装逻辑，必要时补充返回字段：\n"
+            "可参考下面的 image_generator 脚本骨架；可保留 import/helper/main/JSON stdout 结构并填充 build_image_prompt() 中的业务 prompt 组装逻辑，必要时补充返回字段：\n"
             "import json\n"
             "import sys\n"
             "from backend.services.skill_runtime import generate_stable_diffusion_image\n\n"
@@ -5517,7 +5514,7 @@ def _script_generation_skeleton(
 
     if plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
         return (
-            "必须使用下面的 pdf_builder 脚本骨架；默认只负责读取已有内容并通过平台 create_pdf helper 构建 PDF 文件；stdout JSON 由 helper 返回 pdf_path/file_paths/file_outputs；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
+            "可参考下面的 pdf_builder 脚本骨架；默认只负责读取已有内容；可通过平台 create_pdf helper 构建 PDF 文件；stdout JSON 必须返回 pdf_path/file_paths/file_outputs；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
             "import json\n"
             "import sys\n"
             "from backend.services.skill_runtime import create_pdf, print_json\n\n"
@@ -5536,7 +5533,7 @@ def _script_generation_skeleton(
 
     if plan_entry.role == "text_generator":
         return (
-            "必须使用下面的 text_generator 脚本骨架；调用平台 generate_text_with_llm，stdout JSON 必须包含非空 text，不要生成图片或 PDF：\n"
+            "可参考下面的 text_generator 脚本骨架；调用平台 generate_text_with_llm，stdout JSON 包含非空 text，不要生成图片或 PDF：\n"
             "import json\n"
             "import sys\n"
             "from backend.services.skill_runtime import generate_text_with_llm\n\n"
@@ -5558,7 +5555,7 @@ def _script_generation_skeleton(
         )
 
     return (
-        "必须使用下面的 generic_script 脚本骨架；不要改变 import/parse_args/main/JSON stdout 结构，只填充 run() 中的真实业务逻辑并按 SkillPlan 使用 payload 字段：\n"
+        "可参考下面的 generic_script 脚本骨架；可保留 import/parse_args/main/JSON stdout 结构并填充 run() 中的真实业务逻辑并按 SkillPlan 使用 payload 字段：\n"
         "import json\n"
         "import sys\n\n"
         "def parse_args() -> dict:\n"
@@ -5708,15 +5705,16 @@ def _build_generate_file_prompt(
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须按 SkillPlan.runtime 解析；Python 默认读取 sys.argv[1] 并 json.loads 解析，Node 使用 process.argv[2]+JSON.parse，Bash 使用 $1 JSON。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
             "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：text_generation 使用 generate_text_with_llm 或 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；image_generation 使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
-            "7. 生成脚本前必须遵守 Tool Resolve 结果：只能调用下方允许的 backend.services.skill_runtime helper；不要自己发明工具、猜 API 地址、绕过 helper 写底层库。是否必须调用文本/图片模型只由当前脚本 SkillPlan.required_capabilities 决定：包含 image_generation 时必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`；builder/exporter 默认是确定性文件构建脚本，不要因为整个 Skill.md 提到模型就强制 builder 调模型；若 builder 需要模型辅助，用 optional_capabilities/allowed_capabilities 或显式 required_capabilities 表达。\n"
-            "8. image_generation stdout 输出结构化 JSON，并返回 helper 结果里的 image_paths；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\")).append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；不要在脚本里写中文 prompt 翻译逻辑；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
+            "7. 生成脚本前必须阅读 Tool Resolve 结果：下方 backend.services.skill_runtime helper 是可用/推荐工具；除 usage_policy=helper_required 的能力外，不强制 helper 或内部实现方式。不要自己发明未配置的外部 API。是否需要文本/图片能力只由当前脚本 SkillPlan.required_capabilities 决定：包含 image_generation 时可优先调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`；builder/exporter 默认是确定性文件构建脚本，不要因为整个 Skill.md 提到模型就强制 builder 调模型；若 builder 需要模型辅助，用 optional_capabilities/allowed_capabilities 或显式 required_capabilities 表达。\n"
+            "8. image_generation stdout 输出结构化 JSON，并返回平台可消费的 image_paths/file_outputs；使用 helper 时建议消费 helper 结果里的 image_path/image_paths，不要假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
             "10. stdout 必须输出结构化 JSON；内部中间字段名由当前 Skill 自行确定，但必须与后续命令 placeholder 真实对齐，最终产物仍必须使用平台标准输出字段和 OUTPUT_DIR/outputs 路径协议。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
             "12. 必须基于下方固定骨架生成：默认优先 Python；若 SkillPlan.runtime 为 node/bash，则使用对应骨架并保留入口、参数解析和 JSON stdout。\n"
             f"13. 最终响应必须是单个 {plan_entry.language} 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
-            "生成前请先隐式检查以下 Tool Resolve 合同；最终脚本只能使用这些 helper/工具，禁止直接调用 forbidden imports：\n"
+            "生成前请先隐式检查以下 Tool Resolve 注册表信息；helper 是可用/推荐工具，只有 usage_policy=helper_required 时才强制使用：\n"
             f"{tool_usage_prompt}\n\n"
+            "必须满足以下脚本文件合同：\n"
             "生成前请先隐式检查以下脚本合同，最终输出必须逐项满足：\n"
             f"{generated_file_contract_text}\n\n"
             f"固定脚本骨架（仅用于约束生成结构；输出时应是补全后的源码，不要保留空实现）：\n{script_skeleton_text}\n\n"
