@@ -201,3 +201,66 @@ def test_creator_tool_snippet_api_resolves_and_smoke_tests():
     assert test_response.status_code == 200
     assert test_response.json()["success"] is True
     assert test_response.json()["side_effect_performed"] is False
+
+
+def test_creator_tool_author_draft_generates_valid_adapter(monkeypatch, tmp_path):
+    from backend.services import creator_tool_registry as registry
+
+    monkeypatch.setattr(registry, "CUSTOM_TOOL_ADAPTER_DIR", tmp_path)
+    monkeypatch.setattr(registry, "_adapter_module_path", lambda cap: tmp_path / f"{cap.name}.py")
+    monkeypatch.setenv("TOOL_AUTHOR_LLM_TIMEOUT_SECONDS", "0.01")
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/creator/tools/author",
+        json={
+            "stage": "draft",
+            "tool_name": "markdown_file_writer",
+            "description": "帮我做一个把 markdown 文本保存成 md 文件并返回路径的小工具",
+            "generates_file": True,
+            "sample_input": {"title": "Demo", "content": "# Demo", "extension": "md"},
+            "allowed_roles": ["generic_script"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["needs_clarification"] is False
+    assert body["manifest"]["name"] == "markdown_file_writer"
+    assert "def run(payload" in body["adapter_code"]
+    assert body["validation"]["success"] is True
+    assert body["requires_human_confirmation"] is True
+
+
+def test_creator_tool_author_finalize_generates_snippet(monkeypatch, tmp_path):
+    from backend.services import creator_tool_registry as registry
+
+    monkeypatch.setattr(registry, "CUSTOM_TOOL_ADAPTER_DIR", tmp_path)
+    monkeypatch.setenv("TOOL_AUTHOR_LLM_TIMEOUT_SECONDS", "0.01")
+    manifest = registry.build_tool_manifest_draft({"tool_name": "echo_author_tool", "description": "Echo payload", "allowed_roles": ["generic_script"]})
+    adapter_code = registry.generate_adapter_code(manifest)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/creator/tools/author",
+        json={"stage": "finalize", "manifest": manifest, "adapter_code": adapter_code, "sample_input": {"payload": {"q": "demo"}}},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["validation"]["success"] is True
+    assert body["snippet"]["id"] == "echo_author_tool.minimal_usage"
+    assert "echo_author_tool" in body["snippet"]["code"]
+
+
+def test_creator_tool_author_asks_for_clarification_on_ambiguous_api(monkeypatch):
+    monkeypatch.setenv("TOOL_AUTHOR_LLM_TIMEOUT_SECONDS", "0.01")
+    client = TestClient(app)
+
+    response = client.post("/api/creator/tools/author", json={"stage": "draft", "description": "帮我做一个调用接口的小工具"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["needs_clarification"] is True
+    assert body["adapter_code"] == ""
+    assert body["questions"]
