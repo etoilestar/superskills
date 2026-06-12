@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
 from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan
-from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status, resolve_tools_for_skill_plan_entry
+from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status, resolve_tools_for_skill_plan_entry, function_cards_for_tool
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
 from ..services.skill_executor import _build_script_runtime_env, run_action
@@ -7611,6 +7611,31 @@ async def _repair_existing_file_for_e2e_failure(
 
     deterministic_error = "\n\n".join(e2e_errors)[-12000:]
 
+    e2e_tool_cards = ""
+    if target_path.startswith("scripts/"):
+        haystack = "\n".join([deterministic_error, current_content[-12000:], skill_md[-12000:]])
+        relevant_cards: list[str] = []
+        for cap in list_tool_capabilities():
+            status = tool_status(cap)
+            function_names = [fn.function_name for fn in cap.functions]
+            output_keys = list((cap.output_schema or {}).get("properties", {}).keys())
+            for fn in cap.functions:
+                output_keys.extend((fn.output_schema or {}).keys())
+            mentioned = (
+                cap.name in haystack
+                or any(helper in haystack for helper in cap.helper_imports)
+                or any(name in haystack for name in function_names)
+                or any(key in haystack for key in output_keys)
+            )
+            if mentioned and status.get("creator_available"):
+                relevant_cards.extend(function_cards_for_tool(cap))
+        if relevant_cards:
+            e2e_tool_cards = (
+                "\n\nE2E 修复相关工具 Function Cards（按 manifest 的 import/signature/return_contract 修复，"
+                "不要猜参数、不要错误包裹 helper 返回值）：\n"
+                + "\n\n---\n\n".join(relevant_cards[:6])
+            )
+
 
     contract_text = _build_generated_file_contract_text(
         target_path,
@@ -7677,6 +7702,7 @@ async def _repair_existing_file_for_e2e_failure(
                 f"{skill_md[-12000:]}\n\n"
                 "其它相关文件摘要：\n"
                 f"{''.join(all_file_summaries)[-20000:]}\n\n"
+                f"{e2e_tool_cards}\n\n"
                 "请只输出修复后的目标文件完整内容。"
             ),
         },

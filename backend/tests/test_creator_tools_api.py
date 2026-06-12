@@ -114,3 +114,59 @@ def test_analyze_blueprint_reports_disabled_required_tools():
     assert "docx_parsing" in missing
     assert missing["docx_parsing"]["enabled"] is False
     assert any("docx_parsing" in warning and "禁用" in warning for warning in body["warnings"])
+
+
+def test_tool_registration_flow_creates_function_card_and_registered_tool(tmp_path, monkeypatch):
+    from backend.services import creator_tool_registry as registry
+
+    monkeypatch.setattr(registry, "CUSTOM_TOOL_REGISTRY_PATH", tmp_path / "tool_registry.custom.json")
+    client = TestClient(app)
+
+    draft_response = client.post(
+        "/api/creator/tools/draft",
+        json={
+            "tool_name": "echo_payload_tool",
+            "description": "Echo payload keys for validation.",
+            "tool_type": "python_helper",
+            "input_description": "payload object",
+            "output_description": "result object",
+            "allowed_roles": ["generic_script"],
+        },
+    )
+    assert draft_response.status_code == 200
+    manifest = draft_response.json()["manifest"]
+    manifest["adapter_path"] = str(tmp_path / "echo_payload_tool.py")
+    assert manifest["functions"][0]["return_contract"]
+
+    code_response = client.post("/api/creator/tools/generate-code", json={"manifest": manifest})
+    assert code_response.status_code == 200
+    adapter_code = code_response.json()["adapter_code"]
+
+    validate_response = client.post(
+        "/api/creator/tools/validate",
+        json={"manifest": manifest, "adapter_code": adapter_code, "sample_input": {"payload": {"query": "demo"}}},
+    )
+    assert validate_response.status_code == 200
+    validation = validate_response.json()
+    assert validation["success"] is True
+    assert "Tool: echo_payload_tool.echo_payload_tool" in validation["tool_card_preview"][0]
+    assert "Input schema:" in validation["tool_card_preview"][0]
+
+    register_response = client.post(
+        "/api/creator/tools/register",
+        json={
+            "manifest": manifest,
+            "adapter_code": adapter_code,
+            "sample_input": {"payload": {"query": "demo"}},
+            "enable": True,
+            "created_by": "pytest",
+        },
+    )
+    assert register_response.status_code == 200
+    tool = register_response.json()["tool"]
+    assert tool["name"] == "echo_payload_tool"
+    assert tool["enabled"] is True
+    assert tool["functions"][0]["function_name"] == "echo_payload_tool"
+    assert registry.CUSTOM_TOOL_REGISTRY_PATH.exists()
+
+    registry.clear_registered_tool_capabilities()

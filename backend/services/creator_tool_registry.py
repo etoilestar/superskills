@@ -10,10 +10,12 @@ names are exported by ``backend.services.skill_runtime``.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields as dataclasses_fields, replace
+from datetime import datetime, timezone
 import ast
 import importlib
 import importlib.util
+import json
 import os
 import re
 from pathlib import Path
@@ -21,6 +23,31 @@ from typing import Any, Literal
 
 
 UsagePolicy = Literal["helper_required", "helper_preferred", "self_implementation_allowed"]
+
+
+@dataclass(frozen=True)
+class ToolFunctionManifest:
+    function_name: str
+    import_path: str
+    short_description: str
+    when_to_use: str
+    signature: str
+    input_schema: dict[str, Any] = field(default_factory=dict)
+    output_schema: dict[str, Any] = field(default_factory=dict)
+    return_contract: str = "Returns a dict that conforms to output_schema."
+    example_call: str = ""
+    example_return: str = ""
+    example_stdout: str = ""
+    common_mistakes: list[str] = field(default_factory=list)
+    trial_mode_behavior: str = ""
+    safety_notes: list[str] = field(default_factory=list)
+    required_env: list[str] = field(default_factory=list)
+    required_secrets: list[str] = field(default_factory=list)
+    usage_policy: UsagePolicy = "self_implementation_allowed"
+    allowed_roles: list[str] = field(default_factory=list)
+    required_capabilities: list[str] = field(default_factory=list)
+    forbidden_imports: list[str] = field(default_factory=list)
+    forbidden_side_effects: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -53,6 +80,16 @@ class ToolCapability:
     trial_mode: Literal["none", "mock", "minimal_file"] = "mock"
     validator_kind: str = "generic"
     prompt_guidance: str = ""
+    tool_type: str = "python_helper"
+    functions: list[ToolFunctionManifest] = field(default_factory=list)
+    adapter_path: str = ""
+    version: str = "1.0.0"
+    approval_status: str = "approved"
+    test_status: str = "unknown"
+    last_validation_result: dict[str, Any] = field(default_factory=dict)
+    created_by: str = "system"
+    created_at: str = ""
+    updated_at: str = ""
 
 
 _ROLE_FORBIDDEN_CAPABILITIES: dict[str, list[str]] = {
@@ -300,9 +337,23 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
 
 RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
 TOOL_OVERRIDE_PERSISTENCE = "process_memory"
+CUSTOM_TOOL_REGISTRY_PATH = Path(__file__).resolve().parents[1] / "config" / "tool_registry.custom.json"
+CUSTOM_TOOL_ADAPTER_DIR = Path(__file__).resolve().parent / "runtime_tools" / "custom_tools"
 _REGISTERED_TOOL_CAPABILITIES: dict[str, ToolCapability] = {}
 _TOOL_OVERRIDES: dict[str, dict[str, bool]] = {}
 _RUNTIME_HELPERS_CACHE: set[str] | None = None
+
+_ALLOWED_USAGE_POLICIES = {"helper_required", "helper_preferred", "self_implementation_allowed"}
+_ALLOWED_TOOL_TYPES = {
+    "python_helper", "http_api", "local_command", "database_query",
+    "file_converter", "document_generator", "image_generator", "custom_adapter",
+}
+_DANGEROUS_IMPORTS = {"subprocess", "shutil", "socket", "paramiko", "ftplib", "telnetlib"}
+_DANGEROUS_CALLS = {"eval", "exec", "compile", "open"}
+_HIGH_RISK_CAPABILITIES = {
+    "database_write", "external_http", "wechat_publish", "file_delete",
+    "shell_command", "network_access", "secret_access",
+}
 
 _DEPENDENCY_IMPORT_NAMES = {
     "python-docx": "docx",
@@ -321,6 +372,76 @@ def _with_overrides(capability: ToolCapability) -> ToolCapability:
         capability,
         enabled_by_default=override.get("enabled", capability.enabled_by_default),
         allow_creator_use=override.get("allow_creator_use", capability.allow_creator_use),
+    )
+
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _slug(value: str, fallback: str = "custom_tool") -> str:
+    text = re.sub(r"[^a-zA-Z0-9_]+", "_", (value or "").strip().lower()).strip("_")
+    if not text:
+        text = fallback
+    if text[0].isdigit():
+        text = f"tool_{text}"
+    return text[:64]
+
+
+def _function_from_dict(data: dict[str, Any]) -> ToolFunctionManifest:
+    known = {field.name for field in dataclasses_fields(ToolFunctionManifest)}
+    payload = {key: value for key, value in (data or {}).items() if key in known}
+    return ToolFunctionManifest(**payload)
+
+
+def _capability_from_dict(data: dict[str, Any]) -> ToolCapability:
+    payload = dict(data or {})
+    functions = payload.pop("functions", []) or []
+    if "enabled" in payload and "enabled_by_default" not in payload:
+        payload["enabled_by_default"] = bool(payload.pop("enabled"))
+    if "allowed_roles" in payload and "roles" not in payload:
+        payload["roles"] = list(payload.get("allowed_roles") or [])
+    known = {field.name for field in dataclasses_fields(ToolCapability)}
+    payload = {key: value for key, value in payload.items() if key in known}
+    payload["functions"] = [_function_from_dict(item) for item in functions if isinstance(item, dict)]
+    return ToolCapability(**payload)
+
+
+def _capability_to_registry_record(capability: ToolCapability) -> dict[str, Any]:
+    data = asdict(capability)
+    data["enabled"] = data.pop("enabled_by_default")
+    data["allowed_roles"] = capability.allowed_roles or capability.roles
+    return data
+
+
+def _load_registered_tools_from_disk() -> None:
+    if not CUSTOM_TOOL_REGISTRY_PATH.exists():
+        return
+    try:
+        payload = json.loads(CUSTOM_TOOL_REGISTRY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    records = payload.get("tools") if isinstance(payload, dict) else payload
+    if not isinstance(records, list):
+        return
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        try:
+            cap = _capability_from_dict(record)
+        except Exception:
+            continue
+        if cap.name:
+            _REGISTERED_TOOL_CAPABILITIES[cap.name] = cap
+
+
+def persist_registered_tools() -> None:
+    CUSTOM_TOOL_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    records = [_capability_to_registry_record(cap) for cap in _REGISTERED_TOOL_CAPABILITIES.values()]
+    CUSTOM_TOOL_REGISTRY_PATH.write_text(
+        json.dumps({"tools": records}, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
     )
 
 
@@ -369,8 +490,81 @@ class ToolResolveResult:
     allowed_helper_imports: list[str] = field(default_factory=list)
     required_dependencies: list[str] = field(default_factory=list)
     forbidden_imports: list[str] = field(default_factory=list)
+    tool_function_cards: list[str] = field(default_factory=list)
     tool_usage_prompt: str = ""
     warnings: list[str] = field(default_factory=list)
+
+
+
+def _schema_summary(schema: dict[str, Any]) -> str:
+    if not schema:
+        return "{}"
+    return json.dumps(schema, ensure_ascii=False, sort_keys=True)
+
+
+def function_cards_for_tool(capability: ToolCapability) -> list[str]:
+    """Return Creator prompt cards with function-level I/O and call contracts."""
+    functions = list(capability.functions)
+    if not functions:
+        functions = [
+            ToolFunctionManifest(
+                function_name=helper,
+                import_path=capability.helper_module,
+                short_description=capability.prompt_guidance or capability.display_name,
+                when_to_use=f"Use for capability {capability.name} when role/capability resolution allows it.",
+                signature=f"{helper}(...) -> dict",
+                input_schema=capability.input_schema,
+                output_schema=capability.output_schema,
+                return_contract="Return the helper result directly when it already contains platform stdout fields; do not wrap helper result in the wrong key.",
+                example_call=f"from {capability.helper_module} import {helper}\nresult = {helper}(...)\nreturn result",
+                example_stdout="return result",
+                common_mistakes=[
+                    "Do not guess parameters; inspect the signature or follow the generated adapter contract.",
+                    "Do not wrap a platform stdout dict inside another unrelated field.",
+                ],
+                trial_mode_behavior=str(capability.trial_mode),
+                safety_notes=[capability.prompt_guidance] if capability.prompt_guidance else [],
+                required_env=capability.required_env,
+                required_secrets=capability.required_secrets,
+                usage_policy=capability.usage_policy,
+                allowed_roles=capability.allowed_roles or capability.roles,
+                required_capabilities=capability.required_capabilities or [capability.name],
+                forbidden_imports=capability.forbidden_direct_imports,
+            )
+            for helper in capability.helper_imports
+        ]
+    cards: list[str] = []
+    for fn in functions:
+        mistakes = "\n".join(f"  - {item}" for item in fn.common_mistakes) or "  - None declared"
+        safety = "\n".join(f"  - {item}" for item in fn.safety_notes) or "  - Follow platform sandbox and OUTPUT_DIR rules."
+        import_stmt = f"from {fn.import_path} import {fn.function_name}" if fn.import_path else f"import {fn.function_name}"
+        cards.append(
+            "\n".join([
+                f"Tool: {capability.name}.{fn.function_name}",
+                f"Purpose: {fn.short_description}",
+                f"When to use: {fn.when_to_use}",
+                f"Import: {import_stmt}",
+                f"Signature: {fn.signature}",
+                f"Input schema: {_schema_summary(fn.input_schema)}",
+                f"Output schema: {_schema_summary(fn.output_schema)}",
+                f"Return contract: {fn.return_contract}",
+                f"Example call: {fn.example_call}",
+                f"Example stdout/return: {fn.example_stdout or fn.example_return}",
+                "Common mistakes:",
+                mistakes,
+                f"Trial mode behavior: {fn.trial_mode_behavior}",
+                "Safety notes:",
+                safety,
+                f"Usage policy: {fn.usage_policy or capability.usage_policy}",
+                f"Allowed roles: {', '.join(fn.allowed_roles or capability.allowed_roles or capability.roles) if (fn.allowed_roles or capability.allowed_roles or capability.roles) else 'all'}",
+                f"Required capabilities: {', '.join(fn.required_capabilities or capability.required_capabilities or [capability.name])}",
+                f"Required env: {', '.join(fn.required_env or capability.required_env) if (fn.required_env or capability.required_env) else 'none'}",
+                f"Required secrets: {', '.join(fn.required_secrets or capability.required_secrets) if (fn.required_secrets or capability.required_secrets) else 'none'}",
+                f"Forbidden imports: {', '.join(fn.forbidden_imports or capability.forbidden_direct_imports) if (fn.forbidden_imports or capability.forbidden_direct_imports) else 'none'}",
+                f"Forbidden side effects: {', '.join(fn.forbidden_side_effects) if fn.forbidden_side_effects else 'none'}",
+            ])
+        )
+    return cards
 
 
 def _entry_capabilities(entry: Any) -> list[str]:
@@ -409,6 +603,7 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
     required_dependencies: list[str] = []
     forbidden_imports: list[str] = []
     guidance: list[str] = []
+    tool_function_cards: list[str] = []
     warnings: list[str] = []
 
     for capability in capabilities:
@@ -437,6 +632,7 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
         required_dependencies.extend(cap.dependencies)
         if cap.usage_policy == "helper_required":
             forbidden_imports.extend(cap.forbidden_direct_imports)
+        tool_function_cards.extend(function_cards_for_tool(cap))
         if cap.prompt_guidance:
             guidance.append(f"- {cap.name}: {cap.prompt_guidance}")
 
@@ -474,12 +670,15 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
         if forbidden_imports else
         "除 usage_policy=helper_required 的能力外，helper 是可用/推荐工具，不强制实现方式；最终以 E2E stdout/artifact 合同为准。"
     )
-    tool_usage_prompt = "\n".join([helper_line, forbid_line, *policy_lines, *guidance])
+    cards_text = "\n\n".join(tool_function_cards)
+    card_header = "当前脚本可用工具 Function Cards（按函数级 manifest 调用，不要只凭函数名猜参数/返回值）:" if tool_function_cards else "当前脚本可用工具 Function Cards: 无"
+    tool_usage_prompt = "\n".join([helper_line, forbid_line, *policy_lines, *guidance, card_header, cards_text])
     return ToolResolveResult(
         allowed_tools=allowed_tools,
         allowed_helper_imports=allowed_helper_imports,
         required_dependencies=required_dependencies,
         forbidden_imports=forbidden_imports,
+        tool_function_cards=tool_function_cards,
         tool_usage_prompt=tool_usage_prompt,
         warnings=warnings,
     )
@@ -565,6 +764,210 @@ def validate_capability_names(names: list[str]) -> list[str]:
     return [name for name in names if name not in known]
 
 
+
+def build_tool_manifest_draft(description: dict[str, Any]) -> dict[str, Any]:
+    '''Deterministically draft a complete function-level manifest from NL form fields.'''
+    name = _slug(str(description.get("tool_name") or description.get("name") or description.get("display_name") or "custom_tool"))
+    display_name = str(description.get("display_name") or description.get("tool_name") or name.replace("_", " ").title())
+    tool_type = str(description.get("tool_type") or "python_helper")
+    output_generates_file = bool(description.get("generates_file"))
+    safety_level = "high" if description.get("high_risk") else ("medium" if description.get("needs_external_network") or description.get("needs_secret") else "low")
+    usage_policy = "helper_required" if safety_level == "high" else "helper_preferred"
+    roles = [str(item) for item in description.get("allowed_roles") or [] if item] or ["generic_script", "composite_generator"]
+    capability = _slug(str(description.get("capability") or name))
+    input_schema = description.get("input_schema") if isinstance(description.get("input_schema"), dict) else {
+        "payload": {"type": "object", "required": True, "description": str(description.get("input_description") or "Tool input payload.")}
+    }
+    output_schema = description.get("output_schema") if isinstance(description.get("output_schema"), dict) else {
+        "result": {"type": "object", "description": str(description.get("output_description") or "Tool result.")}
+    }
+    if output_generates_file:
+        output_schema.setdefault("file_paths", {"type": "array[string]", "description": "Generated files under OUTPUT_DIR."})
+        output_schema.setdefault("file_outputs", {"type": "array[object]", "description": "Platform downloadable file metadata."})
+    adapter_import = f"backend.services.runtime_tools.custom_tools.{name}"
+    return {
+        "name": name, "display_name": display_name, "category": str(description.get("category") or ("document" if output_generates_file else "custom")),
+        "capability": capability, "tool_type": tool_type if tool_type in _ALLOWED_TOOL_TYPES else "custom_adapter", "usage_policy": usage_policy,
+        "allowed_roles": roles, "roles": roles, "required_capabilities": [capability],
+        "required_env": [str(item) for item in description.get("required_env") or [] if item],
+        "required_secrets": [str(item) for item in description.get("required_secrets") or [] if item] + (["TOOL_API_KEY"] if description.get("needs_secret") else []),
+        "dependencies": [str(item) for item in description.get("dependencies") or [] if item], "safety_level": safety_level,
+        "enabled": False, "approval_status": "draft", "test_status": "untested", "adapter_path": f"backend/services/runtime_tools/custom_tools/{name}.py",
+        "version": "0.1.0",
+        "functions": [{
+            "function_name": name, "import_path": adapter_import,
+            "short_description": str(description.get("short_description") or description.get("purpose") or description.get("description") or display_name),
+            "when_to_use": str(description.get("when_to_use") or f"Use when a Creator script needs {display_name}."),
+            "signature": f"{name}(payload: dict) -> dict", "input_schema": input_schema, "output_schema": output_schema,
+            "return_contract": "Returns a dict conforming to output_schema. If file_outputs/file_paths are returned, paths must exist under OUTPUT_DIR.",
+            "example_call": f"from {adapter_import} import {name}\nresult = {name}(payload)\nreturn result",
+            "example_stdout": "return result", "example_return": "{...output_schema fields...}",
+            "common_mistakes": ["Do not guess parameter names; follow the signature and input_schema.", "Do not print or return secret values.", "Do not write files outside OUTPUT_DIR."],
+            "trial_mode_behavior": str(description.get("trial_mode_behavior") or "When SKILL_TRIAL_RUN=1, return a minimal deterministic mock that still satisfies output_schema."),
+            "safety_notes": ["Validate paths before reading or writing.", "Declare every env var, secret, network host, and side effect in the manifest."],
+            "required_env": [str(item) for item in description.get("required_env") or [] if item], "required_secrets": [str(item) for item in description.get("required_secrets") or [] if item],
+            "usage_policy": usage_policy, "allowed_roles": roles, "required_capabilities": [capability],
+            "forbidden_imports": sorted(_DANGEROUS_IMPORTS), "forbidden_side_effects": ["write outside OUTPUT_DIR", "leak secrets", "undeclared network access"],
+        }],
+    }
+
+
+def generate_adapter_code(manifest: dict[str, Any]) -> str:
+    cap = _capability_from_dict(manifest)
+    fn = cap.functions[0] if cap.functions else _function_from_dict(build_tool_manifest_draft(manifest)["functions"][0])
+    output_keys = list((fn.output_schema or {}).keys()) or ["result"]
+    trial_lines = "\n".join([f"        result.setdefault({key!r}, [] if 'paths' in {key!r} or 'outputs' in {key!r} else {{}})" for key in output_keys]) or '        result["result"] = {"ok": True}'
+    return f'''# Generated adapter for registered Creator tool: {cap.name}.
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+
+def _output_dir() -> Path:
+    root = Path(os.environ.get("OUTPUT_DIR", "outputs")).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def {fn.function_name}(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    # {fn.short_description}
+    # Signature: {fn.signature}
+    # Return contract: {fn.return_contract}
+    # Trial mode: {fn.trial_mode_behavior}
+    payload = dict(payload or {{}})
+    result: dict[str, Any] = {{"result": {{"ok": True, "payload_keys": sorted(payload.keys())}}}}
+    if os.environ.get("SKILL_TRIAL_RUN") == "1":
+{trial_lines}
+        return result
+    # TODO: Replace this deterministic scaffold with the real adapter body.
+    # Safety constraints: do not read/write outside OUTPUT_DIR; do not leak secrets;
+    # do not perform undeclared network, database, shell, or publishing side effects.
+    return result
+'''
+
+
+def _manifest_errors(manifest: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    try:
+        cap = _capability_from_dict(manifest)
+    except Exception as exc:
+        return [f"manifest cannot be parsed: {exc}"]
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", cap.name or ""):
+        errors.append("name must be a valid Python identifier-like slug")
+    if cap.tool_type not in _ALLOWED_TOOL_TYPES:
+        errors.append(f"tool_type must be one of {sorted(_ALLOWED_TOOL_TYPES)}")
+    if cap.usage_policy not in _ALLOWED_USAGE_POLICIES:
+        errors.append("usage_policy is invalid")
+    if cap.safety_level not in {"low", "medium", "high", "standard"}:
+        errors.append("safety_level must be low/medium/high")
+    if not cap.functions:
+        errors.append("at least one function manifest is required")
+    for fn in cap.functions:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", fn.function_name or ""):
+            errors.append(f"invalid function_name: {fn.function_name!r}")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", fn.import_path or ""):
+            errors.append(f"invalid import_path for {fn.function_name}")
+        if not fn.signature or "(" not in fn.signature or ")" not in fn.signature:
+            errors.append(f"signature is not parseable for {fn.function_name}")
+        if not isinstance(fn.input_schema, dict) or not fn.input_schema:
+            errors.append(f"input_schema is required for {fn.function_name}")
+        if not isinstance(fn.output_schema, dict) or not fn.output_schema:
+            errors.append(f"output_schema is required for {fn.function_name}")
+    if set(cap.required_capabilities) & _HIGH_RISK_CAPABILITIES and cap.approval_status not in {"approved", "validated"}:
+        errors.append("high-risk tools must be validated and admin-approved before enabling")
+    return errors
+
+
+def _code_security_errors(code: str) -> list[str]:
+    errors: list[str] = []
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError as exc:
+        return [f"adapter code syntax error: {exc}"]
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [alias.name.split(".")[0] for alias in node.names]
+            if isinstance(node, ast.ImportFrom) and node.module:
+                names.append(node.module.split(".")[0])
+            for name in names:
+                if name in _DANGEROUS_IMPORTS:
+                    errors.append(f"dangerous import is forbidden: {name}")
+        if isinstance(node, ast.Call):
+            func = node.func
+            called = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else "")
+            if called in _DANGEROUS_CALLS:
+                errors.append(f"dangerous call requires a controlled helper: {called}")
+    if re.search(r"(?:sk-|AKIA|-----BEGIN [A-Z ]*PRIVATE KEY-----)[A-Za-z0-9_\-+/=]{8,}", code or ""):
+        errors.append("adapter appears to contain a hard-coded secret")
+    return sorted(set(errors))
+
+
+def _adapter_module_path(cap: ToolCapability) -> Path:
+    if cap.adapter_path:
+        path = Path(cap.adapter_path)
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parents[2] / path
+    else:
+        path = CUSTOM_TOOL_ADAPTER_DIR / f"{cap.name}.py"
+    return path.resolve()
+
+
+def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None = None, sample_input: dict[str, Any] | None = None, dynamic: bool = True) -> dict[str, Any]:
+    errors = _manifest_errors(manifest)
+    warnings: list[str] = []
+    cap = _capability_from_dict(manifest) if not errors else None
+    if adapter_code:
+        errors.extend(_code_security_errors(adapter_code))
+    dynamic_result: dict[str, Any] = {"skipped": not dynamic}
+    if cap and dynamic and not errors:
+        path = _adapter_module_path(cap)
+        if adapter_code:
+            CUSTOM_TOOL_ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(adapter_code, encoding="utf-8")
+        if not path.exists():
+            errors.append(f"adapter file does not exist: {path}")
+        else:
+            try:
+                spec = importlib.util.spec_from_file_location(f"_custom_tool_validation_{cap.name}", path)
+                if spec is None or spec.loader is None:
+                    raise ImportError("could not create import spec")
+                module = importlib.util.module_from_spec(spec)
+                old_trial = os.environ.get("SKILL_TRIAL_RUN")
+                os.environ["SKILL_TRIAL_RUN"] = "1"
+                try:
+                    spec.loader.exec_module(module)
+                    fn = cap.functions[0]
+                    target = getattr(module, fn.function_name)
+                    if not callable(target):
+                        raise TypeError(f"{fn.function_name} is not callable")
+                    payload = sample_input or {}
+                    try:
+                        value = target(payload)
+                    except TypeError:
+                        value = target(**payload)
+                finally:
+                    if old_trial is None:
+                        os.environ.pop("SKILL_TRIAL_RUN", None)
+                    else:
+                        os.environ["SKILL_TRIAL_RUN"] = old_trial
+                if not isinstance(value, dict):
+                    errors.append("dynamic trial must return a dict")
+                    value = {}
+                expected = set((cap.functions[0].output_schema or {}).keys())
+                missing = [key for key in expected if key not in value]
+                if missing:
+                    warnings.append(f"dynamic trial did not return declared optional/expected fields: {', '.join(missing)}")
+                dynamic_result = {"skipped": False, "return_keys": sorted(value.keys())}
+            except Exception as exc:
+                errors.append(f"dynamic trial failed: {exc}")
+    success = not errors
+    return {"success": success, "status": "validated" if success else "failed", "errors": errors, "warnings": warnings, "dynamic_trial": dynamic_result, "tool_card_preview": function_cards_for_tool(cap) if cap else []}
+
+
 def tool_status(capability: ToolCapability) -> dict[str, Any]:
     missing_env = [name for name in capability.required_env if not os.environ.get(name)]
     missing_secrets = [name for name in capability.required_secrets if not os.environ.get(name)]
@@ -581,11 +984,13 @@ def tool_status(capability: ToolCapability) -> dict[str, Any]:
         "configured": not missing_env and not missing_secrets,
         "missing_env": missing_env,
         "missing_secrets": missing_secrets,
-        # Toggle overrides are intentionally process-local for this P0 registry
-        # layer.  Persisting them to a database/config file belongs to the tools
-        # management page follow-up.
+        # Toggle overrides remain process-local; custom registered manifests are
+        # persisted separately in backend/config/tool_registry.custom.json.
         "override_persistence": TOOL_OVERRIDE_PERSISTENCE,
         "runtime_helpers_available": runtime_helpers_available,
         "missing_runtime_helpers": missing_runtime_helpers,
         "missing_dependencies": missing_dependencies,
     }
+
+
+_load_registered_tools_from_disk()

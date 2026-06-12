@@ -264,3 +264,44 @@ export async function packageSkill(
   const payload = await resp.json()
   return assertActionSuccess(payload, '打包失败')
 }
+
+export async function listCreatorTools() {
+  const resp = await fetch('/api/creator/tools')
+  if (!resp.ok) throw new Error('工具列表加载失败')
+  return resp.json()
+}
+
+async function postCreatorTool(path, payload) {
+  const resp = await fetch(`/api/creator/tools/${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new Error(data.detail?.message || data.detail || data.message || '工具请求失败')
+  return data
+}
+
+export function draftCreatorTool(payload) {
+  return postCreatorTool('draft', payload)
+}
+
+export function generateCreatorToolCode(payload) {
+  return postCreatorTool('generate-code', payload)
+}
+
+export function validateCreatorTool(payload) {
+  return postCreatorTool('validate', payload)
+}
+
+export function registerCreatorTool(payload) {
+  return postCreatorTool('register', payload)
+}
+
+export function enableCreatorTool(name) {
+  return postCreatorTool(`${encodeURIComponent(name)}/enable`, {})
+}
+
+export function disableCreatorTool(name) {
+  return postCreatorTool(`${encodeURIComponent(name)}/disable`, {})
+}
