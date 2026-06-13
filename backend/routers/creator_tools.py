@@ -33,6 +33,8 @@ from ..services.creator_tool_registry import (
     validate_tool_manifest,
     validate_tool_snippet,
     stream_author_tool,
+    save_tool_authoring_config,
+    tool_authoring_config_status,
     tool_status,
     write_registered_adapter,
     _capability_from_dict,
@@ -73,6 +75,21 @@ class ToolManifestRequest(BaseModel):
     adapter_code: str | None = None
     sample_input: dict[str, Any] = Field(default_factory=dict)
     dynamic: bool = True
+
+
+class ToolConfigSaveRequest(BaseModel):
+    session_id: str = "default"
+    tool_name: str = ""
+    operation: str = ""
+    base_url: str = ""
+    base_url_env: str | None = None
+    auth_type: str = "none"
+    secret_env: str | None = None
+    secret_value: str | None = None
+    extra: dict[str, Any] = Field(default_factory=dict)
+    additional_fields: list[dict[str, Any]] = Field(default_factory=list)
+    sample_input: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolAuthorRequest(BaseModel):
@@ -153,6 +170,19 @@ def draft_creator_tool(request: ToolDraftRequest) -> dict[str, Any]:
 def generate_creator_tool_code(request: ToolManifestRequest) -> dict[str, Any]:
     code = generate_adapter_code(request.manifest)
     return {"adapter_code": code, "adapter_path": request.manifest.get("adapter_path"), "requires_validation": True}
+
+
+@router.post("/tool-config/save")
+def save_creator_tool_config(request: ToolConfigSaveRequest) -> dict[str, Any]:
+    try:
+        return save_tool_authoring_config(request.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/tool-config/status")
+def creator_tool_config_status(session_id: str = "default") -> dict[str, Any]:
+    return tool_authoring_config_status(session_id)
 
 
 @router.post("/tools/author")

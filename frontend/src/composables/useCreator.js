@@ -319,6 +319,24 @@ export async function* authorCreatorToolStream(payload, signal) {
   }
 }
 
+export async function saveCreatorToolConfig(payload) {
+  const resp = await fetch('/api/creator/tool-config/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new Error(data.detail?.message || data.detail || data.message || '配置保存失败')
+  return data
+}
+
+export async function getCreatorToolConfigStatus(sessionId = 'default') {
+  const resp = await fetch(`/api/creator/tool-config/status?session_id=${encodeURIComponent(sessionId)}`)
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new Error(data.detail?.message || data.detail || data.message || '配置状态加载失败')
+  return data
+}
+
 export function liveTestCreatorTool(payload) {
   return postCreatorTool('author', { ...payload, action: 'live_test' })
 }
