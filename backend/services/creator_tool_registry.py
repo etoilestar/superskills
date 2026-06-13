@@ -1632,6 +1632,7 @@ def _plan_defaults() -> dict[str, Any]:
         "requires_authorization": False,
         "tool_kind": "unknown",
         "operation": "",
+        "resolved_clarifications": [],
         "requires_secret": False,
         "secret_env_suggestions": [],
         "requires_external_network": False,
@@ -1691,7 +1692,49 @@ def _suggest_external_api_entrypoint(request: dict[str, Any], config: dict[str, 
     return {"base_url": base_url, "method": method, "auth_type": auth_type, "secret_env": secret_env, "confidence": confidence}
 
 
+def _clarification_answer_texts(request_or_answers: Any) -> list[str]:
+    answers = request_or_answers.get("clarification_answers") if isinstance(request_or_answers, dict) else request_or_answers
+    values: list[str] = []
+    for item in answers or []:
+        if isinstance(item, dict):
+            answer = str(item.get("answer") or "").strip()
+        else:
+            answer = str(item or "").strip()
+        if answer:
+            values.append(answer)
+    return values
+
+
+def _apply_clarification_answers(request: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(request or {})
+    answers = [item for item in (updated.get("clarification_answers") or []) if isinstance(item, dict) and str(item.get("answer") or "").strip()]
+    capability_answers = _clarification_answer_texts(answers)
+    if capability_answers:
+        updated["operation"] = capability_answers[-1]
+    if answers:
+        updated["resolved_clarifications"] = answers
+    return updated
+
+
+def _filter_answered_clarification_questions(questions: list[Any], answers: list[Any]) -> list[str]:
+    answered_questions = {
+        str(item.get("question") or "").strip()
+        for item in answers or []
+        if isinstance(item, dict) and str(item.get("answer") or "").strip()
+    }
+    if not answered_questions:
+        return [str(q.get("question") if isinstance(q, dict) else q).strip() for q in questions if str(q.get("question") if isinstance(q, dict) else q).strip()]
+    filtered: list[str] = []
+    for question in questions or []:
+        text = str(question.get("question") if isinstance(question, dict) else question).strip()
+        if text and text not in answered_questions:
+            filtered.append(text)
+    return filtered
+
+
 def _needs_capability_clarification(request: dict[str, Any]) -> bool:
+    if _clarification_answer_texts(request):
+        return False
     text = " ".join(str(request.get(key) or "") for key in ("description", "operation", "input_description", "output_description")).strip().lower()
     if not text:
         return True
@@ -1865,6 +1908,7 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         normalized["ready_for_live_test"] = not _external_api_missing_fields(config, sample, {**request, "allow_external_network": True})
         normalized["missing_fields"] = []
         safe_questions = _safe_clarification_questions((normalized.get("clarification_questions") or normalized.get("questions") or []), fallback.get("clarification_questions") or fallback.get("questions") or [])
+        safe_questions = _filter_answered_clarification_questions(safe_questions, request.get("clarification_answers") or [])
         normalized["clarification_questions"] = safe_questions
         normalized["questions"] = safe_questions
         if missing:
@@ -1879,10 +1923,15 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         normalized["ready_for_code_generation"] = bool(normalized.get("ready_for_code_generation")) and (live_success or request.get("skip_live_test") is True)
     elif not normalized.get("manifest"):
         normalized["manifest"] = fallback.get("manifest") or {}
+    if request.get("operation"):
+        normalized["operation"] = request.get("operation")
+    if request.get("resolved_clarifications"):
+        normalized["resolved_clarifications"] = request.get("resolved_clarifications")
     normalized["requires_authoring_tools"] = bool(normalized.get("authoring_tool_plan")) or bool(normalized.get("requires_authoring_tools"))
     if normalized["requires_authoring_tools"]:
         normalized["ready_for_code_generation"] = False
     normalized["clarification_questions"] = _safe_clarification_questions(normalized.get("clarification_questions") or normalized.get("questions") or [], fallback.get("clarification_questions") or fallback.get("questions") or [])
+    normalized["clarification_questions"] = _filter_answered_clarification_questions(normalized["clarification_questions"], request.get("clarification_answers") or [])
     normalized["questions"] = normalized["clarification_questions"]
     normalized["needs_clarification"] = bool(normalized["clarification_questions"])
     if (
@@ -2385,6 +2434,7 @@ def _author_response_from_plan(plan: dict[str, Any], *, model_notes: list[str], 
         "requires_authorization": bool(plan.get("requires_authorization")),
         "tool_kind": plan.get("tool_kind") or "unknown",
         "operation": plan.get("operation") or "",
+        "resolved_clarifications": plan.get("resolved_clarifications") or [],
         "requires_secret": bool(plan.get("requires_secret")),
         "secret_env_suggestions": plan.get("secret_env_suggestions") or [],
         "requires_external_network": bool(plan.get("requires_external_network")),
@@ -2412,6 +2462,8 @@ def _author_response_from_plan(plan: dict[str, Any], *, model_notes: list[str], 
 
 async def _run_capability_ambiguity_judge(request: dict[str, Any], model_notes: list[str], warnings: list[str]) -> list[str]:
     """Ask planner_model to catch capability ambiguity that deterministic heuristics may miss."""
+    if _clarification_answer_texts(request):
+        return []
     judge_payload = {
         key: request.get(key)
         for key in [
@@ -2431,6 +2483,7 @@ async def _run_capability_ambiguity_judge(request: dict[str, Any], model_notes: 
                 "You are the planner_model capability ambiguity judge for Tool Authoring. "
                 "Return strict JSON: {needs_capability_clarification: boolean, question: string}. "
                 "Set needs_capability_clarification=true only when the user's desired business capability or operation is genuinely unclear. "
+                "If clarification_answers already contain a non-empty answer that resolves the requested operation, return needs_capability_clarification=false. Do not ask the same question again. "
                 "The question must be Chinese, short, and ask only what the tool should do. "
                 "Do not ask for service address, endpoint, IP, key, token, auth method, connection-test permission, method, headers/body/query templates, schemas, sample input, or expected output fields."
             ),
@@ -2449,6 +2502,7 @@ async def _run_capability_ambiguity_judge(request: dict[str, Any], model_notes: 
     return _safe_clarification_questions([question], [])
 
 async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
+    request = _apply_clarification_answers(request)
     planner_payload = {
         key: request.get(key)
         for key in [
@@ -2466,6 +2520,7 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
             "generates_file",
             "high_risk",
             "clarification_answers",
+            "resolved_clarifications",
             "tool_kind",
             "operation",
             "config",
