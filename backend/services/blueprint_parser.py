@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .creator_tool_registry import get_tool_capability
-from .skill_plan import ROLE_ALLOWED_CAPABILITIES, RESOURCE_ROLES, SCRIPT_ROLES, SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings
+from .skill_plan import ROLE_ALLOWED_CAPABILITIES, RESOURCE_ROLES, SCRIPT_ROLES, SkillPlan, SkillPlanEntry, build_skill_plan_entry, capability_layer, is_business_capability, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -230,12 +230,13 @@ def validate_blueprint_shape_for_creator(blueprint_text: str) -> None:
         "outputs",
         "dependencies",
         "required_capabilities",
-        "forbidden_capabilities",
         "references",
     ]
     valid_roles = set(SCRIPT_ROLES) | set(RESOURCE_ROLES)
     for path, block in path_blocks.items():
         missing = [field for field in required_fields if not re.search(rf"(?m)^\s*{field}\s*:", block)]
+        if not re.search(r"(?m)^\s*(?:business_forbidden_capabilities|forbidden_capabilities)\s*:", block):
+            missing.append("business_forbidden_capabilities")
         if missing:
             issues.append(f"{path} 文件计划缺少字段：{', '.join(missing)}。")
 
@@ -258,12 +259,20 @@ def validate_blueprint_shape_for_creator(blueprint_text: str) -> None:
         if required_caps and path.startswith("scripts/"):
             allowed = ROLE_ALLOWED_CAPABILITIES.get(role, frozenset())
             for capability in required_caps:
-                if get_tool_capability(capability) is None:
+                layer = capability_layer(capability)
+                if layer != "business_skill":
+                    issues.append(f"{path} required_capabilities 只能声明业务能力，不能包含 {layer} capability `{capability}`。")
+                elif get_tool_capability(capability) is None:
                     issues.append(f"{path} required_capabilities 包含未注册 capability `{capability}`。")
                 elif capability not in allowed:
                     issues.append(f"{path} role `{role}` 不允许 capability `{capability}`。")
         elif required_caps and not path.startswith("scripts/"):
             issues.append(f"资源文件 `{path}` 不能声明 runtime required_capabilities。")
+
+        forbidden_caps = _list_field_from_block(block, "business_forbidden_capabilities") or _list_field_from_block(block, "forbidden_capabilities")
+        for capability in forbidden_caps:
+            if not is_business_capability(capability):
+                issues.append(f"{path} business_forbidden_capabilities 只能声明业务禁止能力，不能包含平台安全/协议 `{capability}`。")
 
     for path in sorted(script_paths | reference_paths | asset_paths | {"SKILL.md"}):
         if path not in path_blocks:
