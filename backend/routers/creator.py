@@ -2820,6 +2820,54 @@ def _script_uses_registry_helpers(content: str, capability: str) -> bool:
     return bool(re.search(rf"\b(?:{helper_pattern})\b", content, re.IGNORECASE))
 
 
+
+_FORBIDDEN_GUESSED_HELPER_IMPORTS = {
+    "pdf_generation",
+    "file_output",
+    "platform_helpers",
+    "helpers.pdf_builder",
+    "tool_registry.pdf_builder",
+}
+
+
+def _registry_function_import_paths() -> set[str]:
+    paths: set[str] = set()
+    for capability in list_tool_capabilities():
+        for fn in getattr(capability, "functions", []) or []:
+            import_path = str(getattr(fn, "import_path", "") or "").strip()
+            signature = str(getattr(fn, "signature", "") or "").strip()
+            if import_path and signature:
+                paths.add(import_path)
+    return paths
+
+
+def _python_imported_modules(content: str) -> set[str]:
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return set()
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name:
+                    modules.add(alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+    return modules
+
+
+def _forbidden_guessed_helper_imports(content: str) -> list[str]:
+    allowed_cards = _registry_function_import_paths()
+    hits: list[str] = []
+    for module in _python_imported_modules(content):
+        for forbidden in _FORBIDDEN_GUESSED_HELPER_IMPORTS:
+            if module == forbidden or module.startswith(forbidden + "."):
+                if module not in allowed_cards:
+                    hits.append(module)
+    return sorted(set(hits))
+
+
 def _script_satisfies_required_capability(content: str, capability: str) -> bool:
     """Statically enforce only helper_required capabilities.
 
@@ -2967,22 +3015,17 @@ def _check_script_file_contract(
             )
         )
 
-        uses_keys, missing_keys = _script_uses_input_keys(
-            stripped,
-            list(plan_entry.inputs or ["payload"]),
-        )
+        # First-round validation only proves the script file itself can run as
+        # a standalone argv/stdout program. Whether each declared input is
+        # actually produced by an upstream step belongs to second-round E2E.
         results.append(
             ContractCheckResult(
                 id="script.skillplan_inputs.used",
-                passed=uses_keys,
+                passed=True,
                 target=file_path,
-                message=(
-                    "脚本源码使用了所有 SkillPlan inputs。"
-                    if uses_keys
-                    else f"脚本源码未使用这些 SkillPlan inputs：{', '.join(missing_keys)}。"
-                ),
-                expected=f"源码必须实际读取/使用 inputs：{', '.join(plan_entry.inputs or ['payload'])}。",
-                minimal_edit="在参数解析或业务逻辑中读取并使用缺失的 payload key。",
+                message="第一轮不静态要求源码逐字出现每个 SkillPlan input；declared inputs 用于构造 smoke payload。",
+                expected="第一轮只检查脚本自身入口、JSON argv、stdout JSON、非空壳、非 mock、helper_required 和 forbidden capability。",
+                minimal_edit="如 E2E 发现字段未接上，再修 SKILL.md 命令或脚本字段映射。",
             )
         )
 
@@ -3003,6 +3046,22 @@ def _check_script_file_contract(
         )
 
     tool_resolve = resolve_tools_for_skill_plan_entry(plan_entry)
+
+    guessed_helper_imports = _forbidden_guessed_helper_imports(stripped) if plan_entry.language == "python" else []
+    results.append(
+        ContractCheckResult(
+            id="tool_usage_contract.forbidden_helper_import",
+            passed=not guessed_helper_imports,
+            target=file_path,
+            message=(
+                "脚本未猜测未在 Tool Registry function card 中明确给出的 helper import path。"
+                if not guessed_helper_imports
+                else f"{file_path} import 了未由 Tool Registry function card 明确提供 import path 和调用签名的 helper：{', '.join(guessed_helper_imports)}。"
+            ),
+            expected="只有 Tool Registry function card 明确给出 import_path 和 signature 时才可 import helper；否则必须自包含实现或使用标准库。",
+            minimal_edit="该模块不可 import；如果 Tool Registry 没有明确 function card，请移除该 import，改为自实现。",
+        )
+    )
 
     helper_required_capabilities = [
         capability
@@ -3967,7 +4026,7 @@ def _json_argv_text_optional_variants(args: list[str]) -> list[list[str]]:
     return []
 
 
-def _trial_args_for_script(skill_md: str, file_path: str, content: str) -> list[list[str]]:
+def _trial_args_for_script(skill_md: str, file_path: str, content: str, skill_plan_entry: dict[str, Any] | SkillPlanEntry | None = None) -> list[list[str]]:
     commands = _extract_script_command_templates(skill_md, file_path)
     arg_sets: list[list[str]] = []
     for cmd in commands:
@@ -3975,14 +4034,26 @@ def _trial_args_for_script(skill_md: str, file_path: str, content: str) -> list[
         if args is not None:
             arg_sets.append(args)
     if not arg_sets and _script_reads_json_argv(content, runtime_for_language(language_for_path(file_path), file_type_for_path(file_path))):
-        arg_sets = [[json.dumps({
-            "payload": {
-                "user_request": _sample_value_for_placeholder("payload"),
-                "fields": {},
-                "options": {},
-                "input_files": [],
-            }
-        }, ensure_ascii=False)]]
+        entry = _skill_plan_entry_for_file(file_path=file_path, skill_plan_entry=skill_plan_entry)
+        payload = {
+            "payload": _sample_value_for_placeholder("payload"),
+            "user_request": _sample_value_for_placeholder("user_request"),
+            "fields": {},
+            "options": {},
+            "input_files": [],
+        }
+        for key in entry.inputs or []:
+            if key in payload:
+                continue
+            if key.endswith("_path") or key in {"image_path", "pdf_path", "docx_path", "pptx_path", "html_path"}:
+                payload[key] = "inputs/sample.txt"
+            elif key.endswith("_paths") or key in {"image_paths", "file_paths"}:
+                payload[key] = ["inputs/sample.txt"]
+            elif key.startswith("structured_") or key.endswith("_data") or key.endswith("_json"):
+                payload[key] = {"title": "试运行样例", "items": ["示例"]}
+            else:
+                payload[key] = _sample_value_for_placeholder(key)
+        arg_sets = [[json.dumps(payload, ensure_ascii=False)]]
     if not arg_sets:
         arg_sets = [[]]
 
@@ -4247,7 +4318,7 @@ def _trial_run_generated_script(
         except RuntimeError as exc:
             raise ValueError(f"脚本试运行环境准备失败：{exc}") from exc
 
-        for args in _trial_args_for_script(skill_md, file_path, content):
+        for args in _trial_args_for_script(skill_md, file_path, content, skill_plan_entry=skill_plan_entry):
             try:
                 proc = subprocess.run(
                     [str(venv_python), str(script_path), *args],
@@ -4584,6 +4655,9 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
     if file_path.startswith("scripts/"):
         lower_error = error_text.lower()
 
+        if "ModuleNotFoundError: No module named 'pdf_generation'" in error_text or 'ModuleNotFoundError: No module named "pdf_generation"' in error_text:
+            return "该模块不可 import；如果 Tool Registry 没有明确 function card，请移除该 import，改为自实现。"
+
         if (
             "stdout JSON 不得包含 error 字段" in error_text
             or "stdout JSON 至少需要一个非空字段" in error_text
@@ -4679,6 +4753,8 @@ async def _run_generated_file_validator_round(
                 "不要使用 '''bash 或 '''json；不要把行内 scripts/*.py 当成执行命令。"
                 "SKILL.md YAML frontmatter 只需要在文件开头用 --- 开启，并在 metadata 后用 --- 关闭；"
                 "不要求整个文件末尾再出现 ---。"
+                "禁止报告推测性 Python 运行风险（例如 unhashable type: dict、深度序列化、dict key 类型、可能不可哈希等）；"
+                "真实运行错误只以单脚本 smoke traceback 为准。"
             ),
         },
         {
@@ -4768,6 +4844,10 @@ def _filter_validator_model_call_misjudgements(
     deterministic contract for this script may introduce required model calls.
     """
     issue_strings = [str(item) for item in issues]
+    speculative_runtime_re = re.compile(r"unhashable type:? ?dict|不可哈希|unhashable|深度序列化|dict key|字典键|可能.*哈希", re.IGNORECASE)
+    issue_strings = [item for item in issue_strings if not speculative_runtime_re.search(item)]
+    if speculative_runtime_re.search(instructions or ""):
+        instructions = deterministic_error
     if not file_path.startswith("scripts/"):
         return issue_strings, instructions
     deterministic_scope = f"{deterministic_error}\n{failed_checks_text}"
@@ -5340,6 +5420,7 @@ def _build_generate_file_prompt(
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
             "6. 是否允许模型、网络、外部副作用或平台 helper，只由当前脚本显式 SkillPlan role/capabilities/forbidden_capabilities 与 Tool Registry 决定；不要从蓝图业务词、文件名或输出类型推断。\n"
             "7. 生成脚本前必须阅读统一 Tool Registry 上下文；除 usage_policy=helper_required 的能力外，不强制 helper 或内部实现方式。不要自己发明未配置的外部 API。\n"
+            "7a. 硬规则：不要猜测平台 helper/import path；只有 Tool Registry 明确提供 import path 和 call signature 时才能 import。否则使用自包含实现或可用标准库。\n"
             "8. 如果没有显式模型能力，不要引入 LLM、图片模型、视觉模型或检索模型调用；如果没有显式外部副作用能力，不要引入外部副作用。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
             "10. stdout 必须输出结构化 JSON；内部中间字段名由当前 Skill 自行确定，但必须与后续命令 placeholder 真实对齐，最终产物仍必须使用平台标准输出字段和 OUTPUT_DIR/outputs 路径协议。\n"
@@ -5680,6 +5761,45 @@ async def upload_asset(
         message=f"素材已上传：{target_rel_path}",
     )
 
+
+_STRICT_REWRITE_ERROR_MARKERS = (
+    "ast.parse",
+    "不是合法 Python 源码",
+    "script.source.syntax",
+    "script.runtime.entrypoint",
+    "缺少 python 入口",
+    "JSON argv",
+    "json_argv",
+    "stdout JSON",
+    "stdout 非 JSON",
+    "ImportError",
+    "ModuleNotFoundError",
+    "Traceback",
+    "脚本试运行失败",
+    "forbidden_helper",
+    "tool_usage_contract.forbidden_helper_import",
+    "helper_required",
+    "script.required_capabilities.called",
+)
+
+
+def _strict_contract_rewrite_allowed(error_text: str) -> bool:
+    return any(marker in (error_text or "") for marker in _STRICT_REWRITE_ERROR_MARKERS)
+
+
+def _repair_error_layer(error_text: str) -> str:
+    if "generation_empty" in (error_text or ""):
+        return "generation_empty"
+    layer = _failure_layer_from_error_text(error_text) or "contract"
+    match = re.search(r"(?:^|\n)-\s+([^\s]+)\s+target=", error_text or "")
+    if match:
+        return match.group(1)
+    if "ModuleNotFoundError" in (error_text or ""):
+        m = re.search(r"ModuleNotFoundError: No module named ['\"]([^'\"]+)", error_text)
+        return "ModuleNotFoundError:" + (m.group(1) if m else "unknown")
+    return layer
+
+
 @router.post("/generate-file")
 async def generate_file(request: GenerateFileRequest):
     """Generate one Creator file and stream it back as SSE.
@@ -5732,6 +5852,7 @@ async def generate_file(request: GenerateFileRequest):
             return
 
         candidate = ""
+        repair_counts_by_layer: dict[str, int] = {}
         try:
             candidate = await complete_chat_once(prompt_messages, route.model)
         except Exception as exc:
@@ -5744,6 +5865,9 @@ async def generate_file(request: GenerateFileRequest):
 
         for attempt in range(1, _MAX_FILE_REPAIR_ATTEMPTS + 1):
             try:
+                if len(candidate or "") == 0:
+                    raise ValueError("generation_empty: 模型生成结果 content_chars=0，跳过 validator/repair；应直接重新生成一次或换模型。")
+
                 content = _sanitize_generated_file_content(
                     request.file_path,
                     candidate,
@@ -5847,6 +5971,44 @@ async def generate_file(request: GenerateFileRequest):
 
             except Exception as exc:
                 deterministic_error = str(exc)
+                error_layer = _repair_error_layer(deterministic_error)
+                repair_counts_by_layer[error_layer] = repair_counts_by_layer.get(error_layer, 0) + 1
+
+                if error_layer == "generation_empty":
+                    if repair_counts_by_layer[error_layer] > 1:
+                        yield _sse({
+                            "type": "file_done",
+                            "status": "error",
+                            "success": False,
+                            "file_path": request.file_path,
+                            "role": request.role,
+                            "error": "文件内容生成失败：generation_empty 重试 1 次后仍为空，请换模型或重新生成。",
+                            "done": True,
+                        })
+                        return
+                    yield _sse({
+                        "type": "validation",
+                        "status": "regenerating",
+                        "success": False,
+                        "file_path": request.file_path,
+                        "role": request.role,
+                        "validation": {"status": "regenerating", "attempt": attempt, "error": deterministic_error},
+                    })
+                    candidate = await complete_chat_once(prompt_messages, route.model)
+                    continue
+
+                if repair_counts_by_layer[error_layer] > 2:
+                    yield _sse({
+                        "type": "file_done",
+                        "status": "error",
+                        "success": False,
+                        "file_path": request.file_path,
+                        "role": request.role,
+                        "error": f"文件内容生成失败：同一错误层 {error_layer} 已修复 2 次仍未通过。最后错误：{deterministic_error}",
+                        "done": True,
+                    })
+                    return
+
                 targeted_repair = _targeted_generated_file_repair_instructions(
                     file_path=request.file_path,
                     deterministic_error=deterministic_error,
@@ -5931,7 +6093,7 @@ async def generate_file(request: GenerateFileRequest):
                     failed_checks_text=failed_checks_text,
                     repair_mode=(
                         "strict_contract_rewrite"
-                        if attempt >= 2 and request.file_path.startswith("scripts/")
+                        if attempt >= 2 and request.file_path.startswith("scripts/") and _strict_contract_rewrite_allowed(deterministic_error)
                         else "minimal_edit"
                     ),
                 )
@@ -5954,7 +6116,7 @@ async def generate_file(request: GenerateFileRequest):
                     failed_checks_text=failed_checks_text,
                     repair_mode=(
                         "strict_contract_rewrite"
-                        if attempt >= 2 and request.file_path.startswith("scripts/")
+                        if attempt >= 2 and request.file_path.startswith("scripts/") and _strict_contract_rewrite_allowed(deterministic_error)
                         else "minimal_edit"
                     ),
                     skill_plan_entry=request.skill_plan_entry,
