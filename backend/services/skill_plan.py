@@ -27,6 +27,33 @@ FileRole = str
 
 SCRIPT_ROLES: frozenset[str] = frozenset(get_script_roles())
 
+PLATFORM_LAYER_NAMES: frozenset[str] = frozenset({
+    "creator_internal",
+    "business_skill",
+    "runtime_artifact",
+    "static_resource",
+    "platform_protocol",
+})
+
+# Capabilities in SkillPlan are a business contract. Host execution/sandbox
+# protocol and Creator safety controls are tracked separately so generated
+# business Skills cannot smuggle platform policy through required/forbidden
+# capability lists.
+_PLATFORM_PROTOCOL_CAPABILITIES: frozenset[str] = frozenset({
+    "deterministic_execution",
+    "runtime_execution",
+    "sandbox_execution",
+    "host_scheduling",
+    "script_runner",
+})
+_PLATFORM_SAFETY_CAPABILITIES: frozenset[str] = frozenset({
+    "network_disabled",
+    "filesystem_sandbox",
+    "secret_redaction",
+    "user_confirmation",
+    "approval_required",
+})
+
 ROLE_ALLOWED_CAPABILITIES: dict[str, frozenset[str]] = {
     "text_generator": frozenset({"text_generation", "file_output"}),
     "image_generator": frozenset({"image_generation", "file_output"}),
@@ -54,6 +81,32 @@ ROLE_ALLOWED_CAPABILITIES: dict[str, frozenset[str]] = {
     "asset_builder": frozenset({"asset_generation", "file_output"}),
     "generic_script": frozenset({"deterministic_execution", "file_output"}),
 }
+
+
+def capability_layer(capability: str) -> str:
+    """Classify a declared capability by ownership layer."""
+    name = re.sub(r"[^A-Za-z0-9_-]", "", str(capability or "").strip())
+    if not name:
+        return "business_skill"
+    if name in _PLATFORM_PROTOCOL_CAPABILITIES:
+        return "platform_protocol"
+    if name in _PLATFORM_SAFETY_CAPABILITIES:
+        return "creator_internal"
+    cap = get_tool_capability(name)
+    if cap and cap.category in {"authoring"}:
+        return "creator_internal"
+    if cap and cap.category == "resource":
+        return "static_resource"
+    return "business_skill"
+
+
+def is_business_capability(capability: str) -> bool:
+    return capability_layer(capability) == "business_skill"
+
+
+def is_platform_safety_constraint(capability: str) -> bool:
+    return capability_layer(capability) == "creator_internal"
+
 
 def _dedupe_capabilities(values: list[str]) -> list[str]:
     seen: set[str] = set()
@@ -94,6 +147,8 @@ def normalize_required_capabilities(
     for capability in requested:
         cap = get_tool_capability(capability)
         if cap and cap.category == "resource":
+            continue
+        if capability_layer(capability) != "business_skill":
             continue
         runtime_only.append(capability)
 
@@ -153,6 +208,12 @@ class SkillPlanEntry:
     optional_capabilities: list[str] = field(default_factory=list)
     allowed_capabilities: list[str] = field(default_factory=list)
     forbidden_capabilities: list[str] = field(default_factory=list)
+    business_capabilities: list[str] = field(default_factory=list)
+    platform_capabilities: list[str] = field(default_factory=list)
+    business_forbidden_capabilities: list[str] = field(default_factory=list)
+    platform_safety_constraints: list[str] = field(default_factory=list)
+    execution_contract: dict[str, str] = field(default_factory=dict)
+    layer: str = "business_skill"
     reference_files: list[str] = field(default_factory=list)
     skill_local_references: list[str] = field(default_factory=list)
     creator_internal_references: list[str] = field(default_factory=list)
@@ -320,7 +381,7 @@ def _segment_for_file(file_path: str, *texts: str) -> str:
             segment = after[: next_match.start()] if next_match else after
             # Prefer block-style segments that actually contain contract fields;
             # inline path mentions in section summaries often have no local data.
-            if re.search(r"\b(?:role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|forbidden_capabilities)\b\s*[：:=]", segment, re.I):
+            if re.search(r"\b(?:role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|business_forbidden_capabilities|forbidden_capabilities)\b\s*[：:=]", segment, re.I):
                 return segment
             if len(segment) > len(best):
                 best = segment
@@ -338,7 +399,7 @@ _FIELD_AMBIGUOUS_RE = re.compile(
     r"(?:[|/+&]|\b(?:or|alias|aka|alternative|alternatives)\b|或|或者|别名|候选|可选)",
     re.I,
 )
-_FIELD_LIST_NAMES_RE = r"role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|forbidden_capabilities|language|runtime"
+_FIELD_LIST_NAMES_RE = r"role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|business_forbidden_capabilities|forbidden_capabilities|language|runtime"
 
 
 def _clean_concrete_field_name(raw_item: str) -> tuple[str | None, bool]:
@@ -616,17 +677,26 @@ def build_skill_plan_entry(
     explicit_dependencies = _explicit_list_field("dependencies", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     dependencies = _dedupe_paths([ref for ref in (explicit_dependencies or skill_local_references) if _is_skill_local_reference(ref)])
     default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
-    required_capabilities = explicit_required_capabilities or default_required_capabilities
+    raw_required_capabilities = explicit_required_capabilities or default_required_capabilities
+    platform_capabilities = [cap for cap in _dedupe_capabilities(raw_required_capabilities) if capability_layer(cap) == "platform_protocol"]
     required_capabilities = normalize_required_capabilities(
         role=role,
         path=file_path,
-        required_capabilities=required_capabilities,
+        required_capabilities=raw_required_capabilities,
         user_blueprint_text=f"{purpose}\n{blueprint_summary}",
     )
-    optional_capabilities = explicit_optional_capabilities or []
-    allowed_capabilities = explicit_allowed_capabilities or []
-    forbidden_capabilities = _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_forbidden_capabilities
-    forbidden_capabilities = [capability for capability in forbidden_capabilities if capability not in required_capabilities]
+    optional_capabilities = [cap for cap in (explicit_optional_capabilities or []) if is_business_capability(cap)]
+    allowed_capabilities = [cap for cap in (explicit_allowed_capabilities or []) if is_business_capability(cap)]
+    explicit_forbidden = (
+        _explicit_list_field("business_forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+        or _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+    )
+    raw_forbidden_capabilities = explicit_forbidden or default_forbidden_capabilities
+    platform_safety_constraints = [cap for cap in _dedupe_capabilities(raw_forbidden_capabilities) if is_platform_safety_constraint(cap)]
+    forbidden_capabilities = [
+        capability for capability in _dedupe_capabilities(raw_forbidden_capabilities)
+        if is_business_capability(capability) and capability not in required_capabilities
+    ]
     detected_language = language_for_path(file_path)
     explicit_language = _explicit_scalar_field("language", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     language = explicit_language if explicit_language in {"python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"} else detected_language
@@ -646,6 +716,12 @@ def build_skill_plan_entry(
         optional_capabilities=optional_capabilities,
         allowed_capabilities=allowed_capabilities,
         forbidden_capabilities=forbidden_capabilities,
+        business_capabilities=required_capabilities,
+        platform_capabilities=platform_capabilities,
+        business_forbidden_capabilities=forbidden_capabilities,
+        platform_safety_constraints=platform_safety_constraints,
+        execution_contract={"runtime": runtime, "entrypoint": file_path} if file_type == "script" else {},
+        layer="business_skill" if file_type in {"skill", "script", "skill_md"} else "static_resource",
         # Public/final SKILL.md references are skill-local only.  Creator
         # kernel references remain separate internal context and must never be
         # merged into reference_files/skill_local_references.
@@ -759,7 +835,11 @@ def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
             path=path,
             required_capabilities=normalized_required,
             dependencies=dependencies,
-            forbidden_capabilities=[cap for cap in entry.forbidden_capabilities if cap not in set(normalized_required)],
+            forbidden_capabilities=[cap for cap in entry.forbidden_capabilities if cap not in set(normalized_required) and is_business_capability(cap)],
+            business_capabilities=normalized_required,
+            platform_capabilities=[cap for cap in entry.platform_capabilities if capability_layer(cap) == "platform_protocol"],
+            business_forbidden_capabilities=[cap for cap in entry.business_forbidden_capabilities or entry.forbidden_capabilities if cap not in set(normalized_required) and is_business_capability(cap)],
+            platform_safety_constraints=[cap for cap in entry.platform_safety_constraints if is_platform_safety_constraint(cap)],
         )
 
         if cleaned.role in RESOURCE_ROLES or cleaned.file_type in {"skill_md", "reference", "asset"}:
@@ -769,7 +849,7 @@ def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
             if not _is_asset_upload_only(cleaned):
                 warnings.append(f"已移除非法 asset 文件计划项 {path}；assets/ 只能表示用户上传或系统预置的静态素材，不能是运行时产物。")
                 continue
-            cleaned = replace(cleaned, inputs=[], outputs=[], dependencies=[], required_capabilities=[], optional_capabilities=[], allowed_capabilities=[], runtime="none", entrypoint="", command_template="")
+            cleaned = replace(cleaned, inputs=[], outputs=[], dependencies=[], required_capabilities=[], optional_capabilities=[], allowed_capabilities=[], business_capabilities=[], platform_capabilities=[], runtime="none", entrypoint="", command_template="", execution_contract={}, layer="static_resource")
 
         if cleaned.file_type == "reference" and cleaned.path.startswith("references/") and cleaned.runtime != "none":
             cleaned = replace(cleaned, runtime="none", entrypoint="", command_template="")

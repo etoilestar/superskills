@@ -1529,3 +1529,71 @@ python scripts/write.py --topic "{{topic}}"
     failed = {result.id for result in validate_file_contract(file_path="SKILL.md", content=skill_md, blueprint_text=blueprint) if not result.passed}
 
     assert "skill_md.command_block.signature_parseable" in failed
+
+
+def test_skillplan_separates_platform_protocol_and_business_capabilities():
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    entry = build_skill_plan_entry(
+        file_path="scripts/run.py",
+        purpose=(
+            "role: generic_script inputs: payload outputs: result "
+            "required_capabilities: deterministic_execution, file_output "
+            "business_forbidden_capabilities: network_disabled, image_generation"
+        ),
+    )
+
+    assert entry.required_capabilities == ["file_output"]
+    assert entry.business_capabilities == ["file_output"]
+    assert entry.platform_capabilities == ["deterministic_execution"]
+    assert entry.business_forbidden_capabilities == ["image_generation"]
+    assert entry.platform_safety_constraints == ["network_disabled"]
+    assert entry.execution_contract == {"runtime": "python", "entrypoint": "scripts/run.py"}
+
+
+def test_strict_blueprint_rejects_platform_protocol_in_business_capabilities():
+    import pytest
+    from backend.services.blueprint_parser import BlueprintShapeError, validate_blueprint_shape_for_creator
+
+    blueprint = """
+## 📋 Skill 架构蓝图
+- **Skill 名称**: layered-demo
+
+### 目录结构
+- SKILL.md
+- scripts/: `scripts/run.py`
+- references/: 无需创建
+- assets/: 无需创建
+
+### SkillPlan / 文件职责计划
+- path: `SKILL.md`
+  role: skill_overview
+  inputs: [user_request]
+  outputs: [workflow]
+  dependencies: []
+  required_capabilities: []
+  business_forbidden_capabilities: []
+  references: []
+- path: `scripts/run.py`
+  role: generic_script
+  inputs: [payload]
+  outputs: [result]
+  dependencies: []
+  required_capabilities: [deterministic_execution, file_output]
+  business_forbidden_capabilities: [network_disabled]
+  references: []
+
+### 宿主执行方式
+```bash
+python scripts/run.py '{"payload":"{{payload}}"}'
+```
+"""
+
+    with pytest.raises(BlueprintShapeError) as excinfo:
+        validate_blueprint_shape_for_creator(blueprint)
+
+    message = str(excinfo.value)
+    assert "只能声明业务能力" in message
+    assert "deterministic_execution" in message
+    assert "业务禁止能力" in message
+    assert "network_disabled" in message
