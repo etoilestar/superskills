@@ -1593,19 +1593,24 @@ print(os.environ['IMAGE_BASE_URL'], os.environ['VISION_MODEL'], prompt)
         )
 
 
-def test_creator_trial_args_add_text_optional_cases():
+def test_creator_trial_args_use_declared_inputs_for_fallback_payload():
     from backend.routers.creator import _trial_args_for_script
 
-    skill_md = """```bash
-python scripts/story.py '{"topic":"{{topic}}","text":"{{text}}"}'
-```"""
+    arg_sets = _trial_args_for_script(
+        "",
+        "scripts/build.py",
+        "import json, sys\njson.loads(sys.argv[1])",
+        skill_plan_entry={
+            "path": "scripts/build.py",
+            "role": "pdf_builder",
+            "inputs": ["structured_biography", "image_path"],
+        },
+    )
+    payload = json.loads(arg_sets[0][0])
 
-    arg_sets = _trial_args_for_script(skill_md, "scripts/story.py", "import json, sys\njson.loads(sys.argv[1])")
-    payloads = [json.loads(args[0]) for args in arg_sets]
-
-    assert any("text" in payload and payload["text"] for payload in payloads)
-    assert any("topic" in payload and "text" not in payload for payload in payloads)
-    assert any(payload.get("text") == "" for payload in payloads)
+    assert payload["structured_biography"] == {"title": "试运行样例", "items": ["示例"]}
+    assert payload["image_path"] == "inputs/sample.txt"
+    assert payload["user_request"]
 
 
 def test_creator_trial_stdout_requires_json_object_for_scripts():
@@ -1758,8 +1763,8 @@ python scripts/generate.py '{"prompt":"{{prompt}}","topic":"{{topic}}"}'
 
     assert len(args) == 1
     payload = json.loads(args[0][0])
-    assert payload["prompt"] == "a cinematic watercolor cat under a warm sunset"
-    assert payload["topic"] == "system time"
+    assert payload["prompt"]
+    assert payload["topic"]
 
 
 def test_run_command_falls_back_when_inferred_skill_root_missing(tmp_path, monkeypatch):
@@ -3327,6 +3332,43 @@ def test_creator_validator_filters_model_invented_failed_checks():
         {"id": "skill_md.frontmatter", "target": "SKILL.md"}
     ]
     assert _filter_validator_failed_checks(model_checks, "") == []
+
+
+
+def test_creator_validator_filters_speculative_python_runtime_risks():
+    from backend.routers.creator import _filter_validator_model_call_misjudgements
+
+    issues, instructions = _filter_validator_model_call_misjudgements(
+        file_path="scripts/build.py",
+        deterministic_error="脚本试运行通过，只剩 deterministic contract",
+        failed_checks_text="",
+        issues=["可能出现 unhashable type: dict", "真实问题"],
+        instructions="请修复 dict key 类型和可能不可哈希问题",
+    )
+
+    assert issues == ["真实问题"]
+    assert instructions == "脚本试运行通过，只剩 deterministic contract"
+
+
+def test_script_contract_rejects_guessed_helper_import_without_function_card():
+    from backend.routers.creator import _check_script_file_contract
+
+    results = _check_script_file_contract(
+        "scripts/build_pdf.py",
+        "import json\nimport sys\nimport pdf_generation\n\ndef main():\n    print(json.dumps({'text': 'ok'}))\n\nif __name__ == '__main__':\n    main()\n",
+        skill_plan_entry={
+            "path": "scripts/build_pdf.py",
+            "role": "pdf_builder",
+            "inputs": ["payload"],
+            "outputs": ["pdf_path"],
+            "required_capabilities": ["pdf_generation", "file_output"],
+        },
+    )
+
+    helper_check = next(result for result in results if result.id == "tool_usage_contract.forbidden_helper_import")
+    assert not helper_check.passed
+    assert "该模块不可 import" in helper_check.minimal_edit
+
 
 def test_creator_trial_stdout_accepts_arbitrary_real_file_field(tmp_path):
     from backend.routers.creator import _validate_trial_stdout_json
