@@ -55,13 +55,6 @@ ROLE_ALLOWED_CAPABILITIES: dict[str, frozenset[str]] = {
     "generic_script": frozenset({"deterministic_execution", "file_output"}),
 }
 
-_HIGH_RISK_EXPLICIT_HINTS: dict[str, re.Pattern[str]] = {
-    "web_search": re.compile(r"联网|网页搜索|网络搜索|搜索网页|web[-_ ]?search|internet|search engine|searchxng|searxng", re.I),
-    "database_read": re.compile(r"数据库|SQL|业务表|数据表|database|readonly|read[-_ ]?only|query_database", re.I),
-    "vision_understanding": re.compile(r"看图|识图|OCR|截图理解|图片内容分析|视觉理解|vision|analy[sz]e image|image understanding", re.I),
-    "wechat_publish": re.compile(r"直接发布|推送到公众号|发布到公众号|wechat_publish|publish_wechat", re.I),
-}
-
 def _dedupe_capabilities(values: list[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -81,15 +74,11 @@ def normalize_required_capabilities(
     required_capabilities: list[str],
     user_blueprint_text: str = "",
 ) -> list[str]:
-    """Keep SkillPlan runtime capabilities scoped to the file's real role.
+    """Keep only explicitly declared runtime capabilities allowed for the role.
 
-    Model-written blueprints sometimes copy every platform capability into
-    ``required_capabilities``.  This normalization is intentionally stricter:
-    resource/meta files never expose runtime capabilities, resource-category
-    capabilities are dropped, and script roles only keep capabilities that the
-    role can actually use.  High-risk retrieval/vision/publish capabilities are
-    only kept when the role is their dedicated role (or the blueprint explicitly
-    asks for that operation).
+    ``user_blueprint_text`` is accepted for backwards compatibility with older
+    callers, but is intentionally ignored. Creator backend must not infer
+    business capabilities from blueprint prose, purpose text, or file names.
     """
     normalized_role = (role or "").strip()
     normalized_path = (path or "").strip().replace("\\", "/")
@@ -108,23 +97,7 @@ def normalize_required_capabilities(
             continue
         runtime_only.append(capability)
 
-    blueprint_text = user_blueprint_text or ""
-    guarded_roles = {
-        "web_search": "search_reader",
-        "database_read": "database_reader",
-        "vision_understanding": "vision_analyzer",
-        "wechat_publish": "wechat_publisher",
-    }
-    guarded: list[str] = []
-    for capability in runtime_only:
-        dedicated_role = guarded_roles.get(capability)
-        if dedicated_role and normalized_role != dedicated_role:
-            pattern = _HIGH_RISK_EXPLICIT_HINTS.get(capability)
-            if not (pattern and pattern.search(blueprint_text)):
-                continue
-        guarded.append(capability)
-
-    return guarded
+    return runtime_only
 
 RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
 _CREATOR_INTERNAL_REFERENCE_PATHS: tuple[str, ...] = (
@@ -203,14 +176,6 @@ class SkillPlan:
     warnings: list[str] = field(default_factory=list)
 
 
-_IMAGE_RE = re.compile(r"图片|图像|绘图|海报|插画|image|photo|poster|illustration|stable\s*diffusion", re.I)
-_PDF_RE = re.compile(r"pdf|报告|排版|layout|document|report", re.I)
-_TEXT_RE = re.compile(r"文本|文案|故事|童话|剧本|谜语|摘要|写作|text|story|tale|fairy|riddle|summary|copy", re.I)
-_MODEL_RE = re.compile(r"模型|llm|大语言|多模态|vision|image_model|text_model", re.I)
-_IMAGE_SCRIPT_NAME_RE = re.compile(r"(?:^|[_/-])(images|imgs|render|illustration|poster|picture|photo|visuals)(?:[_.-]|$)|配图|插画|海报|图片", re.I)
-_PDF_SCRIPT_NAME_RE = re.compile(r"(?:^|[_/-])(?:build|export|create|make|render|combine|merge)?_?pdf(?:[_.-]|$)|(?:^|[_/-])(?:pdf_builder|build_pdf|export_pdf|combine_to_pdf|merge_to_pdf)(?:[_.-]|$)|合并.*pdf|pdf.*合并", re.I)
-
-
 def file_type_for_path(path: str) -> FileType:
     if path == "SKILL.md":
         return "skill_md"
@@ -222,19 +187,26 @@ def file_type_for_path(path: str) -> FileType:
 
 
 def heuristic_signals_for_file(file_path: str, purpose: str = "", blueprint_summary: str = "") -> list[str]:
-    """Return role-classification hints without making the final contract decision."""
-    text = f"{file_path}\n{purpose}\n{blueprint_summary}"
+    """Return platform-structure debug signals only; never business semantics."""
     signals: list[str] = []
-    if _IMAGE_RE.search(text):
-        signals.append("mentions_image")
-    if _PDF_RE.search(text):
-        signals.append("mentions_pdf")
-    if _TEXT_RE.search(text):
-        signals.append("mentions_text")
-    if _MODEL_RE.search(text):
-        signals.append("mentions_model")
-    if Path(file_path).suffix.lower() == ".py":
-        signals.append("python_script")
+    file_type = file_type_for_path(file_path)
+    if file_type == "script":
+        signals.append("path_is_script")
+    elif file_type == "reference":
+        signals.append("path_is_reference")
+    elif file_type == "asset":
+        signals.append("path_is_asset")
+    elif file_type == "skill_md":
+        signals.append("path_is_skill_md")
+    explicit_role = _explicit_role_from_plan_text(
+        file_path=file_path,
+        purpose=purpose,
+        blueprint_summary=blueprint_summary,
+    )
+    if explicit_role:
+        signals.append("explicit_role_declared" if explicit_role in SCRIPT_ROLES or explicit_role in RESOURCE_ROLES else "invalid_role_for_path")
+    elif file_type == "script":
+        signals.append("missing_explicit_role")
     return signals
 
 
@@ -540,41 +512,6 @@ def _explicit_role_from_plan_text(*, file_path: str, purpose: str = "", blueprin
 
 
 
-def _should_promote_pdf_builder_role(file_path: str, purpose: str = "", blueprint_summary: str = "") -> bool:
-    """Return True for deterministic scripts whose local responsibility is PDF output.
-
-    PDF merge/export scripts are file builders, not model generators.  The path
-    must identify a PDF builder/exporter (for example build_pdf.py,
-    export_pdf.py, or combine_to_pdf.py); global SKILL.md model prose is ignored.
-    """
-    if file_type_for_path(file_path) != "script":
-        return False
-    if not _PDF_SCRIPT_NAME_RE.search(file_path):
-        return False
-    local_segment = _segment_for_file(file_path, purpose, blueprint_summary)
-    local_text = f"{file_path}\n{local_segment or purpose}"
-    if _IMAGE_SCRIPT_NAME_RE.search(file_path):
-        return False
-    return bool(_PDF_RE.search(local_text) or _PDF_SCRIPT_NAME_RE.search(file_path))
-
-
-def _should_promote_image_script_role(file_path: str, purpose: str = "", blueprint_summary: str = "") -> bool:
-    """Return True for scripts whose local contract clearly names image generation.
-
-    Generic prose such as "this skill generates images and PDFs" remains
-    conservative.  Promotion requires both image-generation wording and an
-    image-oriented script path/name so `scripts/main.py` in an ambiguous
-    composite blueprint still falls back to `generic_script` unless role is
-    explicitly declared.
-    """
-    if file_type_for_path(file_path) != "script":
-        return False
-    text = f"{file_path}\n{purpose}\n{blueprint_summary}"
-    if not _IMAGE_RE.search(text):
-        return False
-    return bool(_IMAGE_SCRIPT_NAME_RE.search(file_path))
-
-
 def _augment_inputs_for_role(role: FileRole, inputs: list[str], *, purpose: str = "", blueprint_summary: str = "") -> list[str]:
     """Return declared inputs without platform-invented business fields."""
     return list(inputs)
@@ -586,23 +523,14 @@ def file_role_classifier(
     blueprint_summary: str = "",
     heuristic_signals: list[str] | None = None,
 ) -> RoleClassification:
-    """Classify one file into a Creator role from the plan/model contract.
-
-    Domain keyword/regex matches are collected as heuristic_signals only.  They
-    do not directly select model capabilities.  Model-generating roles require
-    an explicit plan/model role such as ``role: image_generator``; deterministic
-    PDF exporter paths such as ``build_pdf.py``/``combine_to_pdf.py`` can be
-    inferred as ``pdf_builder`` because that role only grants file-output
-    capabilities.  Ambiguous scripts fall back to conservative
-    ``generic_script`` so high-impact capabilities are not enabled by accident.
-    """
+    """Classify files by platform path and explicit SkillPlan role only."""
     file_type = file_type_for_path(file_path)
     signals = list(heuristic_signals or heuristic_signals_for_file(file_path, purpose, blueprint_summary))
 
     if file_type == "skill_md":
         return RoleClassification("skill_overview", 1.0, "SKILL.md is the process overview file", signals)
     if file_type == "reference":
-        return RoleClassification("reference", 1.0, "references/ files contain subtask guidance", signals)
+        return RoleClassification("reference", 1.0, "references/ files contain auxiliary reference material", signals)
     if file_type == "asset":
         return RoleClassification("asset", 1.0, "assets/ files are static resources or templates", signals)
 
@@ -612,36 +540,7 @@ def file_role_classifier(
         blueprint_summary=blueprint_summary,
     )
     if explicit_role in SCRIPT_ROLES:
-        return RoleClassification(explicit_role, 0.95, "explicit role declared by SkillPlan/blueprint", signals)
-
-    if _should_promote_pdf_builder_role(file_path, purpose, blueprint_summary):
-        if "inferred_pdf_builder_role" not in signals:
-            signals.append("inferred_pdf_builder_role")
-        return RoleClassification(
-            "pdf_builder",
-            0.82,
-            "pdf-oriented script path/local responsibility builds or combines PDF files",
-            signals,
-        )
-
-    if _should_promote_image_script_role(file_path, purpose, blueprint_summary):
-        if "inferred_image_script_role" not in signals:
-            signals.append("inferred_image_script_role")
-        if _TEXT_RE.search(f"{file_path}\n{purpose}\n{blueprint_summary}"):
-            if "inferred_composite_script_role" not in signals:
-                signals.append("inferred_composite_script_role")
-            return RoleClassification(
-                "composite_generator",
-                0.84,
-                "image-oriented script also requires text_generation capability",
-                signals,
-            )
-        return RoleClassification(
-            "image_generator",
-            0.82,
-            "image-oriented script path/purpose requires image_generation capability",
-            signals,
-        )
+        return RoleClassification(explicit_role, 0.95, "explicit role declared by SkillPlan", signals)
 
     return RoleClassification(
         "generic_script",
@@ -661,7 +560,7 @@ def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
     if role in SCRIPT_ROLES:
         return ["payload"], []
     if role == "reference":
-        return [], ["non_empty_markdown", "required_sections"]
+        return [], ["reference_metadata", "reference_body"]
     if role == "asset":
         return [], []
     if role == "skill_overview":
@@ -701,14 +600,6 @@ def build_skill_plan_entry(
     explicit_allowed_capabilities = _explicit_list_field("allowed_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     role = classification.role
     role_reason = classification.reason
-    if (
-        file_type == "script"
-        and explicit_required_capabilities
-        and {"text_generation", "image_generation"}.issubset(set(explicit_required_capabilities))
-        and role not in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}
-    ):
-        role = "composite_generator"
-        role_reason = "normalized text_generation + image_generation capabilities to composite_generator"
     explicit_inputs = _explicit_list_field("inputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     explicit_outputs = _explicit_list_field("outputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     explicit_default_values = _explicit_default_values(file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
@@ -732,25 +623,6 @@ def build_skill_plan_entry(
         required_capabilities=required_capabilities,
         user_blueprint_text=f"{purpose}\n{blueprint_summary}",
     )
-    if (
-        file_type == "script"
-        and {"text_generation", "image_generation"}.issubset(set(required_capabilities))
-        and role not in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}
-    ):
-        role = "composite_generator"
-        default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
-        if not explicit_required_capabilities:
-            required_capabilities = default_required_capabilities
-        required_capabilities = normalize_required_capabilities(
-            role=role,
-            path=file_path,
-            required_capabilities=required_capabilities,
-            user_blueprint_text=f"{purpose}\n{blueprint_summary}",
-        )
-        inputs = explicit_inputs if explicit_inputs is not None else default_io_for_role(role)[0]
-        inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
-        outputs = explicit_outputs if explicit_outputs is not None else default_io_for_role(role)[1]
-        role_reason = "normalized text_generation + image_generation capabilities to composite_generator"
     optional_capabilities = explicit_optional_capabilities or []
     allowed_capabilities = explicit_allowed_capabilities or []
     forbidden_capabilities = _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_forbidden_capabilities

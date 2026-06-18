@@ -1142,21 +1142,15 @@ def tool_layer_prompt_for_context(
         else:
             self_allowed.append(name)
 
-    deterministic_examples = [
-        "datetime（当前时间、日期/时间格式化）",
-        "json/csv（结构化转换）",
-        "pathlib/os/shutil（路径整理与本地文件读写）",
-        "hashlib/zipfile（摘要与归档）",
-        "字符串格式化、Markdown/CSV/JSON 拼接",
-        "本地 PDF/docx/pptx/html/图片构建库（仅在当前能力允许产物时使用）",
-    ]
-
     lines = [
-        "工具分层提示：",
-        "第一层：基础确定性工具层（普通编程任务默认使用，不需要 LLM）：",
-        "- " + "；".join(deterministic_examples),
-        "- 获取当前时间、数学计算、格式转换、路径整理、简单文本拼接、本地文件读取等确定性任务，应优先自实现。",
-        "第二层：平台 helper 层：",
+        "工具上下文（仅由显式 SkillPlan 能力合同解析，禁止按业务关键词扩权）：",
+        f"- 显式 role：{role or '未声明'}",
+        f"- 显式 required_capabilities：{', '.join(required) if required else '无'}",
+        f"- 显式 optional_capabilities：{', '.join(optional) if optional else '无'}",
+        f"- 显式 allowed_capabilities：{', '.join(allowed) if allowed else '无'}",
+        "基础确定性实现能力：",
+        "- 当前脚本可使用目标语言标准库完成确定性计算、解析、格式化、本地文件处理和结构转换。",
+        "平台 helper 层：",
         f"- helper_required（必须调用）：{', '.join(helper_required) if helper_required else '无'}",
         f"- helper_preferred（推荐调用，不强制）：{', '.join(helper_preferred) if helper_preferred else '无'}",
         f"- self_implementation_allowed（允许自实现）：{', '.join(self_allowed) if self_allowed else '无'}",
@@ -1213,7 +1207,7 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
         forbidden_imports=[],
         tool_function_cards=[],
         tool_snippets=snippets,
-        tool_usage_prompt="通用工具平台：coder 生成 python_script，后端 runner 只负责执行和校验。\n" + layered_prompt + "\n" + tool_snippet_prompt(snippets),
+        tool_usage_prompt="通用工具平台：工具选择只来自显式 role/capabilities/forbidden_capabilities 与 registry 元数据；禁止根据业务关键词、文件名、purpose、蓝图正文或 reference 正文推断工具。\n" + layered_prompt + "\n" + tool_snippet_prompt(snippets),
         warnings=warnings,
     )
 

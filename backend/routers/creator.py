@@ -766,13 +766,12 @@ class ContractValidationError(ValueError):
 
 
 def _infer_script_input_keys_from_blueprint(script_path: str, blueprint_text: str) -> list[str]:
-    """Infer stable JSON argv keys from the blueprint for a script path."""
-    lowered = (blueprint_text or "").lower()
-    key_candidates = ["topic", "prompt", "text", "keywords"]
-    keys = [key for key in key_candidates if key in lowered]
-    if not keys:
-        keys = ["topic"]
-    return keys[:3]
+    """Compatibility shim: Creator no longer guesses business argv keys.
+
+    Input fields must come from SkillPlan.inputs, SKILL.md command JSON argv, or
+    E2E trace payload/stdout. The generic fallback is a single payload object.
+    """
+    return ["payload"]
 
 
 def _script_command_template(script_path: str, blueprint_text: str, entry: SkillPlanEntry | None = None) -> str:
@@ -780,6 +779,52 @@ def _script_command_template(script_path: str, blueprint_text: str, entry: Skill
     if entry is None:
         entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
     return render_script_command_from_skill_plan(entry)
+
+
+def _creator_tool_context_for_script(
+    *,
+    file_path: str,
+    skill_plan_entry: SkillPlanEntry | dict[str, Any] | None,
+    blueprint_text: str = "",
+    failure_layer: str | None = None,
+    error_text: str | None = None,
+    include_snippets: bool = True,
+) -> str:
+    """Build tool context from explicit SkillPlan contract and registry metadata only."""
+    if not file_path.startswith("scripts/"):
+        return ""
+    entry = skill_plan_entry or _skill_plan_entry_for_file(file_path=file_path, blueprint_text=blueprint_text)
+    tool_resolve = resolve_tools_for_skill_plan_entry(entry)
+    parts = [tool_resolve.tool_usage_prompt]
+    if failure_layer or error_text:
+        role = str(entry.get("role") if isinstance(entry, dict) else getattr(entry, "role", "") or "")
+        required = list(entry.get("required_capabilities", []) if isinstance(entry, dict) else getattr(entry, "required_capabilities", []) or [])
+        optional = list(entry.get("optional_capabilities", []) if isinstance(entry, dict) else getattr(entry, "optional_capabilities", []) or [])
+        allowed = list(entry.get("allowed_capabilities", []) if isinstance(entry, dict) else getattr(entry, "allowed_capabilities", []) or [])
+        forbidden = list(entry.get("forbidden_capabilities", []) if isinstance(entry, dict) else getattr(entry, "forbidden_capabilities", []) or [])
+        from ..services.creator_tool_registry import tool_layer_prompt_for_context
+        parts.append(tool_layer_prompt_for_context(
+            role=role,
+            required_capabilities=required,
+            optional_capabilities=optional,
+            allowed_capabilities=allowed,
+            forbidden_capabilities=forbidden,
+            failure_layer=failure_layer,
+            error_text=error_text,
+        ))
+        if include_snippets:
+            snippets = resolve_tool_snippets_for_context(
+                role=role,
+                capabilities=[*required, *optional, *allowed],
+                tool_names=[*required, *optional, *allowed],
+                file_path=file_path,
+                failure_layer=failure_layer,
+                error_text=error_text,
+                max_snippets=6,
+            )
+            if snippets:
+                parts.append(tool_snippet_prompt(snippets))
+    return "\n\n".join(part for part in parts if part)
 
 
 
@@ -2209,53 +2254,69 @@ def _reference_metadata_contract_checks(
     content: str,
     purpose: str = "",
 ) -> list[ContractCheckResult]:
-    """Light metadata checks for references.
-
-    Frontmatter is optional. If present, only reject fields that conflict with
-    the file's identity/resource role; do not require a rich metadata schema.
-    """
+    """Validate required reference metadata while keeping body structure flexible."""
     meta, body = _reference_frontmatter_metadata(content)
     results: list[ContractCheckResult] = []
 
-    if meta:
-        path_value = meta.get("path")
-        if path_value not in (None, ""):
-            results.append(ContractCheckResult(
-                id="reference.metadata.path_matches",
-                passed=path_value == file_path,
-                target=file_path,
-                message=(
-                    "reference metadata.path 与文件路径不冲突。"
-                    if path_value == file_path
-                    else f"reference metadata.path={path_value!r} 与文件路径 {file_path!r} 冲突。"
-                ),
-                expected=f"如声明 metadata.path，则必须等于 {file_path}；也可以删除该字段。",
-                minimal_edit=f"把 metadata.path 改为 {file_path}，或删除 path 字段。",
-            ))
+    required_keys = ["name", "description", "role", "type", "path", "scope", "loading", "when_to_use"]
+    has_frontmatter = bool(re.match(r"\A---\s*\n", content or ""))
+    results.append(ContractCheckResult(
+        id="reference.metadata.frontmatter_exists",
+        passed=has_frontmatter and bool(meta),
+        target=file_path,
+        message=("reference 包含 YAML frontmatter metadata。" if has_frontmatter and meta else "reference 缺少 YAML frontmatter metadata。"),
+        expected="reference 必须以 YAML frontmatter 开始，用于 metadata-first 按需加载。",
+        minimal_edit="在文件开头补充 --- 包裹的 YAML metadata。",
+    ))
 
-        role_value = meta.get("role")
-        type_value = meta.get("type")
-        role_type_ok = role_value in (None, "", "reference") and type_value in (None, "", "reference")
-        results.append(ContractCheckResult(
-            id="reference.metadata.role_type",
-            passed=role_type_ok,
-            target=file_path,
-            message=(
-                "reference metadata role/type 不冲突。"
-                if role_type_ok
-                else "reference metadata.role/type 与 reference 定位冲突。"
-            ),
-            expected="如声明 role/type，只能为 reference；也可以删除这些字段。",
-            minimal_edit="把 role/type 改为 reference，或删除冲突字段。",
-        ))
+    missing = [key for key in required_keys if meta.get(key) in (None, "", [])]
+    results.append(ContractCheckResult(
+        id="reference.metadata.required_keys",
+        passed=not missing,
+        target=file_path,
+        message=("reference metadata 核心字段完整。" if not missing else "reference metadata 缺少核心字段：" + ", ".join(missing)),
+        expected="metadata 必须包含 name、description、role、type、path、scope、loading、when_to_use。",
+        minimal_edit="补齐缺失 metadata 字段，但不要把 reference 改成第二套 SkillPlan。",
+    ))
+
+    path_value = meta.get("path")
+    results.append(ContractCheckResult(
+        id="reference.metadata.path_matches",
+        passed=path_value == file_path,
+        target=file_path,
+        message=(
+            "reference metadata.path 与文件路径一致。"
+            if path_value == file_path
+            else f"reference metadata.path={path_value!r} 与文件路径 {file_path!r} 冲突。"
+        ),
+        expected=f"metadata.path 必须等于 {file_path}。",
+        minimal_edit=f"把 metadata.path 改为 {file_path}。",
+    ))
+
+    role_value = meta.get("role")
+    type_value = meta.get("type")
+    loading_value = meta.get("loading")
+    role_type_loading_ok = role_value == "reference" and type_value == "reference" and loading_value == "metadata-first-body-on-demand"
+    results.append(ContractCheckResult(
+        id="reference.metadata.role_type_loading",
+        passed=role_type_loading_ok,
+        target=file_path,
+        message=(
+            "reference metadata role/type/loading 符合平台协议。"
+            if role_type_loading_ok
+            else "reference metadata.role/type/loading 与平台协议冲突。"
+        ),
+        expected="metadata.role=reference、metadata.type=reference、metadata.loading=metadata-first-body-on-demand。",
+        minimal_edit="修正 role/type/loading 平台协议字段。",
+    ))
 
     results.append(ContractCheckResult(
         id="reference.metadata.body_exists",
         passed=bool(body.strip()),
         target=file_path,
         message=("reference 存在 Markdown 正文。" if body.strip() else "reference 正文为空。"),
-        expected="reference 作为辅助上下文必须有非空 Markdown 正文。",
-        minimal_edit="补充 reference 正文。",
+        expected="reference 作为辅助上下文必须有非空 Markdown 正文，但正文结构不强制固定章节。",
+        minimal_edit="补充非空 reference 正文。",
     ))
     return results
 
@@ -2267,14 +2328,13 @@ def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_
         entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
         if file_path in entry.reference_files or not entry.reference_files:
             script_lines.extend([
-                f"- 本 reference 默认只写规范、风格、正例、反例和质量标准；不要重新定义 {script_path} 的 role/inputs/outputs/capabilities/command_template。",
+                f"- 本 reference 是 {script_path} 的辅助资料；不要重新定义该脚本的 role/inputs/outputs/capabilities/command_template。",
                 f"- 如果 SKILL.md 已包含 {script_path} 的可执行命令块，本 reference 不要再写命令块。",
-                f"- 若 reference 必须提供命令块，只能复用 SkillPlan.command_template 的等价执行合同：```bash\n{_script_command_template(script_path, blueprint_text, entry)}\n```",
-                f"- 禁止把上述正确命令、JSON keys（{', '.join(entry.inputs or ['payload'])}）或 role={entry.role} 写成反例。",
+                "- reference 正文可以自由组织，只要提供有用参考信息且不成为第二套 SkillPlan。",
             ])
 
     if not script_lines:
-        script_lines.append("- 本 reference 对应一个独立子任务/模块；必须写清 inputs、outputs、执行步骤、约束和示例。")
+        script_lines.append("- 本 reference 对应一个独立子任务/模块；正文必须非空并提供有用参考信息，但不强制固定章节结构。")
 
     metadata_example = yaml.safe_dump(
         {
@@ -2315,11 +2375,11 @@ def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_
         "B. 内容职责:",
         f"- 职责说明：{purpose or '根据蓝图提供可操作参考资料'}",
         "- 每个 reference 只对应一个子任务/模块，不要把整个 Skill 包打包到一个 reference。",
-        "- 默认只写写作规范、风格要求、正例、反例、质量标准；如果 SKILL.md 已有可执行命令块，reference 不要重复写命令块。",
+        "- 正文是辅助参考资料；不要重新定义 SkillPlan 的 role/capability/input/output 合同；如果 SKILL.md 已有可执行命令块，reference 不要重复写命令块。",
         "- 不要重新定义 role / inputs / outputs / capabilities / command_template。",
         *script_lines,
         "- 内容必须是有实际指导价值的参考资料，不是对‘将要生成参考资料’的再描述。",
-        "- 必须包含任务规范/步骤、示例、反例、约束/禁止项等章节，且正文长度足以指导子任务。",
+        "- 正文必须非空并提供有用参考信息；不要求固定章节、示例、反例、步骤清单或输入输出段落。",
         "C. 禁止项:",
         "- 不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
         "- 不要包含其它 SKILL.md/scripts/assets/references 文件的打包内容。",
@@ -3159,6 +3219,18 @@ def _check_script_file_contract(
             )
         )
 
+    if uses_image_helper and "image_generation" not in (plan_entry.required_capabilities or []):
+        results.append(
+            ContractCheckResult(
+                id="script.capability.forbidden_image_generation",
+                passed=False,
+                target=file_path,
+                message=f"{file_path} 调用了图片生成 helper，但 SkillPlan.required_capabilities 未显式声明 image_generation。",
+                expected="只有 required_capabilities 显式包含 image_generation 且未被 forbidden_capabilities 禁止时，脚本才可调用图片生成 helper。",
+                minimal_edit="移除图片生成 helper，或由规划模型在 SkillPlan 中显式声明 image_generation。",
+            )
+        )
+
     if "image_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
@@ -3182,6 +3254,18 @@ def _check_script_file_contract(
             re.IGNORECASE,
         )
     )
+    if uses_text_helper and "text_generation" not in (plan_entry.required_capabilities or []):
+        results.append(
+            ContractCheckResult(
+                id="script.capability.forbidden_text_generation",
+                passed=False,
+                target=file_path,
+                message=f"{file_path} 调用了文本模型 helper/LLM，但 SkillPlan.required_capabilities 未显式声明 text_generation。",
+                expected="只有 required_capabilities 显式包含 text_generation 且未被 forbidden_capabilities 禁止时，脚本才可调用文本模型能力。",
+                minimal_edit="移除文本模型调用，或由规划模型在 SkillPlan 中显式声明 text_generation。",
+            )
+        )
+
     if "text_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
@@ -4341,10 +4425,9 @@ def _targeted_e2e_repair_hint(errors: list[str]) -> str:
         return (
             "当前失败只属于最终平台输出字段不对齐。"
             "不要修改 SKILL.md，不要新增模型调用，不要改变已有业务字段。"
-            "请在最后一步脚本 stdout JSON 中增加一个合法平台字段："
-            "纯文本结果使用 text，Markdown 使用 markdown，图片使用 image_paths，"
-            "PDF/DOCX/PPTX/HTML 文件分别使用 pdf_path/docx_path/pptx_path/html_path。"
-            "如果现有 stdout 只有一个非空字符串字段，则保留它，并把相同内容映射到 text。"
+            "请保留最后一步脚本 stdout JSON 的原有业务字段，并额外映射到合法平台最终输出字段。"
+            "如果最后一步已有可展示的主要结果值，保留原字段并额外映射到 text 或 markdown。"
+            "如果最后一步产出文件，输出对应平台文件字段。"
         )
 
     if layer == "final_platform_output_value_invalid":
@@ -4424,25 +4507,19 @@ async def _repair_generated_file_with_feedback(
         else "保留已经正确的 frontmatter、章节结构、脚本命令示例和 reference 引用。"
     )
     if is_script:
-        role_rule = ""
-        if plan_entry is not None and plan_entry.role == "composite_generator":
-            caps = set(plan_entry.required_capabilities or [])
-            role_rule = "role=composite_generator：表示多能力组合脚本；具体 helper 由 SkillPlan.required_capabilities 决定；stdout 字段名由现有 SKILL.md 后续变量引用/业务语义决定，不要把 composite 固定理解为 text+image。"
-            if {"text_generation", "image_generation"} <= caps:
-                role_rule += " 当前合同同时声明文本和图片能力，可优先保留 generate_text_with_llm 与 generate_stable_diffusion_image，也可自实现；最终由 E2E 验证。"
-        elif plan_entry is not None and plan_entry.role == "image_generator":
-            role_rule = "role=image_generator：可优先调用 generate_stable_diffusion_image；stdout 输出非空 JSON，并使用现有 SKILL.md/脚本链路会消费的字段名；禁止占位图片。"
-        elif plan_entry is not None and plan_entry.role == "text_generator":
-            role_rule = "role=text_generator：可优先调用 generate_text_with_llm 或平台 LLM，也可自实现；禁止调用图片 helper 或输出固定 template-only 文本。"
-        elif plan_entry is not None and plan_entry.role == "pdf_builder":
-            role_rule = "role=pdf_builder：默认是纯文件合并/排版/PDF 构建脚本，只需真实构建文件并在 stdout JSON 返回实际存在路径；不要因为全局 SKILL.md 提到模型就调用 LLM/IMAGE_MODEL，除非当前脚本的有效 required_capabilities 明确要求模型。"
-        elif plan_entry is not None and plan_entry.role == "generic_script":
-            role_rule = "role=generic_script：只能调用 SkillPlan.required_capabilities 声明的能力；若现有 SkillPlan.required_capabilities 已声明文本+图片，只能修当前脚本实现以匹配，禁止修改蓝图或 SKILL.md。"
+        tool_context = _creator_tool_context_for_script(
+            file_path=file_path,
+            skill_plan_entry=plan_entry,
+            failure_layer=_failure_layer_from_error_text(validation_error),
+            error_text=validation_error,
+            include_snippets=True,
+        ) if plan_entry is not None else ""
         extra_rules = (
             "Python / Node / Bash 必须按 SkillPlan.runtime 读取单个 JSON argv，并且 JSON argv keys 匹配现有 SKILL.md 命令占位符；"
-            "禁止生成 topicstring / tonehumorous / stylepopular-science 这类把 key、类型或默认值拼接起来的字段；"
-            f"{role_rule}"
-            "不要直接调用 /v1/images/generations，不要用 VISION_MODEL 生成图片，不要写 placeholder/模拟图片。"
+            "修复只能基于当前验证错误、显式 SkillPlan role/capabilities/forbidden_capabilities 与 Tool Registry 上下文；"
+            "不要根据错误文本、业务词、文件名或输出类型重新判断 role/capabilities；"
+            "不要生成 topicstring / tonehumorous / stylepopular-science 这类把 key、类型或默认值拼接起来的字段；"
+            f"\n统一 Tool Registry 上下文：\n{tool_context}"
         )
     else:
         extra_rules = (
@@ -5234,7 +5311,7 @@ def _script_generation_skeleton(
     role: str | None = None,
     skill_plan_entry: dict[str, Any] | None = None,
 ) -> str:
-    """Return a runtime-aware scaffold selected by SkillPlan role/runtime."""
+    """Return protocol-only scaffolds; tool calls come from Tool Registry snippets."""
     plan_entry = _skill_plan_entry_for_file(
         file_path=file_path,
         purpose=purpose,
@@ -5243,308 +5320,47 @@ def _script_generation_skeleton(
         skill_plan_entry=skill_plan_entry,
     )
     input_keys = list(plan_entry.inputs or ["payload"])
-    effective_required_capabilities = _effective_required_capabilities_for_script(plan_entry)
     py_value_expr = " or ".join(f"payload.get({key!r})" for key in input_keys) + " or ''"
     js_value_expr = " || ".join(f"payload[{json.dumps(key)}]" for key in input_keys) + " || ''"
     bash_py_expr = " or ".join(f"p.get({key!r})" for key in input_keys) + " or ''"
 
     if plan_entry.runtime == "node":
-        if {"text_generation", "image_generation"} <= set(effective_required_capabilities):
-            return (
-                "可参考下面的 node composite_generator skeleton；可先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout 只能 console.log JSON 字符串：\n"
-                "const { spawnSync } = require('child_process');\n"
-                "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
-                "function pyEval(code, arg) {\n"
-                "  const proc = spawnSync(process.env.PYTHON || 'python', ['-c', code, arg], { encoding: 'utf8' });\n"
-                "  if (proc.status !== 0) throw new Error(proc.stderr || 'platform helper failed');\n"
-                "  return JSON.parse(proc.stdout);\n"
-                "}\n"
-                "function run(payload) {\n"
-                f"  const prompt = String({js_value_expr}).trim();\n"
-                "  const textCode = `from backend.services.skill_runtime import generate_text_with_llm\\nimport json,sys\\nprint(json.dumps({'text': generate_text_with_llm(sys.argv[1])}, ensure_ascii=False))`;\n"
-                "  const textResult = pyEval(textCode, prompt);\n"
-                "  const imagePrompt = textResult.text || prompt;\n"
-                "  const imageCode = `from backend.services.skill_runtime import generate_stable_diffusion_image\\nimport json,sys\\nresult = generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated')\\nprint(json.dumps(result, ensure_ascii=False))`;\n"
-                "  const imageResult = pyEval(imageCode, imagePrompt);\n"
-                "  return { text: textResult.text, image_paths: [imageResult.image_path].filter(Boolean) };\n"
-                "}\n"
-                "console.log(JSON.stringify(run(payload)));"
-            )
-        if plan_entry.role == "image_generator":
-            return (
-                "可参考下面的 node image_generator skeleton；可通过 Python 平台 helper 生成图片，stdout 只能 console.log JSON 字符串：\n"
-                "const { spawnSync } = require('child_process');\n"
-                "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
-                "function run(payload) {\n"
-                f"  const desc = String({js_value_expr}).trim();\n"
-                "  const helper = `from backend.services.skill_runtime import generate_stable_diffusion_image\\nimport json,sys\\nresult = generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated')\\nprint(json.dumps(result, ensure_ascii=False))`;\n"
-                "  const proc = spawnSync(process.env.PYTHON || 'python', ['-c', helper, desc], { encoding: 'utf8' });\n"
-                "  if (proc.status !== 0) throw new Error(proc.stderr || 'generate_stable_diffusion_image failed');\n"
-                "  const result = JSON.parse(proc.stdout);\n"
-                "  const image_paths = [];\n"
-                "  image_paths.push(result.image_path);\n"
-                "  return { image_paths: image_paths.filter(Boolean) };\n"
-                "}\n"
-                "console.log(JSON.stringify(run(payload)));"
-            )
-        if plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
-            return (
-                "可参考下面的 node pdf_builder skeleton；可通过 Python 平台 PDF helper 生成文件，stdout 只能 console.log JSON 字符串：\n"
-                "const { spawnSync } = require('child_process');\n"
-                "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
-                "function run(payload) {\n"
-                f"  const text = String({js_value_expr} || payload.content || payload.text || 'Generated PDF');\n"
-                "  const helper = `from backend.services.skill_runtime import create_pdf\\nimport json,sys\\ntext=sys.argv[1] or 'Generated PDF'\\nresult=create_pdf(text, filename='output.pdf')\\nprint(json.dumps(result, ensure_ascii=False))`;\n"
-                "  const proc = spawnSync(process.env.PYTHON || 'python', ['-c', helper, text], { encoding: 'utf8' });\n"
-                "  if (proc.status !== 0) throw new Error(proc.stderr || 'create_pdf failed');\n"
-                "  return JSON.parse(proc.stdout);\n"
-                "}\n"
-                "console.log(JSON.stringify(run(payload)));"
-            )
-        if plan_entry.role == "text_generator":
-            return (
-                "可参考下面的 node text_generator skeleton；可调用平台 generate_text_with_llm helper，stdout JSON 包含非空 text：\n"
-                "const { spawnSync } = require('child_process');\n"
-                "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
-                "function run(payload) {\n"
-                f"  const prompt = String({js_value_expr}).trim();\n"
-                "  const helper = `from backend.services.skill_runtime import generate_text_with_llm\\nimport json,sys\\nprint(json.dumps({'text': generate_text_with_llm(sys.argv[1])}, ensure_ascii=False))`;\n"
-                "  const proc = spawnSync(process.env.PYTHON || 'python', ['-c', helper, prompt], { encoding: 'utf8' });\n"
-                "  if (proc.status !== 0) throw new Error(proc.stderr || 'generate_text_with_llm failed');\n"
-                "  return JSON.parse(proc.stdout);\n"
-                "}\n"
-                "console.log(JSON.stringify(run(payload)));"
-            )
         return (
-            "可参考下面的 node_skeleton；解析 process.argv[2] JSON，stdout 只能 console.log JSON 字符串：\n"
+            "协议骨架（只约束 argv/run/stdout；具体工具调用必须来自 Tool Registry snippets/function cards）：\n"
             "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
             "function run(payload) {\n"
-            f"  const text = String({js_value_expr}).trim();\n"
-            "  return { text, file_paths: [] };\n"
+            f"  const value = String({js_value_expr}).trim();\n"
+            "  return { text: value };\n"
             "}\n"
             "console.log(JSON.stringify(run(payload)));"
         )
 
     if plan_entry.runtime in {"bash", "shell"}:
-        if {"text_generation", "image_generation"} <= set(effective_required_capabilities):
-            helper = "from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); text=generate_text_with_llm(prompt); result=generate_stable_diffusion_image(text or prompt, filename_prefix='generated'); print(json.dumps({'text': text, 'image_paths':[result.get('image_path')]}, ensure_ascii=False))"
-        elif plan_entry.role == "image_generator":
-            helper = "from backend.services.skill_runtime import generate_stable_diffusion_image; import json,sys; result=generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated'); print(json.dumps({'image_paths':[result.get('image_path')]}, ensure_ascii=False))"
-        elif plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
-            helper = "from backend.services.skill_runtime import create_pdf; import json,sys; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + " or 'Generated PDF'); print(json.dumps(create_pdf(text, output_dir=p.get('output_dir') or 'outputs'), ensure_ascii=False))"
-        elif plan_entry.role == "text_generator":
-            helper = "from backend.services.skill_runtime import generate_text_with_llm; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); print(json.dumps({'text': generate_text_with_llm(prompt)}, ensure_ascii=False))"
-        else:
-            helper = "import json,sys; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + "); print(json.dumps({'text': text, 'file_paths': []}, ensure_ascii=False))"
+        helper = "import json,sys; p=json.loads(sys.argv[1] or '{}'); value=str(" + bash_py_expr + "); print(json.dumps({'text': value}, ensure_ascii=False))"
         return (
-            "可参考下面的 shell_skeleton；从 $1 读取 JSON argv，并向 stdout 输出 JSON（文件生成脚本必须包含 pdf_path/docx_path/pptx_path 与 file_paths/file_outputs）：\n"
+            "协议骨架（只约束 $1 JSON argv 与 stdout JSON；具体工具调用必须来自 Tool Registry snippets/function cards）：\n"
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
             "payload_json=${1:-'{}'}\n"
             f"python -c {shlex.quote(helper)} \"$payload_json\""
         )
 
-
-    if plan_entry.role == "docx_builder" or "docx_generation" in set(effective_required_capabilities):
-        return (
-            "可参考下面的 docx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths；可通过平台 create_docx helper 生成 Word；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
-            "import json\n"
-            "import sys\n"
-            "from backend.services.skill_runtime import create_docx, print_json\n\n"
-            "def parse_args() -> dict:\n"
-            "    if len(sys.argv) < 2:\n"
-            "        return {}\n"
-            "    return json.loads(sys.argv[1])\n\n"
-            "def previous_payload(payload: dict) -> dict:\n"
-            "    raw = payload.get('previous_stdout') or payload.get('stdout_json') or '{}'\n"
-            "    if isinstance(raw, dict):\n"
-            "        return raw\n"
-            "    try:\n"
-            "        data = json.loads(str(raw))\n"
-            "        return data if isinstance(data, dict) else {}\n"
-            "    except json.JSONDecodeError:\n"
-            "        return {}\n\n"
-            "def run(payload: dict) -> dict:\n"
-            "    prev = previous_payload(payload)\n"
-            f"    text = str(payload.get('text') or prev.get('text') or {py_value_expr} or 'Generated document').strip()\n"
-            "    return create_docx(text, filename='output.docx')\n\n"
-            "def main() -> None:\n"
-            "    print_json(run(parse_args()))\n\n"
-            "if __name__ == '__main__':\n"
-            "    main()"
-        )
-
-    if plan_entry.role == "pptx_builder" or "pptx_generation" in set(effective_required_capabilities):
-        return (
-            "可参考下面的 pptx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths；可通过平台 create_pptx helper 生成 PPT；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
-            "import json\n"
-            "import sys\n"
-            "from backend.services.skill_runtime import create_pptx, print_json\n\n"
-            "def parse_args() -> dict:\n"
-            "    if len(sys.argv) < 2:\n"
-            "        return {}\n"
-            "    return json.loads(sys.argv[1])\n\n"
-            "def run(payload: dict) -> dict:\n"
-            f"    text = str(payload.get('text') or {py_value_expr} or 'Generated presentation').strip()\n"
-            "    return create_pptx(text, filename='output.pptx')\n\n"
-            "def main() -> None:\n"
-            "    print_json(run(parse_args()))\n\n"
-            "if __name__ == '__main__':\n"
-            "    main()"
-        )
-
-    if plan_entry.role in {"html_asset_builder", "asset_builder"} or ({"html_generation", "html_asset_generation"} & set(effective_required_capabilities)):
-        return (
-            "可参考下面的 html_asset_builder Python 脚本骨架；只能在当前 Skill 的 OUTPUT_DIR/outputs 下写入 HTML，并在 stdout JSON 返回 html_path、file_paths 与 file_outputs：\n"
-            "import html\n"
-            "import json\n"
-            "import re\n"
-            "import sys\n"
-            "from pathlib import Path\n\n"
-            "def parse_args() -> dict:\n"
-            "    if len(sys.argv) < 2:\n"
-            "        return {}\n"
-            "    return json.loads(sys.argv[1])\n\n"
-            "def slugify(value: str) -> str:\n"
-            "    slug = re.sub(r'[^A-Za-z0-9_-]+', '-', value).strip('-').lower()\n"
-            "    return slug or 'generated'\n\n"
-            "def build_html(payload: dict) -> str:\n"
-            f"    text = str({py_value_expr} or 'Generated HTML').strip()\n"
-            "    safe = html.escape(text)\n"
-            "    return '<!doctype html><html><head><meta charset=\"utf-8\"><title>Generated</title></head><body><main><h1>Generated Asset</h1><p>' + safe + '</p></main></body></html>'\n\n"
-            "def run(payload: dict) -> dict:\n"
-            f"    title = str({py_value_expr} or 'generated').strip()\n"
-            "    skill_root = Path(__file__).resolve().parents[1]\n"
-            "    out_dir = (skill_root / 'outputs').resolve()\n"
-            "    required_root = (skill_root / 'outputs').resolve()\n"
-            "    out_dir.mkdir(parents=True, exist_ok=True)\n"
-            "    html_path = (out_dir / (slugify(title) + '.html')).resolve()\n"
-            "    html_path.relative_to(required_root)\n"
-            "    html_path.write_text(build_html(payload), encoding='utf-8')\n"
-            "    rel = html_path.relative_to(skill_root).as_posix()\n"
-            "    return {'html_path': rel, 'file_paths': [rel], 'file_outputs': [rel]}\n\n"
-            "def main() -> None:\n"
-            "    payload = parse_args()\n"
-            "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
-            "if __name__ == '__main__':\n"
-            "    main()"
-        )
-
-    if {"text_generation", "image_generation"} <= set(effective_required_capabilities):
-        return (
-            "可参考下面的 composite_generator 脚本骨架；可先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout JSON 包含 text 与 image_paths：\n"
-            "import json\n"
-            "import sys\n"
-            "from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image\n\n"
-            "def parse_args() -> dict:\n"
-            "    if len(sys.argv) < 2:\n"
-            "        return {}\n"
-            "    return json.loads(sys.argv[1])\n\n"
-            "def build_prompt(payload: dict) -> str:\n"
-            f"    return str({py_value_expr}).strip()\n\n"
-            "def generate_text(prompt: str) -> str:\n"
-            "    return generate_text_with_llm(prompt).strip()\n\n"
-            "def generate_images(text: str, prompt: str) -> list[str]:\n"
-            "    image_prompt = text or prompt\n"
-            "    result = generate_stable_diffusion_image(image_prompt, filename_prefix='generated')\n"
-            "    image_paths = [result.get('image_path')]\n"
-            "    image_paths = [p for p in image_paths if isinstance(p, str) and p]\n"
-            "    return image_paths, [result]\n\n"
-            "def run(payload: dict) -> dict:\n"
-            "    prompt = build_prompt(payload)\n"
-            "    text = generate_text(prompt)\n"
-            "    image_paths = generate_images(text, prompt)\n"
-            "    return {'text': text, 'image_paths': image_paths}\n\n"
-            "def main() -> None:\n"
-            "    payload = parse_args()\n"
-            "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
-            "if __name__ == '__main__':\n"
-            "    main()"
-        )
-
-    if plan_entry.role == "image_generator":
-        return (
-            "可参考下面的 image_generator 脚本骨架；可保留 import/helper/main/JSON stdout 结构并填充 build_image_prompt() 中的业务 prompt 组装逻辑，必要时补充返回字段：\n"
-            "import json\n"
-            "import sys\n"
-            "from backend.services.skill_runtime import generate_stable_diffusion_image\n\n"
-            "def parse_args() -> dict:\n"
-            "    if len(sys.argv) < 2:\n"
-            "        return {}\n"
-            "    return json.loads(sys.argv[1])\n\n"
-            "def build_image_prompt(payload: dict) -> str:\n"
-            f"    topic = str({py_value_expr}).strip()\n"
-            "    return topic\n\n"
-            "def run(payload: dict) -> dict:\n"
-            "    desc = build_image_prompt(payload)\n"
-            "    image_paths = []\n"
-            "    result = generate_stable_diffusion_image(desc, filename_prefix='generated')\n"
-            "    image_paths.append(result.get('image_path'))\n"
-            "    image_paths = [p for p in image_paths if isinstance(p, str) and p]\n"
-            "    return {'image_paths': image_paths}\n\n"
-            "def main() -> None:\n"
-            "    payload = parse_args()\n"
-            "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
-            "if __name__ == '__main__':\n"
-            "    main()"
-        )
-
-    if plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
-        return (
-            "可参考下面的 pdf_builder 脚本骨架；默认只负责读取已有内容；可通过平台 create_pdf helper 构建 PDF 文件；stdout JSON 必须返回 pdf_path/file_paths/file_outputs；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
-            "import json\n"
-            "import sys\n"
-            "from backend.services.skill_runtime import create_pdf, print_json\n\n"
-            "def parse_args() -> dict:\n"
-            "    if len(sys.argv) < 2:\n"
-            "        return {}\n"
-            "    return json.loads(sys.argv[1])\n\n"
-            "def run(payload: dict) -> dict:\n"
-            f"    text = str({py_value_expr} or payload.get('text') or payload.get('content') or 'Generated PDF').strip()\n"
-            "    return create_pdf(text, filename='output.pdf')\n\n"
-            "def main() -> None:\n"
-            "    print_json(run(parse_args()))\n\n"
-            "if __name__ == '__main__':\n"
-            "    main()"
-        )
-
-    if plan_entry.role == "text_generator":
-        return (
-            "可参考下面的 text_generator 脚本骨架；调用平台 generate_text_with_llm，stdout JSON 包含非空 text，不要生成图片或 PDF：\n"
-            "import json\n"
-            "import sys\n"
-            "from backend.services.skill_runtime import generate_text_with_llm\n\n"
-            "def parse_args() -> dict:\n"
-            "    if len(sys.argv) < 2:\n"
-            "        return {}\n"
-            "    return json.loads(sys.argv[1])\n\n"
-            "def generate_text(payload: dict) -> str:\n"
-            f"    prompt = str({py_value_expr}).strip()\n"
-            "    return generate_text_with_llm(prompt)\n\n"
-            "def run(payload: dict) -> dict:\n"
-            "    text = generate_text(payload).strip()\n"
-            "    return {'text': text}\n\n"
-            "def main() -> None:\n"
-            "    payload = parse_args()\n"
-            "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
-            "if __name__ == '__main__':\n"
-            "    main()"
-        )
-
     return (
-        "可参考下面的 generic_script 脚本骨架；可保留 import/parse_args/main/JSON stdout 结构并填充 run() 中的真实业务逻辑并按 SkillPlan 使用 payload 字段：\n"
+        "协议骨架（只约束 parse_args/run/main/stdout JSON；具体工具调用必须来自 Tool Registry snippets/function cards）：\n"
         "import json\n"
         "import sys\n\n"
         "def parse_args() -> dict:\n"
         "    if len(sys.argv) < 2:\n"
         "        return {}\n"
-        "    return json.loads(sys.argv[1])\n\n"
+        "    data = json.loads(sys.argv[1])\n"
+        "    if not isinstance(data, dict):\n"
+        "        raise ValueError('argv JSON must be an object')\n"
+        "    return data\n\n"
         "def run(payload: dict) -> dict:\n"
-        f"    text = str({py_value_expr}).strip()\n"
-        "    return {'text': text, 'file_paths': []}\n\n"
+        f"    value = str({py_value_expr}).strip()\n"
+        "    return {'text': value}\n\n"
         "def main() -> None:\n"
-        "    payload = parse_args()\n"
-        "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
+        "    print(json.dumps(run(parse_args()), ensure_ascii=False))\n\n"
         "if __name__ == '__main__':\n"
         "    main()"
     )
@@ -5608,8 +5424,12 @@ def _build_generate_file_prompt(
         if file_path == "SKILL.md"
         else ""
     )
-    tool_resolve = resolve_tools_for_skill_plan_entry(plan_entry) if file_path.startswith("scripts/") else None
-    tool_usage_prompt = tool_resolve.tool_usage_prompt if tool_resolve is not None else ""
+    tool_usage_prompt = _creator_tool_context_for_script(
+        file_path=file_path,
+        skill_plan_entry=plan_entry,
+        blueprint_text=blueprint_text,
+        include_snippets=True,
+    ) if file_path.startswith("scripts/") else ""
     script_skeleton_text = _script_generation_skeleton(
         file_path,
         purpose,
@@ -5681,9 +5501,9 @@ def _build_generate_file_prompt(
             "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图和 SKILL.md 里的 Markdown 命令示例一致。\n"
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须按 SkillPlan.runtime 解析；Python 默认读取 sys.argv[1] 并 json.loads 解析，Node 使用 process.argv[2]+JSON.parse，Bash 使用 $1 JSON。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
-            "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：text_generation 使用 generate_text_with_llm 或 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；image_generation 使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
-            "7. 生成脚本前必须阅读 Tool Resolve 结果：下方 backend.services.skill_runtime helper 是可用/推荐工具；除 usage_policy=helper_required 的能力外，不强制 helper 或内部实现方式。不要自己发明未配置的外部 API。是否需要文本/图片能力只由当前脚本 SkillPlan.required_capabilities 决定：包含 image_generation 时可优先调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`；builder/exporter 默认是确定性文件构建脚本，不要因为整个 Skill.md 提到模型就强制 builder 调模型；若 builder 需要模型辅助，用 optional_capabilities/allowed_capabilities 或显式 required_capabilities 表达。\n"
-            "8. image_generation stdout 输出结构化 JSON，并返回平台可消费的 image_paths/file_outputs；使用 helper 时建议消费 helper 结果里的 image_path/image_paths，不要假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
+            "6. 是否允许模型、网络、外部副作用或平台 helper，只由当前脚本显式 SkillPlan role/capabilities/forbidden_capabilities 与 Tool Registry 决定；不要从蓝图业务词、文件名或输出类型推断。\n"
+            "7. 生成脚本前必须阅读统一 Tool Registry 上下文；除 usage_policy=helper_required 的能力外，不强制 helper 或内部实现方式。不要自己发明未配置的外部 API。\n"
+            "8. 如果没有显式模型能力，不要引入 LLM、图片模型、视觉模型或检索模型调用；如果没有显式外部副作用能力，不要引入外部副作用。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
             "10. stdout 必须输出结构化 JSON；内部中间字段名由当前 Skill 自行确定，但必须与后续命令 placeholder 真实对齐，最终产物仍必须使用平台标准输出字段和 OUTPUT_DIR/outputs 路径协议。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
@@ -7714,35 +7534,17 @@ async def _repair_existing_file_for_e2e_failure(
 
     e2e_tool_cards = ""
     if target_path.startswith("scripts/"):
-        haystack = "\n".join([deterministic_error, current_content[-12000:], skill_md[-12000:]])
-        mentioned_tool_names: list[str] = []
-        for cap in list_tool_capabilities():
-            function_names = [fn.function_name for fn in cap.functions]
-            output_keys = list((cap.output_schema or {}).get("properties", {}).keys())
-            for fn in cap.functions:
-                output_keys.extend((fn.output_schema or {}).keys())
-            if (
-                cap.name in haystack
-                or any(helper in haystack for helper in cap.helper_imports)
-                or any(name in haystack for name in function_names)
-                or any(key in haystack for key in output_keys)
-            ):
-                mentioned_tool_names.append(cap.name)
-                mentioned_tool_names.extend(cap.helper_imports)
-        snippets = resolve_tool_snippets_for_context(
-            role="",
-            capabilities=[],
-            tool_names=mentioned_tool_names,
+        e2e_entry = _skill_plan_entry_for_file(file_path=target_path, blueprint_text=skill_md)
+        e2e_tool_cards = _creator_tool_context_for_script(
             file_path=target_path,
+            skill_plan_entry=e2e_entry,
+            blueprint_text=skill_md,
             failure_layer=_failure_layer_from_error_text(deterministic_error),
-            error_text=haystack,
-            max_snippets=6,
+            error_text=deterministic_error,
+            include_snippets=True,
         )
-        if snippets:
-            e2e_tool_cards = (
-                "\n\nE2E 修复相关工具 Snippets（下面是相关工具的正确用法；请按 snippet 修复，不要猜参数和返回结构）：\n"
-                + tool_snippet_prompt(snippets)
-            )
+
+
 
 
     contract_text = _build_generated_file_contract_text(
