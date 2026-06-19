@@ -119,6 +119,7 @@ _MAX_HISTORY_TURNS = 6
 # Generated files can repair themselves by sending validator/static/trial-run
 # failures back to the same routed model before returning content to the frontend.
 _MAX_FILE_REPAIR_ATTEMPTS = 10
+_EMPTY_GENERATION_PROMPT_VARIANTS: tuple[str, ...] = ("standard", "simplified", "minimal")
 _SCRIPT_TRIAL_TIMEOUT_SECONDS = 30
 
 # Human-readable language labels indexed by file extension.
@@ -5262,9 +5263,15 @@ def _script_generation_skeleton(
         skill_plan_entry=skill_plan_entry,
     )
     input_keys = list(plan_entry.inputs or ["payload"])
+    output_keys = [key for key in (plan_entry.outputs or []) if isinstance(key, str) and key.strip()]
+    if not output_keys:
+        output_keys = ["text"]
+    py_output_lines = "\n".join(f"        {key!r}: value," for key in output_keys)
+    js_output_lines = "\n".join(f"    {json.dumps(key)}: value," for key in output_keys)
     py_value_expr = " or ".join(f"payload.get({key!r})" for key in input_keys) + " or ''"
     js_value_expr = " || ".join(f"payload[{json.dumps(key)}]" for key in input_keys) + " || ''"
     bash_py_expr = " or ".join(f"p.get({key!r})" for key in input_keys) + " or ''"
+    bash_stdout_expr = "{" + ", ".join(f"{key!r}: value" for key in output_keys) + "}"
 
     if plan_entry.runtime == "node":
         return (
@@ -5272,13 +5279,15 @@ def _script_generation_skeleton(
             "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
             "function run(payload) {\n"
             f"  const value = String({js_value_expr}).trim();\n"
-            "  return { text: value };\n"
+            "  return {\n"
+            f"{js_output_lines}\n"
+            "  };\n"
             "}\n"
             "console.log(JSON.stringify(run(payload)));"
         )
 
     if plan_entry.runtime in {"bash", "shell"}:
-        helper = "import json,sys; p=json.loads(sys.argv[1] or '{}'); value=str(" + bash_py_expr + "); print(json.dumps({'text': value}, ensure_ascii=False))"
+        helper = "import json,sys; p=json.loads(sys.argv[1] or '{}'); value=str(" + bash_py_expr + "); print(json.dumps(" + bash_stdout_expr + ", ensure_ascii=False))"
         return (
             "协议骨架（只约束 $1 JSON argv 与 stdout JSON；具体工具调用必须来自 Tool Registry snippets/function cards）：\n"
             "#!/usr/bin/env bash\n"
@@ -5300,7 +5309,9 @@ def _script_generation_skeleton(
         "    return data\n\n"
         "def run(payload: dict) -> dict:\n"
         f"    value = str({py_value_expr}).strip()\n"
-        "    return {'text': value}\n\n"
+        "    return {\n"
+        f"{py_output_lines}\n"
+        "    }\n\n"
         "def main() -> None:\n"
         "    print(json.dumps(run(parse_args()), ensure_ascii=False))\n\n"
         "if __name__ == '__main__':\n"
@@ -5334,6 +5345,123 @@ def _creator_kernel_reference_context() -> str:
             chunks.append(f"### INTERNAL-ONLY {rel}\n{text[:1800]}")
     return "\n\n".join(chunks)
 
+
+def _script_local_contract_payload(
+    *,
+    file_path: str,
+    purpose: str,
+    plan_entry: SkillPlanEntry,
+    stdout_schema: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the only business contract a script-generation prompt should need."""
+    return {
+        "path": file_path,
+        "role": plan_entry.role,
+        "runtime": plan_entry.runtime,
+        "language": plan_entry.language,
+        "entrypoint": plan_entry.entrypoint or file_path,
+        "purpose": purpose or plan_entry.purpose,
+        "inputs": list(plan_entry.inputs or []),
+        "outputs": list(plan_entry.outputs or []),
+        "dependencies": list(plan_entry.dependencies or []),
+        "required_capabilities": list(plan_entry.required_capabilities or []),
+        "forbidden_capabilities": list(plan_entry.forbidden_capabilities or []),
+        "reference_files": list(plan_entry.reference_files or []),
+        "stdout_schema": stdout_schema,
+    }
+
+
+def _script_stdout_schema_for_entry(plan_entry: SkillPlanEntry) -> dict[str, Any]:
+    """Build a deterministic stdout schema from the per-file output contract."""
+    properties = {
+        key: {"description": f"Non-empty value for declared output field {key}."}
+        for key in (plan_entry.outputs or [])
+        if isinstance(key, str) and key.strip()
+    }
+    if not properties:
+        properties = {"text": {"type": "string", "description": "Non-empty human-readable result."}}
+    return {
+        "type": "object",
+        "required": list(properties.keys()),
+        "properties": properties,
+        "additionalProperties": True,
+        "forbidden": ["error"],
+    }
+
+
+def _build_script_generate_file_prompt_variant(
+    *,
+    file_path: str,
+    skill_name: str,
+    purpose: str,
+    blueprint_text: str,
+    role: str | None,
+    skill_plan_entry: dict[str, Any] | None,
+    variant: str,
+) -> list[dict]:
+    """Build script-only prompts using progressively smaller local contracts.
+
+    Scripts must not receive the full blueprint, creator UI copy, global kernel
+    docs, or E2E/platform workflow text. The platform owns invocation/stdout
+    parsing; the model only implements this one file's internals.
+    """
+    plan_entry = _skill_plan_entry_for_file(
+        file_path=file_path, purpose=purpose, blueprint_text=blueprint_text, role=role, skill_plan_entry=skill_plan_entry
+    )
+    stdout_schema = _script_stdout_schema_for_entry(plan_entry)
+    local_contract = _script_local_contract_payload(
+        file_path=file_path,
+        purpose=purpose,
+        plan_entry=plan_entry,
+        stdout_schema=stdout_schema,
+    )
+    tool_usage_prompt = ""
+    script_skeleton_text = ""
+    if variant == "standard":
+        tool_usage_prompt = _creator_tool_context_for_script(
+            file_path=file_path,
+            skill_plan_entry=plan_entry,
+            blueprint_text="",
+            include_snippets=True,
+        )
+        script_skeleton_text = _script_generation_skeleton(
+            file_path,
+            purpose,
+            "",
+            role=plan_entry.role,
+            skill_plan_entry=skill_plan_entry,
+        )
+    elif variant == "simplified":
+        script_skeleton_text = _script_generation_skeleton(
+            file_path,
+            purpose,
+            "",
+            role=plan_entry.role,
+            skill_plan_entry=skill_plan_entry,
+        )
+
+    instruction = [
+        f'你正在为 Skill 包 "{skill_name}" 生成单个脚本文件：{file_path}。',
+        "必须满足以下脚本文件合同（局部合同）：",
+        "只实现当前文件；不要重新规划整个 Skill；不要输出 Markdown fence、解释、文件名标题或多文件包。",
+        "scripts/ 生成不会追加聊天历史，也不会注入完整蓝图。",
+        "外层调用、参数传递和 stdout 解析由 Creator 的确定性规则处理；你不要自由改协议，只实现内部逻辑。",
+        "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
+        "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
+        "必须使用用户输入或上游输入生成结果；禁止固定示例、placeholder/mock/fake API、空文件或空路径。",
+        "只有 required_capabilities/forbidden_capabilities 和 available tools 允许的能力可以使用；不要猜测平台 helper/import path。",
+        f"prompt_variant: {variant}",
+        "当前文件结构化合同：",
+        json.dumps(local_contract, ensure_ascii=False, indent=2),
+    ]
+    if tool_usage_prompt:
+        instruction.extend(["available tools / snippets（如与自我猜测冲突，以 snippet 为准）：", tool_usage_prompt])
+    if script_skeleton_text:
+        instruction.extend(["固定脚本骨架 / 动态协议骨架（根据当前 outputs 生成；输出时应补全为可运行源码）：", script_skeleton_text])
+    if variant == "minimal":
+        instruction.append("极简要求：返回可运行脚本源码，解析 JSON argv，真实处理输入，打印满足 stdout_schema 的 JSON object。")
+    return [{"role": "system", "content": "\n\n".join(instruction)}]
+
 def _build_generate_file_prompt(
     file_path: str,
     skill_name: str,
@@ -5350,6 +5478,17 @@ def _build_generate_file_prompt(
     """
     ext = Path(file_path).suffix.lower()
     lang = _LANG_LABELS.get(ext, "文本")
+
+    if file_path.startswith("scripts/"):
+        return _build_script_generate_file_prompt_variant(
+            file_path=file_path,
+            skill_name=skill_name,
+            purpose=purpose,
+            blueprint_text=blueprint_text,
+            role=role,
+            skill_plan_entry=skill_plan_entry,
+            variant="standard",
+        )
 
     clean_blueprint_text = _clean_blueprint_for_file_prompt(blueprint_text)
     declared_paths = _extract_declared_skill_paths(blueprint_text)
@@ -5815,6 +5954,63 @@ def _stage_error_from_exception(source: str, exc: Exception, *, default_layer: s
     return FileGenerationStageError(source=source, layer=layer, detail=str(exc), original=exc)
 
 
+def _prompt_chars(messages: list[dict]) -> int:
+    return sum(len(str(message.get("content") or "")) for message in messages if isinstance(message, dict))
+
+
+async def _complete_creator_file_generation(
+    *,
+    messages: list[dict],
+    model: str,
+    skill_name: str,
+    file_path: str,
+    prompt_variant: str,
+    retry_index: int,
+) -> str:
+    """Call the file-generation model with minimum diagnostic logging."""
+    prompt_text = "\n".join(str(message.get("content") or "") for message in messages if isinstance(message, dict))
+    logger.info(
+        "[Creator][generate_file][llm_request] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d prompt_chars=%d contains_full_blueprint=%s contains_platform_protocol=%s",
+        skill_name,
+        file_path,
+        model,
+        prompt_variant,
+        retry_index,
+        _prompt_chars(messages),
+        "已确认的蓝图" in prompt_text,
+        any(
+            marker in prompt_text
+            for marker in ("宿主 Markdown 执行说明", "SKILL.md workflow", "第二轮 E2E", "平台执行协议")
+        ),
+    )
+    try:
+        content = await complete_chat_once(messages, model)
+    except Exception as exc:
+        logger.exception(
+            "[Creator][generate_file][llm_response] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d error_type=%s",
+            skill_name,
+            file_path,
+            model,
+            prompt_variant,
+            retry_index,
+            type(exc).__name__,
+        )
+        raise
+    logger.info(
+        "[Creator][generate_file][llm_response] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d raw_finish_reason=%s completion_tokens=%s raw_content_length=%d error_type=%s",
+        skill_name,
+        file_path,
+        model,
+        prompt_variant,
+        retry_index,
+        "unknown",
+        "unknown",
+        len(content or ""),
+        "",
+    )
+    return content
+
+
 def _strict_contract_rewrite_allowed(source: str) -> bool:
     # Strict rewrites are allowed only when the backend has produced a
     # deterministic first-round result. The decision is source-based rather
@@ -5865,6 +6061,7 @@ async def generate_file(request: GenerateFileRequest):
                 role=request.role,
                 skill_plan_entry=request.skill_plan_entry,
             )
+            prompt_variant = "standard"
         except Exception as exc:
             logger.exception("Creator generate_file prepare failed: %s", exc)
             yield _sse({
@@ -5876,7 +6073,14 @@ async def generate_file(request: GenerateFileRequest):
         candidate = ""
         repair_counts_by_layer: dict[str, int] = {}
         try:
-            candidate = await complete_chat_once(prompt_messages, route.model)
+            candidate = await _complete_creator_file_generation(
+                messages=prompt_messages,
+                model=route.model,
+                skill_name=skill_name,
+                file_path=request.file_path,
+                prompt_variant=prompt_variant,
+                retry_index=0,
+            )
         except Exception as exc:
             logger.exception("Creator generate_file initial model call failed: %s", exc)
             yield _sse({
@@ -6009,17 +6213,61 @@ async def generate_file(request: GenerateFileRequest):
                 repair_counts_by_layer[error_layer] = repair_counts_by_layer.get(error_layer, 0) + 1
 
                 if error_source == "generation_empty":
-                    if repair_counts_by_layer[error_layer] > 1:
+                    empty_retry_index = repair_counts_by_layer[error_layer]
+                    if empty_retry_index >= len(_EMPTY_GENERATION_PROMPT_VARIANTS):
+                        fallback_route = route_model("code", requested_model=request.model, reason="creator empty generation fallback code model")
+                        fallback_variant = "minimal"
+                        fallback_messages = (
+                            _build_script_generate_file_prompt_variant(
+                                file_path=request.file_path,
+                                skill_name=skill_name,
+                                purpose=request.purpose,
+                                blueprint_text=request.blueprint_text,
+                                role=request.role,
+                                skill_plan_entry=request.skill_plan_entry,
+                                variant=fallback_variant,
+                            )
+                            if request.file_path.startswith("scripts/")
+                            else prompt_messages
+                        )
+                        fallback_candidate = await _complete_creator_file_generation(
+                            messages=fallback_messages,
+                            model=fallback_route.model,
+                            skill_name=skill_name,
+                            file_path=request.file_path,
+                            prompt_variant=f"{fallback_variant}:fallback_code_model",
+                            retry_index=empty_retry_index,
+                        )
+                        if fallback_candidate:
+                            candidate = fallback_candidate
+                            prompt_messages = fallback_messages
+                            route = fallback_route
+                            prompt_variant = fallback_variant
+                            continue
                         yield _sse({
                             "type": "file_done",
                             "status": "error",
                             "success": False,
                             "file_path": request.file_path,
                             "role": request.role,
-                            "error": "文件内容生成失败：generation_empty 重试 1 次后仍为空，请换模型或重新生成。",
+                            "error": "文件内容生成失败：standard/simplified/minimal 与 fallback code model 后仍为空，请换模型或重新生成。",
                             "done": True,
                         })
                         return
+                    next_variant = _EMPTY_GENERATION_PROMPT_VARIANTS[empty_retry_index]
+                    next_messages = (
+                        _build_script_generate_file_prompt_variant(
+                            file_path=request.file_path,
+                            skill_name=skill_name,
+                            purpose=request.purpose,
+                            blueprint_text=request.blueprint_text,
+                            role=request.role,
+                            skill_plan_entry=request.skill_plan_entry,
+                            variant=next_variant,
+                        )
+                        if request.file_path.startswith("scripts/")
+                        else prompt_messages
+                    )
                     yield _sse({
                         "type": "validation",
                         "status": "regenerating",
@@ -6028,7 +6276,16 @@ async def generate_file(request: GenerateFileRequest):
                         "role": request.role,
                         "validation": {"status": "regenerating", "attempt": attempt, "source": error_source, "layer": stage_error.layer, "error": deterministic_error},
                     })
-                    candidate = await complete_chat_once(prompt_messages, route.model)
+                    candidate = await _complete_creator_file_generation(
+                        messages=next_messages,
+                        model=route.model,
+                        skill_name=skill_name,
+                        file_path=request.file_path,
+                        prompt_variant=next_variant,
+                        retry_index=empty_retry_index,
+                    )
+                    prompt_messages = next_messages
+                    prompt_variant = next_variant
                     continue
 
                 if repair_counts_by_layer[error_layer] > 2:
