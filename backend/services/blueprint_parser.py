@@ -269,6 +269,7 @@ def validate_blueprint_shape_for_creator(blueprint_text: str) -> None:
     """
     text = blueprint_text or ""
     issues: list[str] = []
+    warnings: list[str] = []
 
     if not _has_required_blueprint_marker(text):
         if "✅ Skill 架构蓝图" in text or "Skill 架构蓝图" in text:
@@ -302,54 +303,34 @@ def validate_blueprint_shape_for_creator(blueprint_text: str) -> None:
         issues.append("如需要 scripts/，目录结构或 SkillPlan 必须列出具体 `scripts/*.py` 路径。")
 
     required_fields = [
-        "role",
         "inputs",
         "outputs",
         "dependencies",
-        "required_capabilities",
         "references",
     ]
     valid_roles = set(SCRIPT_ROLES) | set(RESOURCE_ROLES)
     for path, block in path_blocks.items():
         missing = [field for field in required_fields if not re.search(rf"(?m)^\s*{field}\s*:", block)]
-        if not re.search(r"(?m)^\s*(?:business_forbidden_capabilities|forbidden_capabilities)\s*:", block):
-            missing.append("business_forbidden_capabilities")
         if missing:
             issues.append(f"{path} 文件计划缺少字段：{', '.join(missing)}。")
 
         role = _scalar_field_from_block(block, "role")
-        if path.startswith("scripts/"):
-            if not role:
-                issues.append(f"scripts 文件计划 `{path}` 必须显式声明 role，strict 模式不能回退 generic_script。")
-            elif role not in SCRIPT_ROLES:
-                issues.append(f"scripts 文件计划 `{path}` 的 role `{role}` 不是平台注册 script role 枚举。")
-        elif path == "SKILL.md" and role and role != "skill_overview":
-            issues.append("SKILL.md role 必须是 skill_overview。")
-        elif path.startswith("references/") and role and role != "reference":
-            issues.append(f"reference 文件计划 `{path}` 的 role 必须是 reference。")
-        elif path.startswith("assets/") and role and role != "asset":
-            issues.append(f"asset 文件计划 `{path}` 的 role 必须是 asset。")
-        elif role and role not in valid_roles:
-            issues.append(f"{path} 的 role `{role}` 不是平台注册 role 枚举。")
+        if role and role not in valid_roles:
+            warnings.append(f"{path} role `{role}` 已降级为 component_hint；不会用于 hard fail、能力限制或工具选择。")
+
+        file_kind = (_scalar_field_from_block(block, "file_kind") or "").strip().lower()
+        if file_kind and file_kind not in {"script", "skill_doc", "reference", "asset", "config"}:
+            issues.append(f"{path} file_kind `{file_kind}` 不在平台文件类型枚举内。")
+        elif not file_kind:
+            warnings.append(f"{path} 未声明 file_kind；系统将按路径归一化推断。")
 
         required_caps = _list_field_from_block(block, "required_capabilities")
-        if required_caps and path.startswith("scripts/"):
-            allowed = ROLE_ALLOWED_CAPABILITIES.get(role, frozenset())
-            for capability in required_caps:
-                layer = capability_layer(capability)
-                if layer != "business_skill":
-                    issues.append(f"{path} required_capabilities 只能声明业务能力，不能包含 {layer} capability `{capability}`。")
-                elif get_tool_capability(capability) is None:
-                    issues.append(f"{path} required_capabilities 包含未注册 capability `{capability}`。")
-                elif capability not in allowed:
-                    issues.append(f"{path} role `{role}` 不允许 capability `{capability}`。")
-        elif required_caps and not path.startswith("scripts/"):
-            issues.append(f"资源文件 `{path}` 不能声明 runtime required_capabilities。")
+        if required_caps:
+            warnings.append(f"{path} required_capabilities 已降级为 hint；最终能力由 normalized plan 的 required_tool_slots 推断。")
 
         forbidden_caps = _list_field_from_block(block, "business_forbidden_capabilities") or _list_field_from_block(block, "forbidden_capabilities")
-        for capability in forbidden_caps:
-            if not is_business_capability(capability):
-                issues.append(f"{path} business_forbidden_capabilities 只能声明业务禁止能力，不能包含平台安全/协议 `{capability}`。")
+        if forbidden_caps:
+            warnings.append(f"{path} forbidden_capabilities 属于业务层遗留字段，已移出 hard validation；安全约束由平台安全层处理。")
 
     for path in sorted(script_paths | reference_paths | asset_paths | {"SKILL.md"}):
         if path not in path_blocks:
@@ -358,7 +339,7 @@ def validate_blueprint_shape_for_creator(blueprint_text: str) -> None:
     for path in sorted(reference_paths):
         block = path_blocks.get(path, "")
         if block and not re.search(r"(?m)^\s*role\s*:\s*reference\s*$", block):
-            issues.append(f"reference 文件计划 `{path}` 的 role 必须是 reference。")
+            warnings.append(f"reference 文件计划 `{path}` 的 role 已降级为 component_hint；file_kind/path 决定生成方式。")
 
     for path in sorted(asset_paths):
         block = path_blocks.get(path, "")
@@ -713,9 +694,13 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
     # ------------------------------------------------------------------
     # 9. assets/ section
     # ------------------------------------------------------------------
-    # Assets are parsed only from explicit SkillPlan file items with a platform
-    # source field. Directory tree mentions are display/cross-check hints and do
-    # not create upload requirements by themselves.
+    m_assets = _SECTION_ASSETS_RE.search(blueprint_text)
+    assets_desc = m_assets.group(1).strip() if m_assets else ""
+    if assets_desc and not _should_skip(assets_desc):
+        for path in _extract_inline_paths(blueprint_text, "assets"):
+            _add(path, assets_desc, required=False, can_skip=True, asset_source="bundled")
+        for m_bare in re.finditer(r"assets/(\S+\.\w+)", assets_desc):
+            _add("assets/" + m_bare.group(1), assets_desc, required=False, can_skip=True, asset_source="bundled")
 
     return files, warnings
 

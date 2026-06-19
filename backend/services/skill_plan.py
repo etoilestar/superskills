@@ -18,6 +18,7 @@ from .creator_tool_registry import capabilities_for_role as registry_capabilitie
 from .skill_dataflow import parse_schema_input_item
 
 
+FileKind = Literal["script", "skill_doc", "reference", "asset", "config"]
 FileType = Literal["skill", "script", "reference", "asset", "skill_md"]
 Language = Literal["python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"]
 Runtime = Literal["python", "node", "bash", "shell", "generic", "none"]
@@ -193,13 +194,43 @@ class RoleClassification:
 
 
 @dataclass(frozen=True)
+class ToolSlot:
+    """Structured interface need resolved after blueprint normalization."""
+
+    slot_id: str
+    input_contract: dict[str, object] = field(default_factory=dict)
+    output_contract: dict[str, object] = field(default_factory=dict)
+    input_modality: str = "json"
+    output_modality: str = "json"
+    side_effects: list[str] = field(default_factory=list)
+    runtime_requirements: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ImplementationStrategy:
+    """How a normalized tool slot can be implemented."""
+
+    slot_id: str
+    strategy: str = "generate_code"
+    tool_id: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class SkillPlanEntry:
-    """Contract for one file that Creator will generate."""
+    """Normalized contract for one file that Creator will generate.
+
+    ``role`` is retained as a component hint for prompts/UI/backwards
+    compatibility. Hard execution semantics are carried by file_kind, I/O, tool
+    slots, runtime_contract, and artifact_contract.
+    """
 
     path: str
     file_type: FileType
     role: FileRole
     purpose: str
+    file_kind: FileKind = "config"
+    component_hint: str = ""
     inputs: list[str] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
     default_values: dict[str, object] = field(default_factory=dict)
@@ -221,6 +252,13 @@ class SkillPlanEntry:
     runtime: Runtime = "none"
     entrypoint: str = ""
     command_template: str = ""
+    workflow_order: int = 0
+    logical_edges: list[dict[str, object]] = field(default_factory=list)
+    required_tool_slots: list[ToolSlot] = field(default_factory=list)
+    implementation_strategy: list[ImplementationStrategy] = field(default_factory=list)
+    runtime_contract: dict[str, object] = field(default_factory=dict)
+    artifact_contract: dict[str, object] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
     required: bool = True
     can_skip: bool = False
     confidence: float = 0.0
@@ -244,7 +282,22 @@ def file_type_for_path(path: str) -> FileType:
         return "script"
     if path.startswith("references/"):
         return "reference"
+    if path.startswith("assets/"):
+        return "asset"
     return "asset"
+
+
+def file_kind_for_path(path: str) -> FileKind:
+    normalized = (path or "").replace("\\", "/")
+    if normalized == "SKILL.md":
+        return "skill_doc"
+    if normalized.startswith("scripts/"):
+        return "script"
+    if normalized.startswith("references/"):
+        return "reference"
+    if normalized.startswith("assets/"):
+        return "asset"
+    return "config"
 
 
 def heuristic_signals_for_file(file_path: str, purpose: str = "", blueprint_summary: str = "") -> list[str]:
@@ -618,6 +671,12 @@ def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
     determined by the concrete SKILL.md command placeholders and each script's
     JSON stdout, so business Skills can choose domain-specific field names.
     """
+    if role == "pdf_builder":
+        return ["payload"], ["pdf_path"]
+    if role == "docx_builder":
+        return ["payload"], ["docx_path"]
+    if role == "pptx_builder":
+        return ["payload"], ["pptx_path"]
     if role in SCRIPT_ROLES:
         return ["payload"], []
     if role == "reference":
@@ -661,6 +720,12 @@ def build_skill_plan_entry(
     explicit_allowed_capabilities = _explicit_list_field("allowed_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     role = classification.role
     role_reason = classification.reason
+    # Backwards-compatible component hint promotion from explicit capability hints.
+    # This is not used for hard validation or tool selection.
+    cap_hint_set = set(explicit_required_capabilities or [])
+    if role in {"generic_script", "image_generator", "text_generator"} and {"text_generation", "image_generation"}.issubset(cap_hint_set):
+        role = "composite_generator"
+        role_reason = "component_hint promoted from explicit capability hints"
     explicit_inputs = _explicit_list_field("inputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     explicit_outputs = _explicit_list_field("outputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     explicit_default_values = _explicit_default_values(file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
@@ -676,8 +741,13 @@ def build_skill_plan_entry(
             creator_internal_references.append(ref)
     explicit_dependencies = _explicit_list_field("dependencies", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     dependencies = _dedupe_paths([ref for ref in (explicit_dependencies or skill_local_references) if _is_skill_local_reference(ref)])
+    filename_promoted_composite = False
+    if role == "generic_script" and re.search(r"(?:with_images|image|images|图片|配图)", file_path, re.I):
+        role = "composite_generator"
+        role_reason = "component_hint promoted from filename hint"
+        filename_promoted_composite = True
     default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
-    raw_required_capabilities = explicit_required_capabilities or default_required_capabilities
+    raw_required_capabilities = explicit_required_capabilities or (["text_generation", "image_generation"] if filename_promoted_composite else default_required_capabilities)
     platform_capabilities = [cap for cap in _dedupe_capabilities(raw_required_capabilities) if capability_layer(cap) == "platform_protocol"]
     required_capabilities = normalize_required_capabilities(
         role=role,
@@ -691,12 +761,13 @@ def build_skill_plan_entry(
         _explicit_list_field("business_forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
         or _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     )
-    raw_forbidden_capabilities = explicit_forbidden or default_forbidden_capabilities
+    raw_forbidden_capabilities = explicit_forbidden or (["pdf_generation"] if filename_promoted_composite else default_forbidden_capabilities)
     platform_safety_constraints = [cap for cap in _dedupe_capabilities(raw_forbidden_capabilities) if is_platform_safety_constraint(cap)]
     forbidden_capabilities = [
         capability for capability in _dedupe_capabilities(raw_forbidden_capabilities)
         if is_business_capability(capability) and capability not in required_capabilities
     ]
+    file_kind = file_kind_for_path(file_path)
     detected_language = language_for_path(file_path)
     explicit_language = _explicit_scalar_field("language", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     language = explicit_language if explicit_language in {"python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"} else detected_language
@@ -708,6 +779,8 @@ def build_skill_plan_entry(
         file_type=file_type,
         role=role,
         purpose=purpose,
+        file_kind=file_kind,
+        component_hint=role,
         inputs=inputs,
         outputs=outputs,
         default_values=explicit_default_values,
@@ -721,6 +794,8 @@ def build_skill_plan_entry(
         business_forbidden_capabilities=forbidden_capabilities,
         platform_safety_constraints=platform_safety_constraints,
         execution_contract={"runtime": runtime, "entrypoint": file_path} if file_type == "script" else {},
+        runtime_contract={"runtime": runtime, "entrypoint": file_path, "argv": "json_object"} if file_type == "script" else {"runtime": "none"},
+        artifact_contract={"stdout_fields": list(outputs or []), "final": bool(file_type == "script")} if file_type == "script" else {},
         layer="business_skill" if file_type in {"skill", "script", "skill_md"} else "static_resource",
         # Public/final SKILL.md references are skill-local only.  Creator
         # kernel references remain separate internal context and must never be
@@ -833,6 +908,8 @@ def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
         cleaned = replace(
             entry,
             path=path,
+            file_kind=file_kind_for_path(path),
+            component_hint=entry.component_hint or entry.role,
             required_capabilities=normalized_required,
             dependencies=dependencies,
             forbidden_capabilities=[cap for cap in entry.forbidden_capabilities if cap not in set(normalized_required) and is_business_capability(cap)],
@@ -855,7 +932,15 @@ def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
             cleaned = replace(cleaned, runtime="none", entrypoint="", command_template="")
 
         if cleaned.file_type == "script":
-            cleaned = replace(cleaned, command_template=_command_template_for_entry_with_values(cleaned))
+            slots = [ToolSlot(
+                slot_id=f"{cleaned.path}:stdout",
+                input_contract={key: "any" for key in (cleaned.inputs or [])},
+                output_contract={key: "any" for key in (cleaned.outputs or [])},
+                side_effects=["stdout_json"],
+                runtime_requirements={"runtime": cleaned.runtime},
+            )]
+            strategies = [ImplementationStrategy(slot_id=slots[0].slot_id, strategy="generate_code", reason="Creator can generate script implementation")]
+            cleaned = replace(cleaned, command_template=_command_template_for_entry_with_values(cleaned), required_tool_slots=slots, implementation_strategy=strategies, runtime_contract={"runtime": cleaned.runtime, "entrypoint": cleaned.path, "argv": "json_object"}, artifact_contract={"stdout_fields": list(cleaned.outputs or []), "final": True})
             prior_outputs.update(cleaned.outputs or [])
 
         entries.append(cleaned)
@@ -959,3 +1044,37 @@ def validate_role(role: str, file_type: FileType) -> bool:
     if file_type == "script":
         return is_script_role(role)
     return is_resource_role(role)
+
+
+def logical_plan_check(plan: SkillPlan) -> list[str]:
+    """Validate normalized-plan logical closure before concrete tool choice.
+
+    This check is intentionally independent of role/capability labels and tool
+    registry availability. It verifies only file presence, acyclic dependencies,
+    sortable workflow order, input/output flow, and final-artifact clarity.
+    """
+    issues = validate_file_plan_semantics(plan)
+    issues.extend(validate_skill_plan_dataflow(plan))
+    paths = {entry.path for entry in plan.files}
+    for entry in plan.files:
+        for dep in entry.dependencies:
+            if dep.startswith(("scripts/", "references/", "assets/")) and dep not in paths:
+                issues.append(f"{entry.path} dependency has no source file: {dep}")
+    scripts = [entry for entry in plan.files if entry.file_kind == "script"]
+    if scripts and not any(entry.outputs for entry in scripts):
+        issues.append("Final artifact/output is unresolved; at least one script must declare outputs.")
+    return issues
+
+
+def implementation_resolution(plan: SkillPlan) -> list[str]:
+    """Validate that each normalized tool slot has an implementation strategy."""
+    issues: list[str] = []
+    for entry in plan.files:
+        strategies = {strategy.slot_id: strategy.strategy for strategy in (entry.implementation_strategy or [])}
+        for slot in entry.required_tool_slots or []:
+            strategy = strategies.get(slot.slot_id)
+            if not strategy:
+                issues.append(f"{entry.path} tool slot {slot.slot_id} has no implementation strategy.")
+            elif strategy == "unsupported":
+                issues.append(f"{entry.path} tool slot {slot.slot_id} is unsupported.")
+    return issues
