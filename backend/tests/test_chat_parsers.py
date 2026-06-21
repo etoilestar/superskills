@@ -3388,8 +3388,79 @@ def test_script_contract_rejects_guessed_helper_import_without_function_card():
     )
 
     helper_check = next(result for result in results if result.id == "tool_usage_contract.forbidden_helper_import")
-    assert not helper_check.passed
-    assert "该模块不可 import" in helper_check.minimal_edit
+    assert helper_check.passed
+    assert "第一轮不因此阻断" in helper_check.message
+
+
+def test_script_contract_undeclared_helper_is_warning_not_blocker():
+    from backend.routers.creator import _check_script_file_contract
+
+    results = _check_script_file_contract(
+        "scripts/build_pdf.py",
+        "import json\nimport sys\nfrom backend.services.skill_runtime import create_pdf\n\ndef run(payload):\n    result = create_pdf(str(payload.get('text', 'hello')))\n    return {'pdf_path': result.get('pdf_path', 'out.pdf')}\n\ndef main():\n    print(json.dumps(run(json.loads(sys.argv[1]))))\n\nif __name__ == '__main__':\n    main()\n",
+        skill_plan_entry={
+            "path": "scripts/build_pdf.py",
+            "role": "generic_script",
+            "inputs": ["text"],
+            "outputs": ["pdf_path"],
+            "required_capabilities": [],
+        },
+    )
+
+    undeclared = next(result for result in results if result.id == "tool_usage_contract.undeclared_helper")
+    assert undeclared.passed
+    assert "warning:" in undeclared.message
+
+
+def test_script_contract_placeholder_mock_words_are_not_hard_gate():
+    from backend.routers.creator import _check_script_file_contract
+
+    results = _check_script_file_contract(
+        "scripts/mock_named_but_runnable.py",
+        "import json\nimport sys\n\ndef run(payload):\n    # mock/template are allowed words here; runtime contract decides success.\n    return {'result': str(payload.get('payload', 'mock template'))}\n\ndef main():\n    print(json.dumps(run(json.loads(sys.argv[1]))))\n\nif __name__ == '__main__':\n    main()\n",
+        skill_plan_entry={
+            "path": "scripts/mock_named_but_runnable.py",
+            "role": "generic_script",
+            "inputs": ["payload"],
+            "outputs": ["result"],
+            "required_capabilities": [],
+        },
+    )
+
+    fake_check = next(result for result in results if result.id == "script.no_fake_implementation")
+    assert fake_check.passed
+
+
+def test_script_contract_blocks_dangerous_import_and_forbidden_path():
+    from backend.routers.creator import _check_script_file_contract
+
+    results = _check_script_file_contract(
+        "scripts/unsafe.py",
+        "import json\nimport sys\nimport subprocess\n\ndef run(payload):\n    return {'result': open('/etc/passwd').read()}\n\ndef main():\n    print(json.dumps(run(json.loads(sys.argv[1]))))\n\nif __name__ == '__main__':\n    main()\n",
+        skill_plan_entry={
+            "path": "scripts/unsafe.py",
+            "role": "generic_script",
+            "inputs": ["payload"],
+            "outputs": ["result"],
+            "required_capabilities": [],
+        },
+    )
+
+    security = next(result for result in results if result.id == "script.security.dangerous_operations")
+    assert not security.passed
+    assert "subprocess" in security.message
+
+
+def test_trial_stdout_missing_required_output_blocks():
+    from backend.routers.creator import _validate_trial_stdout_json
+
+    with pytest.raises(ValueError, match="stdout_contract"):
+        _validate_trial_stdout_json(
+            stdout=json.dumps({"other": "value"}),
+            content="",
+            args=["{}"],
+            skill_plan_entry={"role": "generic_script", "outputs": ["result"], "required_capabilities": []},
+        )
 
 
 def test_creator_trial_stdout_accepts_arbitrary_real_file_field(tmp_path):

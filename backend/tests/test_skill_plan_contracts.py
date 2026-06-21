@@ -155,7 +155,7 @@ def test_skill_plan_runtime_defaults_python_and_supports_node_bash():
     assert "$1" in _script_generation_skeleton("scripts/main.sh", "", "", skill_plan_entry=sh_entry.__dict__)
 
 
-def test_strict_script_contract_validates_runtime_json_argv_and_inputs():
+def test_strict_script_contract_validates_runtime_json_argv_but_not_static_input_keywords():
     from backend.routers.creator import _check_script_file_contract
 
     entry = {
@@ -173,7 +173,7 @@ def test_strict_script_contract_validates_runtime_json_argv_and_inputs():
     good_failed = {result.id for result in _check_script_file_contract("scripts/main.js", good, skill_plan_entry=entry) if not result.passed}
 
     assert "script.json_argv.runtime" in bad_failed
-    assert "script.skillplan_inputs.used" in bad_failed
+    assert "script.skillplan_inputs.used" not in bad_failed
     assert "script.json_argv.runtime" not in good_failed
     assert "script.skillplan_inputs.used" not in good_failed
 

@@ -1,3 +1,6 @@
+import asyncio
+import time
+
 import httpx
 import json
 import os
@@ -281,17 +284,74 @@ async def stream_chat(
     )
 
 
-async def check_connection() -> dict:
-    """Check if the LLM backend is reachable and return available models."""
+_llm_health_cache: dict[str, object] = {"result": None, "checked_at": 0.0}
+_llm_health_lock = asyncio.Lock()
+_llm_health_refresh_task: asyncio.Task | None = None
+
+
+def _build_models_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if base.endswith("/v1/models"):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}/models"
+    return f"{base}/v1/models"
+
+
+async def _probe_llm_models() -> dict:
+    """Provider-agnostic quick check: verify the configured OpenAI-compatible models endpoint."""
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=float(settings.llm_health_timeout_seconds)) as client:
             response = await client.get(
-                f"{settings.llm_base_url.rstrip('/')}/v1/models",
+                _build_models_url(settings.llm_base_url),
                 headers=_auth_headers(),
             )
             response.raise_for_status()
             data = response.json()
-            models = [m["id"] for m in data.get("data", [])]
-            return {"connected": True, "models": models}
+            models = [str(m.get("id")) for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+            return {"connected": True, "models": models, "stale": False}
     except Exception as exc:
-        return {"connected": False, "error": str(exc), "models": []}
+        return {"connected": False, "error": str(exc), "models": [], "stale": False}
+
+
+async def _refresh_llm_health_cache() -> dict:
+    async with _llm_health_lock:
+        result = await _probe_llm_models()
+        _llm_health_cache["result"] = result
+        _llm_health_cache["checked_at"] = time.monotonic()
+        return result
+
+
+def _schedule_llm_health_refresh() -> None:
+    global _llm_health_refresh_task
+    if _llm_health_refresh_task and not _llm_health_refresh_task.done():
+        return
+    _llm_health_refresh_task = asyncio.create_task(_refresh_llm_health_cache())
+
+
+async def check_connection(*, deep: bool = False) -> dict:
+    """Return cached LLM health quickly; refresh stale cache in background.
+
+    The default quick check never performs model inference. A deep check is an
+    explicit synchronous refresh hook for diagnostics or pre-generation gates;
+    it still uses provider-agnostic configured endpoints rather than hard-coded
+    provider/model assumptions.
+    """
+    ttl = max(0.0, float(settings.llm_health_cache_ttl_seconds))
+    cached = _llm_health_cache.get("result")
+    age = time.monotonic() - float(_llm_health_cache.get("checked_at") or 0.0)
+
+    if deep:
+        if _llm_health_lock.locked() and cached is not None:
+            return {**cached, "stale": True, "refreshing": True}
+        return await _refresh_llm_health_cache()
+
+    if cached is None:
+        _schedule_llm_health_refresh()
+        return {"connected": None, "models": [], "stale": True, "refreshing": True, "status": "unknown"}
+
+    if age <= ttl:
+        return {**cached, "stale": False, "refreshing": False}
+
+    _schedule_llm_health_refresh()
+    return {**cached, "stale": True, "refreshing": True}

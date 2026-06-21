@@ -210,7 +210,7 @@ async def test_check_connection_success():
         mock_client.get = AsyncMock(return_value=mock_response)
         mock_client_cls.return_value = mock_client
 
-        result = await check_connection()
+        result = await check_connection(deep=True)
 
     assert result["connected"] is True
     assert "model-a" in result["models"]
@@ -227,7 +227,59 @@ async def test_check_connection_failure():
         mock_client.get = AsyncMock(side_effect=httpx.ConnectError("refused"))
         mock_client_cls.return_value = mock_client
 
-        result = await check_connection()
+        result = await check_connection(deep=True)
 
     assert result["connected"] is False
     assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_check_connection_quick_returns_unknown_without_cache(monkeypatch):
+    from backend.services import llm_proxy
+
+    llm_proxy._llm_health_cache["result"] = None
+    llm_proxy._llm_health_cache["checked_at"] = 0.0
+    scheduled = {"value": False}
+
+    def fake_schedule():
+        scheduled["value"] = True
+
+    monkeypatch.setattr(llm_proxy, "_schedule_llm_health_refresh", fake_schedule)
+
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        result = await llm_proxy.check_connection(deep=False)
+
+    assert result == {
+        "connected": None,
+        "models": [],
+        "stale": True,
+        "refreshing": True,
+        "status": "unknown",
+    }
+    assert scheduled["value"] is True
+    mock_client_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_check_connection_deep_refreshes_synchronously():
+    from backend.services import llm_proxy
+
+    llm_proxy._llm_health_cache["result"] = None
+    llm_proxy._llm_health_cache["checked_at"] = 0.0
+    model_data = {"data": [{"id": "deep-model"}]}
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value=model_data)
+
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client_cls.return_value = mock_client
+
+        result = await llm_proxy.check_connection(deep=True)
+
+    assert result["connected"] is True
+    assert result["models"] == ["deep-model"]
+    mock_client.get.assert_awaited_once()

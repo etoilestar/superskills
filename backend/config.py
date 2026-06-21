@@ -81,6 +81,10 @@ class Settings(BaseSettings):
 
     # Timeout for LLM HTTP requests in seconds.
     llm_timeout_seconds: int = Field(6000, validation_alias=AliasChoices("LLM_TIMEOUT_SECONDS", "llm_timeout_seconds"))
+    # Short, independent timeout for provider-agnostic health checks.
+    llm_health_timeout_seconds: float = Field(2.0, validation_alias=AliasChoices("LLM_HEALTH_TIMEOUT_SECONDS", "llm_health_timeout_seconds"))
+    # Health cache TTL; stale results are returned immediately while refresh runs in background.
+    llm_health_cache_ttl_seconds: float = Field(30.0, validation_alias=AliasChoices("LLM_HEALTH_CACHE_TTL_SECONDS", "llm_health_cache_ttl_seconds"))
 
     # Filesystem paths
     kernel_path: Path = PROJECT_ROOT / "kernel"

@@ -193,8 +193,14 @@ export async function saveAllowlist(payload) {
   return res.json()
 }
 
-export async function fetchLlmHealth() {
-  const res = await fetch('/api/health/llm')
-  if (!res.ok) throw new Error('Health check failed')
-  return res.json()
+export async function fetchLlmHealth(timeoutMs = 2500) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetch('/api/health/llm', { signal: controller.signal })
+    if (!res.ok) throw new Error('Health check failed')
+    return res.json()
+  } finally {
+    clearTimeout(timeout)
+  }
 }

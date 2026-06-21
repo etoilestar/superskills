@@ -38,17 +38,17 @@ import { ref, onMounted } from 'vue'
 import { fetchLlmHealth } from './composables/useSkills.js'
 
 const llmStatus = ref('unknown')
-const llmLabel = ref('正在检查 LLM…')
+const llmLabel = ref('LLM 状态后台检查中…')
 
 onMounted(async () => {
   try {
     const data = await fetchLlmHealth()
     if (data.connected) {
       llmStatus.value = 'ok'
-      llmLabel.value = `LLM 已连接`
+      llmLabel.value = data.stale ? `LLM 已连接（缓存）` : `LLM 已连接`
     } else {
       llmStatus.value = 'err'
-      llmLabel.value = 'LLM 离线'
+      llmLabel.value = data.stale ? 'LLM 离线（缓存）' : 'LLM 离线'
     }
   } catch {
     llmStatus.value = 'err'
