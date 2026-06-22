@@ -40,6 +40,11 @@ from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, ro
 from ..services.skill_executor import _build_script_runtime_env, run_action
 from ..services.skill_creator_dry_run import build_creator_external_input_context
 from ..services.artifact_validator import validate_stdout_file_outputs, FileOutputValidationError
+from ..services.markdown_metadata import (
+    parse_frontmatter,
+    validate_reference_frontmatter,
+    validate_skill_frontmatter,
+)
 from ..services.creator_contracts import (
     compile_canonical_file_contract,
     contract_payload,
@@ -1469,6 +1474,26 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
         minimal_edit="只修正文件开头 YAML frontmatter；不要在文件末尾追加 ---。",
     ))
 
+    try:
+        frontmatter, _body, has_metadata = parse_frontmatter(stripped)
+        metadata_issues = validate_skill_frontmatter(frontmatter) if has_metadata else ["SKILL.md 缺少 YAML frontmatter"]
+    except Exception as exc:
+        metadata_issues = [f"SKILL.md frontmatter 解析失败：{exc}"]
+    results.append(ContractCheckResult(
+        id="skill_md.frontmatter.schema",
+        passed=not metadata_issues,
+        target="SKILL.md",
+        message=(
+            "SKILL.md frontmatter 顶层字段 schema 合格。"
+            if not metadata_issues
+            else "SKILL.md frontmatter 顶层字段 schema 不合格：" + "; ".join(metadata_issues)
+        ),
+        expected="顶层 YAML frontmatter 只允许 name、description、license、allowed-tools、metadata；Creator 内部规划字段只能放正文、metadata.creator 或内部 contract。",
+        minimal_edit="只修 SKILL.md 的 YAML frontmatter；不改正文、不改 workflow block、不改脚本路径、不改 scripts。",
+        layer="skill_md_metadata",
+        details={"issues": metadata_issues},
+    ))
+
     has_runtime_contract = bool(_SKILL_CUSTOM_RUNTIME_CONTRACT_RE.search(content))
     results.append(ContractCheckResult(
         id="skill_md.forbidden_runtime_contract",
@@ -2518,6 +2543,26 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
         file_path=file_path,
         content=content,
         purpose=purpose,
+    ))
+
+    try:
+        frontmatter, _body, has_metadata = parse_frontmatter(content)
+        metadata_issues = validate_reference_frontmatter(frontmatter) if has_metadata else []
+    except Exception as exc:
+        metadata_issues = [f"{file_path} frontmatter 解析失败：{exc}"]
+    results.append(ContractCheckResult(
+        id="reference.frontmatter.schema",
+        passed=not metadata_issues,
+        target=file_path,
+        message=(
+            f"{file_path} frontmatter schema 合格或无 frontmatter。"
+            if not metadata_issues
+            else f"{file_path} frontmatter schema 不合格：" + "; ".join(metadata_issues)
+        ),
+        expected="references/*.md 可以没有 frontmatter；如有，只允许 title、description、source、license、metadata 等普通文档元数据。",
+        minimal_edit="只修当前 reference md 的 frontmatter；不改正文内容、不改其它文件。",
+        layer="reference_metadata",
+        details={"issues": metadata_issues},
     ))
 
     declares_runtime_protocol = bool(re.search(r"(?im)^\s*(?:runtime_contract|artifact_contract|required_tool_slots|implementation_strategy|command_template)\s*[:=]", stripped))
@@ -4781,12 +4826,19 @@ async def _repair_generated_file_with_feedback(
     else:
         extra_rules = (
             "你只修 SKILL.md；保持主体内容，不重写整个文件；"
+            "如果错误是 skill_md.frontmatter/schema 或 metadata，只修 YAML frontmatter；不改正文、不改 workflow block、不改脚本路径、不改 scripts；"
             "如果错误是命令格式，只修对应 bash command block；统一使用 python scripts/<file>.py '<JSON object>'；"
             "不得使用 --args、--key value、--text_file、--image_file 或裸 JSON；"
             "不要检查或修复上下游字段是否完全接上，那属于第二轮 E2E；"
             "不要改变 workflow 主体、已通过命令块、未被错误指向的文件、role/capability；"
             "如果蓝图包含 references/，必须在正文中明确引用对应 reference 路径；"
             "不得复制 Creator UI 流程、待确认清单、文件创建面板说明或系统自动创建文件提示。"
+        )
+    if file_path.startswith("references/"):
+        extra_rules = (
+            "你只修当前 references/*.md 文件。"
+            "如果错误是 frontmatter/schema 或 metadata，只修 YAML frontmatter；"
+            "不改正文内容、不改代码块、不改其它文件。"
         )
 
     repair_messages = [*prompt_messages]
@@ -8096,6 +8148,41 @@ def _e2e_error(*, target: str, layer: str, message: str) -> str:
     return f"E2E_REPAIR_TARGET={target}\nE2E_LAYER={layer}\n{message}"
 
 
+def _e2e_failure_json(
+    *,
+    failed_step_index: int,
+    target_file: str,
+    target_region: str,
+    failed_command: str,
+    input_payload: dict[str, Any] | None,
+    rendered_payload: dict[str, Any] | None,
+    stdout: str,
+    stderr: str,
+    return_code: int | None,
+    expected: str,
+    actual: str,
+    repair_instruction: str,
+    artifacts: list[str] | None = None,
+) -> str:
+    """Render E2E failure feedback as a local-repair JSON object."""
+    payload = {
+        "failed_step_index": failed_step_index,
+        "target_file": target_file,
+        "target_region": target_region,
+        "failed_command": failed_command,
+        "input_payload": input_payload or {},
+        "rendered_payload": rendered_payload or {},
+        "stdout": stdout[-4000:],
+        "stderr": stderr[-4000:],
+        "return_code": return_code,
+        "expected": expected,
+        "actual": actual,
+        "artifacts": artifacts or [],
+        "repair_instruction": repair_instruction,
+    }
+    return "E2E_STRUCTURED_FAILURE=\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def _e2e_repair_target_from_errors(errors: list[str]) -> str:
     for error in errors:
         match = re.search(r"^E2E_REPAIR_TARGET=([^\n]+)", error)
@@ -8220,6 +8307,21 @@ def _parse_e2e_stdout_json(
                     f"argv={json.dumps(rendered_payload, ensure_ascii=False)}\n"
                     f"stdout={proc.stdout[-4000:]}\n"
                     f"stderr={proc.stderr[-4000:]}"
+                    "\n"
+                    + _e2e_failure_json(
+                        failed_step_index=command.ordinal,
+                        target_file=command.script_path,
+                        target_region="run()/main()",
+                        failed_command=command.raw_command,
+                        input_payload={},
+                        rendered_payload=rendered_payload,
+                        stdout=proc.stdout,
+                        stderr=proc.stderr,
+                        return_code=proc.returncode,
+                        expected="脚本应成功执行，stdout 输出合法 JSON object，并真实生成声明的文件产物。",
+                        actual=f"脚本返回非 0: {proc.returncode}",
+                        repair_instruction=f"只修改 {command.script_path} 中导致当前执行失败的函数/区域，不修改其它文件、SKILL.md 或已通过脚本。",
+                    )
                 ),
             )
         )
@@ -8246,6 +8348,21 @@ def _parse_e2e_stdout_json(
                     f"stdout={proc.stdout[-4000:]}\n"
                     f"stderr={proc.stderr[-4000:]}\n"
                     f"错误={exc}"
+                    "\n"
+                    + _e2e_failure_json(
+                        failed_step_index=command.ordinal,
+                        target_file=command.script_path,
+                        target_region="stdout/artifact output logic",
+                        failed_command=command.raw_command,
+                        input_payload={},
+                        rendered_payload=rendered_payload,
+                        stdout=proc.stdout,
+                        stderr=proc.stderr,
+                        return_code=proc.returncode,
+                        expected="stdout 必须是合法 JSON object，包含 required outputs；声明的文件产物必须真实存在。",
+                        actual=str(exc),
+                        repair_instruction=f"只修改 {command.script_path} 的 stdout 输出和产物生成逻辑；不要重写整个 Skill 或其它脚本。",
+                    )
                 ),
             )
         ) from exc
@@ -8260,6 +8377,21 @@ def _parse_e2e_stdout_json(
                 message=(
                     f"第 {command.ordinal} 步 {command.script_path} stdout 不是合法 JSON。\n"
                     f"stdout={proc.stdout[-4000:]}"
+                    "\n"
+                    + _e2e_failure_json(
+                        failed_step_index=command.ordinal,
+                        target_file=command.script_path,
+                        target_region="stdout output logic",
+                        failed_command=command.raw_command,
+                        input_payload={},
+                        rendered_payload=rendered_payload,
+                        stdout=proc.stdout,
+                        stderr=proc.stderr,
+                        return_code=proc.returncode,
+                        expected="stdout 是可被 json.loads 解析的 JSON object。",
+                        actual=f"JSON 解析失败：{exc}",
+                        repair_instruction=f"只修改 {command.script_path} 的 stdout JSON 输出逻辑，不修改其它文件。",
+                    )
                 ),
             )
         ) from exc
@@ -8771,6 +8903,11 @@ async def _repair_existing_file_for_e2e_failure(
             "content": (
                 "你是 superskills Creator 的最终端到端修复模型。"
                 "你只能输出目标文件的完整新内容，不能输出解释、Markdown 外壳或多文件 bundle。"
+                "强制局部修复：你只能修改 E2E_REPAIR_TARGET/target_file 指向的文件；"
+                "只能修改结构化 failure 的 target_region 指定区域；"
+                "不要重写整个 Skill，不要重写整个 SKILL.md，不要修改已经通过的脚本、frontmatter 或 stdout 字段名；"
+                "不要用固定样例数据代替动态输入，不要通过 try/except 返回假成功；"
+                "修复必须基于 E2E 提供的 stdout/stderr/input_payload/rendered_payload/expected/actual。"
                 "E2E 工作流只由 SKILL.md 定义；references/*.md 是参考资料，不是执行步骤。"
                 "修复目标是让 SKILL.md workflow 从头到尾真实执行通过。"
                 "中间步骤只需要 JSON 边界能流转，不要求使用平台字段；"
@@ -8974,9 +9111,18 @@ async def validate_skill(request: SkillActionRequest):
                 e2e_errors=e2e_errors,
                 requested_model=request.model,
             )
+            # First rerun the same E2E payload and ensure the original failing
+            # point is no longer the active failure before the outer loop starts
+            # another full E2E pass.  This keeps the repair loop local: if the
+            # same file/step still fails, the next repair is fed that exact
+            # failure instead of broadening the edit scope.
+            rerun_errors = validate_workflow_e2e(skill_name, external_context=external_context)
+            rerun_target = _e2e_repair_target_from_errors(rerun_errors) if rerun_errors else ""
+            if rerun_errors and rerun_target == target_path:
+                e2e_errors = rerun_errors
             attempt += 1
             repair_logs.append(
-                f"第 {attempt} 轮：根据端到端失败反馈修复 {repaired_target}"
+                f"第 {attempt} 轮：根据端到端失败反馈修复 {repaired_target}；已用同一 payload 复跑失败点"
             )
         except Exception as exc:
             logger.exception(
