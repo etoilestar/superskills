@@ -172,6 +172,29 @@ class ImplementationStrategy:
     reason: str = ""
 
 
+
+
+@dataclass(frozen=True)
+class ScriptRuntimeSpec:
+    """Internal post-trial runtime spec used to render final SKILL.md commands.
+
+    This is not written into SKILL.md; it records the argv/stdout/artifact
+    shape that actually ran successfully during script validation.
+    """
+
+    script_path: str
+    runtime: str
+    role: str
+    responsibility: str
+    input_policy: str
+    accepted_sample_argv: dict[str, object] = field(default_factory=dict)
+    required_outputs: list[str] = field(default_factory=list)
+    actual_stdout_fields: list[str] = field(default_factory=list)
+    artifact_fields: list[str] = field(default_factory=list)
+    file_outputs: list[str] = field(default_factory=list)
+    command_template: str = ""
+
+
 @dataclass(frozen=True)
 class SkillPlanEntry:
     """Normalized contract for one file that Creator will generate.
@@ -329,31 +352,69 @@ def _runner_for_runtime(runtime: Runtime) -> str:
     return ""
 
 
-def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -> str:
-    keys = inputs or ["payload"]
-    payload = "{" + ",".join(f'"{key}":"{{{{{key}}}}}"' for key in keys) + "}"
-    runner = _runner_for_runtime(runtime)
-    if runner:
-        return f"{runner} {path} '{payload}'"
-    return f"{path} '{payload}'"
+def _stable_external_envelope(values: dict[str, str] | None = None) -> dict[str, object]:
+    values = values or {}
+    return {
+        "payload": values.get("payload", "{{user_request}}"),
+        "fields": {},
+        "options": {},
+        "input_files": [],
+    }
 
 
-def render_script_command_from_skill_plan(entry: SkillPlanEntry, values: dict[str, str] | None = None) -> str:
-    """Render a SKILL.md script command directly from one SkillPlan entry.
+def _command_args_from_runtime_contract(runtime_contract: dict[str, object] | None) -> dict[str, object]:
+    contract = runtime_contract or {}
+    command_args = contract.get("command_args")
+    if isinstance(command_args, dict):
+        return dict(command_args)
+    return {}
 
-    The JSON argv key set is determined solely by ``entry.inputs``.  ``values``
-    may provide placeholder/value expressions for those keys, but it cannot add
-    extra keys.  Missing values fall back to the same-named placeholder so the
-    command remains a generic, self-consistent contract rather than a
-    business-specific guess.
-    """
-    payload_keys = list(entry.inputs or ["payload"])
-    payload = {key: (values or {}).get(key, f"{{{{{key}}}}}") for key in payload_keys}
+
+def _render_command(path: str, runtime: Runtime | str, payload: dict[str, object]) -> str:
     rendered_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    runner = _runner_for_runtime(entry.runtime)
+    runner = _runner_for_runtime(runtime)  # type: ignore[arg-type]
     if runner:
-        return f"{runner} {entry.path} '{rendered_payload}'"
-    return f"{entry.path} '{rendered_payload}'"
+        return f"{runner} {path} '{rendered_payload}'"
+    return f"{path} '{rendered_payload}'"
+
+
+def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str], runtime_contract: dict[str, object] | None = None) -> str:
+    """Render a generic command without treating SkillPlan.inputs as argv keys."""
+    payload = _command_args_from_runtime_contract(runtime_contract) or _stable_external_envelope()
+    return _render_command(path, runtime, payload)
+
+
+def render_script_command_from_skill_plan(
+    entry: SkillPlanEntry,
+    values: dict[str, str] | None = None,
+    runtime_spec: ScriptRuntimeSpec | dict[str, object] | None = None,
+) -> str:
+    """Render a SKILL.md script command from verified runtime args when available.
+
+    Priority: ScriptRuntimeSpec.accepted_sample_argv, runtime_contract.command_args,
+    entry.command_template, then the platform-stable external envelope.
+    SkillPlan.inputs remain generation hints and are not used as argv keys.
+    """
+    if runtime_spec is not None:
+        if isinstance(runtime_spec, ScriptRuntimeSpec):
+            if runtime_spec.accepted_sample_argv:
+                return _render_command(runtime_spec.script_path or entry.path, runtime_spec.runtime or entry.runtime, dict(runtime_spec.accepted_sample_argv))
+            if runtime_spec.command_template:
+                return runtime_spec.command_template
+        elif isinstance(runtime_spec, dict):
+            accepted = runtime_spec.get("accepted_sample_argv")
+            if isinstance(accepted, dict) and accepted:
+                return _render_command(str(runtime_spec.get("script_path") or entry.path), str(runtime_spec.get("runtime") or entry.runtime), dict(accepted))
+            template = str(runtime_spec.get("command_template") or "")
+            if template:
+                return template
+
+    payload = _command_args_from_runtime_contract(entry.runtime_contract)
+    if payload:
+        return _render_command(entry.path, entry.runtime, payload)
+    if entry.command_template:
+        return entry.command_template
+    return _render_command(entry.path, entry.runtime, _stable_external_envelope(values))
 
 
 

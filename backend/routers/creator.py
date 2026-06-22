@@ -32,8 +32,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..config import settings
-from ..services.blueprint_parser import BlueprintPlan, BlueprintShapeError, parse_blueprint
-from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_file_kind, file_role_classifier, file_type_for_path, file_kind_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan
+from ..services.blueprint_parser import BlueprintPlan, BlueprintShapeError, clean_blueprint_body_text, parse_blueprint
+from ..services.skill_plan import SkillPlanEntry, ScriptRuntimeSpec, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_file_kind, file_role_classifier, file_type_for_path, file_kind_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan
 from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status, resolve_tools_for_skill_plan_entry, function_cards_for_tool, resolve_tool_snippets_for_context, tool_snippet_prompt
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
@@ -178,6 +178,7 @@ class SkillMdBlueprintReviewResponse(BaseModel):
 
 class FileSpecOut(BaseModel):
     path: str
+    generation_order: int = 0
     purpose: str
     required: bool
     can_skip: bool
@@ -212,8 +213,50 @@ class FileSpecOut(BaseModel):
     asset_source: str = ""
 
 
+
+
+def _generation_order_for_file(path: str, asset_source: str = "") -> int:
+    normalized = _normalize_skill_path(path)
+    if normalized.startswith("references/"):
+        return 0
+    if normalized.startswith("scripts/"):
+        return 1
+    if normalized.startswith("assets/") and asset_source != "user_upload":
+        return 2
+    if normalized.startswith("assets/") and asset_source == "user_upload":
+        return 3
+    if normalized == "SKILL.md":
+        return 4
+    return 2
+
+
+def _final_outputs_from_plan_entries(entries: list[SkillPlanEntry]) -> list[str]:
+    for entry in entries or []:
+        contract = entry.artifact_contract or {}
+        explicit = contract.get("final_output") or contract.get("final_outputs")
+        if isinstance(explicit, str) and explicit.strip():
+            return [explicit.strip()]
+        if isinstance(explicit, list):
+            values = [str(item).strip() for item in explicit if str(item).strip()]
+            if values:
+                return values
+    final_entries = [entry for entry in entries or [] if bool((entry.artifact_contract or {}).get("final"))]
+    for entry in reversed(final_entries or entries or []):
+        contract = entry.artifact_contract or {}
+        for key in ("stdout_fields", "artifact_fields", "file_fields", "file_outputs"):
+            raw = contract.get(key)
+            if isinstance(raw, list):
+                values = [str(item).strip() for item in raw if str(item).strip()]
+                if values:
+                    return values
+        if entry.outputs:
+            return list(entry.outputs)
+    return []
+
+
 class AssetRequirementOut(BaseModel):
     path: str
+    generation_order: int = 3
     source: str
     required: bool = True
     description: str = ""
@@ -224,6 +267,7 @@ class AnalyzeBlueprintResponse(BaseModel):
     files: list[FileSpecOut]
     warnings: list[Any]
     asset_requirements: list[AssetRequirementOut] = Field(default_factory=list)
+    final_outputs: list[str] = Field(default_factory=list)
     available_tools: list[dict[str, Any]] = Field(default_factory=list)
     missing_tool_configs: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -263,6 +307,18 @@ class WriteFileResponse(BaseModel):
     path: Optional[str] = None
     bytes: int = 0
     message: str
+    runtime_spec: Optional[dict[str, Any]] = None
+
+
+class FinalizeSkillMdRequest(BaseModel):
+    skill_name: str
+    description: str = ""
+    blueprint_text: str = ""
+    model: Optional[str] = None
+    references: list[str] = Field(default_factory=list)
+    assets: list[str] = Field(default_factory=list)
+    script_runtime_specs: list[dict[str, Any]] = Field(default_factory=list)
+    final_outputs: list[str] = Field(default_factory=list)
 
 class UploadAssetResponse(BaseModel):
     success: bool
@@ -1364,7 +1420,7 @@ def _check_skill_md_command_dataflow(content: str, blueprint_text: str) -> list[
         produced.update(entry.outputs or [])
         available_values.update(entry.outputs or [])
 
-    final_outputs = set(entries[-1].outputs or []) if entries else set()
+    final_outputs = set(_final_outputs_from_plan_entries(entries))
     for output in sorted(produced - consumed - final_outputs):
         results.append(ContractCheckResult(
             id="skill_md.dataflow.output_consumed_or_final",
@@ -1376,6 +1432,9 @@ def _check_skill_md_command_dataflow(content: str, blueprint_text: str) -> list[
         ))
 
     return results
+
+
+
 
 
 def _check_skill_md_contract(content: str, blueprint_text: str) -> list[ContractCheckResult]:
@@ -2131,9 +2190,10 @@ def _build_script_file_contract_text(
         f"declared_outputs: {', '.join(entry.outputs)}",
         "A. 输出形态:",
         "- 单文件源码，Python 脚本必须通过 ast.parse。",
-        "B. 参数接口:",
-        "- 默认 JSON argv，字段名由 workflow 决定，不强制 SkillPlan inputs。",
-        "- 必须读取 SKILL.md/reference 命令块传入的 keys。",
+        "B. 参数接口（输入宽松）:",
+        "- 脚本必须能读取一个 JSON argv object。",
+        "- 可以宽松兼容 payload / fields / options / input_files / 上游 stdout 字段。",
+        "- 不要求第一轮读取所有 input_sources 或 SkillPlan inputs；不因可选输入未使用而失败。",
         "- 内部 workflow 字段名可用 payload/context 或上游 stdout 字段。",
         "C. 角色输出合同:",
     ]
@@ -4268,8 +4328,9 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
         missing = [str(key) for key in required or [] if str(key) not in payload or not _json_value_non_empty(payload.get(str(key)))]
         if missing:
             raise ValueError(
-                "stdout_contract: 脚本试运行 stdout 缺少 refined canonical stdout_schema.required 非空字段："
-                f"{', '.join(missing)} argv={args!r} stdout={stripped[-4000:]}"
+                "stdout_required_outputs_missing: 当前脚本 stdout 缺少 required_outputs。"
+                f" missing={missing!r} actual={list(payload.keys())!r} required={list(required or [])!r} "
+                f"argv={args!r} stdout={stripped[-4000:]}"
             )
     elif skill_plan_entry is not None:
         entry = _skill_plan_entry_for_file(file_path=str((skill_plan_entry or {}).get("path") or "scripts/main.py"), skill_plan_entry=skill_plan_entry)
@@ -4278,8 +4339,9 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
         missing = [str(key) for key in required or [] if str(key) not in payload or not _json_value_non_empty(payload.get(str(key)))]
         if missing:
             raise ValueError(
-                "stdout_contract: 脚本试运行 stdout 缺少 canonical stdout_schema.required 非空字段："
-                f"{', '.join(missing)} argv={args!r} stdout={stripped[-4000:]}"
+                "stdout_required_outputs_missing: 当前脚本 stdout 缺少 required_outputs。"
+                f" missing={missing!r} actual={list(payload.keys())!r} required={list(required or [])!r} "
+                f"argv={args!r} stdout={stripped[-4000:]}"
             )
 
     try:
@@ -4364,6 +4426,127 @@ def _contract_resolution_for_trial(file_path: str, skill_md: str, role: str | No
     return refined_contract, resolution
 
 
+
+
+def _artifact_fields_from_contract_dict(contract: dict[str, Any] | None) -> list[str]:
+    fields: list[str] = []
+    contract = contract or {}
+    for key in ("artifact_fields", "file_fields", "stdout_fields", "file_outputs", "output_fields"):
+        raw = contract.get(key)
+        if isinstance(raw, str) and raw.strip():
+            fields.append(raw.strip())
+        elif isinstance(raw, list):
+            fields.extend(str(item).strip() for item in raw if str(item).strip())
+    raw_outputs = contract.get("artifact_outputs")
+    if isinstance(raw_outputs, list):
+        for item in raw_outputs:
+            if isinstance(item, dict):
+                field = str(item.get("field") or item.get("name") or "").strip()
+                if field:
+                    fields.append(field)
+    return list(dict.fromkeys(fields))
+
+
+def _artifact_fields_from_tool_manifests(entry: SkillPlanEntry) -> list[str]:
+    fields: list[str] = []
+    for capability_name in list(entry.required_capabilities or []) + list(entry.selected_tools if hasattr(entry, "selected_tools") else []):
+        cap = get_tool_capability(str(capability_name))
+        if not cap:
+            continue
+        for output in getattr(cap, "artifact_outputs", []) or []:
+            if isinstance(output, dict):
+                field = str(output.get("field") or output.get("name") or "").strip()
+                if field:
+                    fields.append(field)
+        for fn in getattr(cap, "functions", []) or []:
+            for output in getattr(fn, "artifact_outputs", []) or []:
+                if isinstance(output, dict):
+                    field = str(output.get("field") or output.get("name") or "").strip()
+                    if field:
+                        fields.append(field)
+    return list(dict.fromkeys(fields))
+
+
+def _artifact_fields_for_entry(entry: SkillPlanEntry, canonical_contract: Any | None = None) -> list[str]:
+    fields: list[str] = []
+    fields.extend(_artifact_fields_from_contract_dict(entry.artifact_contract))
+    if canonical_contract is not None:
+        fields.extend(_artifact_fields_from_contract_dict(getattr(canonical_contract, "artifact_contract", {}) or {}))
+    fields.extend(_artifact_fields_from_tool_manifests(entry))
+    return list(dict.fromkeys(field for field in fields if field))
+
+
+def _script_runtime_spec_to_dict(spec: ScriptRuntimeSpec | None) -> dict[str, Any] | None:
+    if spec is None:
+        return None
+    return {
+        "script_path": spec.script_path,
+        "runtime": spec.runtime,
+        "role": spec.role,
+        "responsibility": spec.responsibility,
+        "input_policy": spec.input_policy,
+        "accepted_sample_argv": spec.accepted_sample_argv,
+        "required_outputs": spec.required_outputs,
+        "actual_stdout_fields": spec.actual_stdout_fields,
+        "artifact_fields": spec.artifact_fields,
+        "file_outputs": spec.file_outputs,
+        "command_template": spec.command_template,
+    }
+
+
+def _build_script_runtime_spec_from_trial(
+    *,
+    file_path: str,
+    entry: SkillPlanEntry,
+    args: list[str],
+    stdout: str,
+    skill_dir: Path,
+    canonical_contract: Any | None = None,
+) -> ScriptRuntimeSpec:
+    accepted: dict[str, Any] = {}
+    if args:
+        try:
+            parsed_arg = json.loads(args[0])
+            if isinstance(parsed_arg, dict):
+                accepted = parsed_arg
+        except Exception:
+            accepted = {}
+
+    payload = json.loads((stdout or "{}").strip())
+    actual_fields = list(payload.keys()) if isinstance(payload, dict) else []
+    file_outputs: list[str] = []
+    artifact_fields: list[str] = _artifact_fields_for_entry(entry, canonical_contract)
+    if isinstance(payload, dict) and artifact_fields:
+        for key in artifact_fields:
+            value = payload.get(key)
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                if isinstance(item, str) and item.strip():
+                    file_outputs.append(item.strip())
+
+    command_template = render_script_command_from_skill_plan(
+        entry,
+        runtime_spec={
+            "script_path": file_path,
+            "runtime": entry.runtime,
+            "accepted_sample_argv": accepted or {"payload": "{{user_request}}", "fields": {}, "options": {}, "input_files": []},
+        },
+    )
+    return ScriptRuntimeSpec(
+        script_path=file_path,
+        runtime=entry.runtime,
+        role=entry.role,
+        responsibility=entry.purpose,
+        input_policy="宽松 JSON argv object；兼容 payload/fields/options/input_files 和上游 stdout 字段。",
+        accepted_sample_argv=accepted or {"payload": "{{user_request}}", "fields": {}, "options": {}, "input_files": []},
+        required_outputs=list(entry.outputs or []),
+        actual_stdout_fields=actual_fields,
+        artifact_fields=sorted(set(artifact_fields)),
+        file_outputs=file_outputs,
+        command_template=command_template,
+    )
+
+
 def _trial_run_generated_script_with_plan(
     skill_name: str,
     file_path: str,
@@ -4371,16 +4554,16 @@ def _trial_run_generated_script_with_plan(
     *,
     role: str | None = None,
     skill_plan_entry: dict[str, Any] | None = None,
-) -> None:
+) -> ScriptRuntimeSpec | None:
     try:
-        _trial_run_generated_script(skill_name, file_path, content, role, skill_plan_entry)
+        return _trial_run_generated_script(skill_name, file_path, content, role, skill_plan_entry)
     except TypeError as exc:
         # Some tests monkeypatch the trial runner with the historical
         # 4-argument signature; keep production role-aware calls while allowing
         # those narrow fakes to exercise the repair loop.
         if "positional" not in str(exc) and "unexpected keyword" not in str(exc):
             raise
-        _trial_run_generated_script(skill_name, file_path, content, role)
+        return _trial_run_generated_script(skill_name, file_path, content, role)
 
 
 def _trial_run_generated_script(
@@ -4389,7 +4572,7 @@ def _trial_run_generated_script(
     content: str,
     role: str | None = None,
     skill_plan_entry: dict[str, Any] | None = None,
-) -> None:
+) -> ScriptRuntimeSpec | None:
     """Run a generated Python script before accepting it from Creator.
 
     Python scripts are executed in a temporary per-skill virtual environment.
@@ -4397,7 +4580,7 @@ def _trial_run_generated_script(
     canonical contracts; arbitrary third-party imports must fail validation.
     """
     if not file_path.startswith("scripts/") or Path(file_path).suffix.lower() != ".py":
-        return
+        return None
 
     skill_md_path = settings.skills_path / skill_name / "SKILL.md"
     skill_md = skill_md_path.read_text(encoding="utf-8") if skill_md_path.is_file() else ""
@@ -4471,7 +4654,16 @@ def _trial_run_generated_script(
                 skill_plan_entry=skill_plan_entry,
                 canonical_contract=refined_contract,
             )
+            return _build_script_runtime_spec_from_trial(
+                file_path=file_path,
+                entry=inferred_entry,
+                args=args,
+                stdout=proc.stdout,
+                skill_dir=skill_dir,
+                canonical_contract=refined_contract,
+            )
 
+    return None
 
 
 def _e2e_layer_from_errors(errors: list[str]) -> str:
@@ -4561,7 +4753,7 @@ async def _repair_generated_file_with_feedback(
         "shell": "Shell: parse $1 as JSON，并向 stdout 输出 JSON 或声明的文件产物。",
     }.get(repair_runtime, "只输出该文件类型的原始内容；不得包含 Markdown fence。")
     output_contract = (
-        f"Rewrite as raw {repair_language} source. Remove any fenced code blocks or file labels. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Align JSON argv keys with the existing SKILL.md command placeholders; do not change the blueprint or SKILL.md. {runtime_rule}"
+        f"Rewrite as raw {repair_language} source. Remove any fenced code blocks or file labels. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Keep JSON argv parsing broad and compatible with the current workflow envelope; do not change the blueprint or SKILL.md. {runtime_rule}"
         if is_script
         else "最终只返回 SKILL.md 文件正文；不要在文件外层套 Markdown 代码块，不要输出 Creator 创建流程、确认清单或 `点击开始创建` 文案。"
     )
@@ -4579,7 +4771,7 @@ async def _repair_generated_file_with_feedback(
             include_snippets=True,
         ) if plan_entry is not None else ""
         extra_rules = (
-            "Python / Node / Bash 必须按 SkillPlan.runtime 读取单个 JSON argv，并且 JSON argv keys 匹配现有 SKILL.md 命令占位符；"
+            "Python / Node / Bash 必须按 SkillPlan.runtime 读取单个 JSON argv；输入解析应宽松兼容 payload / fields / options / input_files / 上游 stdout 字段；"
             "修复只能基于当前确定性验证错误、当前脚本合同与必要 Tool Snippet；"
             "不要根据错误文本、业务词、文件名或输出类型重新判断 role/capabilities；"
             "不要修改 SkillPlan、SKILL.md capability、workflow 或上下游脚本；"
@@ -4649,7 +4841,7 @@ async def _repair_generated_file_with_feedback(
             + (f"\n\n未通过检查（本轮只修这些项）：\n{failed_checks_text}" if failed_checks_text else "")
             + (f"\n\n本轮修复模式：{repair_mode}" if repair_mode else "")
             + ("\n- minimal_edit：只做最小编辑；strict_contract_rewrite：上一轮仍未通过同一 contract，必须重写目标小节但保留已通过项。")
-            + ("\n- scripts/ 修复示例：Rewrite as raw <language> source, remove any fenced code blocks or file labels, align JSON argv keys with SkillPlan inputs." if is_script else "")
+            + ("\n- scripts/ 修复示例：Rewrite as raw <language> source, remove any fenced code blocks or file labels, keep JSON argv parsing broad and preserve required stdout outputs." if is_script else "")
             + ("\n- 如果这是 scripts/ 文件且进入 strict_contract_rewrite：不要继续修补 Markdown 包裹草稿；必须重新输出会被直接保存的单文件源码，第一行必须是当前 runtime 的源码字符，全文不得出现 ``` 或 ~~~。" if is_script and repair_mode == "strict_contract_rewrite" else "")
             + (f"\n\n后端根据确定性错误生成的必做修复步骤：\n{targeted_repair}" if targeted_repair else "")
         ),
@@ -4735,6 +4927,13 @@ _MISSING_SKILL_REFERENCE_RE = re.compile(
 def _targeted_generated_file_repair_instructions(*, file_path: str, deterministic_error: str) -> str:
     """Return deterministic, actionable instructions for recurring validation failures."""
     error_text = deterministic_error or ""
+
+    if "stdout_required_outputs_missing" in error_text:
+        return (
+            "当前脚本 stdout 缺少 required_outputs。不要改 SKILL.md；不要为了适配所有输入参数重写逻辑。"
+            "只修改当前脚本 run()/main() 的输出组织。必须返回 deterministic error 中 missing 列出的字段，且值非空；"
+            "保留已有核心业务逻辑和宽松 JSON argv 读取，不要把修复方向转向输入参数重命名。"
+        )
 
     if file_path == "SKILL.md":
         if (
@@ -5963,6 +6162,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             if _normalize_skill_path(f.path).startswith("assets") and re.search(r"上传|user[_ -]?upload|素材|图片|image|asset", local_context, re.IGNORECASE) and not re.search(r"无需|不需要|不用|无需创建|不生成", local_context):
                 directory_asset_requirements.append(AssetRequirementOut(
                     path="assets/",
+                    generation_order=_generation_order_for_file("assets/", "user_upload"),
                     source="user_upload",
                     required=getattr(f, "required", True),
                     description=f.purpose or "需要用户上传素材",
@@ -5977,6 +6177,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         files_out.append(
             FileSpecOut(
                 path=f.path,
+                generation_order=_generation_order_for_file(f.path, f.asset_source if f.path.startswith("assets/") else ""),
                 purpose=f.purpose,
                 required=f.required,
                 can_skip=f.can_skip,
@@ -6025,6 +6226,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         files_out.append(
             FileSpecOut(
                 path=path,
+                generation_order=_generation_order_for_file(path, ""),
                 purpose=(
                     f"用户上传的静态素材：{path}"
                     if is_asset
@@ -6070,6 +6272,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     asset_requirements = [
         AssetRequirementOut(
             path=file_spec.path,
+            generation_order=file_spec.generation_order,
             source=file_spec.asset_source,
             required=file_spec.required,
             description=file_spec.purpose,
@@ -6139,6 +6342,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         files=files_out,
         warnings=warnings,
         asset_requirements=asset_requirements,
+        final_outputs=_final_outputs_from_plan_entries(list(entries_by_path.values())),
         available_tools=available_tools,
         missing_tool_configs=missing_tool_configs,
     )
@@ -6295,11 +6499,124 @@ async def _complete_creator_file_generation(
     return content
 
 
+
+
+def _runtime_spec_bash_block_references(script_runtime_specs: list[Any] | None) -> str:
+    blocks: list[str] = []
+    for spec in script_runtime_specs or []:
+        getter = (lambda key, default="": getattr(spec, key, default) if not isinstance(spec, dict) else spec.get(key, default))
+        script_path = str(getter("script_path", "")).strip()
+        if not script_path:
+            continue
+        command = str(getter("command_template", "")).strip()
+        if not command:
+            runtime = str(getter("runtime", "python"))
+            argv = getter("accepted_sample_argv", {}) or {"payload": "{{user_request}}", "fields": {}, "options": {}, "input_files": []}
+            runner = "python" if runtime == "python" else "node" if runtime == "node" else "bash" if runtime in {"bash", "shell"} else ""
+            payload = json.dumps(argv, ensure_ascii=False, separators=(",", ":"))
+            command = f"{runner + ' ' if runner else ''}{script_path} '{payload}'"
+        blocks.append(f"脚本：{script_path}\n```bash\n{command}\n```")
+    return "\n\n".join(blocks)
+
+
+def _build_skill_md_model_finalizer_prompt(
+    *,
+    skill_name: str,
+    description: str,
+    blueprint_text: str,
+    references: list[str] | None,
+    assets: list[str] | None,
+    script_runtime_specs: list[dict[str, Any]] | None,
+    final_outputs: list[str] | None,
+) -> list[dict[str, str]]:
+    runtime_reference = _runtime_spec_bash_block_references(script_runtime_specs)
+    resource_reference = {"references": references or [], "assets": assets or [], "final_outputs": final_outputs or []}
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是 Skill.md 最终说明文档编辑器。请基于蓝图创作完整、自然、用户可读的 SKILL.md。"
+                "runtime spec 只能作为脚本 bash block 的参考，不得泄露 runtime_contract、artifact_contract、ToolSlot、implementation_strategy 等内部字段。"
+                "不要把本文档退化成合同字段清单；保留说明文档的表达能力。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Skill 名称：{skill_name}\n"
+                f"描述：{description}\n\n"
+                "蓝图：\n"
+                f"{clean_blueprint_body_text(blueprint_text or '')}\n\n"
+                "已验证脚本命令参考（必须用作 bash fenced block 的依据，但不要公开内部 runtime spec 字段）：\n"
+                f"{runtime_reference or '无脚本命令参考。'}\n\n"
+                "资源和最终输出参考：\n"
+                f"{json.dumps(resource_reference, ensure_ascii=False, indent=2)}\n\n"
+                "请输出完整 SKILL.md 文件正文：包含 YAML frontmatter、适用场景、用户需提供内容、自动执行流程、每个真实脚本的 bash fenced block、references/assets 使用说明、最终产物和注意事项。"
+                "第一轮只需满足格式和蓝图对齐；接口闭环由第二轮 E2E 校验。"
+            ),
+        },
+    ]
+
+
 def _strict_contract_rewrite_allowed(source: str) -> bool:
     # Strict rewrites are allowed only when the backend has produced a
     # deterministic first-round result. The decision is source-based rather
     # than inferred from error-message text.
     return source in {"content_review", "script_smoke"}
+
+
+
+
+@router.post("/finalize-skill-md")
+async def finalize_skill_md(request: FinalizeSkillMdRequest):
+    """Finalize SKILL.md with a model, using runtime specs only as bash-block references."""
+    skill_name = _validate_skill_name(request.skill_name)
+    route = route_creator_file_model(
+        file_path="SKILL.md",
+        purpose=request.description or "final SKILL.md",
+        requested_model=request.model,
+    )
+    prompt_messages = _build_skill_md_model_finalizer_prompt(
+        skill_name=skill_name,
+        description=request.description or "",
+        blueprint_text=request.blueprint_text or "",
+        references=request.references,
+        assets=request.assets,
+        script_runtime_specs=request.script_runtime_specs,
+        final_outputs=request.final_outputs,
+    )
+    try:
+        candidate = await _complete_creator_file_generation(
+            messages=prompt_messages,
+            model=route.model,
+            skill_name=skill_name,
+            file_path="SKILL.md",
+            prompt_variant="model_finalizer",
+            retry_index=0,
+        )
+        content = _sanitize_generated_file_content("SKILL.md", candidate)
+        _raise_file_contract_failures(validate_file_contract(
+            file_path="SKILL.md",
+            content=content,
+            blueprint_text=request.blueprint_text or "",
+            skill_plan_entry=None,
+        ))
+        _validate_skill_md_against_existing_files(
+            skill_name,
+            content,
+            blueprint_text=request.blueprint_text or "",
+            require_existing=False,
+        )
+        await _validate_skill_md_blueprint_alignment(
+            skill_name=skill_name,
+            content=content,
+            blueprint_text=request.blueprint_text or "",
+            skill_plan_entry=None,
+            model=request.model or route.model,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"SKILL.md model finalize 校验失败：{exc}") from exc
+    return {"success": True, "content": content}
 
 
 @router.post("/generate-file")
@@ -6470,9 +6787,10 @@ async def generate_file(request: GenerateFileRequest):
                 except Exception as exc:
                     raise _stage_error_from_exception("content_review", exc, default_layer="content_review") from exc
 
+                runtime_spec: ScriptRuntimeSpec | None = None
                 if request.file_path.startswith("scripts/"):
                     try:
-                        _trial_run_generated_script_with_plan(
+                        runtime_spec = _trial_run_generated_script_with_plan(
                             skill_name,
                             request.file_path,
                             content,
@@ -6496,6 +6814,7 @@ async def generate_file(request: GenerateFileRequest):
                     "file_path": request.file_path,
                     "role": request.role,
                     "content": content,
+                    "runtime_spec": _script_runtime_spec_to_dict(runtime_spec),
                 })
 
                 yield _sse({
@@ -6747,6 +7066,8 @@ async def write_file(request: WriteFileRequest):
     if not skill_dir.exists():
         raise HTTPException(status_code=404, detail=f"Skill 不存在：{skill_name}")
 
+    runtime_spec: ScriptRuntimeSpec | None = None
+
     try:
         content = _sanitize_generated_file_content(
             request.file_path,
@@ -6811,7 +7132,7 @@ async def write_file(request: WriteFileRequest):
                 request.file_path,
                 content,
             )
-            _trial_run_generated_script_with_plan(
+            runtime_spec = _trial_run_generated_script_with_plan(
                 skill_name,
                 request.file_path,
                 content,
@@ -6834,6 +7155,7 @@ async def write_file(request: WriteFileRequest):
         path=str(target_path),
         bytes=len(content.encode("utf-8")),
         message=f"已写入：{request.file_path}",
+        runtime_spec=_script_runtime_spec_to_dict(runtime_spec) if request.file_path.startswith("scripts/") else None,
     )
 
 @dataclass(frozen=True)

@@ -701,6 +701,25 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
         for m_bare in re.finditer(r"assets/(\S+\.\w+)", assets_desc):
             _add("assets/" + m_bare.group(1), assets_desc, required=False, can_skip=True, asset_source="bundled")
 
+    generation_order = {"references": 0, "scripts": 1, "bundled_assets": 2, "user_upload_assets": 3, "skill_md": 4}
+
+    def _generation_sort_key(file: FileSpec) -> tuple[int, str]:
+        path = file.path.replace("\\", "/")
+        if path.startswith("references/"):
+            bucket = "references"
+        elif path.startswith("scripts/"):
+            bucket = "scripts"
+        elif path.startswith("assets/") and file.asset_source == "user_upload":
+            bucket = "user_upload_assets"
+        elif path.startswith("assets/"):
+            bucket = "bundled_assets"
+        elif path == "SKILL.md":
+            bucket = "skill_md"
+        else:
+            bucket = "bundled_assets"
+        return (generation_order[bucket], path)
+
+    files.sort(key=_generation_sort_key)
     return files, warnings
 
 

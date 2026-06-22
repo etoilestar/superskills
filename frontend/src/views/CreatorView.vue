@@ -66,6 +66,7 @@
             :model="null"
             :warnings="creationPlan.warnings"
             :asset-requirements="creationPlan.asset_requirements || []"
+            :final-outputs="creationPlan.final_outputs || []"
             @creation-complete="onCreationComplete"
             @creation-error="onCreationError"
           />

@@ -1393,7 +1393,7 @@ python scripts/second.py '{"missing_value":"{{missing_value}}"}'
     assert "command_block.skillplan_inputs.exact" not in failed
 
 
-def test_render_script_command_from_skill_plan_uses_only_entry_inputs():
+def test_render_script_command_from_skill_plan_uses_runtime_contract_before_inputs():
     from backend.services.skill_plan import SkillPlanEntry, render_script_command_from_skill_plan, command_payload_placeholders
 
     entry = SkillPlanEntry(
@@ -1410,9 +1410,24 @@ def test_render_script_command_from_skill_plan_uses_only_entry_inputs():
 
     assert command.startswith("python scripts/run.py")
     assert command_payload_placeholders(command, "scripts/run.py") == {
-        "free_name": "free_name",
-        "another_name": "another_name",
+        "payload": "user_request",
+        "fields": "",
+        "options": "",
+        "input_files": "",
     }
+
+    entry_with_args = SkillPlanEntry(
+        path="scripts/run.py",
+        file_type="script",
+        role="generic_script",
+        purpose="generic",
+        runtime="python",
+        inputs=["free_name"],
+        outputs=["result_name"],
+        runtime_contract={"command_args": {"accepted": "{{accepted}}"}},
+    )
+    command = render_script_command_from_skill_plan(entry_with_args)
+    assert command_payload_placeholders(command, "scripts/run.py") == {"accepted": "accepted"}
 
 
 def test_skill_md_markdown_execution_guide_uses_external_envelope_example():
@@ -1760,3 +1775,234 @@ python scripts/build_pdf.py '{"text":"{{text}}"}'
     assert entry.required_capabilities == []
     assert entry.raw_capability_hints == ["pdf_generation", "image_generation"]
     assert not any("不允许 capability" in warning for warning in plan.warnings)
+
+
+def test_runtime_spec_command_prefers_accepted_argv_over_old_template():
+    from backend.services.skill_plan import SkillPlanEntry, ScriptRuntimeSpec, command_payload_placeholders, render_script_command_from_skill_plan
+
+    entry = SkillPlanEntry(
+        path="scripts/run.py",
+        file_type="script",
+        role="generic_script",
+        purpose="generic",
+        runtime="python",
+        inputs=["legacy"],
+        outputs=["text"],
+        command_template="python scripts/run.py '{\"legacy\":\"{{legacy}}\"}'",
+    )
+    spec = ScriptRuntimeSpec(
+        script_path="scripts/run.py",
+        runtime="python",
+        role="generic_script",
+        responsibility="generic",
+        input_policy="json",
+        accepted_sample_argv={"verified": "{{verified}}"},
+        command_template="python scripts/run.py '{\"legacy\":\"{{legacy}}\"}'",
+    )
+
+    command = render_script_command_from_skill_plan(entry, runtime_spec=spec)
+
+    assert command_payload_placeholders(command, "scripts/run.py") == {"verified": "verified"}
+
+
+def test_trial_run_generated_script_returns_runtime_spec(tmp_path, monkeypatch):
+    from backend.config import settings
+    from backend.routers import creator
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("---\nname: demo-skill\ndescription: demo\n---\n", encoding="utf-8")
+    content = """
+import json, sys
+
+def main():
+    argv = json.loads(sys.argv[1])
+    print(json.dumps({"text": argv.get("payload", "ok")}, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
+"""
+    entry = {
+        "path": "scripts/main.py",
+        "file_type": "script",
+        "file_kind": "script",
+        "role": "generic_script",
+        "purpose": "echo payload",
+        "runtime": "python",
+        "inputs": ["payload"],
+        "outputs": ["text"],
+    }
+
+    spec = creator._trial_run_generated_script("demo-skill", "scripts/main.py", content, skill_plan_entry=entry)
+
+    assert spec is not None
+    assert spec.script_path == "scripts/main.py"
+    assert spec.accepted_sample_argv["payload"]
+    assert spec.actual_stdout_fields == ["text"]
+    assert spec.command_template.startswith("python scripts/main.py")
+
+
+def test_skill_md_model_finalizer_prompt_uses_runtime_specs_as_bash_reference_only():
+    from backend.routers.creator import _build_skill_md_model_finalizer_prompt
+
+    messages = _build_skill_md_model_finalizer_prompt(
+        skill_name="demo-skill",
+        description="Demo skill",
+        blueprint_text="Summarize data.",
+        references=["references/guide.md"],
+        assets=["assets/logo.png"],
+        script_runtime_specs=[{
+            "script_path": "scripts/main.py",
+            "runtime": "python",
+            "responsibility": "Summarize the input.",
+            "accepted_sample_argv": {"payload": "{{user_request}}"},
+            "required_outputs": ["text"],
+        }],
+        final_outputs=["text"],
+    )
+    prompt = "\n".join(message["content"] for message in messages)
+
+    assert "```bash\npython scripts/main.py" in prompt
+    assert "runtime spec 只能作为脚本 bash block 的参考" in prompt
+    assert "references/guide.md" in prompt
+    assert "assets/logo.png" in prompt
+    assert "required_outputs" not in prompt
+    assert "不要把本文档退化成合同字段清单" in prompt
+
+
+def test_required_output_missing_error_and_repair_hint_are_output_focused():
+    import json
+    import pytest
+    from backend.routers.creator import _targeted_generated_file_repair_instructions, _validate_trial_stdout_json
+
+    entry = {"path": "scripts/main.py", "outputs": ["text"], "runtime": "python", "role": "generic_script"}
+    with pytest.raises(ValueError) as excinfo:
+        _validate_trial_stdout_json(stdout=json.dumps({"other": "value"}), content="", args=["{}"], skill_plan_entry=entry)
+
+    error = str(excinfo.value)
+    assert "stdout_required_outputs_missing" in error
+    assert "missing=['text']" in error
+    hint = _targeted_generated_file_repair_instructions(file_path="scripts/main.py", deterministic_error=error)
+    assert "不要改 SKILL.md" in hint
+    assert "对齐 SKILL.md argv keys" not in hint
+
+
+@pytest.mark.asyncio
+async def test_generate_file_rejects_user_upload_assets_before_model_call():
+    import pytest
+    from fastapi import HTTPException
+    from backend.routers.creator import GenerateFileRequest, generate_file
+
+    request = GenerateFileRequest(
+        skill_name="demo-skill",
+        file_path="assets/photo.png",
+        purpose="user supplied photo",
+        blueprint_text="",
+        conversation_history=[],
+        skill_plan_entry={"asset_source": "user_upload"},
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        await generate_file(request)
+
+    assert excinfo.value.status_code == 400
+    assert "必须上传" in str(excinfo.value.detail)
+
+
+def test_runtime_spec_artifact_fields_come_from_contract_not_field_name(tmp_path):
+    import json
+    from backend.routers.creator import _build_script_runtime_spec_from_trial
+    from backend.services.skill_plan import SkillPlanEntry
+
+    entry = SkillPlanEntry(
+        path="scripts/main.py",
+        file_type="script",
+        role="generic_script",
+        purpose="build artifact",
+        runtime="python",
+        outputs=["download"],
+        artifact_contract={"artifact_fields": ["download"]},
+    )
+
+    spec = _build_script_runtime_spec_from_trial(
+        file_path="scripts/main.py",
+        entry=entry,
+        args=[json.dumps({"payload": "x"})],
+        stdout=json.dumps({"download": "outputs/report.custom"}),
+        skill_dir=tmp_path,
+    )
+
+    assert spec.artifact_fields == ["download"]
+    assert spec.file_outputs == ["outputs/report.custom"]
+
+
+def test_analyze_blueprint_returns_generation_order_and_final_outputs():
+    from backend.routers.creator import FileSpecOut, _final_outputs_from_plan_entries
+    from backend.services.skill_plan import SkillPlanEntry
+
+    file_out = FileSpecOut(path="SKILL.md", generation_order=4, purpose="doc", required=True, can_skip=False)
+    assert file_out.generation_order == 4
+
+    entry = SkillPlanEntry(
+        path="scripts/final.py",
+        file_type="script",
+        role="generic_script",
+        purpose="final",
+        runtime="python",
+        outputs=["legacy_guess"],
+        artifact_contract={"final_output": ["pdf_path"]},
+    )
+    assert _final_outputs_from_plan_entries([entry]) == ["pdf_path"]
+
+
+def test_repair_prompt_does_not_request_argv_key_alignment():
+    import inspect
+    from backend.routers.creator import _repair_generated_file_with_feedback
+
+    source = inspect.getsource(_repair_generated_file_with_feedback)
+
+    assert "Align JSON argv keys with the existing SKILL.md command placeholders" not in source
+    assert "JSON argv keys 匹配现有 SKILL.md 命令占位符" not in source
+    assert "align JSON argv keys with SkillPlan inputs" not in source
+    assert "keep JSON argv parsing broad" in source
+
+
+@pytest.mark.asyncio
+async def test_finalize_skill_md_endpoint_uses_model_finalizer(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.routers import creator
+    from backend.routers.creator import FinalizeSkillMdRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    (tmp_path / "demo-skill").mkdir()
+    calls = []
+
+    async def fake_complete_creator_file_generation(**kwargs):
+        calls.append(kwargs)
+        return """---
+name: demo-skill
+description: Demo
+---
+# 适用场景
+Demo.
+```bash
+python scripts/main.py '{"payload":"{{user_request}}"}'
+```
+"""
+
+    async def fake_alignment(**_kwargs):
+        return None
+
+    monkeypatch.setattr(creator, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(creator, "_validate_skill_md_blueprint_alignment", fake_alignment)
+
+    result = await creator.finalize_skill_md(FinalizeSkillMdRequest(
+        skill_name="demo-skill",
+        description="Demo",
+        blueprint_text="scripts/main.py",
+        script_runtime_specs=[{"script_path": "scripts/main.py", "accepted_sample_argv": {"payload": "{{user_request}}"}}],
+    ))
+
+    assert result["success"] is True
+    assert calls and calls[0]["prompt_variant"] == "model_finalizer"
