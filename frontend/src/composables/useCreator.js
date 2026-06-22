@@ -159,12 +159,13 @@ export async function* generateFileStream({
 
 
 /**
- * Finalize SKILL.md from verified script runtime specs; this does not call the LLM.
+ * Finalize SKILL.md with the model using verified script runtime specs as bash-block references.
  */
 export async function finalizeSkillMd({
   skillName,
   description = '',
   blueprintText = '',
+  model = null,
   references = [],
   assets = [],
   scriptRuntimeSpecs = [],
@@ -177,6 +178,7 @@ export async function finalizeSkillMd({
       skill_name: skillName,
       description,
       blueprint_text: blueprintBodyOnly(blueprintText),
+      model,
       references,
       assets,
       script_runtime_specs: scriptRuntimeSpecs,

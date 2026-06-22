@@ -1843,13 +1843,13 @@ if __name__ == "__main__":
     assert spec.command_template.startswith("python scripts/main.py")
 
 
-def test_finalize_skill_md_uses_runtime_specs_without_internal_contracts():
-    from backend.routers.creator import finalize_skill_md_from_runtime_specs
+def test_skill_md_model_finalizer_prompt_uses_runtime_specs_as_bash_reference_only():
+    from backend.routers.creator import _build_skill_md_model_finalizer_prompt
 
-    content = finalize_skill_md_from_runtime_specs(
+    messages = _build_skill_md_model_finalizer_prompt(
         skill_name="demo-skill",
         description="Demo skill",
-        blueprint_summary="Summarize data.",
+        blueprint_text="Summarize data.",
         references=["references/guide.md"],
         assets=["assets/logo.png"],
         script_runtime_specs=[{
@@ -1857,15 +1857,18 @@ def test_finalize_skill_md_uses_runtime_specs_without_internal_contracts():
             "runtime": "python",
             "responsibility": "Summarize the input.",
             "accepted_sample_argv": {"payload": "{{user_request}}"},
+            "required_outputs": ["text"],
         }],
         final_outputs=["text"],
     )
+    prompt = "\n".join(message["content"] for message in messages)
 
-    assert "```bash\npython scripts/main.py" in content
-    assert "references/guide.md" in content
-    assert "assets/logo.png" in content
-    assert "runtime_contract" not in content
-    assert "required_outputs" not in content
+    assert "```bash\npython scripts/main.py" in prompt
+    assert "runtime spec 只能作为脚本 bash block 的参考" in prompt
+    assert "references/guide.md" in prompt
+    assert "assets/logo.png" in prompt
+    assert "required_outputs" not in prompt
+    assert "不要把本文档退化成合同字段清单" in prompt
 
 
 def test_required_output_missing_error_and_repair_hint_are_output_focused():
@@ -1963,3 +1966,43 @@ def test_repair_prompt_does_not_request_argv_key_alignment():
     assert "JSON argv keys 匹配现有 SKILL.md 命令占位符" not in source
     assert "align JSON argv keys with SkillPlan inputs" not in source
     assert "keep JSON argv parsing broad" in source
+
+
+@pytest.mark.asyncio
+async def test_finalize_skill_md_endpoint_uses_model_finalizer(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.routers import creator
+    from backend.routers.creator import FinalizeSkillMdRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    (tmp_path / "demo-skill").mkdir()
+    calls = []
+
+    async def fake_complete_creator_file_generation(**kwargs):
+        calls.append(kwargs)
+        return """---
+name: demo-skill
+description: Demo
+---
+# 适用场景
+Demo.
+```bash
+python scripts/main.py '{"payload":"{{user_request}}"}'
+```
+"""
+
+    async def fake_alignment(**_kwargs):
+        return None
+
+    monkeypatch.setattr(creator, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(creator, "_validate_skill_md_blueprint_alignment", fake_alignment)
+
+    result = await creator.finalize_skill_md(FinalizeSkillMdRequest(
+        skill_name="demo-skill",
+        description="Demo",
+        blueprint_text="scripts/main.py",
+        script_runtime_specs=[{"script_path": "scripts/main.py", "accepted_sample_argv": {"payload": "{{user_request}}"}}],
+    ))
+
+    assert result["success"] is True
+    assert calls and calls[0]["prompt_variant"] == "model_finalizer"

@@ -314,6 +314,7 @@ class FinalizeSkillMdRequest(BaseModel):
     skill_name: str
     description: str = ""
     blueprint_text: str = ""
+    model: Optional[str] = None
     references: list[str] = Field(default_factory=list)
     assets: list[str] = Field(default_factory=list)
     script_runtime_specs: list[dict[str, Any]] = Field(default_factory=list)
@@ -1434,97 +1435,6 @@ def _check_skill_md_command_dataflow(content: str, blueprint_text: str) -> list[
 
 
 
-
-
-SKILL_MD_FINALIZER_TEMPLATE = {
-    "sections": {
-        "scenario": "# 适用场景",
-        "inputs": "# 用户需要提供什么",
-        "workflow": "# 自动执行流程",
-        "resources": "# references/assets 使用说明",
-        "outputs": "# 最终产物",
-        "notes": "# 注意事项",
-    },
-    "default_input_bullets": [
-        "按命令块中的 JSON argv 提供请求内容、选项和必要输入文件。",
-    ],
-    "asset_input_bullet": "按资源说明准备或上传 assets/ 下的静态素材。",
-    "default_note_bullets": [
-        "不要修改 scripts/ 路径结构；如更换素材，请保持 assets/ 路径与命令参数一致。",
-    ],
-}
-
-def finalize_skill_md_from_runtime_specs(
-    *,
-    skill_name: str,
-    description: str,
-    blueprint_summary: str = "",
-    references: list[str] | None = None,
-    assets: list[str] | None = None,
-    script_runtime_specs: list[Any] | None = None,
-    final_outputs: list[str] | None = None,
-) -> str:
-    """Build final SKILL.md usage docs from already-validated script specs.
-
-    The generated Markdown intentionally describes how to use the Skill and its
-    scripts. It does not expose runtime_contract, required_outputs, ToolSlot,
-    or implementation_strategy internals.
-    """
-    safe_name = re.sub(r"[^a-z0-9-]", "-", (skill_name or "skill").lower()).strip("-") or "skill"
-    lines = [
-        "---",
-        f"name: {safe_name}",
-        f"description: {description or blueprint_summary or safe_name}",
-        "---",
-        "",
-        SKILL_MD_FINALIZER_TEMPLATE["sections"]["scenario"],
-        blueprint_summary or description or "用于完成本 Skill 规划的自动化任务。",
-        "",
-        SKILL_MD_FINALIZER_TEMPLATE["sections"]["inputs"],
-        *[f"- {bullet}" for bullet in SKILL_MD_FINALIZER_TEMPLATE["default_input_bullets"]],
-    ]
-    if assets:
-        lines.append(f"- {SKILL_MD_FINALIZER_TEMPLATE['asset_input_bullet']}")
-    lines.extend(["", SKILL_MD_FINALIZER_TEMPLATE["sections"]["workflow"]])
-    specs = script_runtime_specs or []
-    if not specs:
-        lines.append("- 按下方说明运行 Skill。")
-    for idx, spec in enumerate(specs, start=1):
-        getter = (lambda key, default="": getattr(spec, key, default) if not isinstance(spec, dict) else spec.get(key, default))
-        script_path = str(getter("script_path", "")).strip()
-        responsibility = str(getter("responsibility", "处理本步骤任务")).strip() or "处理本步骤任务"
-        command = str(getter("command_template", "")).strip()
-        if not command:
-            runtime = str(getter("runtime", "python"))
-            argv = getter("accepted_sample_argv", {}) or {"payload": "{{user_request}}", "fields": {}, "options": {}, "input_files": []}
-            runner = "python" if runtime == "python" else "node" if runtime == "node" else "bash" if runtime in {"bash", "shell"} else ""
-            payload = json.dumps(argv, ensure_ascii=False, separators=(",", ":"))
-            command = f"{runner + ' ' if runner else ''}{script_path} '{payload}'"
-        lines.extend([
-            f"## 步骤 {idx}: `{script_path}`",
-            responsibility,
-            "",
-            "```bash",
-            command,
-            "```",
-            "",
-        ])
-    lines.extend([SKILL_MD_FINALIZER_TEMPLATE["sections"]["resources"]])
-    for ref in references or []:
-        lines.append(f"- 参考资料：`{ref}`。")
-    for asset in assets or []:
-        lines.append(f"- 静态/上传素材：`{asset}`。")
-    if not (references or assets):
-        lines.append("- 本 Skill 不需要额外静态资源。")
-    lines.extend(["", SKILL_MD_FINALIZER_TEMPLATE["sections"]["outputs"]])
-    if final_outputs:
-        lines.extend([f"- {item}" for item in final_outputs])
-    else:
-        lines.append("- 脚本 stdout JSON 会返回可供平台识别的最终结果或文件路径。")
-    lines.extend(["", SKILL_MD_FINALIZER_TEMPLATE["sections"]["notes"]])
-    lines.extend([f"- {bullet}" for bullet in SKILL_MD_FINALIZER_TEMPLATE["default_note_bullets"]])
-    lines.append("")
-    return "\n".join(lines)
 
 
 def _check_skill_md_contract(content: str, blueprint_text: str) -> list[ContractCheckResult]:
@@ -6589,6 +6499,65 @@ async def _complete_creator_file_generation(
     return content
 
 
+
+
+def _runtime_spec_bash_block_references(script_runtime_specs: list[Any] | None) -> str:
+    blocks: list[str] = []
+    for spec in script_runtime_specs or []:
+        getter = (lambda key, default="": getattr(spec, key, default) if not isinstance(spec, dict) else spec.get(key, default))
+        script_path = str(getter("script_path", "")).strip()
+        if not script_path:
+            continue
+        command = str(getter("command_template", "")).strip()
+        if not command:
+            runtime = str(getter("runtime", "python"))
+            argv = getter("accepted_sample_argv", {}) or {"payload": "{{user_request}}", "fields": {}, "options": {}, "input_files": []}
+            runner = "python" if runtime == "python" else "node" if runtime == "node" else "bash" if runtime in {"bash", "shell"} else ""
+            payload = json.dumps(argv, ensure_ascii=False, separators=(",", ":"))
+            command = f"{runner + ' ' if runner else ''}{script_path} '{payload}'"
+        blocks.append(f"脚本：{script_path}\n```bash\n{command}\n```")
+    return "\n\n".join(blocks)
+
+
+def _build_skill_md_model_finalizer_prompt(
+    *,
+    skill_name: str,
+    description: str,
+    blueprint_text: str,
+    references: list[str] | None,
+    assets: list[str] | None,
+    script_runtime_specs: list[dict[str, Any]] | None,
+    final_outputs: list[str] | None,
+) -> list[dict[str, str]]:
+    runtime_reference = _runtime_spec_bash_block_references(script_runtime_specs)
+    resource_reference = {"references": references or [], "assets": assets or [], "final_outputs": final_outputs or []}
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是 Skill.md 最终说明文档编辑器。请基于蓝图创作完整、自然、用户可读的 SKILL.md。"
+                "runtime spec 只能作为脚本 bash block 的参考，不得泄露 runtime_contract、artifact_contract、ToolSlot、implementation_strategy 等内部字段。"
+                "不要把本文档退化成合同字段清单；保留说明文档的表达能力。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Skill 名称：{skill_name}\n"
+                f"描述：{description}\n\n"
+                "蓝图：\n"
+                f"{clean_blueprint_body_text(blueprint_text or '')}\n\n"
+                "已验证脚本命令参考（必须用作 bash fenced block 的依据，但不要公开内部 runtime spec 字段）：\n"
+                f"{runtime_reference or '无脚本命令参考。'}\n\n"
+                "资源和最终输出参考：\n"
+                f"{json.dumps(resource_reference, ensure_ascii=False, indent=2)}\n\n"
+                "请输出完整 SKILL.md 文件正文：包含 YAML frontmatter、适用场景、用户需提供内容、自动执行流程、每个真实脚本的 bash fenced block、references/assets 使用说明、最终产物和注意事项。"
+                "第一轮只需满足格式和蓝图对齐；接口闭环由第二轮 E2E 校验。"
+            ),
+        },
+    ]
+
+
 def _strict_contract_rewrite_allowed(source: str) -> bool:
     # Strict rewrites are allowed only when the backend has produced a
     # deterministic first-round result. The decision is source-based rather
@@ -6600,18 +6569,32 @@ def _strict_contract_rewrite_allowed(source: str) -> bool:
 
 @router.post("/finalize-skill-md")
 async def finalize_skill_md(request: FinalizeSkillMdRequest):
-    """Finalize SKILL.md from verified script runtime specs, without LLM generation."""
+    """Finalize SKILL.md with a model, using runtime specs only as bash-block references."""
     skill_name = _validate_skill_name(request.skill_name)
-    content = finalize_skill_md_from_runtime_specs(
+    route = route_creator_file_model(
+        file_path="SKILL.md",
+        purpose=request.description or "final SKILL.md",
+        requested_model=request.model,
+    )
+    prompt_messages = _build_skill_md_model_finalizer_prompt(
         skill_name=skill_name,
         description=request.description or "",
-        blueprint_summary=clean_blueprint_body_text(request.blueprint_text or ""),
+        blueprint_text=request.blueprint_text or "",
         references=request.references,
         assets=request.assets,
         script_runtime_specs=request.script_runtime_specs,
         final_outputs=request.final_outputs,
     )
     try:
+        candidate = await _complete_creator_file_generation(
+            messages=prompt_messages,
+            model=route.model,
+            skill_name=skill_name,
+            file_path="SKILL.md",
+            prompt_variant="model_finalizer",
+            retry_index=0,
+        )
+        content = _sanitize_generated_file_content("SKILL.md", candidate)
         _raise_file_contract_failures(validate_file_contract(
             file_path="SKILL.md",
             content=content,
@@ -6624,8 +6607,15 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
             blueprint_text=request.blueprint_text or "",
             require_existing=False,
         )
+        await _validate_skill_md_blueprint_alignment(
+            skill_name=skill_name,
+            content=content,
+            blueprint_text=request.blueprint_text or "",
+            skill_plan_entry=None,
+            model=request.model or route.model,
+        )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"SKILL.md finalize 校验失败：{exc}") from exc
+        raise HTTPException(status_code=400, detail=f"SKILL.md model finalize 校验失败：{exc}") from exc
     return {"success": True, "content": content}
 
 

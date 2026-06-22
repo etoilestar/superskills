@@ -683,6 +683,7 @@ async function generateOneFile(idx) {
         skillName: localSkillName.value,
         description: file.purpose || props.skillName,
         blueprintText: props.blueprintText,
+        model: props.model,
         references: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('references/')),
         assets: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('assets/')),
         scriptRuntimeSpecs: scriptRuntimeSpecs.value,
