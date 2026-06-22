@@ -40,6 +40,11 @@ from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, ro
 from ..services.skill_executor import _build_script_runtime_env, run_action
 from ..services.skill_creator_dry_run import build_creator_external_input_context
 from ..services.artifact_validator import validate_stdout_file_outputs, FileOutputValidationError
+from ..services.markdown_metadata import (
+    parse_frontmatter,
+    validate_skill_frontmatter,
+    validate_reference_frontmatter,
+)
 from ..services.creator_contracts import (
     compile_canonical_file_contract,
     contract_payload,
@@ -1306,32 +1311,14 @@ def _existing_skill_local_paths_for_skill(skill_name: str) -> set[str]:
                 paths.add(child.relative_to(skill_dir).as_posix())
     return paths
 
+def _skill_md_frontmatter_errors(content: str) -> list[str]:
+    meta, _body, _had = parse_frontmatter(content)
+    return validate_skill_frontmatter(meta)
+
+
 def _has_valid_skill_md_frontmatter(content: str) -> bool:
-    """Validate SKILL.md YAML frontmatter.
-
-    Correct rule:
-    - SKILL.md starts with YAML frontmatter.
-    - frontmatter contains name and description.
-    - frontmatter is closed after metadata with ---.
-    - The whole file does NOT need to end with ---.
-    """
-    text = (content or "").lstrip("\ufeff").lstrip()
-    match = re.match(r"^---\s*\n([\s\S]*?)\n---\s*(?:\n|$)", text)
-    if not match:
-        return False
-
-    raw_meta = match.group(1)
-    try:
-        meta = yaml.safe_load(raw_meta) or {}
-    except Exception:
-        return False
-
-    if not isinstance(meta, dict):
-        return False
-
-    return bool(str(meta.get("name") or "").strip()) and bool(
-        str(meta.get("description") or "").strip()
-    )
+    """Validate SKILL.md frontmatter using the Creator top-level schema."""
+    return not _skill_md_frontmatter_errors(content)
 
 
 def _check_skill_md_command_dataflow(content: str, blueprint_text: str) -> list[ContractCheckResult]:
@@ -1456,7 +1443,8 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
     stripped = content.strip()
     results: list[ContractCheckResult] = []
 
-    has_frontmatter = _has_valid_skill_md_frontmatter(stripped)
+    frontmatter_errors = _skill_md_frontmatter_errors(stripped)
+    has_frontmatter = not frontmatter_errors
     results.append(ContractCheckResult(
         id="skill_md.frontmatter",
         passed=has_frontmatter,
@@ -1464,10 +1452,10 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
         message=(
             "SKILL.md frontmatter 合格。"
             if has_frontmatter
-            else "SKILL.md 必须以 YAML frontmatter 开始，并在 metadata 后用 --- 关闭，且包含 name 和 description。"
+            else "SKILL.md frontmatter 必须只包含允许的顶层 YAML 字段，并包含 name/description。错误：" + "; ".join(frontmatter_errors)
         ),
-        expected="文件开头格式：--- / name: ... / description: ... / ---；不要求文件末尾以 --- 结束。",
-        minimal_edit="只修正文件开头 YAML frontmatter；不要在文件末尾追加 ---。",
+        expected="顶层 YAML 只允许 name、description、license、allowed-tools、metadata；Creator 规划字段只能放正文或 metadata.creator。",
+        minimal_edit="只修正文件开头 YAML frontmatter；不改正文、workflow block、脚本路径或 scripts。",
     ))
 
     has_runtime_contract = bool(_SKILL_CUSTOM_RUNTIME_CONTRACT_RE.search(content))
@@ -2273,14 +2261,14 @@ def _reference_metadata_defaults(
     title = _slug_from_reference_path(file_path)
     description = (purpose or entry.get("purpose") or f"{file_path} reference").strip()
     return {
-        "name": title,
+        "title": title,
         "description": description,
-        "role": "reference",
-        "type": "reference",
-        "path": file_path,
-        "scope": "skill-local",
-        "loading": "metadata-first-body-on-demand",
-        "when_to_use": (purpose or entry.get("purpose") or "按 SKILL.md 工作流需要读取正文").strip(),
+        "metadata": {
+            "creator": {
+                "path": file_path,
+                "purpose": (purpose or entry.get("purpose") or "按 SKILL.md 工作流需要读取正文").strip(),
+            }
+        },
     }
 
 
@@ -2311,13 +2299,6 @@ def _ensure_reference_metadata_frontmatter(
         if value not in (None, "", [], {}):
             merged[key] = value
 
-    # Normalize required metadata fields. Do not allow wrong path/role/type.
-    merged["role"] = "reference"
-    merged["type"] = "reference"
-    merged["path"] = file_path
-    merged["scope"] = "skill-local"
-    merged["loading"] = "metadata-first-body-on-demand"
-
     body = body.strip()
 
     yaml_text = yaml.safe_dump(
@@ -2336,67 +2317,35 @@ def _reference_metadata_contract_checks(
     content: str,
     purpose: str = "",
 ) -> list[ContractCheckResult]:
-    """Validate required reference metadata while keeping body structure flexible."""
-    meta, body = _reference_frontmatter_metadata(content)
+    """Validate references/*.md frontmatter without requiring it.
+
+    references may omit frontmatter. If present, only ordinary document metadata
+    is allowed; Creator internal planning fields must not leak here. Body is not
+    rewritten by metadata repair.
+    """
+    meta, body, had_frontmatter = parse_frontmatter(content)
+    metadata_errors = validate_reference_frontmatter(meta)
     results: list[ContractCheckResult] = []
 
-    required_keys = ["name", "description", "role", "type", "path", "scope", "loading", "when_to_use"]
-    has_frontmatter = bool(re.match(r"\A---\s*\n", content or ""))
     results.append(ContractCheckResult(
-        id="reference.metadata.frontmatter_exists",
-        passed=has_frontmatter and bool(meta),
-        target=file_path,
-        message=("reference 包含 YAML frontmatter metadata。" if has_frontmatter and meta else "reference 缺少 YAML frontmatter metadata。"),
-        expected="reference 必须以 YAML frontmatter 开始，用于 metadata-first 按需加载。",
-        minimal_edit="在文件开头补充 --- 包裹的 YAML metadata。",
-    ))
-
-    missing = [key for key in required_keys if meta.get(key) in (None, "", [])]
-    results.append(ContractCheckResult(
-        id="reference.metadata.required_keys",
-        passed=not missing,
-        target=file_path,
-        message=("reference metadata 核心字段完整。" if not missing else "reference metadata 缺少核心字段：" + ", ".join(missing)),
-        expected="metadata 必须包含 name、description、role、type、path、scope、loading、when_to_use。",
-        minimal_edit="补齐缺失 metadata 字段，但不要把 reference 改成第二套 SkillPlan。",
-    ))
-
-    path_value = meta.get("path")
-    results.append(ContractCheckResult(
-        id="reference.metadata.path_matches",
-        passed=path_value == file_path,
+        id="reference.metadata.frontmatter_schema",
+        passed=not metadata_errors,
         target=file_path,
         message=(
-            "reference metadata.path 与文件路径一致。"
-            if path_value == file_path
-            else f"reference metadata.path={path_value!r} 与文件路径 {file_path!r} 冲突。"
+            "reference frontmatter schema 合格（或未提供 frontmatter）。"
+            if not metadata_errors
+            else "reference frontmatter 只能包含普通文档元数据。错误：" + "; ".join(metadata_errors)
         ),
-        expected=f"metadata.path 必须等于 {file_path}。",
-        minimal_edit=f"把 metadata.path 改为 {file_path}。",
-    ))
-
-    role_value = meta.get("role")
-    type_value = meta.get("type")
-    loading_value = meta.get("loading")
-    role_type_loading_ok = role_value == "reference" and type_value == "reference" and loading_value == "metadata-first-body-on-demand"
-    results.append(ContractCheckResult(
-        id="reference.metadata.role_type_loading",
-        passed=role_type_loading_ok,
-        target=file_path,
-        message=(
-            "reference metadata role/type/loading 符合平台协议。"
-            if role_type_loading_ok
-            else "reference metadata.role/type/loading 与平台协议冲突。"
-        ),
-        expected="metadata.role=reference、metadata.type=reference、metadata.loading=metadata-first-body-on-demand。",
-        minimal_edit="修正 role/type/loading 平台协议字段。",
+        expected="references/*.md 可无 frontmatter；如有，只允许 title、description、source、license、metadata。",
+        minimal_edit="只修当前 reference md 的 YAML frontmatter；不改正文内容，不改其它文件。",
+        details={"had_frontmatter": had_frontmatter},
     ))
 
     results.append(ContractCheckResult(
         id="reference.metadata.body_exists",
-        passed=bool(body.strip()),
+        passed=bool(body.strip() if had_frontmatter else (content or "").strip()),
         target=file_path,
-        message=("reference 存在 Markdown 正文。" if body.strip() else "reference 正文为空。"),
+        message=("reference 存在 Markdown 正文。" if (body.strip() if had_frontmatter else (content or "").strip()) else "reference 正文为空。"),
         expected="reference 作为辅助上下文必须有非空 Markdown 正文，但正文结构不强制固定章节。",
         minimal_edit="补充非空 reference 正文。",
     ))
@@ -7793,6 +7742,51 @@ class E2EStepTrace:
     stdout_shape: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class E2EFailure:
+    failed_step_index: int
+    target_file: str
+    target_region: str
+    failed_command: str
+    input_payload: dict[str, Any] = field(default_factory=dict)
+    rendered_payload: dict[str, Any] = field(default_factory=dict)
+    stdout: str = ""
+    stderr: str = ""
+    return_code: int | None = None
+    expected: str = ""
+    actual: str = ""
+    repair_instruction: str = ""
+    layer: str = ""
+    artifact_paths: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "failed_step_index": self.failed_step_index,
+            "target_file": self.target_file,
+            "target_region": self.target_region,
+            "failed_command": self.failed_command,
+            "input_payload": self.input_payload,
+            "rendered_payload": self.rendered_payload,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "return_code": self.return_code,
+            "expected": self.expected,
+            "actual": self.actual,
+            "repair_instruction": self.repair_instruction,
+            "layer": self.layer,
+            "artifact_paths": self.artifact_paths,
+        }
+
+
+def _format_e2e_failure(failure: E2EFailure) -> str:
+    return (
+        f"E2E_REPAIR_TARGET={failure.target_file}\n"
+        f"E2E_LAYER={failure.layer}\n"
+        "E2E_STRUCTURED_FAILURE="
+        + json.dumps(failure.to_dict(), ensure_ascii=False, sort_keys=True)
+    )
+
+
 def _iter_markdown_shell_blocks_with_source(content: str, *, source_path: str) -> list[tuple[str, str]]:
     """Return shell/bash fenced blocks in document order.
 
@@ -8495,7 +8489,21 @@ def _seed_initial_e2e_payload(
 
 
 def _e2e_error(*, target: str, layer: str, message: str) -> str:
-    return f"E2E_REPAIR_TARGET={target}\nE2E_LAYER={layer}\n{message}"
+    failure = {
+        "failed_step_index": 0,
+        "target_file": target,
+        "target_region": "frontmatter" if "frontmatter" in layer else ("workflow block" if target == "SKILL.md" else "run()"),
+        "failed_command": "",
+        "input_payload": {},
+        "stdout": "",
+        "stderr": message,
+        "return_code": None,
+        "expected": "Creator E2E step must be executable and produce valid JSON/artifacts.",
+        "actual": message,
+        "repair_instruction": f"只修改 {target} 中与 {layer} 失败相关的最小区域，不修改其它文件。",
+        "layer": layer,
+    }
+    return f"E2E_REPAIR_TARGET={target}\nE2E_LAYER={layer}\nE2E_STRUCTURED_FAILURE={json.dumps(failure, ensure_ascii=False, sort_keys=True)}\n{message}"
 
 
 def _e2e_repair_target_from_errors(errors: list[str]) -> str:
@@ -8613,19 +8621,21 @@ def _parse_e2e_stdout_json(
     rendered_payload: dict[str, Any],
 ) -> dict[str, Any]:
     if proc.returncode != 0:
-        raise ValueError(
-            _e2e_error(
-                target=command.script_path,
-                layer="script_exit",
-                message=(
-                    f"第 {command.ordinal} 步 {command.script_path} 执行失败。\n"
-                    f"exit_code={proc.returncode}\n"
-                    f"argv={json.dumps(rendered_payload, ensure_ascii=False)}\n"
-                    f"stdout={proc.stdout[-4000:]}\n"
-                    f"stderr={proc.stderr[-4000:]}"
-                ),
-            )
-        )
+        raise ValueError(_format_e2e_failure(E2EFailure(
+            failed_step_index=command.ordinal,
+            target_file=command.script_path,
+            target_region="run()",
+            failed_command=command.raw_command,
+            input_payload=rendered_payload,
+            rendered_payload=rendered_payload,
+            stdout=(proc.stdout or "")[-4000:],
+            stderr=(proc.stderr or "")[-4000:],
+            return_code=proc.returncode,
+            expected="脚本必须成功退出、stdout 输出合法 JSON object，并真实完成该步骤职责。",
+            actual=f"return_code={proc.returncode}",
+            repair_instruction=f"只修改 {command.script_path} 中 run()/main 执行失败相关区域，不修改其它文件或已通过步骤。",
+            layer="script_exit",
+        )))
 
     try:
         refined_contract, _resolution = _contract_resolution_for_trial(command.script_path, trial_skill_md, entry.role, entry.__dict__)
@@ -8639,19 +8649,21 @@ def _parse_e2e_stdout_json(
             canonical_contract=refined_contract,
         )
     except ValueError as exc:
-        raise ValueError(
-            _e2e_error(
-                target=command.script_path,
-                layer="stdout_contract",
-                message=(
-                    f"第 {command.ordinal} 步 {command.script_path} stdout JSON 不符合运行时合同。\n"
-                    f"argv={json.dumps(rendered_payload, ensure_ascii=False)}\n"
-                    f"stdout={proc.stdout[-4000:]}\n"
-                    f"stderr={proc.stderr[-4000:]}\n"
-                    f"错误={exc}"
-                ),
-            )
-        ) from exc
+        raise ValueError(_format_e2e_failure(E2EFailure(
+            failed_step_index=command.ordinal,
+            target_file=command.script_path,
+            target_region="stdout output logic",
+            failed_command=command.raw_command,
+            input_payload=rendered_payload,
+            rendered_payload=rendered_payload,
+            stdout=(proc.stdout or "")[-4000:],
+            stderr=(proc.stderr or "")[-4000:],
+            return_code=proc.returncode,
+            expected="stdout 必须是合法 JSON object，required outputs 存在，文件产物真实存在。",
+            actual=f"stdout_contract_error={exc}",
+            repair_instruction=f"只修改 {command.script_path} 的 stdout/artifact 输出逻辑，不修改其它文件。",
+            layer="stdout_contract",
+        ))) from exc
 
     try:
         parsed = json.loads((proc.stdout or "").strip())
@@ -9049,6 +9061,20 @@ def _patch_skill_md_command_payloads_from_skill_plan(content: str, blueprint_tex
     """
     return content, []
 
+
+def _structured_failure_from_errors(errors: list[str]) -> dict[str, Any]:
+    for error in errors or []:
+        match = re.search(r"E2E_STRUCTURED_FAILURE=(\{.*?\})(?:\n|$)", error, re.S)
+        if not match:
+            continue
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return {}
+
 async def _repair_existing_file_for_e2e_failure(
     *,
     skill_name: str,
@@ -9119,6 +9145,8 @@ async def _repair_existing_file_for_e2e_failure(
     )
 
     deterministic_error = "\n\n".join(e2e_errors)[-12000:]
+    structured_failure = _structured_failure_from_errors(e2e_errors)
+    target_region = str(structured_failure.get("target_region") or ("workflow block" if target_path == "SKILL.md" else "run()"))
     targeted_e2e_hint = _targeted_e2e_repair_hint(e2e_errors)
 
     e2e_tool_cards = ""
@@ -9187,13 +9215,18 @@ async def _repair_existing_file_for_e2e_failure(
                 "中间步骤只需要 JSON 边界能流转，不要求使用平台字段；"
                 "最终步骤必须输出与 sandbox 运行时一致的平台字段。"
                 "错误信息中的已成功前序边界 trace 是冻结区，不要重复修改已经通过的部分。"
+                "你只能修改 E2E_STRUCTURED_FAILURE.target_file 指向的文件，且只能修改 target_region 指定区域。"
+                "不要重写整个 Skill，不要重写整个 SKILL.md，不要修改已经通过的脚本/frontmatter/stdout 字段名。"
+                "不要用固定样例数据代替动态输入，不要通过 try/except 返回假成功。"
             ),
         },
         {
             "role": "user",
             "content": (
                 f"Skill 名称：{skill_name}\n"
-                f"当前需要修复的文件：{target_path}\n\n"
+                f"当前需要修复的文件：{target_path}\n"
+                f"只能修改区域：{target_region}\n\n"
+                f"结构化失败对象：\n{json.dumps(structured_failure, ensure_ascii=False, sort_keys=True)}\n\n"
                 f"{target_rule}\n\n"
                 f"定向 E2E 修复提示：{targeted_e2e_hint or '无'}\n\n"
                 "端到端失败信息：\n"
