@@ -2143,6 +2143,53 @@ def _reference_contains_write_file_directive(markdown_body: str) -> bool:
     ))
 
 
+
+def _reference_placeholder_matches(markdown_body: str) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    in_fenced = False
+    lines = str(markdown_body or "").splitlines()
+    for index, line in enumerate(lines, start=1):
+        if re.match(r"^\s*```", line):
+            in_fenced = not in_fenced
+        for match in _REFERENCE_PLACEHOLDER_RE.finditer(line):
+            start = max(0, index - 2)
+            end = min(len(lines), index + 1)
+            matches.append({
+                "term": match.group(0),
+                "line_number": index,
+                "line_text": line,
+                "context_excerpt": "\n".join(lines[start:end]),
+                "in_fenced_block": in_fenced,
+            })
+    return matches
+
+
+def _sanitize_reference_placeholders(content: str) -> str:
+    meta, body = _reference_frontmatter_metadata(content)
+    had_frontmatter = str(content or "").lstrip().startswith("---")
+    body_lines = body.splitlines()
+    sanitized: list[str] = []
+    in_fenced = False
+    for line in body_lines:
+        if re.match(r"^\s*```", line):
+            in_fenced = not in_fenced
+            sanitized.append(line)
+            continue
+        if in_fenced or not _REFERENCE_PLACEHOLDER_RE.search(line):
+            sanitized.append(line)
+            continue
+        cleaned = _REFERENCE_PLACEHOLDER_RE.sub("具体规则、示例和约束", line).strip()
+        if not cleaned or cleaned in {"具体规则、示例和约束", "- 具体规则、示例和约束"}:
+            continue
+        sanitized.append(cleaned)
+    new_body = "\n".join(sanitized).strip() + "\n"
+    if not had_frontmatter:
+        return new_body
+    frontmatter_match = re.match(r"\s*(---\s*\n.*?\n---\s*\n?)", str(content or ""), flags=re.S)
+    if not frontmatter_match:
+        return str(content or "")
+    return frontmatter_match.group(1).rstrip() + "\n" + new_body
+
 def _check_reference_file_contract(file_path: str, content: str, *, purpose: str = "") -> list[ContractCheckResult]:
     raw_failures = _basic_markdown_format_failures(
         file_path,
@@ -2413,7 +2460,8 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
         ),
     ))
 
-    has_placeholder = bool(_REFERENCE_PLACEHOLDER_RE.search(stripped))
+    placeholder_matches = _reference_placeholder_matches(stripped)
+    has_placeholder = bool(placeholder_matches)
     results.append(ContractCheckResult(
         id="reference.no_placeholder_phrases",
         passed=not has_placeholder,
@@ -2425,6 +2473,7 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
         ),
         expected="不要使用 placeholder、TODO、待补充、将要生成等占位表达。",
         minimal_edit="删除占位短语并替换为实际任务规则和示例。",
+        details={"matches": placeholder_matches, "banned_terms": sorted(set(match["term"] for match in placeholder_matches))},
     ))
 
     return results

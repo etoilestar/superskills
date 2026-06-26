@@ -833,6 +833,7 @@ def _run_e2e_step_argument_effect_review(
     trace: E2EStepTrace,
     previous_traces: list[E2EStepTrace],
     requested_model: str | None = None,
+    requirements: Any = None,
 ) -> dict[str, Any]:
     """Second-round E2E step interface + argument-effect review.
 
@@ -864,9 +865,11 @@ def _run_e2e_step_argument_effect_review(
     placeholders = sorted(_e2e_command_placeholders(command))
     argv_template = command.argv_template if isinstance(command.argv_template, dict) else {}
 
-    # 只有完全没有 argv、没有 placeholder、没有声明输入时，才跳过。
-    # 之前 rendered_payload 空就直接跳过，会漏掉“SKILL.md 没传参数”的接口问题。
-    if not rendered_payload and not argv_template and not placeholders and not declared_inputs:
+    req_items = coerce_requirement_items(requirements) or coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
+    artifact_contract = getattr(skill_plan_entry, "artifact_contract", {}) or {}
+    substantive_step = bool(rendered_payload or argv_template or placeholders or declared_inputs or artifact_contract or any(getattr(r, "required", False) for r in req_items))
+    # 只有完全没有 argv、没有 placeholder、没有声明输入、没有 required requirements/产物合同时，才跳过。
+    if not substantive_step:
         return {
             "passed": True,
             "model": None,
@@ -970,38 +973,68 @@ def _run_e2e_step_argument_effect_review(
         },
     ]
 
-    try:
-        text = _complete_chat_once_sync_for_e2e(messages, route.model)
-    except Exception as exc:
-        logger.warning(
-            "[Creator][E2E][argument_effect_review_unavailable] step=%s script=%s error=%s",
-            command.ordinal,
-            command.script_path,
-            exc,
-        )
-        return {
-            "passed": True,
-            "model": route.model,
-            "advisory_notes": [
-                f"E2E 接口审查模型不可用，已跳过本轮 LLM 接口审查：{type(exc).__name__}: {exc}"
-            ],
-        }
+    last_text = ""
+    data: dict[str, Any] | None = None
+    for review_attempt in range(2):
+        try:
+            active_messages = messages if review_attempt == 0 else [
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "上一轮 E2E requirement validator 没有返回合法 JSON object。\n"
+                        "请只重试 JSON 格式；不要要求修改 SKILL.md 或脚本。\n"
+                        f"上一轮输出片段：{last_text[:1200]}"
+                    ),
+                },
+            ]
+            text = _complete_chat_once_sync_for_e2e(active_messages, route.model)
+            last_text = str(text or "")
+        except Exception as exc:
+            if review_attempt == 0:
+                last_text = f"validator unavailable: {type(exc).__name__}: {exc}"
+                continue
+            logger.warning(
+                "[Creator][E2E][argument_effect_review_unavailable] step=%s script=%s error=%s",
+                command.ordinal,
+                command.script_path,
+                exc,
+            )
+            return {
+                "passed": False,
+                "failure_type": "e2e_requirement_validator_error",
+                "target_file": command.script_path if rendered_payload else "SKILL.md",
+                "layer": "e2e_requirement_validator_error",
+                "problem": f"E2E requirement validator unavailable: {type(exc).__name__}: {exc}",
+                "evidence": "validator unavailable after format retry; not a business-file failure",
+                "repair_instruction": "Retry validator or return recoverable validator failure; do not patch business files solely for this.",
+                "model": route.model,
+            }
 
-    data = _parse_validator_json_object(text)
-    if not isinstance(data, dict) or not data:
+        parsed = _parse_validator_json_object(last_text)
+        if isinstance(parsed, dict) and parsed:
+            data = parsed
+            break
+        if review_attempt == 0:
+            continue
         logger.warning(
             "[Creator][E2E][argument_effect_review_invalid_json] step=%s script=%s raw=%s",
             command.ordinal,
             command.script_path,
-            str(text or "")[:1000],
+            last_text[:1000],
         )
         return {
-            "passed": True,
+            "passed": False,
+            "failure_type": "e2e_requirement_validator_error",
+            "target_file": command.script_path if rendered_payload else "SKILL.md",
+            "layer": "e2e_requirement_validator_error",
+            "problem": "E2E requirement validator did not return valid JSON after format retry.",
+            "evidence": last_text[:1000],
+            "repair_instruction": "Retry validator or return recoverable validator failure; do not patch business files solely for this.",
             "model": route.model,
-            "advisory_notes": [
-                "E2E 接口审查模型没有返回合法 JSON object，已跳过本轮 LLM 接口审查。"
-            ],
         }
+
+    data = data or {}
 
     if data.get("passed") is True:
         return {
@@ -1069,6 +1102,122 @@ def _run_e2e_step_argument_effect_review(
         "raw_review": data,
     }
 
+def _e2e_requirement_mapping_failure(**kwargs) -> str:
+    return _e2e_argument_effect_failure(**kwargs)
+
+def _e2e_requirement_effect_failure(**kwargs) -> str:
+    return _e2e_argument_effect_failure(**kwargs)
+
+
+def _load_requirement_graph_for_e2e(skill_dir: Path) -> RequirementGraph:
+    path = skill_dir / ".creator" / "requirement_graph.json"
+    if not path.is_file():
+        return RequirementGraph()
+    try:
+        return normalize_requirement_graph(parse_requirement_graph_result(path.read_text(encoding="utf-8")))
+    except RequirementGraphValidationError:
+        raise
+    except Exception as exc:
+        raise RequirementGraphValidationError(
+            f"E2E requirement graph metadata is unreadable: {type(exc).__name__}: {exc}",
+            code="validator_error",
+            details={"path": str(path)},
+        ) from exc
+
+
+def _attach_requirements_to_entry(entry: SkillPlanEntry, requirements: list[RequirementItem]) -> SkillPlanEntry:
+    try:
+        setattr(entry, "requirements", requirements)
+    except Exception:
+        pass
+    return entry
+
+
+def _constraint_matches_metadata(constraint: RequirementConstraint, metadata: dict[str, Any]) -> bool:
+    name = str(constraint.name or "").strip()
+    value = constraint.value
+    kind = str(constraint.kind or "").strip()
+    buckets = []
+    for key in ("styles", "options", "constraint_values", "layout_options"):
+        if isinstance(metadata.get(key), dict):
+            buckets.append(metadata[key])
+    for bucket in buckets:
+        if name and name in bucket:
+            if value in (None, ""):
+                return True
+            return bucket.get(name) == value or str(bucket.get(name)) == str(value)
+        if value not in (None, "") and any(v == value or str(v) == str(value) for v in bucket.values()):
+            return True
+    if kind in {"media_property", "media"} and metadata.get("media_items"):
+        return True
+    if kind in {"layout_style", "layout"} and metadata.get("layout_options"):
+        return True
+    if kind == "quantity":
+        for key in ("block_count",):
+            if metadata.get(key) == value or str(metadata.get(key)) == str(value):
+                return True
+    return False
+
+
+def _structured_requirement_metadata_missing(requirement: RequirementItem, metadata: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    policy = requirement.evidence_policy if isinstance(requirement.evidence_policy, dict) else {}
+    metadata_paths = policy.get("metadata_paths") if isinstance(policy.get("metadata_paths"), list) else []
+    for dotted in metadata_paths:
+        cursor: Any = metadata
+        for part in str(dotted).split("."):
+            if isinstance(cursor, dict) and part in cursor:
+                cursor = cursor[part]
+            else:
+                missing.append(f"metadata.{dotted}")
+                break
+    component_types = metadata.get("component_types") if isinstance(metadata.get("component_types"), list) else []
+    policy_components = policy.get("component_types") if isinstance(policy.get("component_types"), list) else []
+    for component in policy_components:
+        if component not in component_types:
+            missing.append(f"component_types contains {component}")
+    for constraint in requirement.constraints or []:
+        if (
+            getattr(constraint, "required", True)
+            and str(getattr(constraint, "source", "") or "") in {"user_explicit", "blueprint", "inferred"}
+            and not _constraint_matches_metadata(constraint, metadata)
+        ):
+            missing.append(f"constraint:{constraint.name or constraint.kind}")
+    return missing
+
+def _run_e2e_requirement_flow_review(
+    *,
+    command: E2EWorkflowCommand,
+    script_content: str,
+    skill_plan_entry: SkillPlanEntry,
+    rendered_payload: dict[str, Any],
+    stdout_json: dict[str, Any],
+    artifact_paths: list[str],
+    trace: E2EStepTrace,
+    previous_traces: list[E2EStepTrace],
+    requested_model: str | None = None,
+    requirements: Any = None,
+) -> dict[str, Any]:
+    reqs = coerce_requirement_items(requirements) or coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
+    review = _run_e2e_step_argument_effect_review(
+        command=command, script_content=script_content, skill_plan_entry=skill_plan_entry,
+        rendered_payload=rendered_payload, stdout_json=stdout_json, artifact_paths=artifact_paths,
+        trace=trace, previous_traces=previous_traces, requested_model=requested_model, requirements=reqs,
+    )
+    if not review.get("passed"):
+        return review
+    required = [r for r in reqs if getattr(r, "required", False)]
+    metadata = stdout_json.get("artifact_metadata") if isinstance(stdout_json.get("artifact_metadata"), dict) else {}
+    if required and not rendered_payload and any(r.semantic_inputs for r in required):
+        r = next((x for x in required if x.semantic_inputs), required[0])
+        return {"passed": False, "target_file": "SKILL.md", "layer": "e2e_requirement_mapping_failed", "failure_kind": "missing_payload", "problem": "Required semantic input was not delivered to the step payload.", "evidence": "rendered_payload is empty while requirement declares semantic_inputs", "requirement_id": r.id, "missing_evidence": ["semantic input in rendered_payload"], "repair_instruction": "Pass the required semantic input from user input or previous stdout into this command."}
+    if required and artifact_paths and metadata:
+        for r in required:
+            missing = _structured_requirement_metadata_missing(r, metadata)
+            if missing:
+                return {"passed": False, "target_file": command.script_path, "layer": "runtime_metadata_requirement_failed", "failure_kind": "runtime_metadata_missing_evidence", "problem": "Runtime metadata is missing structured evidence for a required requirement.", "evidence": json.dumps(metadata, ensure_ascii=False, default=str)[:1000], "requirement_id": r.id, "missing_evidence": missing, "repair_instruction": "Ensure stdout or runtime helper metadata exposes structured evidence for the required component/constraint."}
+    return review
+
 def _e2e_argument_effect_failure(
     *,
     command: E2EWorkflowCommand,
@@ -1078,8 +1227,8 @@ def _e2e_argument_effect_failure(
     artifact_paths: list[str],
     traces: list[E2EStepTrace],
 ) -> str:
-    target_file = str(review.get("target_file") or command.script_path)
     layer = str(review.get("layer") or "e2e_step_argument_effect")
+    target_file = "__validator__" if layer in {"e2e_requirement_validator_error", "e2e_requirement_validator_incomplete"} else str(review.get("target_file") or command.script_path)
     problem = str(review.get("problem") or "当前 E2E step 参数有效性审查失败。")
     evidence = str(review.get("evidence") or "")
     repair_instruction = str(
@@ -1470,6 +1619,10 @@ def _run_skill_workflow_e2e_once(
         else:
             trial_skill_dir = e2e_session.workspace_dir
         trial_skill_md = (trial_skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        requirement_graph = _load_requirement_graph_for_e2e(trial_skill_dir)
+        requirements_by_file: dict[str, list[RequirementItem]] = {}
+        for req in requirement_graph.requirements:
+            requirements_by_file.setdefault(req.target_file, []).append(req)
 
         payload: dict[str, Any] = _seed_initial_e2e_payload(
             commands,
@@ -1495,10 +1648,10 @@ def _run_skill_workflow_e2e_once(
                         if not command.script_path.endswith(".py"):
                             continue
 
-                        entry = _skill_plan_entry_for_file(
+                        entry = _attach_requirements_to_entry(_skill_plan_entry_for_file(
                             file_path=command.script_path,
                             blueprint_text=trial_skill_md,
-                        )
+                        ), requirements_by_file.get(command.script_path, []))
 
                         _install_capability_dependencies(
                             venv_python,
@@ -1561,12 +1714,12 @@ def _run_skill_workflow_e2e_once(
             if command.ordinal < resume_from_step:
                 continue
             try:
-                entry = _validate_e2e_command_static(
+                entry = _attach_requirements_to_entry(_validate_e2e_command_static(
                     command=command,
                     trial_skill_dir=trial_skill_dir,
                     skill_md=trial_skill_md,
                     available_payload_keys=set(payload.keys()),
-                )
+                ), requirements_by_file.get(command.script_path, []))
 
                 content = (trial_skill_dir / command.script_path).read_text(encoding="utf-8")
 
@@ -1641,7 +1794,7 @@ def _run_skill_workflow_e2e_once(
                     stdout_shape=_json_object_shape(stdout_json),
                 )
 
-                argument_effect_review = _run_e2e_step_argument_effect_review(
+                argument_effect_review = _run_e2e_requirement_flow_review(
                     command=command,
                     script_content=content,
                     skill_plan_entry=entry,
@@ -1651,6 +1804,7 @@ def _run_skill_workflow_e2e_once(
                     trace=trace,
                     previous_traces=traces,
                     requested_model=requested_model,
+                    requirements=requirements_by_file.get(command.script_path, []),
                 )
 
                 if not argument_effect_review.get("passed"):

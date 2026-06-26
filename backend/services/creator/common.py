@@ -12,6 +12,7 @@ These endpoints decouple the file-creation phase from the main
 """
 
 import ast
+import hashlib
 import difflib
 import base64
 import csv
@@ -30,7 +31,7 @@ import shutil
 
 from fastapi import APIRouter, HTTPException, File, Form, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ...config import settings
 from ..blueprint_parser import BlueprintPlan, BlueprintShapeError, clean_blueprint_body_text, parse_blueprint
@@ -196,6 +197,215 @@ class SkillMdBlueprintReviewResponse(BaseModel):
     repair_suggestions: str = ""
     fixed_content: Optional[str] = None
 
+class RequirementGraphValidationError(ValueError):
+    """Requirement graph parser/schema failure that must not be treated as a business-file error."""
+
+    def __init__(self, message: str, *, code: str = "validator_error", details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+
+
+class RequirementConstraint(BaseModel):
+    name: str = ""
+    kind: str = "constraint"
+    value: Any = None
+    comparator: str = "equals"
+    unit: str = ""
+    source: str = "blueprint"
+    required: bool = True
+    evidence_policy: dict[str, Any] = Field(default_factory=dict)
+
+
+class RequirementItem(BaseModel):
+    id: str
+    target_file: str
+    owner_step: Optional[str] = None
+    kind: str = "component"
+    required: bool = True
+    source: str = "blueprint"
+    description: str = ""
+    semantic_inputs: list[str] = Field(default_factory=list)
+    semantic_outputs: list[str] = Field(default_factory=list)
+    required_components: list[str] = Field(default_factory=list)
+    constraints: list[RequirementConstraint] = Field(default_factory=list)
+    evidence_policy: dict[str, Any] = Field(default_factory=dict)
+    non_requirements: list[str] = Field(default_factory=list)
+
+    @field_validator("constraints", mode="before")
+    @classmethod
+    def _coerce_constraints(cls, value: Any) -> list[Any]:
+        if value in (None, ""):
+            return []
+        raw_items = value if isinstance(value, list) else [value]
+        items: list[Any] = []
+        for raw in raw_items:
+            if isinstance(raw, RequirementConstraint):
+                items.append(raw)
+            elif isinstance(raw, dict):
+                items.append(raw)
+            else:
+                text = str(raw or "").strip()
+                if text:
+                    items.append({
+                        "name": text,
+                        "kind": "constraint",
+                        "value": text,
+                        "comparator": "describes",
+                        "source": "blueprint",
+                        "required": True,
+                    })
+        return items
+
+
+class RequirementGraph(BaseModel):
+    requirements: list[RequirementItem] = Field(default_factory=list)
+    requirement_graph_source: str = "validator"
+    requirement_graph_quality: str = "full"
+
+
+def _requirement_id_for_file(path: str, suffix: str) -> str:
+    base = re.sub(r"[^a-zA-Z0-9]+", "_", str(path or "file")).strip("_").lower() or "file"
+    tail = re.sub(r"[^a-zA-Z0-9]+", "_", str(suffix or "requirement")).strip("_").lower() or "requirement"
+    return f"req_{base}_{tail}"[:120]
+
+
+def _file_spec_has_substantive_responsibility(file_spec: Any) -> bool:
+    return bool(
+        getattr(file_spec, "outputs", None)
+        or getattr(file_spec, "artifact_contract", None)
+        or getattr(file_spec, "required_capabilities", None)
+        or getattr(file_spec, "runtime_contract", None)
+        or str(getattr(file_spec, "purpose", "") or "").strip()
+    )
+
+
+def build_default_requirement_graph(files: list[Any]) -> RequirementGraph:
+    items: list[RequirementItem] = []
+    for file_spec in files or []:
+        path = str(getattr(file_spec, "path", "") or "")
+        if not path or path == "SKILL.md" or path.startswith("assets/"):
+            continue
+        required = bool(getattr(file_spec, "required", True))
+        purpose = str(getattr(file_spec, "purpose", "") or "").strip()
+        inputs = [str(x).strip() for x in (getattr(file_spec, "inputs", []) or []) if str(x).strip()]
+        outputs = [str(x).strip() for x in (getattr(file_spec, "outputs", []) or []) if str(x).strip()]
+        components = [purpose] if purpose else []
+        constraints: list[str] = []
+        artifact_contract = getattr(file_spec, "artifact_contract", None) or {}
+        runtime_contract = getattr(file_spec, "runtime_contract", None) or {}
+        for source_obj in (artifact_contract, runtime_contract):
+            if isinstance(source_obj, dict):
+                for key, value in source_obj.items():
+                    if value not in (None, "", [], {}):
+                        constraints.append(RequirementConstraint(
+                            name=str(key),
+                            kind="contract",
+                            value=value,
+                            comparator="declared",
+                            source="default_contract",
+                            required=True,
+                            evidence_policy={"first_round": "look for semantic use in options/styles/config/parameters/builders", "e2e": "look for structured runtime metadata evidence"},
+                        ))
+        if purpose or outputs or components or constraints:
+            items.append(RequirementItem(
+                id=_requirement_id_for_file(path, "core"),
+                target_file=path,
+                owner_step=path,
+                kind="component",
+                required=required,
+                source="inferred",
+                description=purpose or f"Implement the declared responsibility for {path}.",
+                semantic_inputs=inputs,
+                semantic_outputs=outputs,
+                required_components=components,
+                constraints=constraints,
+                evidence_policy={
+                    "first_round": "Review semantic responsibility evidence in the target file without hard-gating field, variable, function, or tool names.",
+                    "e2e": "Verify required semantic inputs are mapped, received, consumed, and reflected in stdout/runtime metadata when applicable.",
+                    "graph_quality": "fallback_coarse",
+                },
+                non_requirements=[
+                    "exact field names", "exact variable names", "fixed function names",
+                    "fixed helper/tool invocation style", "subjective quality wording",
+                ],
+            ))
+    return RequirementGraph(
+        requirements=items,
+        requirement_graph_source="fallback",
+        requirement_graph_quality="fallback_coarse",
+    )
+
+
+def parse_requirement_graph_result(text: str | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(text, dict):
+        return text
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I | re.S).strip()
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        raise RequirementGraphValidationError("Requirement graph validator did not return valid JSON.", code="validator_error", details={"error": str(exc), "raw": raw[:1000]}) from exc
+    if not isinstance(data, dict):
+        raise RequirementGraphValidationError("Requirement graph JSON must be an object.", code="validator_incomplete", details={"type": type(data).__name__})
+    return data
+
+
+def normalize_requirement_graph(data: dict[str, Any] | RequirementGraph) -> RequirementGraph:
+    if isinstance(data, RequirementGraph):
+        return data
+    raw_items = data.get("requirements", data.get("items", [])) if isinstance(data, dict) else []
+    if not isinstance(raw_items, list):
+        raise RequirementGraphValidationError("Requirement graph requirements must be a list.", code="validator_incomplete")
+    items: list[RequirementItem] = []
+    for idx, raw in enumerate(raw_items):
+        if not isinstance(raw, dict):
+            raise RequirementGraphValidationError("Requirement item must be an object.", code="validator_incomplete", details={"index": idx})
+        merged = dict(raw)
+        merged.setdefault("id", f"req_{idx+1}")
+        merged.setdefault("kind", "component")
+        merged.setdefault("required", True)
+        merged.setdefault("source", "blueprint")
+        for key in ("semantic_inputs", "semantic_outputs", "required_components", "non_requirements"):
+            value = merged.get(key, [])
+            if isinstance(value, str):
+                value = [value]
+            merged[key] = [str(v).strip() for v in (value or []) if str(v).strip()] if isinstance(value, list) else []
+        if not isinstance(merged.get("constraints"), list):
+            merged["constraints"] = [merged.get("constraints")] if merged.get("constraints") else []
+        if not isinstance(merged.get("evidence_policy"), dict):
+            merged["evidence_policy"] = {}
+        try:
+            item = RequirementItem(**merged)
+        except Exception as exc:
+            raise RequirementGraphValidationError("Requirement item schema is incomplete.", code="validator_incomplete", details={"index": idx, "error": str(exc)}) from exc
+        if not item.id.strip() or not item.target_file.strip() or not item.description.strip():
+            raise RequirementGraphValidationError("Requirement item misses id, target_file, or description.", code="validator_incomplete", details={"index": idx, "item": merged})
+        items.append(item)
+    source = str(data.get("requirement_graph_source") or data.get("source") or "validator") if isinstance(data, dict) else "validator"
+    quality = str(data.get("requirement_graph_quality") or data.get("quality") or "full") if isinstance(data, dict) else "full"
+    return RequirementGraph(requirements=items, requirement_graph_source=source, requirement_graph_quality=quality)
+
+
+def validate_requirement_graph_schema(graph: RequirementGraph, files: list[Any]) -> RequirementGraph:
+    required_by_file: dict[str, list[RequirementItem]] = {}
+    for item in graph.requirements:
+        if item.required:
+            required_by_file.setdefault(item.target_file, []).append(item)
+    for file_spec in files or []:
+        path = str(getattr(file_spec, "path", "") or "")
+        if not path.startswith("scripts/"):
+            continue
+        if _file_spec_has_substantive_responsibility(file_spec) and not required_by_file.get(path):
+            raise RequirementGraphValidationError(
+                f"Required script {path} has substantive responsibilities but no required requirement.",
+                code="validator_incomplete",
+                details={"path": path},
+            )
+    return graph
+
+
 class FileSpecOut(BaseModel):
     path: str
     generation_order: int = 0
@@ -231,6 +441,7 @@ class FileSpecOut(BaseModel):
     reason: str = ""
     heuristic_signals: list[str] = Field(default_factory=list)
     asset_source: str = ""
+    requirements: list[RequirementItem] = Field(default_factory=list)
 
 
 
@@ -290,6 +501,7 @@ class AnalyzeBlueprintResponse(BaseModel):
     final_outputs: list[str] = Field(default_factory=list)
     available_tools: list[dict[str, Any]] = Field(default_factory=list)
     missing_tool_configs: list[dict[str, Any]] = Field(default_factory=list)
+    requirement_graph: RequirementGraph = Field(default_factory=RequirementGraph)
 
     # 这是展示给用户确认的最终蓝图文本。
     # 注意：前端应该展示这个字段，而不是展示 LLM 第一次生成的原始蓝图。
@@ -1342,3 +1554,23 @@ def _complete_chat_once_sync_for_e2e(messages: list[dict[str, str]], model: str)
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]
+
+
+def coerce_requirement_items(requirements: Any) -> list[RequirementItem]:
+    """Best-effort requirement coercion shared by validator layers."""
+    items: list[RequirementItem] = []
+    for raw in requirements or []:
+        try:
+            if isinstance(raw, RequirementItem):
+                items.append(raw)
+            elif isinstance(raw, dict):
+                items.append(RequirementItem(**raw))
+        except Exception:
+            continue
+    return items
+
+_coerce_requirement_items = coerce_requirement_items
+try:
+    __all__.extend(["coerce_requirement_items", "_coerce_requirement_items"])
+except Exception:
+    pass

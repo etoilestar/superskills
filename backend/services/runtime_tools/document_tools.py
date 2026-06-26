@@ -71,7 +71,7 @@ def create_text_file(
         safe_name = f"{safe_name}.txt"
     text_path = _output_path(output_path=None, output_dir=output_dir, filename=safe_name)
     text_path.write_text(str(text or ""), encoding="utf-8")
-    return {"text_path": str(text_path), "file_paths": [str(text_path)], "file_outputs": [str(text_path)]}
+    return {"text_path": str(text_path), "file_paths": [str(text_path)], "file_outputs": [str(text_path)], "artifact_metadata": {"creator_tool": "create_text_file", "artifact_type": "text", "block_count": 1, "block_types": ["text"], "component_types": ["text"], "styles": {}, "options": {"filename": safe_name}, "referenced_paths": [], "media_items": [], "table_items": [], "heading_levels": [], "layout_options": {}, "constraint_values": {}}}
 
 def _artifact_result(path: Path, *, artifact_type: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     result = {
@@ -173,6 +173,45 @@ def _register_reportlab_font(font_name: str, font_path: str = "") -> str:
     return font_name
 
 
+
+def _document_requirement_metadata(blocks: list[dict[str, Any]], styles: dict[str, Any], options: dict[str, Any] | None = None) -> dict[str, Any]:
+    block_types = [str(block.get("type") or "").strip().lower() for block in blocks if isinstance(block, dict)]
+    referenced_paths: list[str] = []
+    media_items: list[dict[str, Any]] = []
+    table_items: list[dict[str, Any]] = []
+    heading_levels: list[int] = []
+    constraint_values: dict[str, Any] = {}
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        btype = str(block.get("type") or "").strip().lower()
+        if block.get("path"):
+            referenced_paths.append(str(block.get("path")))
+        if btype in {"image", "media", "audio", "video"}:
+            media_items.append({k: v for k, v in block.items() if k in {"type", "path", "caption", "width", "height"}})
+        if btype == "table":
+            rows = block.get("rows") if isinstance(block.get("rows"), list) else []
+            table_items.append({"headers": block.get("headers") or [], "row_count": len(rows)})
+        if btype == "heading":
+            try:
+                heading_levels.append(int(block.get("level") or 1))
+            except Exception:
+                heading_levels.append(1)
+        for key, value in block.items():
+            if key not in {"text", "content"} and value not in (None, "", [], {}):
+                constraint_values.setdefault(key, value)
+    return {
+        "block_types": block_types,
+        "component_types": sorted(set(block_types)),
+        "options": dict(options or {}),
+        "referenced_paths": referenced_paths,
+        "media_items": media_items,
+        "table_items": table_items,
+        "heading_levels": heading_levels,
+        "layout_options": {k: v for k, v in styles.items() if any(token in k for token in ("margin", "spacing", "size", "width", "height", "indent"))},
+        "constraint_values": constraint_values,
+    }
+
 def create_pdf_document(
     blocks: list[dict[str, Any]] | dict[str, Any] | str | Iterable[Any],
     *,
@@ -209,6 +248,7 @@ def create_pdf_document(
             for key, value in style_cfg.items()
             if key != "font_path"
         },
+        **_document_requirement_metadata(normalized_blocks, {key: value for key, value in style_cfg.items() if key != "font_path"}, {"filename": filename, "title": title}),
         **(metadata or {}),
     }
 
