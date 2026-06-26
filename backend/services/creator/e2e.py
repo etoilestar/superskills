@@ -1,5 +1,8 @@
 """E2E workflow validation, script static checks, and trial-run helpers."""
 
+import hashlib
+import uuid
+
 from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
 
@@ -572,6 +575,240 @@ def _copy_skill_dir_for_e2e(
     return tmp, trial_skill_dir
 
 
+
+
+@dataclass
+class CreatorE2ESession:
+    e2e_session_id: str
+    skill_name: str
+    workspace_dir: Path
+    venv_path: Path
+    outputs_dir: Path
+    deps_signature: str = ""
+    command_plan_signature: str = ""
+    current_revision: int = 0
+    installed_deps_signature: str = ""
+    temp_handle: tempfile.TemporaryDirectory | None = None
+    events: list[dict[str, Any]] = field(default_factory=list)
+    resolved_failures: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_event_base(self) -> dict[str, Any]:
+        return {
+            "phase": "e2e_repair",
+            "e2e_session_id": self.e2e_session_id,
+            "skill_name": self.skill_name,
+            "workspace_dir": str(self.workspace_dir),
+            "venv_path": str(self.venv_path),
+            "outputs_dir": str(self.outputs_dir),
+            "deps_signature": self.deps_signature,
+            "command_plan_signature": self.command_plan_signature,
+            "workspace_revision": self.current_revision,
+        }
+
+
+def _stable_json_hash(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _file_sha256(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def _command_plan_signature(commands: list[E2EWorkflowCommand]) -> str:
+    return _stable_json_hash([
+        {
+            "ordinal": command.ordinal,
+            "script_path": command.script_path,
+            "runner": command.runner,
+            "argv_template": command.argv_template,
+            "raw_command": command.raw_command,
+        }
+        for command in commands
+    ])
+
+
+def _deps_signature_for_commands(skill_dir: Path, skill_md: str, commands: list[E2EWorkflowCommand]) -> str:
+    deps: list[str] = []
+    for command in commands:
+        if not command.script_path.endswith(".py"):
+            continue
+        try:
+            entry = _skill_plan_entry_for_file(file_path=command.script_path, blueprint_text=skill_md)
+            deps.extend(str(item) for item in (entry.required_capabilities or []))
+            refined_contract, resolution = _contract_resolution_for_trial(command.script_path, skill_md, None, None)
+            deps.extend(str(item) for item in (refined_contract.declared_dependencies or []))
+            deps.extend(str(item) for item in (resolution.declared_dependencies or []))
+        except Exception as exc:
+            deps.append(f"unresolved:{command.script_path}:{type(exc).__name__}:{exc}")
+    return _stable_json_hash(sorted(set(deps)))
+
+
+def _create_e2e_session(skill_name: str, *, source_skill_dir: Path | None = None) -> CreatorE2ESession:
+    skill_name = _validate_skill_name(skill_name)
+    tmp = tempfile.TemporaryDirectory(prefix="creator-e2e-session-")
+    root = Path(tmp.name)
+    source_dir = (source_skill_dir or (settings.skills_path / skill_name)).resolve()
+    workspace_dir = root / skill_name
+    shutil.copytree(
+        source_dir,
+        workspace_dir,
+        ignore=shutil.ignore_patterns(".venv", "__pycache__", "*.pyc", ".pytest_cache"),
+    )
+    outputs_dir = workspace_dir / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    session = CreatorE2ESession(
+        e2e_session_id=f"e2e-{uuid.uuid4().hex[:12]}",
+        skill_name=skill_name,
+        workspace_dir=workspace_dir,
+        venv_path=workspace_dir / ".venv",
+        outputs_dir=outputs_dir,
+        temp_handle=tmp,
+    )
+    session.events.append({**session.to_event_base(), "event": "session_created", "reused_venv": False})
+    return session
+
+
+def _checkpoint_dir(session: CreatorE2ESession) -> Path:
+    path = session.workspace_dir / ".creator_e2e" / "checkpoints"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _checkpoint_path(session: CreatorE2ESession, step_index: int) -> Path:
+    return _checkpoint_dir(session) / f"step_{step_index:03d}.json"
+
+
+def _shape_for_hash(obj: dict[str, Any]) -> dict[str, str]:
+    return _json_object_shape(obj if isinstance(obj, dict) else {})
+
+
+def _write_step_checkpoint(
+    session: CreatorE2ESession,
+    *,
+    command: E2EWorkflowCommand,
+    rendered_payload: dict[str, Any],
+    stdout_json: dict[str, Any],
+    context_before: dict[str, Any],
+    context_after: dict[str, Any],
+    new_keys: list[str],
+    artifact_paths: list[str],
+    proc: subprocess.CompletedProcess[str],
+) -> dict[str, Any]:
+    checkpoint = {
+        "e2e_session_id": session.e2e_session_id,
+        "skill_name": session.skill_name,
+        "command_plan_signature": session.command_plan_signature,
+        "step_index": command.ordinal,
+        "script_path": command.script_path,
+        "argv_json": rendered_payload,
+        "argv_shape": _shape_for_hash(rendered_payload),
+        "stdout_json": stdout_json,
+        "stdout_shape": _shape_for_hash(stdout_json),
+        "context_before": context_before,
+        "context_after": context_after,
+        "new_keys": new_keys,
+        "artifact_paths": artifact_paths,
+        "file_outputs": artifact_paths,
+        "exit_code": getattr(proc, "returncode", 0),
+        "stderr_excerpt": str(getattr(proc, "stderr", "") or "")[-2000:],
+        "stdout_excerpt": str(getattr(proc, "stdout", "") or "")[-2000:],
+        "script_hash": _file_sha256(session.workspace_dir / command.script_path),
+        "argv_hash": _stable_json_hash(rendered_payload),
+        "context_hash": _stable_json_hash(context_before),
+        "workspace_revision": session.current_revision,
+        "passed": True,
+    }
+    _checkpoint_path(session, command.ordinal).write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    return checkpoint
+
+
+def _load_valid_checkpoint(session: CreatorE2ESession, step_index: int) -> dict[str, Any] | None:
+    path = _checkpoint_path(session, step_index)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if data.get("e2e_session_id") != session.e2e_session_id:
+        return None
+    if data.get("skill_name") != session.skill_name:
+        return None
+    if data.get("command_plan_signature") != session.command_plan_signature:
+        return None
+    if not data.get("passed"):
+        return None
+    return data
+
+
+def _invalidate_checkpoints_from(session: CreatorE2ESession, step_index: int) -> list[int]:
+    invalidated: list[int] = []
+    for path in _checkpoint_dir(session).glob("step_*.json"):
+        match = re.search(r"step_(\d+)\.json$", path.name)
+        if not match:
+            continue
+        index = int(match.group(1))
+        if index >= step_index:
+            invalidated.append(index)
+            path.unlink(missing_ok=True)
+    return sorted(invalidated)
+
+
+def _earliest_invalid_step(
+    *,
+    changed_file: str,
+    commands: list[E2EWorkflowCommand],
+    old_command_plan_signature: str,
+    new_command_plan_signature: str,
+) -> int | None:
+    changed_file = str(changed_file or "").replace("\\", "/").removeprefix("a/").removeprefix("b/")
+    if changed_file == "SKILL.md":
+        if old_command_plan_signature != new_command_plan_signature:
+            return 1
+        return None
+    for command in commands:
+        if str(command.script_path or "").replace("\\", "/").removeprefix("a/").removeprefix("b/") == changed_file:
+            return command.ordinal
+    if changed_file.startswith(("references/", "config/", "assets/")):
+        return 1
+    return None
+
+
+def _failure_signature_from_error(error: str) -> str:
+    structured = _structured_failure_from_errors([error])
+    if structured:
+        basis = {
+            "failure_kind": structured.get("failure_kind") or structured.get("layer"),
+            "target_file": structured.get("target_file"),
+            "step_index": structured.get("failed_step_index"),
+            "return_code": structured.get("return_code"),
+            "stderr_hash": hashlib.sha256(str(structured.get("stderr") or "").encode("utf-8")).hexdigest()[:16],
+            "layer": structured.get("layer"),
+        }
+    else:
+        basis = {"error_hash": hashlib.sha256(str(error or "").encode("utf-8")).hexdigest()[:16]}
+    return _stable_json_hash(basis)
+
+
+def _e2e_repair_state_from_errors(errors: list[str], *, resolved_failures: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    failed_checks = [error for error in (errors or []) if str(error or "").strip()]
+    resolved = list(resolved_failures or [])
+    resolved_signatures = {item.get("failure_signature") for item in resolved}
+    remaining = [error for error in failed_checks if _failure_signature_from_error(error) not in resolved_signatures]
+    return {
+        "full_e2e_passed": not remaining,
+        "passed_checks": [] if remaining else ["workflow_e2e"],
+        "failed_checks": failed_checks,
+        "advisory_notes": [],
+        "resolved_failures": resolved,
+        "remaining_failed_checks": remaining,
+        "current_target_file": _e2e_repair_target_from_errors(remaining) if remaining else "none",
+        "current_resume_step": None,
+    }
+
 def _runner_matches_command_runtime(command: E2EWorkflowCommand, entry: SkillPlanEntry) -> bool:
     runner = Path(command.runner or "").name
     if entry.runtime == "python":
@@ -1132,6 +1369,8 @@ def _run_skill_workflow_e2e_once(
     external_context: dict[str, Any] | None = None,
     source_skill_dir: Path | None = None,
     requested_model: str | None = None,
+    e2e_session: CreatorE2ESession | None = None,
+    resume_from_step: int = 1,
 ) -> list[str]:
     """Run SKILL.md workflow once.
 
@@ -1148,7 +1387,10 @@ def _run_skill_workflow_e2e_once(
     - 判断其它脚本职责。
     """
 
-    source_skill_dir = (source_skill_dir or (settings.skills_path / skill_name)).resolve()
+    if e2e_session is not None:
+        source_skill_dir = e2e_session.workspace_dir.resolve()
+    else:
+        source_skill_dir = (source_skill_dir or (settings.skills_path / skill_name)).resolve()
     skill_md_path = source_skill_dir / "SKILL.md"
 
     if not skill_md_path.is_file():
@@ -1217,10 +1459,13 @@ def _run_skill_workflow_e2e_once(
     tmp_handle: tempfile.TemporaryDirectory | None = None
 
     try:
-        tmp_handle, trial_skill_dir = _copy_skill_dir_for_e2e(
-            skill_name,
-            source_skill_dir=source_skill_dir,
-        )
+        if e2e_session is None:
+            tmp_handle, trial_skill_dir = _copy_skill_dir_for_e2e(
+                skill_name,
+                source_skill_dir=source_skill_dir,
+            )
+        else:
+            trial_skill_dir = e2e_session.workspace_dir
         trial_skill_md = (trial_skill_dir / "SKILL.md").read_text(encoding="utf-8")
 
         payload: dict[str, Any] = _seed_initial_e2e_payload(
@@ -1231,37 +1476,50 @@ def _run_skill_workflow_e2e_once(
 
         venv_python: Path | None = None
 
+        command_signature = _command_plan_signature(commands)
+        deps_signature = _deps_signature_for_commands(trial_skill_dir, trial_skill_md, commands)
+        if e2e_session is not None:
+            e2e_session.command_plan_signature = command_signature
+            e2e_session.deps_signature = deps_signature
+
         if any(command.script_path.endswith(".py") for command in commands):
             try:
                 venv_python = _get_skill_venv_python(trial_skill_dir)
 
-                for command in commands:
-                    if not command.script_path.endswith(".py"):
-                        continue
+                should_install_deps = e2e_session is None or e2e_session.installed_deps_signature != deps_signature
+                if should_install_deps:
+                    for command in commands:
+                        if not command.script_path.endswith(".py"):
+                            continue
 
-                    entry = _skill_plan_entry_for_file(
-                        file_path=command.script_path,
-                        blueprint_text=trial_skill_md,
-                    )
+                        entry = _skill_plan_entry_for_file(
+                            file_path=command.script_path,
+                            blueprint_text=trial_skill_md,
+                        )
 
-                    _install_capability_dependencies(
-                        venv_python,
-                        entry.required_capabilities,
-                    )
+                        _install_capability_dependencies(
+                            venv_python,
+                            entry.required_capabilities,
+                        )
 
-                    refined_contract, resolution = _contract_resolution_for_trial(
-                        command.script_path,
-                        trial_skill_md,
-                        None,
-                        None,
-                    )
+                        refined_contract, resolution = _contract_resolution_for_trial(
+                            command.script_path,
+                            trial_skill_md,
+                            None,
+                            None,
+                        )
 
-                    _install_declared_dependency_packages(
-                        venv_python,
-                        list(refined_contract.declared_dependencies or [])
-                        + list(resolution.declared_dependencies or []),
-                        source_label="implementation_resolution",
-                    )
+                        _install_declared_dependency_packages(
+                            venv_python,
+                            list(refined_contract.declared_dependencies or [])
+                            + list(resolution.declared_dependencies or []),
+                            source_label="implementation_resolution",
+                        )
+                    if e2e_session is not None:
+                        e2e_session.installed_deps_signature = deps_signature
+                        e2e_session.events.append({**e2e_session.to_event_base(), "event": "dependencies_prepared", "reused_venv": False})
+                elif e2e_session is not None:
+                    e2e_session.events.append({**e2e_session.to_event_base(), "event": "dependencies_reused", "reused_venv": True})
 
             except RuntimeError as exc:
                 return [
@@ -1272,7 +1530,33 @@ def _run_skill_workflow_e2e_once(
                     )
                 ]
 
+        reused_checkpoints: list[int] = []
+        if e2e_session is not None and resume_from_step > 1:
+            for prior_step in range(1, resume_from_step):
+                checkpoint = _load_valid_checkpoint(e2e_session, prior_step)
+                if not checkpoint:
+                    resume_from_step = prior_step
+                    break
+                payload = dict(checkpoint.get("context_after") or payload)
+                reused_checkpoints.append(prior_step)
+                traces.append(E2EStepTrace(
+                    ordinal=int(checkpoint.get("step_index") or prior_step),
+                    script_path=str(checkpoint.get("script_path") or ""),
+                    raw_command="[checkpoint]",
+                    placeholders=[],
+                    argv_keys=sorted(str(key) for key in (checkpoint.get("argv_json") or {}).keys()),
+                    stdout_keys=sorted(str(key) for key in (checkpoint.get("stdout_json") or {}).keys()),
+                    new_keys=list(checkpoint.get("new_keys") or []),
+                    artifact_paths=list(checkpoint.get("artifact_paths") or []),
+                    argv_shape=dict(checkpoint.get("argv_shape") or {}),
+                    stdout_shape=dict(checkpoint.get("stdout_shape") or {}),
+                ))
+            if e2e_session is not None:
+                e2e_session.events.append({**e2e_session.to_event_base(), "event": "checkpoints_reused", "resume_from_step": resume_from_step, "reused_checkpoints": reused_checkpoints})
+
         for index, command in enumerate(commands):
+            if command.ordinal < resume_from_step:
+                continue
             try:
                 entry = _validate_e2e_command_static(
                     command=command,
@@ -1384,6 +1668,7 @@ def _run_skill_workflow_e2e_once(
                         traces=traces,
                     )
 
+                context_before = dict(payload)
                 payload.update(stdout_json)
 
                 if artifact_paths:
@@ -1391,6 +1676,20 @@ def _run_skill_workflow_e2e_once(
                     if isinstance(payload["_artifacts"], list):
                         payload["_artifacts"].extend(artifact_paths)
                     payload["_last_artifacts"] = artifact_paths
+
+                if e2e_session is not None:
+                    _write_step_checkpoint(
+                        e2e_session,
+                        command=command,
+                        rendered_payload=rendered_payload,
+                        stdout_json=stdout_json,
+                        context_before=context_before,
+                        context_after=dict(payload),
+                        new_keys=new_keys,
+                        artifact_paths=artifact_paths,
+                        proc=proc,
+                    )
+                    e2e_session.events.append({**e2e_session.to_event_base(), "event": "checkpoint_saved", "step_index": command.ordinal, "script_path": command.script_path})
 
                 traces.append(trace)
 
@@ -1489,6 +1788,7 @@ async def _repair_existing_file_for_e2e_failure(
     e2e_errors: list[str],
     requested_model: str | None = None,
     external_context: dict[str, Any] | None = None,
+    repair_events: list[dict[str, Any]] | None = None,
 ) -> str:
     """Repair existing SKILL.md/script file using local patch + sandbox E2E.
 
@@ -1527,6 +1827,7 @@ async def _repair_existing_file_for_e2e_failure(
         target_path = "SKILL.md"
 
     skill_dir = settings.skills_path / skill_name
+    e2e_session = _create_e2e_session(skill_name, source_skill_dir=skill_dir)
     target_file = skill_dir / target_path
 
     if not target_file.is_file():
@@ -1658,7 +1959,7 @@ async def _repair_existing_file_for_e2e_failure(
     repair_feedback = deterministic_error
     last_failure = ""
     max_candidate_attempts = 5
-    working_content = target_file.read_text(encoding="utf-8")
+    working_content = (e2e_session.workspace_dir / target_path).read_text(encoding="utf-8")
 
     for candidate_attempt in range(1, max_candidate_attempts + 1):
         current_content = working_content
@@ -1719,55 +2020,96 @@ async def _repair_existing_file_for_e2e_failure(
                 )
                 continue
 
-            with tempfile.TemporaryDirectory(prefix="creator-e2e-patch-candidate-") as tmp:
-                tmp_root = Path(tmp)
-                patched_skill_dir = tmp_root / skill_name
+            old_command_signature = e2e_session.command_plan_signature
+            session_target = e2e_session.workspace_dir / target_path
+            session_target.parent.mkdir(parents=True, exist_ok=True)
+            session_target.write_text(sanitized, encoding="utf-8")
+            e2e_session.current_revision += 1
 
-                shutil.copytree(
-                    skill_dir,
-                    patched_skill_dir,
-                    ignore=shutil.ignore_patterns(
-                        ".venv",
-                        "__pycache__",
-                        "*.pyc",
-                        ".pytest_cache",
-                    ),
+            session_skill_md = (e2e_session.workspace_dir / "SKILL.md").read_text(encoding="utf-8")
+            try:
+                session_commands = _extract_e2e_workflow_commands(e2e_session.workspace_dir, session_skill_md)
+                new_command_signature = _command_plan_signature(session_commands)
+            except Exception:
+                session_commands = []
+                new_command_signature = ""
+            earliest_step = _earliest_invalid_step(
+                changed_file=target_path,
+                commands=session_commands,
+                old_command_plan_signature=old_command_signature,
+                new_command_plan_signature=new_command_signature,
+            )
+            resume_from_step = earliest_step or (len(session_commands) + 1 if session_commands else 1)
+            invalidated = _invalidate_checkpoints_from(e2e_session, earliest_step) if earliest_step else []
+            reused = [idx for idx in range(1, max(1, resume_from_step)) if _load_valid_checkpoint(e2e_session, idx)]
+
+            sandbox_gate = _run_e2e_sandbox_acceptance_gate(
+                skill_name=skill_name,
+                candidate_skill_dir=e2e_session.workspace_dir,
+                patched_file=target_path,
+                original_errors=e2e_errors,
+                external_context=external_context,
+                requested_model=requested_model,
+                e2e_session=e2e_session,
+                resume_from_step=resume_from_step,
+            )
+
+            e2e_session.events.append({
+                **e2e_session.to_event_base(),
+                "attempt": candidate_attempt,
+                "target_file": target_path,
+                "resume_from_step": resume_from_step,
+                "reused_venv": True,
+                "reused_checkpoints": reused,
+                "invalidated_checkpoints": invalidated,
+                "failed_checks": sandbox_gate.get("errors") or [],
+                "resolved_failures": e2e_session.resolved_failures,
+                "patch_mode": "exact_replace",
+                "fallback_type": (diff_stats.get("applied") or [{}])[0].get("fallback_type", "none"),
+                "patch_status": "applied",
+                "changed_line_count": diff_stats.get("changed_line_count"),
+                "diff_excerpt": diff_stats.get("generated_diff_excerpt"),
+                "matched_excerpt": (diff_stats.get("applied") or [{}])[0].get("matched_excerpt"),
+                "original_model_old_excerpt": (diff_stats.get("applied") or [{}])[0].get("original_model_old_excerpt"),
+                "rerun_status": "passed" if sandbox_gate.get("accepted") else "failed",
+                "writeback_status": "candidate_only",
+            })
+
+            if not sandbox_gate.get("accepted"):
+                working_content = sanitized
+                last_failure = (
+                    "SANDBOX_E2E_FAILED：候选 patch 已应用，但简单沙盒 E2E 仍失败。\n"
+                    f"attempt={candidate_attempt}/{max_candidate_attempts}\n"
+                    f"diff_stats={json.dumps(diff_stats, ensure_ascii=False, default=str)[:3000]}\n"
+                    f"sandbox_gate={json.dumps(sandbox_gate, ensure_ascii=False, default=str)[:12000]}\n"
+                    "请基于 sandbox_gate.errors 继续输出新的 exact_replace patch。"
                 )
-
-                patched_target = patched_skill_dir / target_path
-                patched_target.parent.mkdir(parents=True, exist_ok=True)
-                patched_target.write_text(sanitized, encoding="utf-8")
-
-                sandbox_gate = _run_e2e_sandbox_acceptance_gate(
-                    skill_name=skill_name,
-                    candidate_skill_dir=patched_skill_dir,
-                    patched_file=target_path,
-                    original_errors=e2e_errors,
-                    external_context=external_context,
-                    requested_model=requested_model,
+                repair_feedback = "\n\n".join(sandbox_gate.get("errors") or e2e_errors)[-12000:] + "\n\n" + last_failure
+                logger.warning(
+                    "[Creator][E2E][repair_candidate_e2e_failed] skill=%s file=%s attempt=%d/%d",
+                    skill_name,
+                    target_path,
+                    candidate_attempt,
+                    max_candidate_attempts,
                 )
+                continue
 
-                if not sandbox_gate.get("accepted"):
-                    working_content = sanitized
-                    last_failure = (
-                        "SANDBOX_E2E_FAILED：候选 patch 已应用，但简单沙盒 E2E 仍失败。\n"
-                        f"attempt={candidate_attempt}/{max_candidate_attempts}\n"
-                        f"diff_stats={json.dumps(diff_stats, ensure_ascii=False, default=str)[:3000]}\n"
-                        f"sandbox_gate={json.dumps(sandbox_gate, ensure_ascii=False, default=str)[:12000]}\n"
-                        "请基于 sandbox_gate.errors 继续输出新的 exact_replace patch。"
-                    )
-                    repair_feedback = deterministic_error + "\n\n" + last_failure
-                    logger.warning(
-                        "[Creator][E2E][repair_candidate_e2e_failed] skill=%s file=%s attempt=%d/%d",
-                        skill_name,
-                        target_path,
-                        candidate_attempt,
-                        max_candidate_attempts,
-                    )
-                    continue
+            for error in e2e_errors:
+                e2e_session.resolved_failures.append({
+                    "failure_signature": _failure_signature_from_error(error),
+                    "target_file": target_path,
+                    "failure_kind": _failure_layer_from_error_text(error) or "e2e",
+                    "step_index": structured_failure.get("failed_step_index"),
+                    "resolved_by_revision": e2e_session.current_revision,
+                    "verified_by_e2e": True,
+                })
 
             target_file.parent.mkdir(parents=True, exist_ok=True)
             target_file.write_text(sanitized, encoding="utf-8")
+            if e2e_session.events:
+                e2e_session.events[-1]["writeback_status"] = "written"
+            if repair_events is not None:
+                repair_events.extend(e2e_session.events)
 
             logger.info(
                 "[Creator][E2E][repair_accept] skill=%s file=%s attempt=%d diff_stats=%s sandbox=passed",
@@ -1843,6 +2185,8 @@ def _run_e2e_sandbox_acceptance_gate(
     original_errors: list[str],
     external_context: dict[str, Any] | None = None,
     requested_model: str | None = None,
+    e2e_session: CreatorE2ESession | None = None,
+    resume_from_step: int = 1,
 ) -> dict[str, Any]:
     """Second-round E2E acceptance gate.
 
@@ -1867,6 +2211,8 @@ def _run_e2e_sandbox_acceptance_gate(
         external_context=external_context,
         source_skill_dir=candidate_skill_dir,
         requested_model=requested_model,
+        e2e_session=e2e_session,
+        resume_from_step=resume_from_step,
     )
 
     if errors:

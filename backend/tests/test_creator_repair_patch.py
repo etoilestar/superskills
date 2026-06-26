@@ -117,3 +117,26 @@ async def test_repeated_unapplicable_proposal_is_rejected_without_third_retry(mo
         )
 
     assert calls == 2
+
+
+def test_old_lines_new_lines_patch_parses_to_exact_replace():
+    from backend.services.creator.repair import _extract_json_or_diff_proposal
+
+    proposal = _extract_json_or_diff_proposal(
+        '{"target_file":"SKILL.md","edits":[{"old_lines":["alpha","beta"],"new_lines":["alpha","BETA"]}]}',
+        expected_target_file="SKILL.md",
+    )
+
+    assert proposal.edits == [{"old": "alpha\nbeta", "new": "alpha\nBETA"}]
+
+
+def test_normalized_span_mapping_trims_spans_with_surrounding_whitespace():
+    original = "\n\n  标题： “你好”  \n下一行\n  "
+    candidate, stats = _apply_exact_replace_patch(
+        original_content=original,
+        proposal=_proposal(old='标题: "你好" 下一行', new="标题：您好\n下一行"),
+        expected_target_file="SKILL.md",
+    )
+
+    assert candidate == "\n\n  标题：您好\n下一行\n  "
+    assert stats["applied"][0]["fallback_type"] == "normalized_exact"

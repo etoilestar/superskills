@@ -227,11 +227,21 @@ def _extract_json_or_diff_proposal(
                 old = edit.get("old")
                 new = edit.get("new")
 
+                if old is None and isinstance(edit.get("old_lines"), list):
+                    if not all(isinstance(line, str) for line in edit["old_lines"]):
+                        raise ValueError(f"edits[{index}].old_lines 必须是字符串数组。")
+                    old = "\n".join(edit["old_lines"])
+
+                if new is None and isinstance(edit.get("new_lines"), list):
+                    if not all(isinstance(line, str) for line in edit["new_lines"]):
+                        raise ValueError(f"edits[{index}].new_lines 必须是字符串数组。")
+                    new = "\n".join(edit["new_lines"])
+
                 if not isinstance(old, str) or not old:
-                    raise ValueError(f"edits[{index}].old 必须是非空字符串。")
+                    raise ValueError(f"edits[{index}].old/old_lines 必须是非空字符串。")
 
                 if not isinstance(new, str):
-                    raise ValueError(f"edits[{index}].new 必须是字符串。")
+                    raise ValueError(f"edits[{index}].new/new_lines 必须是字符串。")
 
                 normalized_edits.append({"old": old, "new": new})
 
@@ -372,7 +382,13 @@ def _normalize_text_with_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
             normalized.append(mapped_ch)
             spans.append((pos, pos + 1))
 
-    return "".join(normalized).strip(), spans
+    while normalized and normalized[0] == " ":
+        normalized.pop(0)
+        spans.pop(0)
+    while normalized and normalized[-1] == " ":
+        normalized.pop()
+        spans.pop()
+    return "".join(normalized), spans
 
 
 def _find_unique_normalized_span(content: str, old: str) -> tuple[int, int] | None:
@@ -506,6 +522,10 @@ def _find_approximate_substring_span(content: str, query: str) -> dict[str, Any]
         best["reason"] = "accepted"
     return best
 
+class CreatorRepairNoopPatch(ValueError):
+    """Raised when a proposal contains no effective edits and should not consume normal retries."""
+
+
 def _apply_exact_replace_patch(
     *,
     original_content: str,
@@ -622,8 +642,8 @@ def _apply_exact_replace_patch(
         })
 
     if not applied:
-        raise ValueError(
-            "exact_replace patch 没有任何真实 edit。"
+        raise CreatorRepairNoopPatch(
+            "proposal_noop：exact_replace patch 没有任何真实 edit。"
             "所有 edits 都是 no-op，old 与 new 完全相同。"
             "请提交会真实改变当前失败内容的 patch。"
         )
@@ -949,6 +969,7 @@ async def _request_repair_diff_proposal(
                 "3. 不要输出完整文件源码。\n"
                 "4. 不要输出 Markdown。\n"
                 "5. 不要手写 unified diff，除非你非常确定 hunk 完全正确。\n"
+                "6. 多行代码片段建议使用 old_lines/new_lines 字符串数组，后端会用换行 join，避免 JSON 字符串裸换行转义错误。\n"
             ),
         },
     ]
@@ -1102,7 +1123,7 @@ async def _request_and_apply_repair_patch(
             last_error = exc
             if proposal_signature is not None:
                 failed_proposal_counts[proposal_signature] = failed_proposal_counts.get(proposal_signature, 0) + 1
-            if "REPEATED_UNAPPLICABLE_PROPOSAL" in str(exc):
+            if isinstance(exc, CreatorRepairNoopPatch) or "REPEATED_UNAPPLICABLE_PROPOSAL" in str(exc):
                 break
 
             logger.warning(
