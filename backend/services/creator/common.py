@@ -12,6 +12,7 @@ These endpoints decouple the file-creation phase from the main
 """
 
 import ast
+import hashlib
 import difflib
 import base64
 import csv

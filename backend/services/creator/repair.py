@@ -2559,15 +2559,24 @@ def _format_file_validator_feedback(
             json.dumps(safe_localizations, ensure_ascii=False, indent=2, default=str),
         ])
 
+    advisory_only_report = (
+        isinstance(validator_report, dict)
+        and (validator_report.get("passed") is True or validator_report.get("failure_type") in {"none", None, ""})
+        and not validator_report.get("issues")
+    )
+    repair_text = str(validator_report.get("repair_instructions") or "").strip() if isinstance(validator_report, dict) else ""
+    if repair_text and _is_advisory_responsibility_issue({"repair_instructions": repair_text}):
+        advisory_only_report = True
     if (
         not delegate_to_backend_contract
         and isinstance(validator_report, dict)
-        and str(validator_report.get("repair_instructions") or "").strip()
+        and repair_text
+        and not advisory_only_report
     ):
         parts.extend([
             "",
             "校验模型给出的辅助 repair_instructions，仅作为定位参考，不得覆盖 deterministic_error：",
-            str(validator_report.get("repair_instructions") or "").strip(),
+            repair_text,
         ])
 
     parts.extend([
@@ -2739,6 +2748,19 @@ def _normalize_responsibility_review_issues(
     return normalized
 
 
+_ADVISORY_RESPONSIBILITY_PATTERNS = (
+    "field_name_mismatch", "extra_stdout_field", "undeclared_output_field",
+    "output_schema_exact_match", "variable_name_mismatch", "implementation_style",
+    "helper_preference", "tool_name_preference", "file_outputs_extra",
+    "字段名", "额外", "未声明字段", "变量名", "实现风格", "工具调用",
+)
+
+
+def _is_advisory_responsibility_issue(item: dict[str, Any]) -> bool:
+    text = json.dumps(item, ensure_ascii=False, default=str).lower()
+    return any(pattern.lower() in text for pattern in _ADVISORY_RESPONSIBILITY_PATTERNS)
+
+
 def _coerce_requirement_items(requirements: Any) -> list[RequirementItem]:
     items: list[RequirementItem] = []
     for raw in requirements or []:
@@ -2755,6 +2777,13 @@ def _coerce_requirement_items(requirements: Any) -> list[RequirementItem]:
 def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list[RequirementItem], file_path: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {"passed": False, "failure_type": "script_requirement_validator_error", "issues": [{"id": "script_requirement_validator_error", "failed_file": file_path, "reason": "review JSON is not an object", "allowed_scope": "do not repair business files"}]}
+    advisory_notes = list(data.get("advisory_notes") or []) if isinstance(data.get("advisory_notes"), list) else []
+    for collection_name in ("blocking_issues", "issues"):
+        collection = data.get(collection_name)
+        if isinstance(collection, list):
+            for raw_issue in collection:
+                if isinstance(raw_issue, dict) and (not raw_issue.get("requirement_id") or _is_advisory_responsibility_issue(raw_issue)):
+                    advisory_notes.append(raw_issue)
     checks = data.get("checks")
     if not isinstance(checks, list):
         return {"passed": False, "failure_type": "script_requirement_validator_incomplete", "issues": [{"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review missing checks[]", "allowed_scope": "do not repair business files"}], "raw_review": data}
@@ -2768,7 +2797,11 @@ def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list
         if not isinstance(check, dict):
             continue
         rid = str(check.get("requirement_id") or "")
+        if not rid or _is_advisory_responsibility_issue(check):
+            advisory_notes.append(check)
+            continue
         if rid not in required_ids:
+            advisory_notes.append(check)
             continue
         if str(check.get("evidence_level") or "").lower() == "missing" and str(check.get("severity") or "").lower() == "blocking":
             missing_evidence = check.get("missing_evidence") if isinstance(check.get("missing_evidence"), list) else []
@@ -2787,7 +2820,7 @@ def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list
                 "forbidden_scope": "Do not modify SKILL.md, workflow mapping, field names only, or other files.",
                 "details": {"check": check},
             })
-    return {"passed": not blocking, "failure_type": "script_requirement_failed" if blocking else "none", "issues": blocking, "checks": checks, "advisory_notes": data.get("advisory_notes") if isinstance(data.get("advisory_notes"), list) else [], "raw_review": data}
+    return {"passed": not blocking, "failure_type": "script_requirement_failed" if blocking else "none", "issues": blocking, "checks": checks, "advisory_notes": advisory_notes, "repair_instructions": "" if not blocking else str(data.get("repair_instructions") or ""), "raw_review": data}
 
 
 def detect_error_stdout_bypass(script_content: str, requirements: list[RequirementItem], expected_outputs: list[str] | None = None) -> list[dict[str, Any]]:

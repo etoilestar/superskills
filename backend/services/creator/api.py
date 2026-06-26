@@ -1298,6 +1298,7 @@ async def generate_file(request: GenerateFileRequest):
 
         candidate = ""
         repair_counts_by_layer: dict[str, int] = {}
+        repair_failure_signatures: dict[str, tuple[int, str]] = {}
 
         try:
             candidate = await _complete_creator_file_generation(
@@ -1403,15 +1404,29 @@ async def generate_file(request: GenerateFileRequest):
                         )
 
                     elif request.file_path.startswith("references/"):
-                        _raise_file_contract_failures(validate_file_contract(
+                        reference_entry = {
+                            **(effective_skill_plan_entry or {}),
+                            "purpose": request.purpose or request.blueprint_text,
+                        }
+                        reference_results = validate_file_contract(
                             file_path=request.file_path,
                             content=content,
                             blueprint_text=request.blueprint_text,
-                            skill_plan_entry={
-                                **(effective_skill_plan_entry or {}),
-                                "purpose": request.purpose or request.blueprint_text,
-                            },
-                        ))
+                            skill_plan_entry=reference_entry,
+                        )
+                        if any((not result.passed and result.id == "reference.no_placeholder_phrases") for result in reference_results):
+                            patched_reference = _sanitize_reference_placeholders(content)
+                            if patched_reference != content:
+                                patched_results = validate_file_contract(
+                                    file_path=request.file_path,
+                                    content=patched_reference,
+                                    blueprint_text=request.blueprint_text,
+                                    skill_plan_entry=reference_entry,
+                                )
+                                if not any(not result.passed for result in patched_results):
+                                    content = patched_reference
+                                    reference_results = patched_results
+                        _raise_file_contract_failures(reference_results)
 
                     elif request.file_path.startswith("scripts/"):
                         _raise_file_contract_failures(_check_script_content_review_contract(
@@ -1543,6 +1558,13 @@ async def generate_file(request: GenerateFileRequest):
                 error_source = stage_error.source
                 error_layer = f"{stage_error.source}:{stage_error.layer}"
                 repair_counts_by_layer[error_layer] = repair_counts_by_layer.get(error_layer, 0) + 1
+                check_match = re.search(r'"id"\s*:\s*"([^"]+)"|\bid[=:]([A-Za-z0-9_.-]+)', deterministic_error)
+                check_id = (check_match.group(1) or check_match.group(2)) if check_match else error_layer
+                candidate_digest = hashlib.sha256((candidate or "").encode("utf-8")).hexdigest()
+                signature_key = f"{error_layer}:{check_id}"
+                previous_repeat_count, previous_digest = repair_failure_signatures.get(signature_key, (0, ""))
+                repeated_same_failure = previous_repeat_count >= 1 and previous_digest == candidate_digest
+                repair_failure_signatures[signature_key] = (previous_repeat_count + 1, candidate_digest)
 
                 if error_source == "model_empty_content":
                     empty_retry_index = repair_counts_by_layer[error_layer]
@@ -1807,11 +1829,11 @@ async def generate_file(request: GenerateFileRequest):
                         contract_text=contract_text,
                         passed_checks_text=passed_checks_text,
                         failed_checks_text=failed_checks_text,
-                        repair_mode=_repair_mode_for_first_round(
+                        repair_mode=("strict_patch" if repeated_same_failure else _repair_mode_for_first_round(
                             source=error_source,
                             file_path=request.file_path,
                             attempt=attempt,
-                        ),
+                        )),
                     )
 
                     feedback = _format_file_validator_feedback(
@@ -1821,7 +1843,7 @@ async def generate_file(request: GenerateFileRequest):
                         file_path=request.file_path,
                     )
 
-                    repair_mode = _repair_mode_for_first_round(
+                    repair_mode = "strict_patch" if repeated_same_failure else _repair_mode_for_first_round(
                         source=error_source,
                         file_path=request.file_path,
                         attempt=attempt,
