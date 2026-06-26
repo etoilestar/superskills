@@ -235,6 +235,20 @@
           }}
         </span>
         <pre v-if="validateResult?.message" class="post-detail">{{ validateResult.message }}</pre>
+        <div v-if="validateResult?.repair_events?.length" class="post-detail repair-events">
+          <div v-for="(event, idx) in validateResult.repair_events" :key="idx" class="repair-event">
+            <strong>{{ event.phase || 'e2e_repair' }}</strong>
+            <span v-if="event.e2e_session_id"> · session {{ event.e2e_session_id }}</span>
+            <span v-if="event.target_file"> · {{ event.target_file }}</span>
+            <span v-if="event.resume_from_step"> · 从第 {{ event.resume_from_step }} 步继续</span>
+            <span v-if="Array.isArray(event.reused_checkpoints)"> · 复用 checkpoint: {{ event.reused_checkpoints.join(', ') || '无' }}</span>
+            <span v-if="Array.isArray(event.invalidated_checkpoints)"> · 失效 checkpoint: {{ event.invalidated_checkpoints.join(', ') || '无' }}</span>
+            <span v-if="event.reused_venv !== undefined"> · {{ event.reused_venv ? '复用 venv' : '准备 venv' }}</span>
+            <span v-if="event.patch_status"> · patch {{ event.patch_status }}</span>
+            <span v-if="event.rerun_status"> · rerun {{ event.rerun_status }}</span>
+            <pre v-if="event.diff_excerpt" class="post-detail">{{ event.diff_excerpt }}</pre>
+          </div>
+        </div>
       </div>
 
       <div

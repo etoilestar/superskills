@@ -368,6 +368,7 @@ class SkillActionResponse(BaseModel):
     success: bool
     path: Optional[str] = None
     message: str
+    repair_events: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ListFilesRequest(BaseModel):

@@ -227,11 +227,21 @@ def _extract_json_or_diff_proposal(
                 old = edit.get("old")
                 new = edit.get("new")
 
+                if old is None and isinstance(edit.get("old_lines"), list):
+                    if not all(isinstance(line, str) for line in edit["old_lines"]):
+                        raise ValueError(f"edits[{index}].old_lines 必须是字符串数组。")
+                    old = "\n".join(edit["old_lines"])
+
+                if new is None and isinstance(edit.get("new_lines"), list):
+                    if not all(isinstance(line, str) for line in edit["new_lines"]):
+                        raise ValueError(f"edits[{index}].new_lines 必须是字符串数组。")
+                    new = "\n".join(edit["new_lines"])
+
                 if not isinstance(old, str) or not old:
-                    raise ValueError(f"edits[{index}].old 必须是非空字符串。")
+                    raise ValueError(f"edits[{index}].old/old_lines 必须是非空字符串。")
 
                 if not isinstance(new, str):
-                    raise ValueError(f"edits[{index}].new 必须是字符串。")
+                    raise ValueError(f"edits[{index}].new/new_lines 必须是字符串。")
 
                 normalized_edits.append({"old": old, "new": new})
 
@@ -330,6 +340,192 @@ def _unified_diff_target_files(diff_text: str) -> tuple[str, str]:
 
     return old_path, new_path
 
+
+
+_NORMALIZE_TRANSLATION = str.maketrans({
+    "“": '"', "”": '"', "„": '"', "‟": '"',
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",
+    "，": ",", "。": ".", "：": ":", "；": ";", "！": "!", "？": "?",
+    "（": "(", "）": ")", "【": "[", "】": "]", "［": "[", "］": "]",
+    "｛": "{", "｝": "}", "《": "<", "》": ">", "、": ",",
+    "—": "-", "–": "-", "－": "-", "…": "...",
+})
+
+
+def _normalize_text_with_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """Normalize text for conservative matching while retaining original spans."""
+
+    normalized: list[str] = []
+    spans: list[tuple[int, int]] = []
+    pending_space_start: int | None = None
+    pending_space_end: int | None = None
+
+    def flush_space() -> None:
+        nonlocal pending_space_start, pending_space_end
+        if pending_space_start is None or pending_space_end is None:
+            return
+        if normalized and normalized[-1] != " ":
+            normalized.append(" ")
+            spans.append((pending_space_start, pending_space_end))
+        pending_space_start = None
+        pending_space_end = None
+
+    for pos, ch in enumerate(text or ""):
+        if ch.isspace():
+            if pending_space_start is None:
+                pending_space_start = pos
+            pending_space_end = pos + 1
+            continue
+        flush_space()
+        mapped = ch.translate(_NORMALIZE_TRANSLATION)
+        for mapped_ch in mapped:
+            normalized.append(mapped_ch)
+            spans.append((pos, pos + 1))
+
+    while normalized and normalized[0] == " ":
+        normalized.pop(0)
+        spans.pop(0)
+    while normalized and normalized[-1] == " ":
+        normalized.pop()
+        spans.pop()
+    return "".join(normalized), spans
+
+
+def _find_unique_normalized_span(content: str, old: str) -> tuple[int, int] | None:
+    norm_content, spans = _normalize_text_with_spans(content)
+    norm_old, _ = _normalize_text_with_spans(old)
+    if not norm_old:
+        return None
+    starts = [m.start() for m in re.finditer(re.escape(norm_old), norm_content)]
+    if len(starts) != 1:
+        return None
+    norm_start = starts[0]
+    norm_end = norm_start + len(norm_old) - 1
+    return spans[norm_start][0], spans[norm_end][1]
+
+
+def _is_approximate_replace_allowed(target_file: str) -> bool:
+    path = _strip_diff_path_prefix(target_file).lower()
+    if path.startswith("scripts/") and path.endswith(".py"):
+        return False
+    return path.endswith((".md", ".markdown", ".txt", ".text", ".rst", ".yaml", ".yml", ".json"))
+
+
+def _extract_approximate_anchors(query: str) -> list[str]:
+    patterns = [
+        r"(?:[\w.-]+/)+[\w.-]+",
+        r"`([^`]{3,120})`",
+        r"https?://[^\s)\]>'\"]+",
+        r"[\"']([^\"']{6,120})[\"']",
+        r"[\u4e00-\u9fff]{4,}",
+        r"[A-Za-z0-9_./:-]{8,}",
+    ]
+    anchors: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, query or ""):
+            value = next((g for g in match.groups() if g), match.group(0))
+            if value and value not in anchors:
+                anchors.append(value)
+    return anchors[:20]
+
+
+def _excerpt(text: str, start: int, end: int, limit: int = 600) -> str:
+    value = (text or "")[max(0, start):min(len(text or ""), end)]
+    if len(value) <= limit:
+        return value
+    half = max(1, limit // 2)
+    return value[:half] + "\n…\n" + value[-half:]
+
+
+def _find_approximate_substring_span(content: str, query: str) -> dict[str, Any]:
+    norm_content, content_spans = _normalize_text_with_spans(content)
+    norm_query, _ = _normalize_text_with_spans(query)
+    if not norm_content or not norm_query:
+        return {"accepted": False, "reason": "empty_normalized_query_or_content"}
+
+    q_len = len(norm_query)
+    candidate_ranges: set[tuple[int, int]] = set()
+    matcher = difflib.SequenceMatcher(None, norm_query, norm_content, autojunk=False)
+    for block in matcher.get_matching_blocks():
+        if block.size < max(4, min(20, q_len // 8)):
+            continue
+        base = block.b - block.a
+        for delta in (-q_len // 10, 0, q_len // 10):
+            start = max(0, base + delta)
+            end = min(len(norm_content), start + q_len)
+            if end > start:
+                candidate_ranges.add((start, end))
+
+    for anchor in _extract_approximate_anchors(query):
+        norm_anchor, _ = _normalize_text_with_spans(anchor)
+        if not norm_anchor:
+            continue
+        anchor_offset = norm_query.find(norm_anchor)
+        if anchor_offset < 0:
+            continue
+        search_from = 0
+        while True:
+            pos = norm_content.find(norm_anchor, search_from)
+            if pos < 0:
+                break
+            base = pos - anchor_offset
+            for scale in (0.8, 1.0, 1.2):
+                length = max(1, int(q_len * scale))
+                start = max(0, base - max(0, length - q_len) // 2)
+                end = min(len(norm_content), start + length)
+                candidate_ranges.add((start, end))
+            search_from = pos + 1
+
+    scored: list[dict[str, Any]] = []
+    for start, end in candidate_ranges:
+        cand = norm_content[start:end]
+        similarity = difflib.SequenceMatcher(None, norm_query, cand, autojunk=False).ratio()
+        if start < len(content_spans) and end - 1 < len(content_spans):
+            orig_start, orig_end = content_spans[start][0], content_spans[end - 1][1]
+            scored.append({
+                "start": orig_start,
+                "end": orig_end,
+                "similarity": similarity,
+                "matched_excerpt": _excerpt(content, orig_start, orig_end),
+            })
+
+    if not scored:
+        return {"accepted": False, "reason": "no_candidate_substring"}
+
+    scored.sort(key=lambda item: item["similarity"], reverse=True)
+    best = scored[0]
+
+    def substantially_overlaps(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        overlap = max(0, min(left["end"], right["end"]) - max(left["start"], right["start"]))
+        shortest = max(1, min(left["end"] - left["start"], right["end"] - right["start"]))
+        return overlap / shortest >= 0.8
+
+    distinct_best_spans = [
+        item for item in scored
+        if item["similarity"] >= best["similarity"] - 1e-9 and not substantially_overlaps(best, item)
+    ]
+    second_similarity = next((item["similarity"] for item in scored[1:] if not substantially_overlaps(best, item)), 0.0)
+    best["second_similarity"] = second_similarity
+    best["candidate_count"] = len(scored)
+
+    if best["similarity"] < 0.88:
+        best["accepted"] = False
+        best["reason"] = "best_similarity_below_threshold"
+    elif second_similarity and best["similarity"] - second_similarity < 0.05:
+        best["accepted"] = False
+        best["reason"] = "best_second_best_margin_too_small"
+    elif distinct_best_spans:
+        best["accepted"] = False
+        best["reason"] = "matched_span_not_unique"
+    else:
+        best["accepted"] = True
+        best["reason"] = "accepted"
+    return best
+
+class CreatorRepairNoopPatch(ValueError):
+    """Raised when a proposal contains no effective edits and should not consume normal retries."""
+
+
 def _apply_exact_replace_patch(
     *,
     original_content: str,
@@ -378,29 +574,76 @@ def _apply_exact_replace_patch(
             continue
 
         count = candidate.count(old)
+        fallback_type = "exact"
+        similarity: float | None = None
+        matched_excerpt = old
+        replace_start: int | None = None
+        replace_end: int | None = None
 
-        if count == 0:
-            raise ValueError(
-                f"edits[{index}].old 在当前文件中没有匹配。"
-                "请从当前文件逐字复制更准确的 old 片段。"
-            )
-
-        if count > 1:
+        if count == 1:
+            replace_start = candidate.find(old)
+            replace_end = replace_start + len(old)
+        elif count > 1:
             raise ValueError(
                 f"edits[{index}].old 在当前文件中匹配了 {count} 次。"
                 "请提供更长 old 片段，保证唯一匹配。"
             )
+        else:
+            normalized_span = _find_unique_normalized_span(candidate, old)
+            if normalized_span is not None:
+                replace_start, replace_end = normalized_span
+                fallback_type = "normalized_exact"
+                similarity = 1.0
+                matched_excerpt = _excerpt(candidate, replace_start, replace_end)
+            elif _is_approximate_replace_allowed(expected_target_file):
+                approx = _find_approximate_substring_span(candidate, old)
+                if not approx.get("accepted"):
+                    raise ValueError(
+                        f"edits[{index}].old 在当前文件中没有 exact/normalized 匹配，"
+                        "approximate substring 置信度不足，已拒绝自动替换。"
+                        f"reason={approx.get('reason')}; "
+                        f"similarity={float(approx.get('similarity') or 0):.3f}; "
+                        f"second_similarity={float(approx.get('second_similarity') or 0):.3f}; "
+                        "最相近候选原文片段如下，可在下一轮直接复制为 old：\n"
+                        "```text\n"
+                        f"{approx.get('matched_excerpt') or ''}\n"
+                        "```"
+                    )
+                replace_start = int(approx["start"])
+                replace_end = int(approx["end"])
+                fallback_type = "approximate_substring"
+                similarity = float(approx["similarity"])
+                matched_excerpt = str(approx.get("matched_excerpt") or "")
+            else:
+                raise ValueError(
+                    f"edits[{index}].old 在当前文件中没有匹配。"
+                    "当前文件类型只允许 exact 或 normalized exact，不启用 approximate substring 自动替换。"
+                    "请从当前文件逐字复制更准确的 old 片段。"
+                )
 
-        candidate = candidate.replace(old, new, 1)
+        assert replace_start is not None and replace_end is not None
+        original_span = candidate[replace_start:replace_end]
+        if original_span == new:
+            skipped_noop.append({
+                "index": index,
+                "old_chars": len(old),
+                "reason": "匹配到的原文 span 与 new 完全相同，已跳过该 no-op edit。",
+            })
+            continue
+        candidate = candidate[:replace_start] + new + candidate[replace_end:]
         applied.append({
             "index": index,
             "old_chars": len(old),
             "new_chars": len(new),
+            "fallback_type": fallback_type,
+            "similarity": similarity,
+            "matched_excerpt": matched_excerpt[:1000],
+            "original_model_old_excerpt": old[:1000],
         })
 
     if not applied:
-        raise ValueError(
-            "exact_replace patch 没有任何真实 edit。"
+        raise CreatorRepairNoopPatch(
+            "proposal_noop：exact_replace patch 没有任何真实 edit。"
             "所有 edits 都是 no-op，old 与 new 完全相同。"
             "请提交会真实改变当前失败内容的 patch。"
         )
@@ -726,6 +969,7 @@ async def _request_repair_diff_proposal(
                 "3. 不要输出完整文件源码。\n"
                 "4. 不要输出 Markdown。\n"
                 "5. 不要手写 unified diff，除非你非常确定 hunk 完全正确。\n"
+                "6. 多行代码片段建议使用 old_lines/new_lines 字符串数组，后端会用换行 join，避免 JSON 字符串裸换行转义错误。\n"
             ),
         },
     ]
@@ -745,7 +989,6 @@ async def _request_repair_diff_proposal(
 
         except Exception as exc:
             last_error = exc
-
             logger.warning(
                 "[Creator][repair_patch][format_violation] file=%s model=%s attempt=%d/%d error=%s",
                 file_path,
@@ -823,8 +1066,10 @@ async def _request_and_apply_repair_patch(
     accumulated_context = task_context + ("\n\n" + runtime_priority_note if runtime_priority_note else "")
     last_error: Exception | None = None
     last_proposal_excerpt = ""
+    failed_proposal_counts: dict[str, int] = {}
 
     for attempt in range(1, max(1, patch_retry_limit) + 1):
+        proposal_signature: str | None = None
         try:
             proposal = await _request_repair_diff_proposal(
                 model=model,
@@ -837,17 +1082,33 @@ async def _request_and_apply_repair_patch(
                 format_retry_limit=2,
             )
 
+            proposal_signature_payload = proposal.raw if proposal.raw is not None else {
+                "target_file": proposal.target_file,
+                "reason": proposal.reason,
+                "mode": proposal.mode,
+                "diff": proposal.diff[:2000],
+                "edits": proposal.edits,
+            }
             last_proposal_excerpt = json.dumps(
-                proposal.raw if proposal.raw is not None else {
-                    "target_file": proposal.target_file,
-                    "reason": proposal.reason,
-                    "mode": proposal.mode,
-                    "diff": proposal.diff[:2000],
-                    "edits": proposal.edits,
-                },
+                proposal_signature_payload,
                 ensure_ascii=False,
                 default=str,
             )[:5000]
+            proposal_signature = json.dumps(proposal_signature_payload, ensure_ascii=False, sort_keys=True, default=str)
+
+            if failed_proposal_counts.get(proposal_signature, 0) >= 1:
+                repeated_excerpt = ""
+                if proposal.edits:
+                    old_text = str(proposal.edits[0].get("old") or "")
+                    approx = _find_approximate_substring_span(current_content, old_text)
+                    repeated_excerpt = str(approx.get("matched_excerpt") or "")
+                raise ValueError(
+                    "REPEATED_UNAPPLICABLE_PROPOSAL：连续两轮 proposal 完全相同且上一轮不可应用，"
+                    "禁止再次提交同一 old。请直接复制下面最相近候选原文片段作为新的 old，或提供更长唯一片段。\n"
+                    "```text\n"
+                    f"{repeated_excerpt}\n"
+                    "```"
+                )
 
             candidate, diff_stats = _validate_repair_diff_scope(
                 proposal=proposal,
@@ -860,6 +1121,10 @@ async def _request_and_apply_repair_patch(
 
         except Exception as exc:
             last_error = exc
+            if proposal_signature is not None:
+                failed_proposal_counts[proposal_signature] = failed_proposal_counts.get(proposal_signature, 0) + 1
+            if isinstance(exc, CreatorRepairNoopPatch) or "REPEATED_UNAPPLICABLE_PROPOSAL" in str(exc):
+                break
 
             logger.warning(
                 "[Creator][repair_patch][apply_or_parse_failed] file=%s model=%s attempt=%d/%d error=%s",

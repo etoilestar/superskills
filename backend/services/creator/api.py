@@ -1733,6 +1733,7 @@ async def validate_skill(request: SkillActionRequest):
     max_attempts = max(0, min(int(request.max_e2e_repair_attempts or 0), 10))
     attempt = 0
     repair_logs: list[str] = []
+    repair_events: list[dict[str, Any]] = []
 
     while True:
         external_context = _external_context_from_skill_action_request(request)
@@ -1777,6 +1778,7 @@ async def validate_skill(request: SkillActionRequest):
                         if repair_logs else ""
                     )
                 ),
+                repair_events=repair_events,
             )
 
         target_path = _e2e_repair_target_from_errors(e2e_errors)
@@ -1787,6 +1789,7 @@ async def validate_skill(request: SkillActionRequest):
                 e2e_errors=e2e_errors,
                 requested_model=request.model,
                 external_context=external_context,
+                repair_events=repair_events,
             )
             attempt += 1
             repair_logs.append(
@@ -1811,6 +1814,7 @@ async def validate_skill(request: SkillActionRequest):
                         if repair_logs else ""
                     )
                 ),
+                repair_events=repair_events,
             )
 
 
