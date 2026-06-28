@@ -2093,9 +2093,10 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             or "content_responsibility" in lower_error
         ):
             return (
-                "当前失败属于 script_functional 内容职责闭环失败，不是 script_smoke 运行失败。"
+                "当前失败属于第一轮当前脚本自身语义职责失败，不是 script_smoke 运行失败，也不是 E2E 字段链路失败。"
+                "第一轮修复只补当前脚本缺失的语义输入消费、语义产物生成或明确无效内容；"
                 "只修当前脚本中校验信息指出的函数、行号或代码区域；"
-                "保留已经通过的 import、parse_args/main 入口、JSON argv 协议、stdout 字段名和文件输出协议；"
+                "保留已经通过的 import、parse_args/main 入口、JSON argv 协议、stdout 字段名和文件输出协议；不要把修复变成固定字段名改名；"
                 "不得改 SKILL.md、其它脚本或 SkillPlan；不得进入全量重写；"
                 "不得通过 try/except 吞错后输出假成功、固定模板、空值或 mock 数据。"
                 "核心 stdout 字段必须具有 provenance：来自 argv JSON、上游 stdout、reference/assets、工具结果、模型结果或确定性计算。"
@@ -2981,10 +2982,12 @@ def _detect_script_responsibility_static_blockers(
     if not req_items or not str(script_content or "").strip():
         return []
     # First-round responsibility validation must be behavioral, not name-based.
-    # Do not require semantic_inputs / SkillPlanEntry inputs to appear as string
-    # literals, dict keys, variable names, or stdout keys. E2E owns interface and
-    # schema alignment; this static fallback only looks for an input/tool signal
-    # flowing into constructed product/helper/output behavior.
+    # SkillPlan.inputs/outputs and requirement semantic_inputs/semantic_outputs
+    # are semantic responsibility slots, not literal key requirements. Do not
+    # require them to appear as string literals, dict keys, variable names, or
+    # stdout keys. E2E owns interface/schema alignment; this static fallback only
+    # looks for a semantic input/tool signal flowing into constructed
+    # product/helper/output behavior.
 
     try:
         tree = ast.parse(script_content or "")
@@ -3113,9 +3116,9 @@ def _detect_script_responsibility_static_blockers(
         "failed_file": failed_file,
         "failed_function": "current script",
         "code_region": "run() input and product construction path",
-        "reason": "Current script lacks conservative static evidence that inputs or registered tool/model results participate in core product/helper/output construction.",
-        "missing_evidence": ["input or tool/model result participates in core product construction", "constructed product/helper result is returned or printed"],
-        "minimal_edit": "只修改当前脚本 run() 中的输入读取和产物构造逻辑。",
+        "reason": "Current script lacks conservative static evidence that semantic inputs or registered tool/model results participate in the current file's core semantic product construction.",
+        "missing_evidence": ["semantic input or tool/model result participates in core product construction", "constructed semantic product/helper result is returned or printed"],
+        "minimal_edit": "只修改当前脚本 run() 中缺失的语义输入消费和语义产物构造逻辑；不要为了通过第一轮而改成固定字段名。",
         "allowed_scope": "current script only",
     }]
 
@@ -3422,7 +3425,7 @@ async def _run_script_responsibility_review(
 ) -> dict[str, Any]:
     """First-round script responsibility review.
 
-    第一轮只判断当前脚本源码是否完成自身职责。
+    第一轮只判断当前脚本源码是否覆盖自身负责的语义任务。
 
     不判断：
     - 脚本能不能实际运行；
@@ -3432,6 +3435,9 @@ async def _run_script_responsibility_review(
     - 上下游字段映射；
     - 具体输入输出变量名；
     - 最终 E2E 闭环。
+
+    允许阻断的无效内容仅限非常明确的空内容、空集合、纯占位符、
+    明显默认模板、或与当前脚本职责明显无关的内容。
     """
 
     req_items = _coerce_requirement_items(requirements) or _coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
@@ -3478,13 +3484,18 @@ async def _run_script_responsibility_review(
             "content": (
                 "你是 Creator 第一轮单脚本职责审查模型，只输出严格 JSON object。\n\n"
 
-                "你只判断当前 scripts/** 源码是否完成 SkillPlanEntry 描述的自身职责。"
-                "不要判断其它非职责问题。\n\n"
+                "你只判断当前 scripts/** 源码是否覆盖自身负责的语义任务；也就是只判断当前脚本是否完成自身职责。"
+                "不要判断其它文件、workflow、字段名、审美或充分性细节。\n\n"
 
                 "核心原则：\n"
+                "- 第一轮职责检查去字段化：不要求固定字段名，不因字段名不同判失败；可建议可选字段名，但只能作为参考建议。\n"
+                "- SkillPlan.inputs / outputs 和 requirements 的 semantic_inputs / semantic_outputs 是语义职责槽位参考，不是固定字段名要求。\n"
+                "- 脚本可以使用不同变量名、字段名或数据结构，但必须覆盖对应语义输入消费和语义产物生成。\n"
+                "- 如果脚本只产出通用外壳结果，但没有整合自身职责要求的核心语义输入，应 passed=false。\n"
                 "- 只有当前文件自身语义职责未完成，才 passed=false。\n"
                 "- 如果当前文件已经以等价实现完成同一语义职责，应 passed=true。\n"
-                "- blocking_issues 只能描述当前文件缺失的语义职责和最小实现边界。\n\n"
+                "- 默认内容、空内容、纯占位内容、明显模板化内容只能作为兜底健壮性，不能替代核心职责实现。\n"
+                "- 不做质量、审美、风格、充分性细评；blocking_issues 只能描述当前文件缺失的语义职责和最小实现边界。\n\n"
 
                 "返回 JSON object：\n"
                 "{\n"
@@ -3525,9 +3536,10 @@ async def _run_script_responsibility_review(
                 f"{_numbered_source(script_content)[-16000:]}\n\n"
 
                 "审查要求：\n"
-                "1. 只判断当前脚本是否完成自身职责。\n"
-                "2. 不要判断其它非职责问题。\n"
-                "3. 只有职责本身没有实现，才 passed=false。\n"
+                "1. 只判断当前脚本是否覆盖自身语义职责。\n"
+                "2. 不要判断其它非职责问题，不要按字段名/变量名/固定函数名判错。\n"
+                "3. 把 SkillPlan.inputs/outputs 当作语义槽位，检查脚本是否真正消费对应语义输入并生成对应语义产物。\n"
+                "4. 只有职责本身没有实现，或内容明显无效（空、占位、默认模板、明显无关），才 passed=false。\n"
             ),
         },
     ]

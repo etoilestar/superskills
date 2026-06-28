@@ -329,6 +329,7 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "D. workflow / 平台边界:",
         "- SKILL.md 应说明 Skill 用途、真实脚本调用顺序（如有）和最终产物类型，但第一轮不要求证明内部 stdout/placeholder 闭环。",
         "- 命令 placeholder 应从用户输入、显式字段、默认值、上传文件、前序 stdout 中选择当前脚本真正需要的值。",
+        "- 第一轮不要求固定字段名；可建议字段名，但不能让字段名成为判错依据。",
         "- 不要固定特定中间字段名；内部脚本流转只在第二轮 E2E 真实执行时验证。",
         "- 多场景、多图片、多页 PDF 等循环应由脚本实现；SKILL.md 第一轮只需保持命令块静态可解析。",
         "",
@@ -424,6 +425,7 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "",
         "E. 第二轮 E2E 责任边界:",
         "- placeholder 来源、前后脚本 stdout 字段闭环、最终 stdout 平台输出字段，不在第一轮 SKILL.md prompt 中证明。",
+        "- 第二轮 E2E 会按真实运行链路严格检查已选择字段名是否对齐：argv key、脚本读取 key、上游 stdout key、下游 placeholder 不能错位。",
         "- 如果这些内容不一致，第二轮 E2E 真实执行会基于实际 stdout/文件产物反馈修复 SKILL.md 或脚本。",
     ])
 
@@ -1465,6 +1467,8 @@ def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
     severity = str(issue.get("severity") or "error").strip().lower()
     if severity in {"warning", "info", "note", "advisory"}:
         return False
+    if issue.get("blocking") is False:
+        return False
 
     if _review_issue_is_detail_or_proof_request(issue):
         return False
@@ -1478,7 +1482,17 @@ def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
 
     impact = issue.get("contract_impact") or issue.get("impact")
     if isinstance(impact, dict):
-        return any(bool(impact.get(key)) for key in ("platform_io", "final_artifact", "final_output"))
+        return any(bool(impact.get(key)) for key in (
+            "execution_closure", "resource_role", "platform_io", "final_artifact", "final_output", "user_requirement_transfer"
+        ))
+
+    if issue.get("blocking") is True:
+        field = str(issue.get("field") or "").lower()
+        text_for_blocking = _review_issue_text(issue).lower()
+        if field in {"file_plan", "intent", "workflow", "resources", "user_requirement"} and any(
+            term in text_for_blocking for term in ("missing", "缺失", "无法", "cannot", "真实路径", "script path")
+        ):
+            return True
 
     user_requirement = issue.get("user_requirement") or issue.get("key_requirement")
     if isinstance(user_requirement, dict):
@@ -2185,7 +2199,9 @@ def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_
         "C. 内容职责（参考价值要求）:",
         f"- 职责说明：{purpose or '根据蓝图提供可操作参考资料'}",
         "- reference 正文必须是参考资料本身，而不是对用户的澄清问题、确认选项、聊天回复、状态说明或计划询问。",
+        "- 第一轮只检查 reference 是否覆盖自身负责的参考内容；不因固定字段名、固定章节名或措辞不同判失败。",
         "- 正文必须提供可复用的规则、约束、示例、格式说明、风格要求、质量标准或其它参考信息。",
+        "- 可以阻断非常明确的无效内容：空内容、空集合、纯占位符、明显默认模板、与 reference 职责明显无关的内容。",
         "- 每个 reference 只对应一个子任务/模块，不要把整个 Skill 包打包到一个 reference。",
         "- 正文是辅助参考资料；不要重新定义 SkillPlan 的 role/capability/input/output 合同；如果 SKILL.md 已有可执行命令块，reference 不要重复写命令块。",
         "- 不要重新定义 role / inputs / outputs / capabilities / command_template。",
@@ -2298,6 +2314,35 @@ def _sanitize_reference_placeholders(content: str) -> str:
     if not frontmatter_match:
         return str(content or "")
     return frontmatter_match.group(1).rstrip() + "\n" + new_body
+
+
+def _semantic_reference_tokens(text: str) -> set[str]:
+    """Extract lightweight semantic tokens without business-specific wordlists."""
+    raw = str(text or "").lower()
+    tokens = {m.group(0) for m in re.finditer(r"[a-z0-9_][a-z0-9_./-]{2,}", raw)}
+    cjk = "".join(re.findall(r"[\u4e00-\u9fff]", raw))
+    if len(cjk) >= 2:
+        tokens.update(cjk[i:i + 2] for i in range(len(cjk) - 1))
+    generic = {
+        "参考", "文档", "规则", "格式", "示例", "质量", "标准", "内容", "输出", "输入",
+        "reference", "guide", "format", "example", "quality", "content", "output", "input",
+    }
+    return {token for token in tokens if token not in generic and len(token.strip()) >= 2}
+
+
+def _reference_covers_own_semantic_purpose(*, purpose: str, body: str) -> tuple[bool, dict[str, Any]]:
+    purpose_tokens = _semantic_reference_tokens(purpose)
+    if not purpose_tokens:
+        return True, {"reason": "no_specific_purpose_tokens"}
+    body_tokens = _semantic_reference_tokens(body)
+    matched = sorted(purpose_tokens & body_tokens)
+    # This is not a fixed-section or field-name gate. It only catches the
+    # obvious case where a reference has generic document shape but no lexical
+    # evidence of covering its declared own semantic responsibility.
+    return bool(matched), {
+        "purpose_tokens": sorted(purpose_tokens)[:20],
+        "matched_tokens": matched[:20],
+    }
 
 def _check_reference_file_contract(file_path: str, content: str, *, purpose: str = "") -> list[ContractCheckResult]:
     raw_failures = _basic_markdown_format_failures(
@@ -2435,6 +2480,11 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
             or len(nonempty_lines) >= 6
         )
     )
+    reference_semantic_passed, reference_semantic_details = _reference_covers_own_semantic_purpose(
+        purpose=purpose,
+        body=stripped,
+    )
+
     results.append(ContractCheckResult(
         id="reference.content.has_reference_value",
         passed=has_reference_value,
@@ -2463,6 +2513,20 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
             "has_table": has_table,
             "has_fenced_block": has_fenced_block,
         },
+    ))
+
+    results.append(ContractCheckResult(
+        id="reference.content.covers_own_semantic_purpose",
+        passed=reference_semantic_passed,
+        target=file_path,
+        message=(
+            "reference 正文覆盖自身参考内容职责。"
+            if reference_semantic_passed
+            else f"{file_path} 正文具有通用文档外壳，但缺少覆盖自身 purpose 的语义证据。"
+        ),
+        expected="reference 第一轮只按自身语义职责判断；不要求固定章节名或字段名，但正文必须覆盖 purpose 指向的参考内容。",
+        minimal_edit="只补当前 reference 缺失的参考内容职责，例如与 purpose 对应的规则、格式、示例、约束或质量标准；不要改成固定章节名。",
+        details=reference_semantic_details,
     ))
 
     creator_flow_leak = bool(_CREATOR_FLOW_LEAK_RE.search(content))
