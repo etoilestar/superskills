@@ -1075,6 +1075,83 @@ async def _repair_skill_md_model_finalizer(
     )
 
 
+def _strip_unclosed_or_invalid_frontmatter_for_skill_md(content: str) -> str:
+    """Return the best-effort Markdown body without trusting invalid frontmatter."""
+    text = str(content or "").replace("\r\n", "\n")
+    if not text.lstrip().startswith("---"):
+        return text.strip()
+    lines = text.splitlines()
+    start = next((idx for idx, line in enumerate(lines) if line.strip() == "---"), None)
+    if start is None:
+        return text.strip()
+    end = next((idx for idx in range(start + 1, len(lines)) if lines[idx].strip() == "---"), None)
+    if end is not None:
+        return "\n".join(lines[end + 1:]).strip()
+    # Frontmatter never closed. Prefer preserving the first Markdown-looking body
+    # boundary if present; otherwise keep non-boundary text as editable body.
+    markdown_start = next(
+        (idx for idx in range(start + 1, len(lines)) if re.match(r"\s*(#{1,6}\s+|```|~~~|[-*+]\s+|\d+[.)]\s+)", lines[idx])),
+        None,
+    )
+    if markdown_start is not None:
+        return "\n".join(lines[markdown_start:]).strip()
+    return "\n".join(line for line in lines[start + 1:] if line.strip() != "---").strip()
+
+
+def _balance_markdown_fences_for_skill_md_body(body: str) -> str:
+    markers = re.findall(r"(?m)^\s*(```|~~~)", body or "")
+    if len(markers) % 2 == 1:
+        return (body or "").rstrip() + "\n" + markers[-1] + "\n"
+    return body or ""
+
+
+def _minimal_skill_md_hard_format_fallback(
+    *,
+    skill_name: str,
+    description: str,
+    current_content: str,
+) -> str:
+    """Deterministically repair only SKILL.md hard Markdown boundaries.
+
+    This is a last-resort hard-format fallback: rebuild legal frontmatter and
+    preserve the best-effort body without changing business semantics.
+    """
+    safe_name = _validate_skill_name(skill_name)
+    safe_description = str(description or "Skill usage instructions.").strip() or "Skill usage instructions."
+    body = _strip_unclosed_or_invalid_frontmatter_for_skill_md(current_content)
+    body = _balance_markdown_fences_for_skill_md_body(body).strip()
+    if not body:
+        body = f"# {safe_name}\n\n{safe_description}"
+    elif not re.search(r"(?m)^#{1,6}\s+\S", body):
+        body = f"# {safe_name}\n\n{body}"
+    fallback = (
+        "---\n"
+        f"name: {json.dumps(safe_name, ensure_ascii=False)[1:-1]}\n"
+        f"description: {json.dumps(safe_description, ensure_ascii=False)[1:-1]}\n"
+        "---\n"
+        f"{body.rstrip()}\n"
+    )
+    hard_failures = detect_markdown_hard_format_failures("SKILL.md", fallback, require_frontmatter=True)
+    return fallback if not hard_failures else ""
+
+
+def _safe_finalize_failure_content(
+    *,
+    skill_name: str,
+    description: str,
+    content: str,
+    candidate: str,
+) -> str:
+    raw = content or candidate or ""
+    if not detect_markdown_hard_format_failures("SKILL.md", raw, require_frontmatter=True):
+        return raw
+    return _minimal_skill_md_hard_format_fallback(
+        skill_name=skill_name,
+        description=description,
+        current_content=raw,
+    )
+
+
 @router.post("/finalize-skill-md")
 async def finalize_skill_md(request: FinalizeSkillMdRequest):
     """Finalize SKILL.md with staged repair.
@@ -1138,6 +1215,26 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                 })
 
                 if attempt >= 3:
+                    fallback = _minimal_skill_md_hard_format_fallback(
+                        skill_name=skill_name,
+                        description=request.description or "final SKILL.md",
+                        current_content=content,
+                    )
+                    fallback_failures = (
+                        detect_markdown_hard_format_failures("SKILL.md", fallback, require_frontmatter=True)
+                        if fallback
+                        else format_failures
+                    )
+                    repair_events.append({
+                        "attempt": attempt,
+                        "target_file": "SKILL.md",
+                        "patch_status": "deterministic_hard_format_fallback",
+                        "success": bool(fallback) and not fallback_failures,
+                        "failures": fallback_failures,
+                    })
+                    if fallback and not fallback_failures:
+                        content = fallback
+                        candidate = fallback
                     break
 
                 rewrite_messages = [
@@ -1180,6 +1277,19 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                     prompt_variant="format_full_rewrite",
                     retry_index=attempt - 1,
                 )
+                rewritten_content = _sanitize_generated_file_content("SKILL.md", candidate)
+                rewritten_failures = detect_markdown_hard_format_failures(
+                    "SKILL.md",
+                    rewritten_content,
+                    require_frontmatter=True,
+                )
+                repair_events.append({
+                    "attempt": attempt,
+                    "target_file": "SKILL.md",
+                    "patch_status": "format_full_rewrite_validation",
+                    "success": not rewritten_failures,
+                    "failures": rewritten_failures,
+                })
                 continue
 
             # 阶段 2：平台合同、文件引用等非基础 Markdown 格式问题。
@@ -1203,7 +1313,7 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                     "success": True,
                     "content": content,
                     "repair_attempts": attempt - 1,
-                    "validation_status": "passed_after_patch_safety_checks",
+                    "validation_status": "passed",
                     "editable": True,
                     "disabled": False,
                     "repair_events": repair_events,
@@ -1318,9 +1428,15 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
             failures = _exception_to_skill_md_failures(exc, source="skill_md_model_finalize")
             break
 
+    safe_failure_content = _safe_finalize_failure_content(
+        skill_name=skill_name,
+        description=request.description or "final SKILL.md",
+        content=content,
+        candidate=candidate,
+    )
     return {
         "success": False,
-        "content": content or candidate,
+        "content": safe_failure_content,
         "repair_attempts": max(0, attempt if "attempt" in locals() else 0),
         "validation_status": "needs_repair",
         "needs_repair": True,

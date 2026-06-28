@@ -2063,6 +2063,73 @@ python scripts/main.py '{"payload":"{{user_request}}"}'
     assert calls == ["model_finalizer", "format_full_rewrite"]
 
 
+@pytest.mark.asyncio
+async def test_finalize_skill_md_unclosed_frontmatter_returns_editable_failure_not_success(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.routers import creator
+    from backend.services.creator import api as creator_api
+    from backend.routers.creator import FinalizeSkillMdRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    (tmp_path / "demo-skill").mkdir()
+
+    async def fake_complete_creator_file_generation(**_kwargs):
+        return "---\nname: demo-skill\ndescription: Demo\n# swallowed body\n```bash\npython scripts/main.py '{}'\n"
+
+    monkeypatch.setattr(creator_api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    async def fake_alignment(**_kwargs):
+        return None
+
+    monkeypatch.setattr(creator_api, "_validate_skill_md_blueprint_alignment", fake_alignment)
+
+    result = await creator.finalize_skill_md(FinalizeSkillMdRequest(
+        skill_name="demo-skill",
+        description="Demo",
+        blueprint_text="scripts/main.py",
+        script_runtime_specs=[{"script_path": "scripts/main.py", "accepted_sample_argv": {"payload": "{{user_request}}"}}],
+    ))
+
+    assert result["success"] is False
+    assert result["needs_repair"] is True
+    assert result["editable"] is True
+    assert result["failures"]
+    assert all(event.get("patch_status") != "patch_failed" for event in result["repair_events"])
+
+
+@pytest.mark.asyncio
+async def test_finalize_skill_md_format_rewrite_failure_does_not_return_illegal_markdown(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.routers import creator
+    from backend.services.creator import api as creator_api
+    from backend.services.creator.contracts import detect_markdown_hard_format_failures
+    from backend.routers.creator import FinalizeSkillMdRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    (tmp_path / "demo-skill").mkdir()
+
+    async def fake_complete_creator_file_generation(**_kwargs):
+        return "---\nname: demo-skill\nbad: :\n---\n# Body\n```bash\npython scripts/main.py '{}'\n"
+
+    monkeypatch.setattr(creator_api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    async def fake_alignment(**_kwargs):
+        return None
+
+    monkeypatch.setattr(creator_api, "_validate_skill_md_blueprint_alignment", fake_alignment)
+
+    result = await creator.finalize_skill_md(FinalizeSkillMdRequest(
+        skill_name="demo-skill",
+        description="Demo",
+        blueprint_text="scripts/main.py",
+        script_runtime_specs=[{"script_path": "scripts/main.py", "accepted_sample_argv": {"payload": "{{user_request}}"}}],
+    ))
+
+    assert result["success"] is False
+    assert result["needs_repair"] is True
+    assert result["editable"] is True
+    assert result["content"] != "---\nname: demo-skill\nbad: :\n---\n# Body\n```bash\npython scripts/main.py '{}'\n"
+    assert not detect_markdown_hard_format_failures("SKILL.md", result["content"], True)
+    assert any(event.get("patch_status") == "format_full_rewrite_validation" for event in result["repair_events"])
+
 
 
 @pytest.mark.asyncio

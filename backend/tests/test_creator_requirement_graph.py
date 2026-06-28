@@ -137,6 +137,22 @@ def test_static_responsibility_blocks_required_input_not_in_core_path():
     assert issues[0]["allowed_scope"] == "current script only"
 
 
+
+
+def test_static_responsibility_blocks_generic_shell_without_semantic_product():
+    spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+    script = """
+def run(payload):
+    source = payload.get('any_alias')
+    return {'status': 'ok', 'message': 'done'}
+"""
+    issues = _detect_script_responsibility_static_blockers(script, spec, [req])
+    assert issues
+    assert issues[0]["id"] == "semantic_responsibility_missing"
+    assert "字段" not in issues[0]["minimal_edit"] or "固定字段名" in issues[0]["minimal_edit"]
+
+
 def test_static_responsibility_passes_when_input_enters_blocks_and_helper_args():
     spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
     req = build_default_requirement_graph([spec]).requirements[0]
@@ -586,7 +602,9 @@ async def test_responsibility_prompt_omits_non_responsibility_counterexamples(mo
 
     prompt_text = "\n".join(str(message.get("content") or "") for message in captured_messages)
     assert "只判断当前脚本是否完成自身职责" in prompt_text
-    for forbidden in ["格式", "字段", "argv", "stdout", "artifact", "E2E", "运行", "跨文件", "表达"]:
+    assert "不要求固定字段名" in prompt_text
+    assert "语义职责槽位参考" in prompt_text
+    for forbidden in ["argv", "stdout", "artifact", "E2E", "跨文件"]:
         assert forbidden not in prompt_text
 
 
@@ -1454,6 +1472,46 @@ def test_missing_evidence_is_required_for_blocking_requirement_failure():
         file_path=req.target_file,
     )
     assert review["passed"] is True
+
+
+
+
+def test_reference_contract_checks_own_semantic_purpose_not_fixed_sections():
+    from backend.services.creator.contracts import _check_reference_file_contract
+
+    good = """---
+title: Tone Guide
+description: Brand voice reference
+---
+# Voice Notes
+
+## Narrative cues
+- Brand voice should stay concise, warm, and evidence-oriented.
+- Typography examples should distinguish heading, label, and body usage.
+- Use contrast rules and spacing notes when adapting layouts.
+
+## Review hints
+Confirm that every sample paragraph follows the brand voice and typography constraints.
+"""
+    good_failed = {r.id for r in _check_reference_file_contract("references/tone.md", good, purpose="brand voice typography constraints") if not r.passed}
+    assert "reference.content.covers_own_semantic_purpose" not in good_failed
+
+    generic = """---
+title: Generic Guide
+description: Generic reference
+---
+# General Notes
+
+## Rules
+- Provide useful information.
+- Keep the content organized.
+- Include examples when needed.
+
+## Checks
+Make sure the document is clear and complete for future users.
+"""
+    generic_failed = {r.id for r in _check_reference_file_contract("references/tone.md", generic, purpose="brand voice typography constraints") if not r.passed}
+    assert "reference.content.covers_own_semantic_purpose" in generic_failed
 
 
 def test_reference_placeholder_matches_include_details_and_sanitizer_preserves_frontmatter():

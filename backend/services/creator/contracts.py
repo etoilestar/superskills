@@ -2315,6 +2315,35 @@ def _sanitize_reference_placeholders(content: str) -> str:
         return str(content or "")
     return frontmatter_match.group(1).rstrip() + "\n" + new_body
 
+
+def _semantic_reference_tokens(text: str) -> set[str]:
+    """Extract lightweight semantic tokens without business-specific wordlists."""
+    raw = str(text or "").lower()
+    tokens = {m.group(0) for m in re.finditer(r"[a-z0-9_][a-z0-9_./-]{2,}", raw)}
+    cjk = "".join(re.findall(r"[\u4e00-\u9fff]", raw))
+    if len(cjk) >= 2:
+        tokens.update(cjk[i:i + 2] for i in range(len(cjk) - 1))
+    generic = {
+        "参考", "文档", "规则", "格式", "示例", "质量", "标准", "内容", "输出", "输入",
+        "reference", "guide", "format", "example", "quality", "content", "output", "input",
+    }
+    return {token for token in tokens if token not in generic and len(token.strip()) >= 2}
+
+
+def _reference_covers_own_semantic_purpose(*, purpose: str, body: str) -> tuple[bool, dict[str, Any]]:
+    purpose_tokens = _semantic_reference_tokens(purpose)
+    if not purpose_tokens:
+        return True, {"reason": "no_specific_purpose_tokens"}
+    body_tokens = _semantic_reference_tokens(body)
+    matched = sorted(purpose_tokens & body_tokens)
+    # This is not a fixed-section or field-name gate. It only catches the
+    # obvious case where a reference has generic document shape but no lexical
+    # evidence of covering its declared own semantic responsibility.
+    return bool(matched), {
+        "purpose_tokens": sorted(purpose_tokens)[:20],
+        "matched_tokens": matched[:20],
+    }
+
 def _check_reference_file_contract(file_path: str, content: str, *, purpose: str = "") -> list[ContractCheckResult]:
     raw_failures = _basic_markdown_format_failures(
         file_path,
@@ -2451,6 +2480,11 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
             or len(nonempty_lines) >= 6
         )
     )
+    reference_semantic_passed, reference_semantic_details = _reference_covers_own_semantic_purpose(
+        purpose=purpose,
+        body=stripped,
+    )
+
     results.append(ContractCheckResult(
         id="reference.content.has_reference_value",
         passed=has_reference_value,
@@ -2479,6 +2513,20 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
             "has_table": has_table,
             "has_fenced_block": has_fenced_block,
         },
+    ))
+
+    results.append(ContractCheckResult(
+        id="reference.content.covers_own_semantic_purpose",
+        passed=reference_semantic_passed,
+        target=file_path,
+        message=(
+            "reference 正文覆盖自身参考内容职责。"
+            if reference_semantic_passed
+            else f"{file_path} 正文具有通用文档外壳，但缺少覆盖自身 purpose 的语义证据。"
+        ),
+        expected="reference 第一轮只按自身语义职责判断；不要求固定章节名或字段名，但正文必须覆盖 purpose 指向的参考内容。",
+        minimal_edit="只补当前 reference 缺失的参考内容职责，例如与 purpose 对应的规则、格式、示例、约束或质量标准；不要改成固定章节名。",
+        details=reference_semantic_details,
     ))
 
     creator_flow_leak = bool(_CREATOR_FLOW_LEAK_RE.search(content))
