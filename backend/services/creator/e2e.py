@@ -837,14 +837,15 @@ def _run_e2e_step_argument_effect_review(
 ) -> dict[str, Any]:
     """Second-round E2E step interface + argument-effect review.
 
-    第二轮只做接口闭环，不做第一轮责任审查：
+    第二轮只检查真实运行链路，不做第一轮责任审查：
 
-    1. SKILL.md 当前 command 是否把当前 step 所需输入/控制参数传进 rendered_payload；
-    2. 当前脚本是否真实读取 rendered_payload；
-    3. rendered_payload 是否影响 stdout_json 或 artifact_paths；
-    4. 如果失败，归因到 SKILL.md 参数映射，或当前脚本参数消费。
+    1. SKILL.md 当前 command 渲染后的 argv 是否包含当前 step 所需输入/控制参数；
+    2. 当前脚本是否实际读取这些 argv 参数；
+    3. stdout_json 是否能被后续步骤 placeholder 或最终平台输出使用；
+    4. artifact_paths / 最终产物是否按链路生成；
+    5. 如果失败，先最小归因为参数没传上、脚本没读到、上游没产出、或当前输出不符合链路需要。
 
-    不写业务字段词表，不要求固定字段名。
+    不要求平台统一字段名；但 workflow 中实际选择的字段名必须严格对齐。
     """
 
     rendered_payload = rendered_payload if isinstance(rendered_payload, dict) else {}
@@ -896,22 +897,23 @@ def _run_e2e_step_argument_effect_review(
             "content": (
                 "你是 Creator 第二轮 E2E 当前 step 接口对齐审查模型，只输出严格 JSON object。\n\n"
 
-                "你只判断当前 step 的接口闭环：\n"
-                "1. SKILL.md 当前 bash command 是否把当前脚本需要的输入/控制参数传入 rendered_payload；\n"
-                "2. 当前脚本是否真实读取 rendered_payload；\n"
-                "3. rendered_payload 中的有效信息是否影响 stdout_json 或 artifact_paths。\n\n"
+                "你只判断当前 step 的真实运行链路：\n"
+                "1. SKILL.md 当前 bash command 渲染后的 argv 是否把当前脚本需要的输入/控制参数传入 rendered_payload；\n"
+                "2. 当前脚本是否实际读取这些 argv 参数，而不是用默认值绕过真实传参；\n"
+                "3. 当前 stdout_json 是否能被后续步骤 placeholder 或最终平台输出消费；\n"
+                "4. artifact_paths / 最终产物是否按当前链路生成。\n\n"
 
                 "重要边界：\n"
                 "- 不做第一轮脚本职责审查；脚本功能是否完整由 _run_script_responsibility_review 负责。\n"
                 "- 不判断完整 SKILL.md 写得好不好。\n"
                 "- 不判断最终产物审美质量。\n"
-                "- 不要求固定字段名。\n"
-                "- 不允许套用业务字段词表。\n"
-                "- 允许脚本通过 payload、input、fields、options、统一对象、别名字段或等价结构接收参数。\n"
-                "- 如果字段名不同但语义已传入并被脚本消费，应 passed=true。\n"
+                "- 不要求平台统一字段名，不允许套用业务字段词表。\n"
+                "- 但 workflow 中实际选择的字段名必须严格对齐：传入 key 和脚本读取 key 不一致，应失败。\n"
+                "- 上游 stdout key 和下游 placeholder 不一致，应失败；通过默认值绕过真实传参，应失败。\n"
+                "- 允许脚本通过 payload、input、fields、options、统一对象、别名字段或等价结构接收参数，但必须能证明实际传入的 key 被读取并影响输出。\n"
                 "- 如果 rendered_payload 缺少当前 step 必需信息，failure_kind=missing_payload，target_file=SKILL.md。\n"
-                "- 如果 rendered_payload 已传入合理信息，但脚本没有读取或被默认值覆盖，failure_kind=script_not_consuming_payload，target_file=当前脚本。\n"
-                "- 如果当前 step 输出了内容，但后续映射接不上，failure_kind=output_mapping_mismatch，target_file=SKILL.md。\n"
+                "- 如果 rendered_payload 已传入合理信息，但脚本没有读取、读取了不同 key、或被默认值覆盖，failure_kind=script_not_consuming_payload，target_file=当前脚本。\n"
+                "- 如果当前 step 输出了内容，但后续 placeholder/字段映射接不上，failure_kind=output_mapping_mismatch，target_file=SKILL.md。\n"
                 "- 如果没有接口问题，返回 passed=true。\n\n"
 
                 "返回 JSON：\n"
@@ -963,12 +965,14 @@ def _run_e2e_step_argument_effect_review(
                 f"{_numbered_source(script_content)[-18000:]}\n\n"
 
                 "审查要求：\n"
-                "1. 先判断 SKILL.md 当前 command 是否把当前 step 必要输入/控制参数传进 rendered_payload。\n"
-                "2. 再判断脚本是否真实读取并使用 rendered_payload。\n"
-                "3. 不要根据固定字段名判断；只看语义是否传入、是否消费、是否影响输出。\n"
-                "4. 如果是 SKILL.md 没传对，target_file=SKILL.md。\n"
-                "5. 如果是脚本没接住，target_file=当前脚本。\n"
-                "6. 如果没有接口闭环问题，passed=true。\n"
+                "1. 先做最小归因：参数没传上、脚本没读到、上游没产出、还是当前输出不符合链路需要。\n"
+                "2. 检查 SKILL.md 当前 command 渲染后的 argv 是否把当前 step 必要输入/控制参数传进 rendered_payload。\n"
+                "3. 检查脚本是否真实读取并使用同一组传入 key；不能靠默认值绕过真实传参。\n"
+                "4. 检查 stdout key 是否能被后续 placeholder 或最终输出使用。\n"
+                "5. 不要求平台统一字段名，但已选择的 workflow 字段名必须严格对齐。\n"
+                "6. 如果是 SKILL.md 没传对或上下游 placeholder 不一致，target_file=SKILL.md。\n"
+                "7. 如果是脚本没接住传入 key 或使用默认值绕过，target_file=当前脚本。\n"
+                "8. 如果没有真实链路问题，passed=true。\n"
             ),
         },
     ]
@@ -1233,7 +1237,7 @@ def _e2e_argument_effect_failure(
     evidence = str(review.get("evidence") or "")
     repair_instruction = str(
         review.get("repair_instruction")
-        or f"只修改 {target_file} 中与当前 step 参数映射/消费相关的最小区域。"
+        or f"只修改 {target_file} 中与当前 step 实际字段传输、参数消费或上下游连接相关的最小区域。"
     )
 
     return _format_e2e_failure(E2EFailure(
@@ -1253,7 +1257,7 @@ def _e2e_argument_effect_failure(
         return_code=0,
         expected=(
             "最终 SKILL.md 当前 workflow block 传入的核心业务参数，"
-            "必须被当前脚本真实消费，并影响当前 step 的 stdout_json 或 artifact。"
+            "必须被当前脚本按同一字段链路真实消费，并影响当前 step 的 stdout_json、后续 placeholder 或 artifact。"
         ),
         actual=problem,
         repair_instruction=repair_instruction,
