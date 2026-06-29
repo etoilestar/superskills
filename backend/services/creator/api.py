@@ -130,11 +130,165 @@ def _load_workflow_allocation_summary(skill_name: str) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
+def _persist_workflow_allocation_edges(skill_name: str, edges: list[dict[str, Any]]) -> None:
+    metadata_dir = settings.skills_path / _validate_skill_name(skill_name) / ".creator"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    (metadata_dir / "workflow_responsibility_edges.json").write_text(
+        json.dumps(list(edges or []), ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+
+def _load_workflow_allocation_edges(skill_name: str) -> list[dict[str, Any]]:
+    path = settings.skills_path / _validate_skill_name(skill_name) / ".creator" / "workflow_responsibility_edges.json"
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+
 def _load_persisted_requirement_graph(skill_name: str) -> RequirementGraph | None:
     path = settings.skills_path / _validate_skill_name(skill_name) / ".creator" / "requirement_graph.json"
     if not path.is_file():
         return None
     return normalize_requirement_graph(parse_requirement_graph_result(path.read_text(encoding="utf-8")))
+
+_PLATFORM_GUARANTEED_INPUT_KEYS = {
+    "user_request",
+    "input",
+    "payload",
+    "envelope",
+    "fields",
+    "options",
+    "files",
+    "input_files",
+    "text",
+}
+
+_EXECUTABLE_ITERATION_MECHANISMS = {"internal_iteration", "platform_loop"}
+_EXECUTABLE_AGGREGATION_MECHANISMS = {"aggregation", "internal_iteration"}
+_RESOURCE_EDGE_MECHANISMS = {"resource", "defaulted"}
+
+
+def _edge_value(edge: dict[str, Any], key: str) -> str:
+    return str(edge.get(key) or "").strip()
+
+
+def _validate_workflow_allocation_graph(
+    *,
+    files_out: list[FileSpecOut],
+    workflow_allocation_summary: str,
+    responsibility_edges: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Validate lightweight allocation edges for executable dataflow closure.
+
+    This is intentionally structural and field-interface oriented. It does not
+    infer business semantics from role names, filenames, singular/plural forms,
+    or domain vocabularies.
+    """
+    issues: list[dict[str, Any]] = []
+    edges = [edge for edge in responsibility_edges or [] if isinstance(edge, dict)]
+    required_scripts = [
+        item
+        for item in sorted(files_out, key=lambda value: (value.generation_order, value.path))
+        if item.path.startswith("scripts/") and item.required
+    ]
+    resources = {
+        item.path
+        for item in files_out
+        if item.path.startswith(("references/", "assets/"))
+    }
+    script_outputs_by_path = {
+        item.path: {str(output).strip() for output in (item.outputs or []) if str(output).strip()}
+        for item in required_scripts
+    }
+
+    prior_outputs: set[str] = set()
+    prior_scripts: set[str] = set()
+    for script in required_scripts:
+        incoming_edges = [edge for edge in edges if _edge_value(edge, "to") == script.path]
+        for input_name in [str(item).strip() for item in (script.inputs or []) if str(item).strip()]:
+            has_source = input_name in _PLATFORM_GUARANTEED_INPUT_KEYS
+            has_source = has_source or input_name in prior_outputs
+            has_source = has_source or input_name in resources
+            if not has_source:
+                for edge in incoming_edges:
+                    mechanism = _edge_value(edge, "mechanism")
+                    source = _edge_value(edge, "from")
+                    edge_input = _edge_value(edge, "input")
+                    edge_output = _edge_value(edge, "output")
+                    if edge_input and edge_input != input_name:
+                        continue
+                    if mechanism in _RESOURCE_EDGE_MECHANISMS:
+                        has_source = True
+                    elif source in resources or source.startswith(("references/", "assets/")):
+                        has_source = True
+                    elif source == "platform_input" and (edge_output in _PLATFORM_GUARANTEED_INPUT_KEYS or edge_input in _PLATFORM_GUARANTEED_INPUT_KEYS):
+                        has_source = True
+                    elif source in prior_scripts and edge_output in script_outputs_by_path.get(source, set()):
+                        has_source = True
+                    if has_source:
+                        break
+            if not has_source:
+                issues.append({
+                    "issue_type": "unresolved_input",
+                    "target_file": script.path,
+                    "input": input_name,
+                    "problem": "input has no producer in platform input, prior outputs, resources, or defaulting edge",
+                })
+        prior_scripts.add(script.path)
+        prior_outputs.update(script_outputs_by_path.get(script.path, set()))
+
+    for edge in edges:
+        target = _edge_value(edge, "to")
+        mechanism = _edge_value(edge, "mechanism") or "unknown"
+        source_granularity = _edge_value(edge, "source_granularity") or "unknown"
+        target_granularity = _edge_value(edge, "target_granularity") or "unknown"
+        if source_granularity == "collection" and target_granularity == "single" and mechanism not in _EXECUTABLE_ITERATION_MECHANISMS:
+            issues.append({
+                "issue_type": "implicit_iteration_not_executable",
+                "target_file": target,
+                "problem": "collection-to-item responsibility exists but no executable loop/map/internal iteration is assigned",
+                "edge": edge,
+            })
+        if source_granularity == "single" and target_granularity == "collection" and mechanism not in _EXECUTABLE_AGGREGATION_MECHANISMS:
+            issues.append({
+                "issue_type": "implicit_aggregation_not_executable",
+                "target_file": target,
+                "problem": "single output is being consumed as collection without an executable aggregation mechanism",
+                "edge": edge,
+            })
+        if "unknown" in {source_granularity, target_granularity, mechanism} and (
+            source_granularity == "collection" or target_granularity == "collection"
+        ):
+            issues.append({
+                "issue_type": "unknown_critical_granularity",
+                "target_file": target,
+                "problem": "collection-level responsibility has unknown granularity or mechanism; allocator must assign executable ownership",
+                "edge": edge,
+            })
+
+    summary_lower = str(workflow_allocation_summary or "").lower()
+    mentions_iteration = any(marker in summary_lower for marker in ("逐项", "依次", "每个", "for each", "per item", "each item"))
+    has_executable_iteration = any(
+        _edge_value(edge, "mechanism") in _EXECUTABLE_ITERATION_MECHANISMS
+        and (
+            _edge_value(edge, "source_granularity") == "collection"
+            or _edge_value(edge, "target_granularity") == "collection"
+        )
+        for edge in edges
+    )
+    if mentions_iteration and not has_executable_iteration:
+        issues.append({
+            "issue_type": "natural_language_iteration_not_executable",
+            "target_file": "",
+            "problem": "workflow allocation describes per-item processing, but no responsibility edge assigns executable internal iteration or platform loop/map",
+        })
+    return issues
+
 
 async def _allocate_workflow_script_responsibilities(
     *,
@@ -142,15 +296,15 @@ async def _allocate_workflow_script_responsibilities(
     files_out: list[FileSpecOut],
     requested_model: str | None = None,
     warnings: list[dict[str, Any]] | None = None,
-) -> str:
-    """Patch script purposes so executable workflow responsibilities are not left implicit."""
+) -> dict[str, Any]:
+    """Patch script purposes so executable workflow responsibilities are executable."""
     targets = [
         file_spec
         for file_spec in files_out
         if file_spec.path.startswith("scripts/") and file_spec.required
     ]
     if not targets:
-        return ""
+        return {"summary": "", "responsibility_edges": [], "validation_errors": []}
     route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator workflow responsibility allocation")
     all_nodes = [
         {
@@ -183,9 +337,13 @@ async def _allocate_workflow_script_responsibilities(
             "逐边判断：上游交付什么、下游需要什么、中间是否丢失结构、顺序、引用、约束或能力边界。\n"
             "职责分配禁止依据 role 名称、文件名或固定业务词表；必须依据当前脚本的上游输入、下游消费者、声明能力与禁止能力、可观察信息、实际可交付输出、全局最终产物需要的中间结果。\n"
             "workflow_allocation_summary 必须描述图上的责任边界；每个 required script 都说明：消费哪类上游结果、交付哪类下游结果、需保留哪些可观察关系、哪些责任由上游建立当前只保留、哪些责任当前无法观察或验证不能压给它。\n"
+            "额外输出 responsibility_edges 作为轻量校验辅助，不要设计复杂 DAG，不暴露给用户；每条边只描述 from/to/output/input/source_granularity/target_granularity/mechanism。\n"
+            "如果 workflow 需要对一组上游结果逐项处理，并交付一组对应结果，而平台 workflow 本身没有显式可执行 loop/map/foreach 节点，则该逐项处理必须落到某个脚本内部实现。\n"
+            "被分配该责任的脚本必须消费集合级输入、在脚本内部遍历集合元素、为每个元素生成或转换对应结果、输出集合级结果、保持输入集合与输出集合的顺序或显式映射关系。\n"
+            "不得只把脚本定义为单元素输入/单元素输出，再用自然语言声称 workflow 会逐项调用。\n"
             "如果下游需要结构化中间结果且上游已有对应结构化输出，可以 patch 当前脚本 purpose，并可在 patch 中给 inputs/outputs 做最小补齐；只能基于图中已有节点和边，不能凭空发明字段。\n"
             "只输出 compact patches；不要新增文件，不硬编码业务案例。purpose 格式：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
-            "返回：{\"workflow_allocation_summary\":\"...\",\"patches\":[{\"target_file\":\"scripts/x.py\",\"purpose\":\"...\",\"inputs\":[],\"outputs\":[]}]}"
+            "返回：{\"workflow_allocation_summary\":\"...\",\"responsibility_edges\":[{\"from\":\"platform_input 或 scripts/x.py 或 references/x.md 或 assets/...\",\"to\":\"scripts/y.py\",\"output\":\"上游交付名称\",\"input\":\"下游消费名称\",\"source_granularity\":\"single|collection|unknown\",\"target_granularity\":\"single|collection|unknown\",\"mechanism\":\"direct|internal_iteration|platform_loop|aggregation|defaulted|resource\"}],\"patches\":[{\"target_file\":\"scripts/x.py\",\"purpose\":\"...\",\"inputs\":[],\"outputs\":[]}]}"
         )},
         {"role": "user", "content": (
             "blueprint_text:\n" + (blueprint_text or "")[:14000] + "\n\n"
@@ -198,38 +356,103 @@ async def _allocate_workflow_script_responsibilities(
         "script_count": len(targets),
         "scripts": [item.path for item in targets],
     }, ensure_ascii=False, default=str))
+    feedback_messages = list(messages)
+    last_validation_errors: list[dict[str, Any]] = []
+    last_summary = ""
+    last_edges: list[dict[str, Any]] = []
     try:
-        data = _parse_validator_json_object(await complete_chat_once(messages, route.model))
-        patches = data.get("patches") if isinstance(data, dict) else None
-        summary = str(data.get("workflow_allocation_summary") or "").strip() if isinstance(data, dict) else ""
-        if not isinstance(patches, list):
-            raise ValueError("missing patches list")
-        by_path = {item.path: item for item in targets}
-        applied: list[str] = []
-        for patch in patches:
-            if not isinstance(patch, dict):
-                continue
-            target = str(patch.get("target_file") or "").strip()
-            purpose = str(patch.get("purpose") or "").strip()
-            if target in by_path and purpose:
-                script = by_path[target]
-                script.purpose = purpose
-                for field_name in ("inputs", "outputs"):
-                    values = patch.get(field_name)
-                    if isinstance(values, list) and all(isinstance(v, str) for v in values):
-                        existing = list(getattr(script, field_name) or [])
-                        for value in values:
-                            value = value.strip()
-                            if value and value not in existing:
-                                existing.append(value)
-                        setattr(script, field_name, existing)
-                applied.append(target)
-        logger.info("[Creator][workflow_allocation][result] %s", json.dumps({
-            "event": "workflow_allocation_result",
-            "applied_targets": applied,
-            "summary": summary,
-        }, ensure_ascii=False, default=str))
-        return summary
+        for attempt in range(3):
+            data = _parse_validator_json_object(await complete_chat_once(feedback_messages, route.model))
+            patches = data.get("patches") if isinstance(data, dict) else None
+            summary = str(data.get("workflow_allocation_summary") or "").strip() if isinstance(data, dict) else ""
+            responsibility_edges = data.get("responsibility_edges") if isinstance(data, dict) else []
+            if not isinstance(responsibility_edges, list):
+                responsibility_edges = []
+            responsibility_edges = [edge for edge in responsibility_edges if isinstance(edge, dict)]
+            last_summary = summary
+            last_edges = responsibility_edges
+            if not isinstance(patches, list):
+                raise ValueError("missing patches list")
+            by_path = {item.path: item for item in targets}
+            applied: list[str] = []
+            for patch in patches:
+                if not isinstance(patch, dict):
+                    continue
+                target = str(patch.get("target_file") or "").strip()
+                purpose = str(patch.get("purpose") or "").strip()
+                if target in by_path and purpose:
+                    script = by_path[target]
+                    script.purpose = purpose
+                    for field_name in ("inputs", "outputs"):
+                        values = patch.get(field_name)
+                        if isinstance(values, list) and all(isinstance(v, str) for v in values):
+                            existing = list(getattr(script, field_name) or [])
+                            for value in values:
+                                value = value.strip()
+                                if value and value not in existing:
+                                    existing.append(value)
+                            setattr(script, field_name, existing)
+                    applied.append(target)
+            validation_errors = _validate_workflow_allocation_graph(
+                files_out=files_out,
+                workflow_allocation_summary=summary,
+                responsibility_edges=responsibility_edges,
+            )
+            last_validation_errors = validation_errors
+            if not validation_errors:
+                logger.info("[Creator][workflow_allocation][result] %s", json.dumps({
+                    "event": "workflow_allocation_result",
+                    "applied_targets": applied,
+                    "edge_count": len(responsibility_edges),
+                    "summary": summary,
+                }, ensure_ascii=False, default=str))
+                return {
+                    "summary": summary,
+                    "responsibility_edges": responsibility_edges,
+                    "validation_errors": [],
+                }
+            logger.info("[Creator][workflow_allocation][graph_invalid] %s", json.dumps({
+                "event": "workflow_allocation_graph_invalid",
+                "attempt": attempt + 1,
+                "applied_targets": applied,
+                "validation_errors": validation_errors,
+            }, ensure_ascii=False, default=str))
+            feedback_messages = [
+                *messages,
+                {
+                    "role": "assistant",
+                    "content": json.dumps(data, ensure_ascii=False, default=str)[:20000],
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "当前 responsibility allocation 没有通过执行图闭环校验。\n"
+                        "请只修正 purpose / inputs / outputs / responsibility_edges。\n"
+                        "不要新增文件。不要硬编码业务案例。\n"
+                        "循环/逐项处理任务在没有平台 loop/map 节点时必须落到某个脚本内部。\n"
+                        "validator_errors:\n"
+                        + json.dumps(validation_errors, ensure_ascii=False, indent=2, default=str)[:12000]
+                    ),
+                },
+            ]
+        if warnings is not None:
+            warnings.append({
+                "severity": "validator_warning",
+                "code": "workflow_allocation_graph_failed",
+                "source": "analyze_blueprint",
+                "path": "",
+                "field": "responsibility_edges",
+                "message": (
+                    "Workflow responsibility allocation did not pass executable graph closure validation; "
+                    "returning editable draft with validation feedback: "
+                    + json.dumps(last_validation_errors, ensure_ascii=False, default=str)[:2000]
+                ),
+            })
+        return {
+            "summary": last_summary,
+            "responsibility_edges": last_edges,
+            "validation_errors": last_validation_errors,
+        }
     except Exception as exc:
         logger.info("[Creator][workflow_allocation][failed] %s", json.dumps({
             "event": "workflow_allocation_failed",
@@ -244,7 +467,7 @@ async def _allocate_workflow_script_responsibilities(
                 "field": "purpose",
                 "message": f"Workflow responsibility allocation failed; keeping parsed purposes: {exc}",
             })
-        return ""
+        return {"summary": "", "responsibility_edges": [], "validation_errors": []}
 
 def _looks_like_semantic_short_contract(text: str) -> bool:
     value = str(text or "")
@@ -523,18 +746,35 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         )
 
     warnings: list[dict[str, Any]] = []
-    workflow_allocation_summary = await _allocate_workflow_script_responsibilities(
+    workflow_allocation = await _allocate_workflow_script_responsibilities(
         blueprint_text=blueprint_text,
         files_out=files_out,
         requested_model=request.model,
         warnings=warnings,
     )
-    await _normalize_script_purpose_short_contracts(
-        blueprint_text=blueprint_text,
-        files_out=files_out,
-        requested_model=request.model,
-        warnings=warnings,
-    )
+    workflow_allocation_summary = str(workflow_allocation.get("summary") or "")
+    workflow_responsibility_edges = [
+        edge for edge in (workflow_allocation.get("responsibility_edges") or []) if isinstance(edge, dict)
+    ]
+    workflow_allocation_errors = [
+        issue for issue in (workflow_allocation.get("validation_errors") or []) if isinstance(issue, dict)
+    ]
+    if not workflow_allocation_errors:
+        await _normalize_script_purpose_short_contracts(
+            blueprint_text=blueprint_text,
+            files_out=files_out,
+            requested_model=request.model,
+            warnings=warnings,
+        )
+    else:
+        warnings.append({
+            "severity": "validator_warning",
+            "code": "purpose_normalization_skipped_after_allocation_graph_failure",
+            "source": "analyze_blueprint",
+            "path": "",
+            "field": "purpose",
+            "message": "Skipped purpose normalization because workflow allocation graph validation failed; keep the draft editable for allocator repair.",
+        })
     fallback_requirement_graph = build_default_requirement_graph(files_out)
     try:
         requirement_graph = await _extract_requirement_graph_with_validator(
@@ -560,6 +800,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         file_spec.requirements = list(requirements_by_file.get(file_spec.path, []))
     _persist_requirement_graph(plan.skill_name, requirement_graph)
     _persist_workflow_allocation_summary(plan.skill_name, workflow_allocation_summary)
+    _persist_workflow_allocation_edges(plan.skill_name, workflow_responsibility_edges)
 
     asset_requirements = [
         AssetRequirementOut(
@@ -2434,6 +2675,7 @@ async def generate_file(request: GenerateFileRequest):
                         if not entry_requirements and isinstance(effective_skill_plan_entry, dict):
                             entry_requirements = effective_skill_plan_entry.get("requirements") or []
                         workflow_allocation_summary = _load_workflow_allocation_summary(skill_name)
+                        workflow_responsibility_edges = _load_workflow_allocation_edges(skill_name)
                         responsibility_review = await _run_script_responsibility_review(
                             file_path=request.file_path,
                             script_content=content,
@@ -2447,6 +2689,7 @@ async def generate_file(request: GenerateFileRequest):
                                 "blueprint_text": request.blueprint_text,
                                 "purpose_short_contract": getattr(entry, "purpose", request.purpose),
                                 "workflow_allocation_summary": workflow_allocation_summary,
+                                "responsibility_edges": workflow_responsibility_edges,
                                 "trial_stdout": "第一轮责任审查在局部 patch 前可能尚未执行试运行；如为空，不得把缺 stdout 当接口失败。",
                                 "artifact_info": "第一轮责任审查只用 artifact 信息辅助判断语义交付；真实存在性由运行/E2E 检查。",
                             },

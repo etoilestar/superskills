@@ -1843,6 +1843,8 @@ async def _repair_generated_file_with_feedback(
             "优先修不可用工具或 helper；然后确保当前脚本语义功能完整、核心产物真实构造、declared artifact 来自真实结果。\n"
             "只使用 selected Tool Registry function cards 中真实存在的 helper；没有可用 helper 时用当前脚本本地逻辑实现职责，不要猜 runtime_tools 函数。\n"
             "不要只改字段名；不要为了通过校验返回空结果或伪造成功。\n"
+            "当失败原因涉及集合责任丢失、隐式循环或隐式聚合时，不要只处理单个元素、只取集合首项、把集合 join 成一个字符串、放宽 strict_json_argv_guard、让下游脚本猜测或补齐缺失集合、或只修改字段名而不恢复集合级处理。\n"
+            "正确修复方向是恢复集合级输入，在当前脚本内部完成逐项处理，输出集合级结果，并保持输入集合与输出集合的顺序或显式映射关系。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整文件。"
         )
 
@@ -3509,6 +3511,7 @@ async def _run_script_responsibility_review(
     short_contract = str(getattr(skill_plan_entry, "purpose", "") or "").strip()
     blueprint_text = str(review_context.get("blueprint_text") or review_context.get("blueprint") or "").strip()
     workflow_allocation_summary = str(review_context.get("workflow_allocation_summary") or "").strip()
+    responsibility_edges = review_context.get("responsibility_edges") if isinstance(review_context.get("responsibility_edges"), list) else []
     trial_stdout = review_context.get("trial_stdout_json", review_context.get("trial_stdout", ""))
     artifact_info = review_context.get("artifact_info", review_context.get("artifact_paths", []))
     req_payload = [
@@ -3534,6 +3537,9 @@ async def _run_script_responsibility_review(
                 "- 不要因为当前脚本没有额外生成 tag/id/metadata 或没有做不可用的语义验证就判失败。\n"
                 "- 只有当当前脚本丢失图中已有结构、打乱顺序、丢弃必要输入、漏交付输出、静默错位、压扁集合导致下游不可恢复，或弱化自身可观察职责时，才 passed=false。\n"
                 "- 如果脚本能运行、能输出 JSON，但只完成更小/更弱/更默认的任务，并导致责任边上可观察输入关系或下游交付丢失，应 passed=false。\n"
+                "- 除检查 purpose 短合同外，还必须检查当前脚本是否满足 responsibility graph 中的基数/粒度责任。\n"
+                "- 如果当前脚本被分配了集合级职责，但源码只消费单元素并只交付单元素，且没有平台可执行 loop/map/foreach 节点支撑，则必须判失败。\n"
+                "- 不要只因为脚本满足了被压窄后的局部单元素 purpose 就判通过；需要结合 workflow_allocation_summary、responsibility_edges 和下游消费关系判断 purpose 是否被错误压窄。\n"
                 "- 默认内容、空内容、纯占位内容、明显模板化内容只能作为兜底健壮性，不能替代核心职责实现。\n"
                 "- 不做质量、审美、风格、充分性细评；blocking_issues 只能描述当前文件在可观察边界内缺失的职责和最小实现边界。\n\n"
 
@@ -3542,7 +3548,7 @@ async def _run_script_responsibility_review(
                 "  \"passed\": true|false,\n"
                 "  \"blocking_issues\": [\n"
                 "    {\n"
-                "      \"issue_type\": \"responsibility_weakened|semantic_source_missing|semantic_action_incomplete|semantic_delivery_incomplete|semantic_constraint_dropped|aggregation_boundary_lost\",\n"
+                "      \"issue_type\": \"responsibility_weakened|semantic_source_missing|semantic_action_incomplete|semantic_delivery_incomplete|semantic_constraint_dropped|aggregation_boundary_lost|responsibility_cardinality_mismatch|collection_boundary_lost|contract_granularity_mismatch\",\n"
                 "      \"scope\": \"current_file_only\",\n"
                 "      \"failure_layer\": \"responsibility\",\n"
                 "      \"severity\": \"error\",\n"
@@ -3574,6 +3580,9 @@ async def _run_script_responsibility_review(
                 "workflow_allocation_summary：\n"
                 f"{workflow_allocation_summary[:4000]}\n\n"
 
+                "responsibility_edges（轻量执行图边界）：\n"
+                f"{json.dumps(responsibility_edges, ensure_ascii=False, default=str)[:6000]}\n\n"
+
                 "SkillPlanEntry：\n"
                 f"{json.dumps({k: getattr(skill_plan_entry, k, '') for k in ('path', 'purpose', 'role', 'component_hint')}, ensure_ascii=False, default=str)[:8000]}\n\n"
 
@@ -3598,6 +3607,7 @@ async def _run_script_responsibility_review(
                 "3. 检查脚本是否保持自己可观察的输入关系，并交付下游需要的输出/产物。\n"
                 "4. 不要要求当前脚本验证无法从输入、依赖、工具或声明能力中观察的信息；上游已建立的关系当前脚本只需保留。\n"
                 "5. 只有丢失已有结构、打乱顺序、丢弃必要输入、漏交付输出、静默错位、压扁集合导致下游不可恢复时，才判责任失败。\n"
+                "6. 如果 responsibility_edges 显示当前脚本承担集合级输入、逐项处理、集合级输出或聚合责任，源码必须有对应集合级入口、内部遍历/聚合逻辑和集合级 stdout。\n"
             ),
         },
     ]
