@@ -144,7 +144,7 @@ async def _allocate_workflow_script_responsibilities(
     files_out: list[FileSpecOut],
     requested_model: str | None = None,
     warnings: list[dict[str, Any]] | None = None,
-) -> tuple[str, set[str]]:
+) -> tuple[str, set[str], bool]:
     """Patch script purposes so executable workflow responsibilities are not left implicit."""
     targets = [
         file_spec
@@ -152,7 +152,7 @@ async def _allocate_workflow_script_responsibilities(
         if file_spec.path.startswith("scripts/") and file_spec.required
     ]
     if not targets:
-        return "", set()
+        return "", set(), False, True
     route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator workflow responsibility allocation")
     all_nodes = [
         {
@@ -185,7 +185,8 @@ async def _allocate_workflow_script_responsibilities(
             "executable workflow graph 只能包含：platform guaranteed input envelope、required scripts/*.py、scripts stdout、scripts artifacts、final artifact；只有这些节点/边可以承担运行时 dataflow。\n"
             "SKILL.md、references/*.md、assets/** 只能作为 reference/context graph 中的说明、规范或资源上下文，不能作为可执行 dataflow 节点：SKILL.md 不承担字段转换、循环、聚合、排序、映射或产物生成；references/*.md 不产生 stdout 字段，不补齐 producer，不补齐集合结果；assets/** 只是上传或静态资源输入，不主动生成中间结果。\n"
             "逐边判断：平台输入如何进入第一步；每个 required script 消费什么上游 stdout/artifact 或 platform runtime 输入；当前脚本完整交付什么；下游真正需要什么；是否存在局部自洽但全局断链；是否存在隐式循环、隐式聚合、集合到单项再到集合的问题；是否需要最小联动调整相邻上下游脚本的 purpose/inputs/outputs。\n"
-            "责任分配必须先从全局可执行合同推导，再落到单个脚本。全局合同由最终产物目标、下游消费者 inputs、平台执行能力边界、可执行脚本链路闭环共同决定；原始 SkillPlanEntry inputs/outputs 只作为局部能力提示，不能覆盖全局闭环。\n"
+            "责任分配必须先从全局可执行合同推导，再落到单个脚本。全局合同由最终产物目标、下游消费者 inputs、上游已能交付的 outputs、平台执行能力边界、可执行脚本链路闭环共同决定；原始 SkillPlanEntry inputs/outputs 只作为局部能力提示，不能覆盖全局闭环。\n"
+            "责任优先级从高到低：全局可执行闭环 > 最终产物目标 > 下游消费者真实输入需求 > 平台执行能力边界 > scripts stdout/artifact 串接 > allocation 后的 final inputs/final outputs > 当前脚本 purpose > 原始 blueprint/原始单脚本计划/references/SKILL.md 描述。低优先级信息与高优先级合同冲突时，必须以高优先级合同为准。\n"
             "职责分配禁止依据 role 名称、文件名或固定业务词表；必须依据当前脚本的上游输入、下游消费者、声明能力与禁止能力、可观察信息、实际可交付输出、全局最终产物需要的中间结果。\n"
             "任何运行链路闭环、字段转换、子字段提取、集合遍历、聚合交付、顺序映射，都必须落到 scripts/*.py 或平台真实 runtime 能力中；不得用 SKILL.md 的自然语言、reference 的规则说明、assets 的存在来解释缺失的 producer、loop、aggregation 或 field mapping。\n"
             "当前平台没有显式可执行 loop/map/foreach 节点。如果蓝图语义需要逐项处理、批量处理、一一对应、多输入单元生成多输出单元、聚合交付或顺序映射，必须把该执行责任落到某个脚本内部；不得只在 purpose 或 SKILL.md 中写逐项调用、每个生成一个、依次处理、保持对应，却没有任何脚本承担真实循环/聚合。\n"
@@ -212,6 +213,8 @@ async def _allocate_workflow_script_responsibilities(
         conflict_feedback = ""
         data: dict[str, Any] = {}
         patches: list[Any] = []
+        fatal_conflicts: list[dict[str, Any]] = []
+        soft_conflicts: list[dict[str, Any]] = []
         summary = ""
         for attempt in range(2):
             attempt_messages = list(messages)
@@ -231,18 +234,53 @@ async def _allocate_workflow_script_responsibilities(
             summary = str(data.get("workflow_allocation_summary") or "").strip() if isinstance(data, dict) else ""
             if not isinstance(patches_candidate, list):
                 raise ValueError("missing patches list")
-            conflicts = _workflow_allocation_patch_conflicts(patches_candidate)
-            if not conflicts:
+            conflict_report = _workflow_allocation_patch_conflicts(patches_candidate)
+            fatal_conflicts = list(conflict_report.get("fatal", []))
+            soft_conflicts = list(conflict_report.get("soft", []))
+            if not fatal_conflicts:
                 patches = patches_candidate
                 break
-            conflict_feedback = json.dumps(conflicts, ensure_ascii=False, default=str)
+            conflict_feedback = json.dumps(fatal_conflicts, ensure_ascii=False, default=str)
             logger.info("[Creator][workflow_allocation][contract_conflict] %s", json.dumps({
                 "event": "workflow_allocation_contract_conflict",
                 "attempt": attempt + 1,
-                "conflicts": conflicts,
+                "fatal_conflicts": fatal_conflicts,
+                "soft_conflicts": soft_conflicts,
             }, ensure_ascii=False, default=str))
         else:
-            raise ValueError(f"workflow allocation final contract conflicts: {conflict_feedback}")
+            patches = [
+                patch for patch in (patches_candidate if isinstance(patches_candidate, list) else [])
+                if isinstance(patch, dict)
+                and str(patch.get("target_file") or "").strip()
+                not in {str(item.get("target_file") or "").strip() for item in fatal_conflicts if isinstance(item, dict)}
+            ]
+        allocation_resolved = not fatal_conflicts
+        if soft_conflicts and warnings is not None:
+            warnings.append({
+                "severity": "validator_warning",
+                "code": "workflow_allocation_soft_conflict",
+                "source": "analyze_blueprint",
+                "path": "",
+                "field": "inputs",
+                "message": (
+                    "Workflow allocation had soft input wording conflicts; "
+                    "safe patches were kept because final outputs were consistent."
+                ),
+                "details": soft_conflicts,
+            })
+        if fatal_conflicts and warnings is not None:
+            warnings.append({
+                "severity": "validator_warning",
+                "code": "workflow_allocation_unresolved",
+                "source": "analyze_blueprint",
+                "path": "",
+                "field": "outputs",
+                "message": (
+                    "Workflow allocation still has fatal final-output contract conflicts after retry; "
+                    "only patches without fatal conflicts were applied and global contract is unresolved."
+                ),
+                "details": fatal_conflicts,
+            })
         if not isinstance(patches, list):
             raise ValueError("missing patches list")
         by_path = {item.path: item for item in targets}
@@ -272,7 +310,7 @@ async def _allocate_workflow_script_responsibilities(
             "applied_targets": applied,
             "summary": summary,
         }, ensure_ascii=False, default=str))
-        return summary, set(applied)
+        return summary, set(applied), allocation_resolved
     except Exception as exc:
         logger.info("[Creator][workflow_allocation][failed] %s", json.dumps({
             "event": "workflow_allocation_failed",
@@ -287,7 +325,7 @@ async def _allocate_workflow_script_responsibilities(
                 "field": "purpose",
                 "message": f"Workflow responsibility allocation failed; keeping parsed purposes: {exc}",
             })
-        return "", set()
+        return "", set(), False
 
 def _looks_like_semantic_short_contract(text: str) -> bool:
     value = str(text or "")
@@ -305,38 +343,59 @@ def _clean_allocation_io_values(values: Any) -> list[str] | None:
     return cleaned
 
 
-def _workflow_allocation_patch_conflicts(patches: list[Any]) -> list[dict[str, Any]]:
+def _workflow_allocation_patch_conflicts(patches: list[Any]) -> dict[str, list[dict[str, Any]]]:
     """Lightweight final-contract consistency check for allocation patches.
 
     This deliberately stays local to the returned compact patches: it does not
     build or validate a graph.  It only verifies that final inputs/outputs and
     purpose text name the same contract before purpose normalization can run.
     """
-    conflicts: list[dict[str, Any]] = []
+    fatal: list[dict[str, Any]] = []
+    soft: list[dict[str, Any]] = []
     for patch in patches:
         if not isinstance(patch, dict):
             continue
         target = str(patch.get("target_file") or "").strip()
         purpose = str(patch.get("purpose") or "").strip()
+        outputs = _clean_allocation_io_values(patch.get("outputs"))
         if not target or not purpose:
+            if target and outputs:
+                fatal.append({
+                    "target_file": target,
+                    "field": "purpose",
+                    "message": "allocation patch with final outputs must include purpose for the same contract",
+                })
             continue
         purpose_lower = purpose.lower()
-        for field_name in ("inputs", "outputs"):
-            values = _clean_allocation_io_values(patch.get(field_name))
-            if values is None or not values:
-                continue
-            missing = [value for value in values if value.lower() not in purpose_lower]
-            if missing:
-                conflicts.append({
+        inputs = _clean_allocation_io_values(patch.get("inputs"))
+        if outputs is not None:
+            if not outputs:
+                fatal.append({
                     "target_file": target,
-                    "field": field_name,
-                    "missing_from_purpose": missing,
+                    "field": "outputs",
+                    "message": "allocation patch outputs is present but empty; final outputs cannot be determined",
+                })
+            missing_outputs = [value for value in outputs if value.lower() not in purpose_lower]
+            if missing_outputs:
+                fatal.append({
+                    "target_file": target,
+                    "field": "outputs",
+                    "missing_from_purpose": missing_outputs,
+                    "message": "final outputs must appear in purpose delivery text",
+                })
+        if inputs:
+            missing_inputs = [value for value in inputs if value.lower() not in purpose_lower]
+            if missing_inputs:
+                soft.append({
+                    "target_file": target,
+                    "field": "inputs",
+                    "missing_from_purpose": missing_inputs,
                     "message": (
-                        "patch purpose must describe the same final "
-                        f"{field_name} names/granularity as patch {field_name}"
+                        "final inputs are not spelled out in purpose; this is advisory "
+                        "because input sources may be described naturally"
                     ),
                 })
-    return conflicts
+    return {"fatal": fatal, "soft": soft}
 
 async def _normalize_script_purpose_short_contracts(
     *,
@@ -621,7 +680,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         )
 
     warnings: list[dict[str, Any]] = []
-    workflow_allocation_summary, allocation_patched_targets = await _allocate_workflow_script_responsibilities(
+    workflow_allocation_summary, allocation_patched_targets, workflow_allocation_resolved = await _allocate_workflow_script_responsibilities(
         blueprint_text=blueprint_text,
         files_out=files_out,
         requested_model=request.model,
@@ -635,19 +694,48 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         requested_model=request.model,
         warnings=warnings,
     )
-    logger.info("[Creator][global_contract][resolved] %s", json.dumps({
-        "event": "creator_global_contract_resolved",
-        "contracts": [
-            {
-                "path": file_spec.path,
-                "final_inputs": list(file_spec.inputs or []),
-                "final_outputs": list(file_spec.outputs or []),
-                "purpose_digest": hashlib.sha256(str(file_spec.purpose or "").encode("utf-8")).hexdigest()[:12],
-            }
-            for file_spec in files_out
-            if file_spec.path.startswith("scripts/") and file_spec.required
-        ],
-    }, ensure_ascii=False, default=str))
+    resolved_contracts = [
+        {
+            "path": file_spec.path,
+            "final_inputs": list(file_spec.inputs or []),
+            "final_outputs": list(file_spec.outputs or []),
+            "purpose_digest": hashlib.sha256(str(file_spec.purpose or "").encode("utf-8")).hexdigest()[:12],
+        }
+        for file_spec in files_out
+        if file_spec.path.startswith("scripts/") and file_spec.required
+    ]
+    logger.info(
+        "[Creator][global_contract][%s] %s",
+        "resolved" if workflow_allocation_resolved else "unresolved",
+        json.dumps({
+            "event": (
+                "creator_global_contract_resolved"
+                if workflow_allocation_resolved
+                else "creator_global_contract_unresolved"
+            ),
+            "contracts": resolved_contracts,
+            "allocation_patched_targets": sorted(allocation_patched_targets),
+        }, ensure_ascii=False, default=str),
+    )
+    warnings.append({
+        "severity": "info" if workflow_allocation_resolved else "validator_warning",
+        "code": (
+            "workflow_allocation_resolved"
+            if workflow_allocation_resolved
+            else "workflow_allocation_unresolved_using_safe_partial_or_fallback"
+        ),
+        "source": "analyze_blueprint",
+        "path": "",
+        "field": "workflow_allocation",
+        "message": (
+            "Using resolved executable workflow final contracts."
+            if workflow_allocation_resolved
+            else (
+                "Executable workflow final contract is unresolved; safe allocation patches "
+                "were applied where possible, otherwise original plan remains as fallback."
+            )
+        ),
+    })
     fallback_requirement_graph = build_default_requirement_graph(files_out)
     try:
         requirement_graph = await _extract_requirement_graph_with_validator(
