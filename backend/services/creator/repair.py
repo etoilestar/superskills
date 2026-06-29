@@ -2780,7 +2780,7 @@ def _normalize_responsibility_review_issues(
             continue
         if failure_layer and failure_layer not in {"responsibility", "semantic_responsibility"}:
             continue
-        if issue_type and issue_type not in {"responsibility_not_met", "content_responsibility", "semantic_responsibility", "responsibility"}:
+        if issue_type and issue_type not in {"responsibility_not_met", "content_responsibility", "semantic_responsibility", "responsibility", "responsibility_weakened", "collection_boundary_lost", "aggregation_boundary_lost"}:
             continue
         if not semantic_failure:
             continue
@@ -3526,7 +3526,10 @@ async def _run_script_responsibility_review(
                 "不要判断其它文件、workflow、字段名、审美或充分性细节。\n\n"
 
                 "核心原则（图谱式可观察边界）：\n"
-                "- 当前脚本的语义职责以 purpose 短合同和 workflow_allocation_summary 中的责任边为准；inputs/outputs 只是接口提示。\n"
+                "- 当前脚本的语义职责以 purpose 短合同和 workflow_allocation_summary 中的责任边为准；inputs/outputs 只是接口提示。审查不能只按被压窄后的局部 purpose 判通过。\n"
+                "- 必须结合 workflow_allocation_summary、当前脚本 inputs/outputs、相邻上下游关系判断当前脚本是否交付了全局 workflow 中需要它交付的完整结果。\n"
+                "- 只有 scripts/*.py 或平台真实 runtime 能力可以承担运行链路闭环；SKILL.md、references/*.md、assets/** 只能提供说明、规范或资源上下文，不能承担运行时字段转换、循环、聚合、子字段提取、顺序映射或产物生成。\n"
+                "- 如果发现当前职责依赖 SKILL.md、references/*.md 或 assets/** 来完成上述运行时 dataflow，应视为职责未闭环。workflow_allocation_summary 若暗示 SKILL.md 会逐项调用、reference 定义了输出所以结果存在、assets 会生成中间结果，不能据此判通过。\n"
                 "- 不写生成类/聚合类/构建类等脚本类型词表，不按 role 名称、文件名、字段名或固定业务词表判责。\n"
                 "- 判断当前脚本在全局图中处在哪条边上：它消费哪些上游结果，交付哪些下游结果，能观察哪些关系，声明能力/禁止能力允许做什么。\n"
                 "- 一个脚本只能被要求完成或验证它能从输入、依赖、工具和声明能力中实际完成/验证的职责。\n"
@@ -3534,6 +3537,7 @@ async def _run_script_responsibility_review(
                 "- 不要因为当前脚本没有额外生成 tag/id/metadata 或没有做不可用的语义验证就判失败。\n"
                 "- 只有当当前脚本丢失图中已有结构、打乱顺序、丢弃必要输入、漏交付输出、静默错位、压扁集合导致下游不可恢复，或弱化自身可观察职责时，才 passed=false。\n"
                 "- 如果脚本能运行、能输出 JSON，但只完成更小/更弱/更默认的任务，并导致责任边上可观察输入关系或下游交付丢失，应 passed=false。\n"
+                "- 如果脚本局部完成‘单个输入 -> 单个输出’，但全局需要完整集合、完整聚合结果、顺序映射或下游可直接消费的完整中间产物，应 passed=false。\n"
                 "- 默认内容、空内容、纯占位内容、明显模板化内容只能作为兜底健壮性，不能替代核心职责实现。\n"
                 "- 不做质量、审美、风格、充分性细评；blocking_issues 只能描述当前文件在可观察边界内缺失的职责和最小实现边界。\n\n"
 
@@ -3542,7 +3546,7 @@ async def _run_script_responsibility_review(
                 "  \"passed\": true|false,\n"
                 "  \"blocking_issues\": [\n"
                 "    {\n"
-                "      \"issue_type\": \"responsibility_weakened|semantic_source_missing|semantic_action_incomplete|semantic_delivery_incomplete|semantic_constraint_dropped|aggregation_boundary_lost\",\n"
+                "      \"issue_type\": \"responsibility_weakened|semantic_source_missing|semantic_action_incomplete|semantic_delivery_incomplete|semantic_constraint_dropped|collection_boundary_lost|aggregation_boundary_lost\",\n"
                 "      \"scope\": \"current_file_only\",\n"
                 "      \"failure_layer\": \"responsibility\",\n"
                 "      \"severity\": \"error\",\n"
@@ -3598,6 +3602,7 @@ async def _run_script_responsibility_review(
                 "3. 检查脚本是否保持自己可观察的输入关系，并交付下游需要的输出/产物。\n"
                 "4. 不要要求当前脚本验证无法从输入、依赖、工具或声明能力中观察的信息；上游已建立的关系当前脚本只需保留。\n"
                 "5. 只有丢失已有结构、打乱顺序、丢弃必要输入、漏交付输出、静默错位、压扁集合导致下游不可恢复时，才判责任失败。\n"
+                "6. 当失败涉及集合边界丢失、隐式循环、隐式聚合或责任被压窄时，repair_instructions 必须要求恢复当前脚本应承担的完整输入、完整处理、完整输出；如果当前脚本负责逐项处理，则在当前脚本内部循环并输出完整结果。不要建议只处理单个元素、只取首项、join 压扁、删除参数、放宽 strict_json_argv_guard 或让下游猜测补齐。\n"
             ),
         },
     ]
