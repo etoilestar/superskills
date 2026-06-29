@@ -370,6 +370,9 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "",
         "D. workflow / 平台边界:",
         "- SKILL.md 应说明 Skill 用途、真实脚本调用顺序（如有）和最终产物类型，但第一轮不要求证明内部 stdout/placeholder 闭环。",
+        "- 用户输入要区分必需项和可选项：依据蓝图语义中的可选、建议、若不指定、可以提供、默认等表达判断，不写固定业务字段词表。",
+        "- 第一条 workflow command 不能引用平台输入 envelope 中不存在的 placeholder；只能引用 guaranteed input envelope 字段，或传入通用 user_request/input payload/envelope 由入口脚本解析。",
+        "- 蓝图可选用户参数若平台 payload 没有同名字段，不应写成必填 placeholder；应由入口脚本内部提供默认值，或从 fields/options/payload 中存在则读取、不存在则默认。",
         "- 命令 placeholder 应从用户输入、显式字段、默认值、上传文件、前序 stdout 中选择当前脚本真正需要的值。",
         "- 第一轮不要求固定字段名；可建议字段名，但不能让字段名成为判错依据。",
         "- 不要固定特定中间字段名；内部脚本流转只在第二轮 E2E 真实执行时验证。",
@@ -412,7 +415,9 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "- 对蓝图真实规划的 scripts/ 文件，使用标准 Markdown 独立 ```bash fenced code block。",
         "- 每个 fence 内只放一条命令；命令必须直接调用 scripts/ 路径。",
         "- 脚本路径后传入 json.loads 可解析的 JSON object argv；所有动态 {{placeholder}} 必须作为 JSON 字符串值出现。",
+        "- 第一条命令只能引用平台 guaranteed input envelope 中存在的字段；不确定具体字段时，传入通用 user_request/input payload/envelope 让入口脚本解析。",
         "- 命令 placeholder 优先引用 external envelope 字段：user_request、input、text、input_files、files、fields、options，或显式 fields/default_values/input_binding。",
+        "- 蓝图语义为可选/建议/若不指定/可以提供/默认的用户参数，不要写成必填 placeholder；入口脚本应存在则读，不存在则默认化。",
         "- 第一轮不要证明后续 placeholder 来自前序 stdout；不要固定特定中间字段名；内部流转交给第二轮 E2E 执行验证。",
         "",
         "B. 资源边界:",
@@ -432,7 +437,9 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
             if str(item).strip()
         ]
 
-        if input_keys:
+        if idx == 1:
+            payload = {"user_request": "{{user_request}}"}
+        elif input_keys:
             payload = {
                 key: "{{" + key + "}}"
                 for key in input_keys
@@ -1832,6 +1839,8 @@ def _build_script_file_contract_text(
         "- inputs/outputs 是接口提示，不是完整职责的替代。",
         "- 脚本可以兼容不同 argv 形式，但不能弱化 purpose 中的来源、动作、交付、约束。",
         "- 可执行职责必须落到脚本内部，不能依赖 SKILL.md 自然语言隐式循环、隐式聚合或人工理解来补完。",
+        "- 如果当前职责图要求脚本对一组输入元素逐项处理并交付一组结果，而平台 workflow 没有显式可执行 loop/map/foreach 节点，则脚本必须在自身逻辑中完成集合处理。",
+        "- 脚本不能只实现单元素版本，也不能依赖 SKILL.md 自然语言中的“逐项处理、依次调用、每个生成一个”等描述来补完执行逻辑。",
         "- role 只是实现提示；不得覆盖或缩小 purpose 短合同。",
         "",
         "A. 输出形态:",
@@ -1845,6 +1854,8 @@ def _build_script_file_contract_text(
         "- 不要求第一轮读取所有 input_sources 或 SkillPlan inputs；不因可选输入未使用而失败。",
         "- 但是，脚本不得用与任务无关的默认 prompt、固定示例值、固定模板或常量结果替代核心业务输入。",
         "- 如果核心输入缺失，可以从 payload/user_request/input/text/fields/options/input_files 或上游 stdout 中选择最合理来源；不要静默退回到无关任务。",
+        "- 集合责任落到当前脚本时，脚本入口、核心 run 逻辑和 stdout 输出必须保持一致：argv 接收集合级输入，run 内部遍历集合，stdout 输出集合级结果。",
+        "- 不通过取首项、join 集合、压扁集合或只返回单个结果来绕过集合责任。",
         "",
         "C. stdout 字段语义:",
         "- declared_stdout_fields 只表示 stdout JSON 中应出现的业务字段，不等于文件路径字段。",

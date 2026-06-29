@@ -465,6 +465,10 @@ def _render_e2e_command_payload(
     if missing:
         unique_missing = sorted(set(missing))
         available = sorted(payload.keys())
+        source_lines = [
+            f"step {trace.ordinal} {trace.script_path}: stdout_keys={trace.stdout_keys} new_keys={trace.new_keys}"
+            for trace in (traces or [])
+        ]
         logger.info("[Creator][E2E][interface_repair_risk] %s", json.dumps({
             "event": "e2e_interface_repair_risk",
             "script_path": command.script_path,
@@ -479,7 +483,7 @@ def _render_e2e_command_payload(
                 target=command.source_path,
                 layer="external_input_missing" if command.ordinal == 1 else "e2e_dataflow_missing",
                 message=(
-                    ("平台外部输入缺失，第一条命令不能引用无确定来源字段。" if command.ordinal == 1 else "Skill 内部 dataflow 缺失，后续命令只能引用已有 context 或前序 stdout 字段。")
+                    ("missing_placeholder: 平台外部输入缺失，第一条命令不能引用 guaranteed envelope 中不存在的字段；可改为传 user_request/input/payload/envelope 并由入口脚本内部解析和默认化可选项。" if command.ordinal == 1 else "missing_placeholder: Skill 内部 dataflow 缺失，后续命令只能引用已有 context 或前序 stdout 字段。")
                     + "\n"
                     + f"第 {command.ordinal} 步 {command.script_path} 的命令模板引用了当前 payload 中不存在的字段："
                     f"{', '.join(unique_missing)}。\n"
@@ -2321,6 +2325,9 @@ async def _repair_existing_file_for_e2e_failure(
             "第二轮 E2E 的目标是让 workflow 在简单沙盒中真实跑通。\n"
             "E2E 只执行 SKILL.md 中的 bash/sh/shell fenced command block，references/*.md 不是执行步骤。\n"
             "只修 workflow/cross-step IO/final output/artifact 相关问题，不修 Markdown 全局格式。\n"
+            "修复 command_json_parse/missing_placeholder 时，必须参考结构化失败对象中的当前脚本真实 argv schema、可用 payload keys、placeholder 来源；"
+            "先分类为 JSON 语法、placeholder 不存在、argv schema 不一致或可选参数误必填。\n"
+            "优先改命令使用平台 guaranteed input，或让入口脚本接受 envelope 并内部默认化可选项；不要反复给不存在 placeholder 加引号。\n"
             "不要重写 SKILL.md 正文。\n"
             "当前 Markdown 格式已经通过；不要修 frontmatter；不要修 code fence；不要新增/删除 ``` 行。\n"
             "只修改失败命令那一行；old_lines 必须包含完整、真实、当前文件中的命令行。\n"
@@ -2335,6 +2342,8 @@ async def _repair_existing_file_for_e2e_failure(
             "你正在修复脚本源码的 E2E 接口串接问题。\n"
             "第二轮 E2E 的目标是让 workflow 在简单沙盒中真实跑通。\n"
             "只修当前脚本与 SKILL.md 命令块、上游 stdout、下游输入之间的接口对齐问题。\n"
+            "修复前核对当前脚本真实 argv schema、可用 payload keys、placeholder 来源；"
+            "如果可选参数被误当成必填，入口脚本应从 envelope/fields/options/payload 中存在则读、不存在则默认。\n"
             "strict_json_argv_guard 是接口不对齐探针；不要只改 guard。\n"
             "同步检查 SKILL.md command argv、脚本入口校验、核心 run/main，使三者对齐。\n"
             "保持功能覆盖面；不能通过删除参数降低功能覆盖面，也不能删除业务参数或功能分支来绕过失败。\n"
@@ -3246,9 +3255,16 @@ def _targeted_e2e_repair_hint(errors: list[str]) -> str:
 
     if layer in {"external_input_missing", "e2e_dataflow_missing"}:
         return (
-            "当前失败属于命令占位符无法从 payload 或前序 stdout 解析。"
-            "优先修 SKILL.md 当前失败步骤的 JSON argv placeholder，"
-            "不要改已成功 trace 对应步骤。"
+            "当前失败属于 missing_placeholder：命令占位符无法从 payload 或前序 stdout 解析。"
+            "先区分 JSON 模板语法错误、placeholder 不存在、argv key 与脚本 schema 不一致、可选参数被误当成必填 placeholder。"
+            "如果裸 placeholder 加引号后仍不在 payload/trace 中，不要继续按 command_json_parse 处理；应改为使用平台 guaranteed input、前序 stdout 字段，或让入口脚本接收 envelope 并内部默认化可选项。"
+            "优先修 SKILL.md 当前失败步骤的 JSON argv placeholder，不要改已成功 trace 对应步骤。"
+        )
+
+    if layer == "command_json_parse":
+        return (
+            "当前失败表面是 command_json_parse，但修复前必须分类：JSON 模板语法错误、placeholder 不存在、argv key 与脚本 schema 不一致、可选参数被误当成必填 placeholder。"
+            "不要反复只给不存在的 placeholder 加引号；若 placeholder 根不在可用 payload keys 或前序 trace 中，应改为 guaranteed input/envelope，或让入口脚本内部解析并提供默认值。"
         )
 
     return ""
