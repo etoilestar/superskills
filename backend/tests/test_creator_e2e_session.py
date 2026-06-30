@@ -222,3 +222,77 @@ async def test_validate_skill_e2e_repair_handoff_continues_to_next_target(monkey
         "partial_success_target_changed",
         "e2e_fully_passed",
     ]
+
+
+def test_e2e_command_parser_normalizes_bare_value_placeholders():
+    from backend.services.creator.common import _parse_e2e_workflow_command
+
+    command = _parse_e2e_workflow_command(
+        command="python scripts/generate_illustrations.py '{\"story_segments\": {{story_segments}}, \"style\": \"fixed-style\"}'",
+        ordinal=1,
+        source_path="SKILL.md",
+    )
+
+    assert command is not None
+    assert command.argv_template == {"story_segments": "{{story_segments}}", "style": "fixed-style"}
+
+
+def test_e2e_command_parser_normalization_renders_whole_placeholder_types():
+    from backend.services.creator.common import _parse_e2e_workflow_command
+    from backend.services.creator.e2e import _render_e2e_command_payload
+
+    command = _parse_e2e_workflow_command(
+        command="python scripts/build_pdf.py '{\"story_segments\": {{story_segments}}, \"image_paths\": {{image_paths}}}'",
+        ordinal=2,
+        source_path="SKILL.md",
+    )
+    payload = {
+        "story_segments": [{"text": "Once"}],
+        "image_paths": ["outputs/a.png"],
+    }
+
+    assert command is not None
+    assert command.argv_template == {
+        "story_segments": "{{story_segments}}",
+        "image_paths": "{{image_paths}}",
+    }
+    rendered = _render_e2e_command_payload(command, payload=payload)
+    assert rendered == payload
+    assert isinstance(rendered["story_segments"], list)
+    assert isinstance(rendered["story_segments"][0], dict)
+    assert isinstance(rendered["image_paths"], list)
+
+
+def test_e2e_command_parser_accepts_nested_and_index_placeholders():
+    from backend.services.creator.common import _parse_e2e_workflow_command
+
+    command = _parse_e2e_workflow_command(
+        command="python scripts/main.py '{\"nested\": {{field.subkey}}, \"first\": {{field.0}}, \"label\": \"ok\"}'",
+        ordinal=1,
+        source_path="SKILL.md",
+    )
+
+    assert command is not None
+    assert command.argv_template == {"nested": "{{field.subkey}}", "first": "{{field.0}}", "label": "ok"}
+
+
+def test_e2e_command_parser_rejects_non_value_illegal_json():
+    from backend.services.creator.common import _parse_e2e_workflow_command
+
+    with pytest.raises(ValueError) as exc_info:
+        _parse_e2e_workflow_command(
+            command="python scripts/main.py '{{bad_key}}: \"value\"}'",
+            ordinal=1,
+            source_path="SKILL.md",
+        )
+
+    assert "command_json_parse" in str(exc_info.value)
+
+
+def test_e2e_repair_hint_does_not_misdiagnose_bare_value_placeholder_as_quote_escape():
+    hint = e2e._targeted_e2e_repair_hint([
+        "E2E_LAYER=command_json_parse\nproblem=Expecting value near {{story_segments}}"
+    ])
+
+    assert "确定性规范化" in hint
+    assert "误诊断为双引号转义问题" in hint
