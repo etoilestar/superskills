@@ -71,6 +71,8 @@
               <button class="btn-ghost" @click="applyStatus(selected.status === 'disabled' ? 'enable' : 'disable')" :disabled="!selected.editable">
                 {{ selected.status === 'disabled' ? '启用' : '禁用' }}
               </button>
+              <a class="btn-secondary zip-download-link" :href="skillZipExportUrl(selected.name, { portable: true })">⬇ 下载 ZIP</a>
+              <button class="btn-ghost" @click="saveZipLocally">保存 ZIP 到服务器</button>
               <label class="btn-secondary zip-import-label" :class="{ disabled: !selected.editable }">
                 ⬆ 升级 ZIP
                 <input type="file" accept=".zip" class="hidden-file-input" :disabled="!selected.editable" @change="onUpgradeZipChange" />
@@ -83,6 +85,8 @@
               </select>
               <button class="btn-ghost" @click="doRollback" :disabled="!selected.editable || !rollbackVersion">回滚</button>
             </div>
+            <div v-if="zipActionMessage" class="muted zip-action-message">{{ zipActionMessage }}</div>
+            <div v-if="zipActionError" class="error zip-action-message">{{ zipActionError }}</div>
             <div class="governance-grid">
               <div class="governance-card">
                 <div class="governance-title">治理摘要</div>
@@ -247,6 +251,8 @@ import {
   saveAllowlist,
   saveAssetContent,
   saveSkill,
+  saveSkillZip,
+  skillZipExportUrl,
   updateSkillStatus,
   upgradeSkillZip,
   uploadAsset,
@@ -261,6 +267,8 @@ const editContent = ref('')
 const editError = ref('')
 const saving = ref(false)
 const deleteTarget = ref(null)
+const zipActionMessage = ref('')
+const zipActionError = ref('')
 
 // assets
 const assetFolders = ['assets', 'references', 'scripts']
@@ -301,6 +309,8 @@ async function select(name) {
   selected.value = await fetchSkill(name, 'manage')
   uploadError.value = ''
   assetError.value = ''
+  zipActionMessage.value = ''
+  zipActionError.value = ''
   await loadAssets(name)
   await loadGovernance(name)
 }
@@ -368,6 +378,8 @@ async function doDelete() {
   assets.value = { assets: [], references: [], scripts: [] }
   uploadError.value = ''
   assetError.value = ''
+  zipActionMessage.value = ''
+  zipActionError.value = ''
   await load()
 }
 
@@ -442,6 +454,18 @@ async function applyStatus(action) {
   await updateSkillStatus(selected.value.name, action)
   await load()
   await select(selected.value.name)
+}
+
+async function saveZipLocally() {
+  if (!selected.value) return
+  zipActionMessage.value = ''
+  zipActionError.value = ''
+  try {
+    const result = await saveSkillZip(selected.value.name, { portable: true, mode: 'manage' })
+    zipActionMessage.value = `已保存 ZIP：${result.filename}`
+  } catch (e) {
+    zipActionError.value = e.message
+  }
 }
 
 async function onUpgradeZipChange(event) {
@@ -539,6 +563,12 @@ onMounted(load)
 
 .zip-import-label {
   cursor: pointer;
+}
+.zip-download-link {
+  text-decoration: none;
+}
+.zip-action-message {
+  padding: 0 16px 8px;
 }
 .zip-import-label.disabled {
   opacity: 0.5;

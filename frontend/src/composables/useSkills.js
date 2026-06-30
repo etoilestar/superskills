@@ -147,6 +147,24 @@ export async function updateSkillStatus(name, action, reason = '') {
   return res.json()
 }
 
+export function skillZipExportUrl(name, { portable = false, mode = 'manage' } = {}) {
+  const params = new URLSearchParams({ mode })
+  if (portable) params.set('portable', 'true')
+  return `/api/skills/${encodeURIComponent(name)}/export?${params.toString()}`
+}
+
+export async function saveSkillZip(name, { portable = true, mode = 'manage' } = {}) {
+  const params = new URLSearchParams({ mode, portable: portable ? 'true' : 'false' })
+  const res = await fetch(`/api/skills/${encodeURIComponent(name)}/save-zip?${params.toString()}`, {
+    method: 'POST',
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new Error(err.detail || 'Save ZIP failed')
+  }
+  return res.json()
+}
+
 export async function upgradeSkillZip(name, file) {
   const form = new FormData()
   form.append('file', file)
