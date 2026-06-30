@@ -202,7 +202,7 @@ def _run_package(name: str, skill_dir: Path) -> dict:
     try:
         result = _run_kernel_script(
             "package_skill.py",
-            [str(skill_dir), str(output_dir)],
+            [str(skill_dir), str(output_dir), "--portable", "--skip-validate"],
         )
     except Exception as exc:
         return {

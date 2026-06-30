@@ -9,12 +9,13 @@ from pathlib import Path as _Path
 from typing import Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from ..services.skill_manager import (
     delete_asset,
     delete_skill,
+    export_skill_zip,
     get_asset,
     get_execution_skill_dir,
     get_skill,
@@ -26,6 +27,8 @@ from ..services.skill_manager import (
     rollback_skill,
     save_asset,
     save_skill,
+    save_skill_zip,
+    saved_skill_zip_path,
     upgrade_skill_zip,
     update_asset,
 )
@@ -485,6 +488,53 @@ async def list_skill_outputs(skill_name: str):
             "modified": stat.st_mtime,
         })
     return {"files": files}
+
+
+@router.get("/{skill_name}/export")
+async def export_skill(skill_name: str, portable: bool = Query(False), portable_style: Literal["inline", "package"] = Query("inline"), mode: SkillMode = Query("manage")):
+    try:
+        data = export_skill_zip(skill_name, portable=portable, portable_style=portable_style, mode=mode)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    filename = f"{skill_name}.portable.{portable_style}.zip" if portable else f"{skill_name}.zip"
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/{skill_name}/save-zip")
+async def save_skill_zip_to_server(
+    skill_name: str,
+    portable: bool = Query(True),
+    portable_style: Literal["inline", "package"] = Query("inline"),
+    mode: SkillMode = Query("manage"),
+    output_dir: str | None = Query(None),
+):
+    try:
+        return save_skill_zip(skill_name, portable=portable, portable_style=portable_style, mode=mode, output_dir=output_dir)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/{skill_name}/saved-zips/{filename}")
+async def download_saved_skill_zip(skill_name: str, filename: str):
+    try:
+        path = saved_skill_zip_path(skill_name, filename)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return FileResponse(path=str(path), filename=filename, media_type="application/zip")
 
 
 @router.get("/{skill_name}/files/{filepath:path}")

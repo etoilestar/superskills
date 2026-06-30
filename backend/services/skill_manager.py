@@ -1,4 +1,5 @@
 import io
+import json
 import shutil
 import zipfile
 from pathlib import Path
@@ -208,7 +209,9 @@ def update_asset(skill_name: str, folder: str, filename: str, content: str) -> d
 
 _MAX_ZIP_BYTES = 50 * 1024 * 1024
 _MAX_UNZIP_BYTES = 50 * 1024 * 1024
-_ALLOWED_ZIP_SUBDIRS = {"scripts", "references", "assets"}
+_ALLOWED_ZIP_SUBDIRS = {"scripts", "references", "assets", "_portable_runtime"}
+_ALLOWED_ZIP_ROOT_FILES = {"SKILL.md", "requirements-portable.txt", ".env.example", "skill-portability.json"}
+_FORBIDDEN_ZIP_SUFFIXES = {".pyc", ".pyo"}
 
 
 def _parse_zip_payload(data: bytes) -> tuple[str, dict, str, list[tuple[str, bytes]], dict]:
@@ -260,21 +263,142 @@ def _parse_zip_payload(data: bytes) -> tuple[str, dict, str, list[tuple[str, byt
             if not rel or rel.endswith("/"):
                 continue
             rel_parts = Path(rel).parts
+            if any(part in {"__pycache__", ""} for part in rel_parts):
+                continue
+            if any(part.startswith(".") for part in rel_parts[:-1]):
+                continue
             if len(rel_parts) == 1:
-                if rel_parts[0] != "SKILL.md":
+                if rel_parts[0] not in _ALLOWED_ZIP_ROOT_FILES:
                     continue
             elif rel_parts[0] not in _ALLOWED_ZIP_SUBDIRS:
                 continue
             fname = rel_parts[-1]
-            if fname.startswith(".") or "\x00" in fname or len(fname) > 255:
+            if "\x00" in fname or len(fname) > 255:
+                continue
+            if fname.startswith(".") and fname != ".env.example":
+                continue
+            if fname == ".env" or Path(fname).suffix in _FORBIDDEN_ZIP_SUFFIXES:
                 continue
             entries_to_extract.append((rel, zf.read(info.filename)))
 
-        return safe_skill_name, meta, skill_md_content, entries_to_extract, {
+        portability = None
+        if any(rel == "skill-portability.json" for rel, _ in entries_to_extract):
+            try:
+                portability = json.loads(zf.read(prefix + "skill-portability.json").decode("utf-8"))
+            except Exception:
+                portability = {"warning": "invalid skill-portability.json"}
+
+        details = {
             "archive_entries": len(entries_to_extract),
             "zip_size": len(data),
         }
+        if portability is not None:
+            details["portability"] = portability
+        return safe_skill_name, meta, skill_md_content, entries_to_extract, details
 
+
+def export_skill_zip(skill_name: str, *, portable: bool = False, portable_style: str = "inline", mode: str = "manage") -> bytes:
+    skill_dir = _resolved_skill_dir(skill_name, mode=mode)
+    buffer = io.BytesIO()
+    from .skill_portability import add_portable_files_to_zip
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+        prefix = f"{skill_dir.name}/"
+        portable_scripts: set[str] = set()
+        if portable:
+            report = add_portable_files_to_zip(zipf, skill_dir, arc_prefix=prefix, portable_style=portable_style)
+            portable_scripts.update(report.patched_scripts)
+            scripts_dir = skill_dir / "scripts"
+            if scripts_dir.exists():
+                portable_scripts.update(p.relative_to(skill_dir).as_posix() for p in scripts_dir.rglob("*.py"))
+        for file_path in skill_dir.rglob("*"):
+            if not file_path.is_file():
+                continue
+            rel = file_path.relative_to(skill_dir).as_posix()
+            if portable and (rel in portable_scripts or rel.startswith("_portable_runtime/") or rel in {"requirements-portable.txt", ".env.example", "skill-portability.json"}):
+                continue
+            zipf.write(file_path, f"{prefix}{rel}")
+    return buffer.getvalue()
+
+
+def _skill_zip_filename(skill_name: str, *, portable: bool, portable_style: str = "inline") -> str:
+    suffix = f".portable.{portable_style}.zip" if portable else ".zip"
+    return f"{Path(skill_name).name}{suffix}"
+
+
+def _exports_skills_dir() -> Path:
+    return Path(getattr(settings, "exports_path", Path(__file__).resolve().parents[1] / "data" / "exports")) / "skills"
+
+
+def _safe_exports_output_dir(output_dir: str | None = None) -> Path:
+    root = _exports_skills_dir().resolve()
+    target = (root / output_dir).resolve() if output_dir else root
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("output_dir must stay under the configured skills exports directory") from exc
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _unique_export_path(directory: Path, filename: str) -> Path:
+    target = directory / filename
+    if not target.exists():
+        return target
+    from datetime import datetime, timezone
+
+    stem = target.stem
+    suffix = target.suffix
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    candidate = directory / f"{stem}.{timestamp}{suffix}"
+    counter = 1
+    while candidate.exists():
+        candidate = directory / f"{stem}.{timestamp}.{counter}{suffix}"
+        counter += 1
+    return candidate
+
+
+def save_skill_zip(skill_name: str, *, portable: bool = True, portable_style: str = "inline", mode: str = "manage", output_dir: str | None = None) -> dict:
+    data = export_skill_zip(skill_name, portable=portable, portable_style=portable_style, mode=mode)
+    directory = _safe_exports_output_dir(output_dir)
+    filename = _skill_zip_filename(skill_name, portable=portable, portable_style=portable_style)
+    path = _unique_export_path(directory, filename)
+    path.write_bytes(data)
+    return {
+        "success": True,
+        "skill_name": skill_name,
+        "portable": portable,
+        "portable_style": portable_style,
+        "path": str(path),
+        "filename": path.name,
+        "size": len(data),
+        "download_url": f"/api/skills/{skill_name}/saved-zips/{path.name}",
+    }
+
+
+def saved_skill_zip_path(skill_name: str, filename: str) -> Path:
+    safe_name = Path(filename).name
+    allowed_prefixes = (f"{Path(skill_name).name}.",)
+    if (
+        not safe_name
+        or safe_name != filename
+        or "\x00" in safe_name
+        or "/" in filename
+        or "\\" in filename
+        or ".." in Path(filename).parts
+        or Path(safe_name).suffix != ".zip"
+        or not safe_name.startswith(allowed_prefixes)
+    ):
+        raise ValueError("Invalid saved ZIP filename")
+    root = _exports_skills_dir().resolve()
+    target = (root / safe_name).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("Invalid saved ZIP filename") from exc
+    if not target.is_file():
+        raise FileNotFoundError(filename)
+    return target
 
 def import_skill_zip(data: bytes, overwrite: bool = False) -> dict:
     skill_name, meta, _content, entries_to_extract, install_details = _parse_zip_payload(data)
