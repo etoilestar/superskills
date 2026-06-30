@@ -321,6 +321,84 @@ def export_skill_zip(skill_name: str, *, portable: bool = False, mode: str = "ma
     return buffer.getvalue()
 
 
+def _skill_zip_filename(skill_name: str, *, portable: bool) -> str:
+    suffix = ".portable.zip" if portable else ".zip"
+    return f"{Path(skill_name).name}{suffix}"
+
+
+def _exports_skills_dir() -> Path:
+    return Path(getattr(settings, "exports_path", Path(__file__).resolve().parents[1] / "data" / "exports")) / "skills"
+
+
+def _safe_exports_output_dir(output_dir: str | None = None) -> Path:
+    root = _exports_skills_dir().resolve()
+    target = (root / output_dir).resolve() if output_dir else root
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("output_dir must stay under the configured skills exports directory") from exc
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _unique_export_path(directory: Path, filename: str) -> Path:
+    target = directory / filename
+    if not target.exists():
+        return target
+    from datetime import datetime, timezone
+
+    stem = target.stem
+    suffix = target.suffix
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    candidate = directory / f"{stem}.{timestamp}{suffix}"
+    counter = 1
+    while candidate.exists():
+        candidate = directory / f"{stem}.{timestamp}.{counter}{suffix}"
+        counter += 1
+    return candidate
+
+
+def save_skill_zip(skill_name: str, *, portable: bool = True, mode: str = "manage", output_dir: str | None = None) -> dict:
+    data = export_skill_zip(skill_name, portable=portable, mode=mode)
+    directory = _safe_exports_output_dir(output_dir)
+    filename = _skill_zip_filename(skill_name, portable=portable)
+    path = _unique_export_path(directory, filename)
+    path.write_bytes(data)
+    return {
+        "success": True,
+        "skill_name": skill_name,
+        "portable": portable,
+        "path": str(path),
+        "filename": path.name,
+        "size": len(data),
+        "download_url": f"/api/skills/{skill_name}/saved-zips/{path.name}",
+    }
+
+
+def saved_skill_zip_path(skill_name: str, filename: str) -> Path:
+    safe_name = Path(filename).name
+    allowed_prefixes = (f"{Path(skill_name).name}.",)
+    if (
+        not safe_name
+        or safe_name != filename
+        or "\x00" in safe_name
+        or "/" in filename
+        or "\\" in filename
+        or ".." in Path(filename).parts
+        or Path(safe_name).suffix != ".zip"
+        or not safe_name.startswith(allowed_prefixes)
+    ):
+        raise ValueError("Invalid saved ZIP filename")
+    root = _exports_skills_dir().resolve()
+    target = (root / safe_name).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("Invalid saved ZIP filename") from exc
+    if not target.is_file():
+        raise FileNotFoundError(filename)
+    return target
+
 def import_skill_zip(data: bytes, overwrite: bool = False) -> dict:
     skill_name, meta, _content, entries_to_extract, install_details = _parse_zip_payload(data)
     skill_dir = _managed_skill_dir(skill_name)

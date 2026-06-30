@@ -27,6 +27,8 @@ from ..services.skill_manager import (
     rollback_skill,
     save_asset,
     save_skill,
+    save_skill_zip,
+    saved_skill_zip_path,
     upgrade_skill_zip,
     update_asset,
 )
@@ -496,12 +498,42 @@ async def export_skill(skill_name: str, portable: bool = Query(False), mode: Ski
         raise HTTPException(status_code=404, detail=str(exc))
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
-    suffix = "portable" if portable else "skill"
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    filename = f"{skill_name}.portable.zip" if portable else f"{skill_name}.zip"
     return Response(
         content=data,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{skill_name}-{suffix}.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.post("/{skill_name}/save-zip")
+async def save_skill_zip_to_server(
+    skill_name: str,
+    portable: bool = Query(True),
+    mode: SkillMode = Query("manage"),
+    output_dir: str | None = Query(None),
+):
+    try:
+        return save_skill_zip(skill_name, portable=portable, mode=mode, output_dir=output_dir)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/{skill_name}/saved-zips/{filename}")
+async def download_saved_skill_zip(skill_name: str, filename: str):
+    try:
+        path = saved_skill_zip_path(skill_name, filename)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return FileResponse(path=str(path), filename=filename, media_type="application/zip")
 
 
 @router.get("/{skill_name}/files/{filepath:path}")
