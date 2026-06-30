@@ -71,7 +71,11 @@
               <button class="btn-ghost" @click="applyStatus(selected.status === 'disabled' ? 'enable' : 'disable')" :disabled="!selected.editable">
                 {{ selected.status === 'disabled' ? '启用' : '禁用' }}
               </button>
-              <a class="btn-secondary zip-download-link" :href="skillZipExportUrl(selected.name, { portable: true })">⬇ 下载 ZIP</a>
+              <select v-model="portableStyle" class="folder-select" title="导出方式">
+                <option value="inline">内联工具函数（推荐）</option>
+                <option value="package">携带 portable runtime 包</option>
+              </select>
+              <a class="btn-secondary zip-download-link" :href="skillZipExportUrl(selected.name, { portable: true, portableStyle })">⬇ 下载 ZIP</a>
               <button class="btn-ghost" @click="saveZipLocally">保存 ZIP 到服务器</button>
               <label class="btn-secondary zip-import-label" :class="{ disabled: !selected.editable }">
                 ⬆ 升级 ZIP
@@ -269,6 +273,7 @@ const saving = ref(false)
 const deleteTarget = ref(null)
 const zipActionMessage = ref('')
 const zipActionError = ref('')
+const portableStyle = ref('inline')
 
 // assets
 const assetFolders = ['assets', 'references', 'scripts']
@@ -461,7 +466,7 @@ async function saveZipLocally() {
   zipActionMessage.value = ''
   zipActionError.value = ''
   try {
-    const result = await saveSkillZip(selected.value.name, { portable: true, mode: 'manage' })
+    const result = await saveSkillZip(selected.value.name, { portable: true, portableStyle: portableStyle.value, mode: 'manage' })
     zipActionMessage.value = `已保存 ZIP：${result.filename}`
   } catch (e) {
     zipActionError.value = e.message

@@ -58,12 +58,12 @@ def test_export_endpoint_returns_portable_zip(tmp_path):
             p.stop()
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/zip")
-    assert 'filename="route-skill.portable.zip"' in response.headers["content-disposition"]
+    assert 'filename="route-skill.portable.inline.zip"' in response.headers["content-disposition"]
     with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
         names = set(zf.namelist())
     assert "route-skill/SKILL.md" in names
-    assert "route-skill/_portable_runtime/runtime_tools.py" in names
     assert "route-skill/skill-portability.json" in names
+    assert not any(name.startswith("route-skill/_portable_runtime/") for name in names)
 
 
 def test_save_zip_endpoint_writes_outside_skill_dir_and_saved_download_works(tmp_path):

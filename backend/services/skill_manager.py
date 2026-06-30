@@ -297,7 +297,7 @@ def _parse_zip_payload(data: bytes) -> tuple[str, dict, str, list[tuple[str, byt
         return safe_skill_name, meta, skill_md_content, entries_to_extract, details
 
 
-def export_skill_zip(skill_name: str, *, portable: bool = False, mode: str = "manage") -> bytes:
+def export_skill_zip(skill_name: str, *, portable: bool = False, portable_style: str = "inline", mode: str = "manage") -> bytes:
     skill_dir = _resolved_skill_dir(skill_name, mode=mode)
     buffer = io.BytesIO()
     from .skill_portability import add_portable_files_to_zip
@@ -306,7 +306,7 @@ def export_skill_zip(skill_name: str, *, portable: bool = False, mode: str = "ma
         prefix = f"{skill_dir.name}/"
         portable_scripts: set[str] = set()
         if portable:
-            report = add_portable_files_to_zip(zipf, skill_dir, arc_prefix=prefix)
+            report = add_portable_files_to_zip(zipf, skill_dir, arc_prefix=prefix, portable_style=portable_style)
             portable_scripts.update(report.patched_scripts)
             scripts_dir = skill_dir / "scripts"
             if scripts_dir.exists():
@@ -321,8 +321,8 @@ def export_skill_zip(skill_name: str, *, portable: bool = False, mode: str = "ma
     return buffer.getvalue()
 
 
-def _skill_zip_filename(skill_name: str, *, portable: bool) -> str:
-    suffix = ".portable.zip" if portable else ".zip"
+def _skill_zip_filename(skill_name: str, *, portable: bool, portable_style: str = "inline") -> str:
+    suffix = f".portable.{portable_style}.zip" if portable else ".zip"
     return f"{Path(skill_name).name}{suffix}"
 
 
@@ -358,16 +358,17 @@ def _unique_export_path(directory: Path, filename: str) -> Path:
     return candidate
 
 
-def save_skill_zip(skill_name: str, *, portable: bool = True, mode: str = "manage", output_dir: str | None = None) -> dict:
-    data = export_skill_zip(skill_name, portable=portable, mode=mode)
+def save_skill_zip(skill_name: str, *, portable: bool = True, portable_style: str = "inline", mode: str = "manage", output_dir: str | None = None) -> dict:
+    data = export_skill_zip(skill_name, portable=portable, portable_style=portable_style, mode=mode)
     directory = _safe_exports_output_dir(output_dir)
-    filename = _skill_zip_filename(skill_name, portable=portable)
+    filename = _skill_zip_filename(skill_name, portable=portable, portable_style=portable_style)
     path = _unique_export_path(directory, filename)
     path.write_bytes(data)
     return {
         "success": True,
         "skill_name": skill_name,
         "portable": portable,
+        "portable_style": portable_style,
         "path": str(path),
         "filename": path.name,
         "size": len(data),

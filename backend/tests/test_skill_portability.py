@@ -1,5 +1,6 @@
 import io
 import json
+import runpy
 import sys
 import zipfile
 from pathlib import Path
@@ -29,9 +30,11 @@ def test_portable_zip_patches_runtime_tools_without_touching_source(tmp_path):
     with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
         names = set(zf.namelist())
         patched = zf.read("scripts/run.py").decode()
-    assert "from _portable_runtime.backend.services.runtime_tools import strict_json_argv_guard" in patched
-    assert "except ImportError:" in patched
-    assert "_portable_runtime/backend/services/runtime_tools/argv_tools.py" in names
+    assert "backend.services.runtime_tools" not in patched
+    assert "_portable_runtime" not in patched
+    assert "def strict_json_argv_guard" in patched
+    assert "_TYPE_ALIASES" in patched
+    assert not any(name.startswith("_portable_runtime/") for name in names)
     assert "skill-portability.json" in names
 
 
@@ -48,8 +51,8 @@ def test_portable_zip_skill_runtime_env_and_no_secret(tmp_path, monkeypatch):
         names = set(zf.namelist())
         env = zf.read(".env.example").decode()
         blob = b"".join(zf.read(n) for n in names)
-    assert "_portable_runtime/backend/services/skill_runtime.py" in names
-    assert "LLM_API_BASE=" in env and "LLM_API_KEY=" in env and "LLM_MODEL=" in env
+    assert not any(name.startswith("_portable_runtime/") for name in names)
+    assert "LLM_API_BASE=<FILL_ME>" in env and "LLM_API_KEY=<FILL_ME>" in env and "LLM_MODEL=<FILL_ME>" in env
     assert b"real-secret" not in blob
 
 
@@ -105,8 +108,8 @@ def test_strict_json_argv_guard_portable_matches_real_backend(tmp_path, monkeypa
     extract_dir = tmp_path / "portable"
     with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
         zf.extractall(extract_dir)
-    monkeypatch.syspath_prepend(str(extract_dir))
-    from _portable_runtime.backend.services.runtime_tools import strict_json_argv_guard as portable_guard
+    namespace = runpy.run_path(str(extract_dir / "scripts" / "guard.py"))
+    portable_guard = namespace["strict_json_argv_guard"]
 
     payload = {"name": "Ada", "count": 2}
     spec = {"name": {"type": "string", "required": True}, "count": {"type": "int", "default": 1}}
@@ -139,8 +142,10 @@ def test_runtime_tool_dependency_closure_and_no_backend_copy(tmp_path, monkeypat
         patched = zf.read("scripts/pdf.py").decode()
         manifest = zf.read("skill-portability.json").decode()
         requirements = zf.read("requirements-portable.txt").decode()
-    assert "_portable_runtime/backend/services/runtime_tools/document_tools.py" in names
-    assert "from _portable_runtime.backend.services.runtime_tools import create_pdf_document" in patched
+    assert not any(name.startswith("_portable_runtime/") for name in names)
+    assert "backend.services.runtime_tools" not in patched
+    assert "def create_pdf_document" in patched
+    assert "def _output_path" in patched
     assert not any("creator" in name or "routers" in name or "governance" in name for name in names)
     assert "backend/services/runtime_tools/document_tools.py" not in names
     assert "copied_modules" in manifest
@@ -185,12 +190,86 @@ def test_skill_runtime_adapter_signature_accepts_real_call_and_errors_at_runtime
     with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
         zf.extractall(extract_dir)
         manifest = json.loads((extract_dir / "skill-portability.json").read_text())
-    for name in list(sys.modules):
-        if name.startswith("_portable_runtime"):
-            sys.modules.pop(name)
-    monkeypatch.syspath_prepend(str(extract_dir))
-    from _portable_runtime.backend.services.skill_runtime import generate_text_with_llm
+    namespace = runpy.run_path(str(extract_dir / "scripts" / "llm.py"))
+    generate_text_with_llm = namespace["generate_text_with_llm"]
 
     assert "generate_text_with_llm" in manifest["adapted_tools"]
+    assert not (extract_dir / "_portable_runtime").exists()
     with pytest.raises(RuntimeError, match="LLM_BASE_URL|LLM_API_BASE|fill .env.example"):
         generate_text_with_llm("hello", system="sys", temperature=0.1)
+
+
+def test_inline_cross_module_class_constant_and_name_conflict(tmp_path, monkeypatch):
+    import backend.services.skill_portability as portability
+
+    runtime = tmp_path / "runtime_tools"
+    runtime.mkdir()
+    (runtime / "__init__.py").write_text("from .helper_tools import public_tool\n", encoding="utf-8")
+    (runtime / "other.py").write_text("def other_helper(value):\n    return value + 1\n\nUNUSED = 'not copied'\n", encoding="utf-8")
+    (runtime / "helper_tools.py").write_text(
+        "from .other import other_helper\n\nCONST_VALUE = 3\n\nclass Box:\n    def __init__(self, value):\n        self.value = value\n\ndef _output_path(value):\n    return other_helper(value) + CONST_VALUE\n\ndef public_tool(value):\n    return Box(_output_path(value)).value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(portability, "RUNTIME_TOOLS_DIR", runtime)
+    d = _skill(tmp_path / "skill")
+    original = "from backend.services.runtime_tools import public_tool\n\ndef _output_path(value):\n    return 'user'\n\nRESULT = public_tool(1)\n"
+    (d / "scripts" / "main.py").write_text(original, encoding="utf-8")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        portability.add_portable_files_to_zip(zf, d)
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
+        names = set(zf.namelist())
+        script = zf.read("scripts/main.py").decode()
+    assert not any(name.startswith("_portable_runtime/") for name in names)
+    assert "def public_tool" in script
+    assert "class Box" in script
+    assert "CONST_VALUE = 3" in script
+    assert "def other_helper" in script
+    assert "def _portable_output_path" in script
+    assert "def _output_path(value):\n    return 'user'" in script
+    namespace = runpy.run_path(str(_write_script(tmp_path, script)))
+    assert namespace["RESULT"] == 5
+    assert (d / "scripts" / "main.py").read_text(encoding="utf-8") == original
+
+
+def _write_script(tmp_path: Path, source: str) -> Path:
+    path = tmp_path / "rendered.py"
+    path.write_text(source, encoding="utf-8")
+    return path
+
+
+def test_inline_fallback_to_package_for_dynamic_runtime_module(tmp_path, monkeypatch):
+    import backend.services.skill_portability as portability
+
+    runtime = tmp_path / "runtime_tools"
+    runtime.mkdir()
+    (runtime / "__init__.py").write_text("from .dynamic_tools import dynamic_tool\n", encoding="utf-8")
+    (runtime / "dynamic_tools.py").write_text("def dynamic_tool(name):\n    return eval(name)\n", encoding="utf-8")
+    monkeypatch.setattr(portability, "RUNTIME_TOOLS_DIR", runtime)
+    d = _skill(tmp_path / "fallback")
+    (d / "scripts" / "dyn.py").write_text("from backend.services.runtime_tools import dynamic_tool\n", encoding="utf-8")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        portability.add_portable_files_to_zip(zf, d)
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
+        names = set(zf.namelist())
+        manifest = json.loads(zf.read("skill-portability.json").decode())
+    assert any(name.startswith("_portable_runtime/") for name in names)
+    assert manifest["fallback_to_package"] is True
+    assert manifest["portable_style"] == "mixed"
+    assert manifest["fallback_reasons"]
+
+
+def test_explicit_package_style_keeps_portable_runtime(tmp_path):
+    from backend.services.skill_portability import add_portable_files_to_zip
+
+    d = _skill(tmp_path)
+    (d / "scripts" / "run.py").write_text("from backend.services.runtime_tools import strict_json_argv_guard\n", encoding="utf-8")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        add_portable_files_to_zip(zf, d, portable_style="package")
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
+        names = set(zf.namelist())
+        manifest = json.loads(zf.read("skill-portability.json").decode())
+    assert "_portable_runtime/backend/services/runtime_tools/argv_tools.py" in names
+    assert manifest["portable_style"] == "package"

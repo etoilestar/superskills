@@ -491,16 +491,16 @@ async def list_skill_outputs(skill_name: str):
 
 
 @router.get("/{skill_name}/export")
-async def export_skill(skill_name: str, portable: bool = Query(False), mode: SkillMode = Query("manage")):
+async def export_skill(skill_name: str, portable: bool = Query(False), portable_style: Literal["inline", "package"] = Query("inline"), mode: SkillMode = Query("manage")):
     try:
-        data = export_skill_zip(skill_name, portable=portable, mode=mode)
+        data = export_skill_zip(skill_name, portable=portable, portable_style=portable_style, mode=mode)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    filename = f"{skill_name}.portable.zip" if portable else f"{skill_name}.zip"
+    filename = f"{skill_name}.portable.{portable_style}.zip" if portable else f"{skill_name}.zip"
     return Response(
         content=data,
         media_type="application/zip",
@@ -512,11 +512,12 @@ async def export_skill(skill_name: str, portable: bool = Query(False), mode: Ski
 async def save_skill_zip_to_server(
     skill_name: str,
     portable: bool = Query(True),
+    portable_style: Literal["inline", "package"] = Query("inline"),
     mode: SkillMode = Query("manage"),
     output_dir: str | None = Query(None),
 ):
     try:
-        return save_skill_zip(skill_name, portable=portable, mode=mode, output_dir=output_dir)
+        return save_skill_zip(skill_name, portable=portable, portable_style=portable_style, mode=mode, output_dir=output_dir)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except PermissionError as exc:

@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from zipfile import ZipFile
 
 PORTABILITY_VERSION = "1.1"
@@ -66,12 +66,32 @@ class PortableReport:
     warnings: list[str] = field(default_factory=list)
     used_runtime_tools: list[str] = field(default_factory=list)
     used_skill_runtime_tools: list[str] = field(default_factory=list)
+    portable_style: str = "inline"
+    inlined_tools: list[str] = field(default_factory=list)
+    inlined_helpers: list[str] = field(default_factory=list)
+    inlined_constants: list[str] = field(default_factory=list)
+    inlined_classes: list[str] = field(default_factory=list)
+    inline_blocks: list[dict[str, Any]] = field(default_factory=list)
+    fallback_to_package: bool = False
+    fallback_reasons: list[str] = field(default_factory=list)
+    fallback_tools: list[str] = field(default_factory=list)
+    fallback_modules: list[str] = field(default_factory=list)
 
     def manifest(self) -> dict[str, Any]:
         return {
             "portability_version": PORTABILITY_VERSION,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "runtime_bundle_dir": RUNTIME_DIR,
+            "portable_style": "mixed" if self.fallback_to_package and self.portable_style == "inline" else self.portable_style,
+            "inlined_tools": self.inlined_tools,
+            "inlined_helpers": self.inlined_helpers,
+            "inlined_constants": self.inlined_constants,
+            "inlined_classes": self.inlined_classes,
+            "inline_blocks": self.inline_blocks,
+            "fallback_to_package": self.fallback_to_package,
+            "fallback_reasons": self.fallback_reasons,
+            "fallback_tools": self.fallback_tools,
+            "fallback_modules": self.fallback_modules,
             "system_tools_used": self.system_tools_used,
             "patched_imports": self.patched_imports,
             "copied_modules": self.copied_modules,
@@ -171,8 +191,13 @@ def _runtime_module_file(module: str) -> Path | None:
 def _module_name_for_file(path: Path) -> str:
     if path == SKILL_RUNTIME_FILE:
         return "backend.services.skill_runtime"
-    rel = path.relative_to(REPO_ROOT).with_suffix("")
-    return ".".join(rel.parts)
+    try:
+        rel = path.relative_to(REPO_ROOT).with_suffix("")
+        return ".".join(rel.parts)
+    except ValueError:
+        if path.parent == RUNTIME_TOOLS_DIR:
+            return f"backend.services.runtime_tools.{path.stem}"
+        return path.stem
 
 
 def _discover_runtime_closure(runtime_names: set[str], runtime_modules: set[str], skill_runtime_names: set[str], report: PortableReport) -> set[Path]:
@@ -270,9 +295,9 @@ def _placeholders(envs: set[str]) -> dict[str, str]:
     return result
 
 
-def collect_portable_dependencies(skill_dir: str | Path) -> PortableReport:
+def collect_portable_dependencies(skill_dir: str | Path, portable_style: Literal["inline", "package"] = "inline") -> PortableReport:
     skill_dir = Path(skill_dir)
-    report = PortableReport()
+    report = PortableReport(portable_style=portable_style)
     runtime_names, runtime_modules, skill_runtime_names, third_party, parsed_scripts = _script_system_imports(skill_dir)
     copied_files = _discover_runtime_closure(runtime_names, runtime_modules, skill_runtime_names, report)
     envs = set(DEFAULT_ENV_PLACEHOLDERS)
@@ -327,7 +352,7 @@ def collect_portable_dependencies(skill_dir: str | Path) -> PortableReport:
     return report
 
 
-def patch_script_imports(source: str, rel_path: str, report: PortableReport) -> str:
+def patch_script_imports(source: str, rel_path: str, report: PortableReport, portable_style: Literal["inline", "package"] = "package") -> str:
     tree = ast.parse(source)
     lines = source.splitlines()
     replacements: list[tuple[int, int, str]] = []
@@ -429,6 +454,401 @@ def _required_env(name: str) -> str:
     return "\n".join(lines) + ("\n" if source.endswith("\n") else "")
 
 
+
+@dataclass
+class SourceModuleIndex:
+    module: str
+    path: Path
+    tree: ast.Module
+    imports: list[ast.stmt]
+    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef]
+    classes: dict[str, ast.ClassDef]
+    assignments: dict[str, ast.Assign | ast.AnnAssign]
+    constants: set[str]
+
+
+@dataclass
+class ToolDefinition:
+    public_name: str
+    module: str
+    path: Path
+    symbol_name: str
+    node: ast.AST
+
+
+@dataclass
+class InlineClosure:
+    imports: list[ast.stmt] = field(default_factory=list)
+    assignments: dict[str, ast.Assign | ast.AnnAssign] = field(default_factory=dict)
+    classes: dict[str, ast.ClassDef] = field(default_factory=dict)
+    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = field(default_factory=dict)
+    entry_symbols: set[str] = field(default_factory=set)
+    modules: set[str] = field(default_factory=set)
+    third_party_roots: set[str] = field(default_factory=set)
+    env_vars: set[str] = field(default_factory=set)
+    fallback_reasons: list[str] = field(default_factory=list)
+
+
+def _build_source_index(module_name: str, path: Path) -> SourceModuleIndex:
+    tree = _parse(path)
+    if tree is None:
+        raise ValueError(f"Could not parse source module {module_name}")
+    imports: list[ast.stmt] = []
+    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    classes: dict[str, ast.ClassDef] = {}
+    assignments: dict[str, ast.Assign | ast.AnnAssign] = {}
+    constants: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imports.append(node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            functions[node.name] = node
+        elif isinstance(node, ast.ClassDef):
+            classes[node.name] = node
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments[target.id] = node
+                    if target.id.isupper() or target.id.startswith("_"):
+                        constants.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            assignments[node.target.id] = node
+            if node.target.id.isupper() or node.target.id.startswith("_"):
+                constants.add(node.target.id)
+    return SourceModuleIndex(module_name, path, tree, imports, functions, classes, assignments, constants)
+
+
+def _resolve_tool_definition(tool_name: str, import_module: str) -> ToolDefinition | None:
+    if import_module == "backend.services.runtime_tools":
+        module = _runtime_export_map().get(tool_name)
+    elif import_module.startswith("backend.services.runtime_tools."):
+        module = import_module
+    elif import_module == "backend.services.skill_runtime":
+        module = import_module
+    else:
+        module = None
+    if not module:
+        return None
+    path = SKILL_RUNTIME_FILE if module == "backend.services.skill_runtime" else _runtime_module_file(module)
+    if path is None or not path.is_file():
+        return None
+    index = _build_source_index(module, path)
+    node = index.functions.get(tool_name) or index.classes.get(tool_name) or index.assignments.get(tool_name)
+    if node is None:
+        return None
+    return ToolDefinition(tool_name, module, path, tool_name, node)
+
+
+def _detect_dynamic_fallback(tree: ast.AST) -> str | None:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
+            return "wildcard import"
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in {"eval", "exec"}:
+                return f"dynamic {node.func.id} call"
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "import_module":
+                return "dynamic import_module call"
+    return None
+
+
+def _names_loaded(node: ast.AST) -> set[str]:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+
+
+def _import_alias_names(node: ast.stmt) -> set[str]:
+    if isinstance(node, ast.Import):
+        return {(alias.asname or alias.name.split(".", 1)[0]) for alias in node.names}
+    if isinstance(node, ast.ImportFrom):
+        return {(alias.asname or alias.name) for alias in node.names if alias.name != "*"}
+    return set()
+
+
+def _relative_runtime_import_module(index: SourceModuleIndex, node: ast.ImportFrom) -> str | None:
+    if node.level == 1 and index.module.startswith("backend.services.runtime_tools") and node.module:
+        return f"backend.services.runtime_tools.{node.module}"
+    if node.module and node.module.startswith("backend.services.runtime_tools."):
+        return node.module
+    return None
+
+
+def _collect_local_symbol_closure(index: SourceModuleIndex, entry_symbols: set[str]) -> InlineClosure:
+    closure = InlineClosure(entry_symbols=set(entry_symbols), modules={index.module})
+    reason = _detect_dynamic_fallback(index.tree)
+    if reason:
+        closure.fallback_reasons.append(f"{index.module}: {reason}")
+        return closure
+    visited: set[tuple[str, str]] = set()
+
+    def add_symbol(symbol: str, current: SourceModuleIndex):
+        key = (current.module, symbol)
+        if key in visited:
+            return
+        visited.add(key)
+        node = current.functions.get(symbol) or current.classes.get(symbol) or current.assignments.get(symbol)
+        if node is None:
+            return
+        closure.modules.add(current.module)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            closure.functions.setdefault(symbol, node)
+        elif isinstance(node, ast.ClassDef):
+            closure.classes.setdefault(symbol, node)
+        else:
+            closure.assignments.setdefault(symbol, node)
+        closure.env_vars.update(_env_vars(node))
+        loaded = _names_loaded(node)
+        for dep in sorted(loaded):
+            if dep in current.functions or dep in current.classes or dep in current.assignments:
+                add_symbol(dep, current)
+        for imp in current.imports:
+            aliases = _import_alias_names(imp)
+            if not (aliases & loaded):
+                continue
+            if isinstance(imp, ast.ImportFrom):
+                dep_module = _relative_runtime_import_module(current, imp)
+                if dep_module:
+                    dep_path = _runtime_module_file(dep_module)
+                    if dep_path is None:
+                        closure.fallback_reasons.append(f"missing runtime import {dep_module}")
+                        continue
+                    dep_index = _build_source_index(dep_module, dep_path)
+                    for alias in imp.names:
+                        if alias.name == "*":
+                            closure.fallback_reasons.append(f"wildcard import in {current.module}")
+                            continue
+                        local = alias.asname or alias.name
+                        if local in loaded:
+                            add_symbol(alias.name, dep_index)
+                    continue
+            closure.imports.append(imp)
+            for root in _import_roots(ast.Module(body=[imp], type_ignores=[])):
+                if root not in _stdlib_roots() and root != "backend":
+                    closure.third_party_roots.add(root)
+
+    for symbol in sorted(entry_symbols):
+        add_symbol(symbol, index)
+    # Deduplicate imports by source text.
+    unique: dict[str, ast.stmt] = {}
+    for imp in closure.imports:
+        try:
+            unique[ast.unparse(imp)] = imp
+        except Exception:
+            pass
+    closure.imports = list(unique.values())
+    return closure
+
+
+class _RenameTransformer(ast.NodeTransformer):
+    def __init__(self, mapping: dict[str, str]):
+        self.mapping = mapping
+
+    def visit_Name(self, node: ast.Name):
+        if node.id in self.mapping:
+            return ast.copy_location(ast.Name(id=self.mapping[node.id], ctx=node.ctx), node)
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        if node.name in self.mapping:
+            node.name = self.mapping[node.name]
+        return self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        if node.name in self.mapping:
+            node.name = self.mapping[node.name]
+        return self.generic_visit(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        if node.name in self.mapping:
+            node.name = self.mapping[node.name]
+        return self.generic_visit(node)
+
+
+def _detect_top_level_names(script_ast: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in script_ast.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update(_import_alias_names(node))
+    return names
+
+
+def _resolve_inline_name_conflicts(closure: InlineClosure, script_names: set[str], public_names: set[str]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    all_inline = set(closure.functions) | set(closure.classes) | set(closure.assignments)
+    for name in sorted(all_inline):
+        if name in public_names:
+            continue
+        if name in script_names:
+            mapping[name] = f"_portable_{name.lstrip('_')}"
+    if not mapping:
+        return mapping
+    transformer = _RenameTransformer(mapping)
+    closure.functions = {mapping.get(k, k): transformer.visit(ast.fix_missing_locations(v)) for k, v in closure.functions.items()}
+    closure.classes = {mapping.get(k, k): transformer.visit(ast.fix_missing_locations(v)) for k, v in closure.classes.items()}
+    closure.assignments = {mapping.get(k, k): transformer.visit(ast.fix_missing_locations(v)) for k, v in closure.assignments.items()}
+    closure.entry_symbols = {mapping.get(k, k) for k in closure.entry_symbols}
+    return mapping
+
+
+def _render_inline_tools_block(closure: InlineClosure, report: PortableReport) -> str:
+    lines = [
+        "# --- BEGIN PORTABLE INLINE TOOLS ---",
+        "# generated by superskills portable exporter",
+        f"# tools: {', '.join(sorted(report.inlined_tools))}",
+        f"# helpers: {', '.join(sorted(report.inlined_helpers))}",
+        f"# constants: {', '.join(sorted(report.inlined_constants))}",
+    ]
+    for node in closure.imports:
+        lines.append(ast.unparse(node))
+    if closure.imports:
+        lines.append("")
+    for name in sorted(closure.assignments):
+        lines.append(ast.unparse(closure.assignments[name]))
+        lines.append("")
+    for name in sorted(closure.classes):
+        lines.append(ast.unparse(closure.classes[name]))
+        lines.append("")
+    for name in sorted(closure.functions):
+        lines.append(ast.unparse(closure.functions[name]))
+        lines.append("")
+    lines.append("# --- END PORTABLE INLINE TOOLS ---")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _strip_existing_inline_block(source: str) -> str:
+    start = "# --- BEGIN PORTABLE INLINE TOOLS ---"
+    end = "# --- END PORTABLE INLINE TOOLS ---"
+    if start not in source:
+        return source
+    before, rest = source.split(start, 1)
+    if end not in rest:
+        return source
+    _old, after = rest.split(end, 1)
+    return before.rstrip() + "\n" + after.lstrip("\n")
+
+
+def _insert_inline_block(source: str, block: str) -> str:
+    source = _strip_existing_inline_block(source)
+    tree = ast.parse(source)
+    lines = source.splitlines()
+    insert_at = 0
+    if lines and lines[0].startswith("#!"):
+        insert_at = 1
+    if len(lines) > insert_at and ("coding" in lines[insert_at] or "encoding" in lines[insert_at]):
+        insert_at += 1
+    body = tree.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+        insert_at = max(insert_at, getattr(body[0], "end_lineno", body[0].lineno))
+    for node in body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            insert_at = max(insert_at, getattr(node, "end_lineno", node.lineno))
+    lines[insert_at:insert_at] = ["", *block.rstrip().splitlines(), ""]
+    return "\n".join(lines) + ("\n" if source.endswith("\n") else "")
+
+
+def _remove_system_imports(source: str) -> str:
+    tree = ast.parse(source)
+    lines = source.splitlines()
+    remove: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            if node.module == "backend.services.runtime_tools" or node.module.startswith("backend.services.runtime_tools.") or node.module == "backend.services.skill_runtime":
+                remove.append((node.lineno - 1, getattr(node, "end_lineno", node.lineno)))
+    for start, end in sorted(remove, reverse=True):
+        del lines[start:end]
+    return "\n".join(lines) + ("\n" if source.endswith("\n") else "")
+
+
+def _adapter_source(name: str) -> str | None:
+    envs = sorted(SERVICE_ENV_BY_TOOL.get(name, []))
+    if not envs:
+        return None
+    return f"""def {name}(*args, **kwargs):\n    required = {envs!r}\n    missing = [name for name in required if not os.environ.get(name) or os.environ.get(name) == '<FILL_ME>']\n    if missing:\n        raise RuntimeError('Portable adapter for {name} requires environment variables: ' + ', '.join(missing) + '; fill .env.example or configure a host adapter.')\n    raise RuntimeError('Portable adapter for {name} needs a host implementation configured via environment variables.')\n"""
+
+
+def _inline_script_source(source: str, rel_path: str, report: PortableReport) -> tuple[str, bool]:
+    tree = ast.parse(source)
+    imports: list[tuple[str, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            if node.module == "backend.services.runtime_tools" or node.module.startswith("backend.services.runtime_tools.") or node.module == "backend.services.skill_runtime":
+                for alias in node.names:
+                    if alias.name != "*":
+                        imports.append((alias.name, node.module))
+    if not imports:
+        return source, False
+    closure = InlineClosure()
+    public_names = {name for name, _module in imports}
+    adapter_nodes: dict[str, ast.FunctionDef] = {}
+    fallback = False
+    for name, module in imports:
+        if name in SERVICE_ENV_BY_TOOL:
+            adapter = _adapter_source(name)
+            if adapter:
+                adapter_nodes[name] = ast.parse(adapter).body[0]
+                closure.imports.append(ast.parse("import os").body[0])
+                report.adapted_tools.append(name)
+                report.env_placeholders.update(_placeholders(SERVICE_ENV_BY_TOOL[name]))
+                continue
+        definition = _resolve_tool_definition(name, module)
+        if definition is None:
+            fallback = True
+            report.fallback_reasons.append(f"could not resolve {module}.{name}")
+            report.fallback_tools.append(name)
+            report.fallback_modules.append(module)
+            continue
+        index = _build_source_index(definition.module, definition.path)
+        part = _collect_local_symbol_closure(index, {definition.symbol_name})
+        if part.fallback_reasons:
+            fallback = True
+            report.fallback_reasons.extend(part.fallback_reasons)
+            report.fallback_tools.append(name)
+            report.fallback_modules.append(definition.module)
+            continue
+        closure.imports.extend(part.imports)
+        closure.assignments.update(part.assignments)
+        closure.classes.update(part.classes)
+        closure.functions.update(part.functions)
+        closure.entry_symbols.update(part.entry_symbols)
+        closure.modules.update(part.modules)
+        closure.third_party_roots.update(part.third_party_roots)
+        closure.env_vars.update(part.env_vars)
+    if fallback:
+        report.fallback_to_package = True
+        return source, False
+    closure.functions.update(adapter_nodes)
+    closure.entry_symbols.update(adapter_nodes)
+    closure.env_vars.update(report.env_placeholders)
+    script_names = _detect_top_level_names(tree) - public_names
+    _resolve_inline_name_conflicts(closure, script_names, public_names)
+    report.inlined_tools.extend(sorted(public_names))
+    helpers = (set(closure.functions) | set(closure.classes) | set(closure.assignments)) - public_names
+    report.inlined_helpers.extend(sorted(set(closure.functions) - public_names))
+    report.inlined_classes.extend(sorted(set(closure.classes) - public_names))
+    report.inlined_constants.extend(sorted(set(closure.assignments)))
+    for root in sorted(closure.third_party_roots):
+        if root not in report.third_party_imports:
+            report.third_party_imports.append(root)
+            req, resolved = _requirement_for_import(root)
+            if req not in report.third_party_requirements:
+                report.third_party_requirements.append(req)
+            if not resolved:
+                report.unresolved_requirements.append(root)
+    report.env_placeholders.update(_placeholders(closure.env_vars | set(DEFAULT_ENV_PLACEHOLDERS)))
+    report.env_vars_used = sorted(report.env_placeholders)
+    block = _render_inline_tools_block(closure, report)
+    stripped = _remove_system_imports(source)
+    report.inline_blocks.append({"script": rel_path, "tools": sorted(public_names), "helpers": sorted(helpers)})
+    report.patched_scripts.append(rel_path)
+    return _insert_inline_block(stripped, block), True
+
+
 def portable_runtime_files(report: PortableReport) -> dict[str, str]:
     files = {
         f"{RUNTIME_DIR}/__init__.py": '"""Portable runtime bundled with an exported Skill."""\n',
@@ -456,8 +876,8 @@ def env_example(report: PortableReport) -> str:
     return "".join(f"{name}={value}\n" for name, value in sorted(report.env_placeholders.items()))
 
 
-def add_portable_files_to_zip(zipf: ZipFile, skill_dir: Path, arc_prefix: str = "") -> PortableReport:
-    report = collect_portable_dependencies(skill_dir)
+def add_package_portable_files_to_zip(zipf: ZipFile, skill_dir: Path, arc_prefix: str = "") -> PortableReport:
+    report = collect_portable_dependencies(skill_dir, portable_style="package")
     for script in sorted((skill_dir / "scripts").rglob("*.py")):
         rel = script.relative_to(skill_dir).as_posix()
         patched = patch_script_imports(script.read_text(encoding="utf-8"), rel, report)
@@ -483,3 +903,65 @@ def add_portable_files_to_zip(zipf: ZipFile, skill_dir: Path, arc_prefix: str = 
     zipf.writestr(f"{arc_prefix}.env.example", env_example(report))
     zipf.writestr(f"{arc_prefix}skill-portability.json", json.dumps(report.manifest(), ensure_ascii=False, indent=2) + "\n")
     return report
+
+
+def add_inline_portable_files_to_zip(zipf: ZipFile, skill_dir: Path, arc_prefix: str = "") -> PortableReport:
+    report = collect_portable_dependencies(skill_dir)
+    report.portable_style = "inline"
+    rendered_scripts: list[tuple[str, str]] = []
+    for script in sorted((skill_dir / "scripts").rglob("*.py")):
+        rel = script.relative_to(skill_dir).as_posix()
+        source = script.read_text(encoding="utf-8")
+        inlined, changed = _inline_script_source(source, rel, report)
+        rendered_scripts.append((rel, inlined))
+    if report.fallback_to_package:
+        package_report = collect_portable_dependencies(skill_dir, portable_style="package")
+        package_report.portable_style = "mixed"
+        package_report.fallback_to_package = True
+        package_report.fallback_reasons = report.fallback_reasons
+        package_report.fallback_tools = sorted(set(report.fallback_tools))
+        package_report.fallback_modules = sorted(set(report.fallback_modules))
+        for script in sorted((skill_dir / "scripts").rglob("*.py")):
+            rel = script.relative_to(skill_dir).as_posix()
+            patched = patch_script_imports(script.read_text(encoding="utf-8"), rel, package_report)
+            zipf.writestr(f"{arc_prefix}{rel}", patched)
+        for content in portable_runtime_files(package_report).values():
+            try:
+                tree = ast.parse(content)
+            except SyntaxError:
+                continue
+            for root in _import_roots(tree):
+                if _is_third_party(root, {RUNTIME_DIR, "_portable_runtime", "backend"}) and root not in package_report.third_party_imports:
+                    package_report.third_party_imports.append(root)
+                    req, resolved = _requirement_for_import(root)
+                    if req not in package_report.third_party_requirements:
+                        package_report.third_party_requirements.append(req)
+                    if not resolved:
+                        package_report.unresolved_requirements.append(root)
+        for arc, content in portable_runtime_files(package_report).items():
+            zipf.writestr(f"{arc_prefix}{arc}", content)
+        zipf.writestr(f"{arc_prefix}requirements-portable.txt", "\n".join(package_report.third_party_requirements) + ("\n" if package_report.third_party_requirements else ""))
+        zipf.writestr(f"{arc_prefix}.env.example", env_example(package_report))
+        zipf.writestr(f"{arc_prefix}skill-portability.json", json.dumps(package_report.manifest(), ensure_ascii=False, indent=2) + "\n")
+        return package_report
+    for rel, inlined in rendered_scripts:
+        zipf.writestr(f"{arc_prefix}{rel}", inlined)
+    zipf.writestr(f"{arc_prefix}requirements-portable.txt", "\n".join(report.third_party_requirements) + ("\n" if report.third_party_requirements else ""))
+    zipf.writestr(f"{arc_prefix}.env.example", env_example(report))
+    zipf.writestr(f"{arc_prefix}skill-portability.json", json.dumps(report.manifest(), ensure_ascii=False, indent=2) + "\n")
+    return report
+
+
+def add_portable_files_to_zip(
+    zipf: ZipFile,
+    skill_dir: Path,
+    arc_prefix: str = "",
+    portable_style: Literal["inline", "package"] = "inline",
+) -> PortableReport:
+    if portable_style == "package":
+        report = add_package_portable_files_to_zip(zipf, skill_dir, arc_prefix=arc_prefix)
+        report.portable_style = "package"
+        return report
+    if portable_style != "inline":
+        raise ValueError("portable_style must be 'inline' or 'package'")
+    return add_inline_portable_files_to_zip(zipf, skill_dir, arc_prefix=arc_prefix)

@@ -24,7 +24,7 @@ def _is_within(path_obj: Path, root: Path) -> bool:
         return False
 
 
-def package_skill(skill_path, output_dir=None, *, portable: bool = False, skip_validate: bool = False):
+def package_skill(skill_path, output_dir=None, *, portable: bool = False, skip_validate: bool = False, portable_style: str = "inline"):
     skill_path = Path(skill_path).resolve()
     if not skill_path.exists():
         print(f"❌ Error: Skill folder not found: {skill_path}")
@@ -56,7 +56,7 @@ def package_skill(skill_path, output_dir=None, *, portable: bool = False, skip_v
             arc_prefix = f"{skill_path.name}/"
             portable_written_scripts: set[str] = set()
             if portable:
-                report = add_portable_files_to_zip(zipf, skill_path, arc_prefix=arc_prefix)
+                report = add_portable_files_to_zip(zipf, skill_path, arc_prefix=arc_prefix, portable_style=portable_style)
                 portable_written_scripts = set(report.patched_scripts)
                 # Even unpatched scripts were written by add_portable_files_to_zip.
                 portable_written_scripts.update(p.relative_to(skill_path).as_posix() for p in (skill_path / "scripts").rglob("*.py"))
@@ -88,11 +88,12 @@ def main():
     parser.add_argument("output_dir", nargs="?")
     parser.add_argument("--portable", action="store_true")
     parser.add_argument("--skip-validate", action="store_true")
+    parser.add_argument("--portable-style", choices=["inline", "package"], default="inline")
     args = parser.parse_args()
     print(f"📦 Packaging skill: {args.skill_path}")
     if args.output_dir:
         print(f"   Output directory: {args.output_dir}")
-    result = package_skill(args.skill_path, args.output_dir, portable=args.portable, skip_validate=args.skip_validate)
+    result = package_skill(args.skill_path, args.output_dir, portable=args.portable, skip_validate=args.skip_validate, portable_style=args.portable_style)
     sys.exit(0 if result else 1)
 
 
