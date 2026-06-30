@@ -3342,14 +3342,14 @@ def _targeted_e2e_repair_hint(errors: list[str]) -> str:
         return (
             "当前失败属于 missing_placeholder：命令占位符无法从 payload 或前序 stdout 解析。"
             "先区分 JSON 模板语法错误、placeholder 不存在、argv key 与脚本 schema 不一致、可选参数被误当成必填 placeholder。"
-            "如果裸 placeholder 加引号后仍不在 payload/trace 中，不要继续按 command_json_parse 处理；应改为使用平台 guaranteed input、前序 stdout 字段，或让入口脚本接收 envelope 并内部默认化可选项。"
+            "裸 placeholder 作为 JSON object value 是合法 workflow template 语义，E2E 会先确定性规范化为字符串占位符；若规范化后仍不在 payload/trace 中，不要继续按 command_json_parse 处理，应改为使用平台 guaranteed input、前序 stdout 字段，或让入口脚本接收 envelope 并内部默认化可选项。"
             "优先修 SKILL.md 当前失败步骤的 JSON argv placeholder，不要改已成功 trace 对应步骤。"
         )
 
     if layer == "command_json_parse":
         return (
             "当前失败表面是 command_json_parse，但修复前必须分类：JSON 模板语法错误、placeholder 不存在、argv key 与脚本 schema 不一致、可选参数被误当成必填 placeholder。"
-            "不要反复只给不存在的 placeholder 加引号；若 placeholder 根不在可用 payload keys 或前序 trace 中，应改为 guaranteed input/envelope，或让入口脚本内部解析并提供默认值。"
+            "不要把 JSON object value 位置的裸 placeholder 误诊断为双引号转义问题；E2E 会确定性规范化这类模板。若 placeholder 根不在可用 payload keys 或前序 trace 中，应改为 guaranteed input/envelope，或让入口脚本内部解析并提供默认值。"
         )
 
     return ""

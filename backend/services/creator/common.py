@@ -1384,6 +1384,83 @@ def _is_valid_e2e_script_path(script_path: str) -> bool:
         ".py",
     }
 
+_JSON_TEMPLATE_VALUE_PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z_][\w.-]*)\s*\}\}")
+
+
+def _normalize_json_template_value_placeholders(text: str) -> str:
+    """Quote bare JSON-template placeholders used as object values.
+
+    SKILL.md workflow commands allow JSON templates such as
+    ``{"items": {{items}}}`` to mean that ``items`` should be rendered as
+    the original upstream value.  That is not valid JSON until the placeholder
+    token is quoted; the E2E renderer later preserves the original type for
+    whole-string placeholders like ``"{{items}}"``.
+    """
+    source = str(text or "")
+    result: list[str] = []
+    idx = 0
+    in_string = False
+    escape = False
+
+    while idx < len(source):
+        ch = source[idx]
+        if in_string:
+            result.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            idx += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            result.append(ch)
+            idx += 1
+            continue
+
+        if source.startswith("{{", idx):
+            end = source.find("}}", idx + 2)
+            if end >= 0:
+                token = source[idx:end + 2]
+                prev_idx = len(result) - 1
+                while prev_idx >= 0 and result[prev_idx].isspace():
+                    prev_idx -= 1
+                next_idx = end + 2
+                while next_idx < len(source) and source[next_idx].isspace():
+                    next_idx += 1
+                prev_ch = result[prev_idx] if prev_idx >= 0 else ""
+                next_ch = source[next_idx] if next_idx < len(source) else ""
+                if (
+                    prev_ch == ":"
+                    and next_ch in {",", "}", "]"}
+                    and _JSON_TEMPLATE_VALUE_PLACEHOLDER_RE.fullmatch(token)
+                ):
+                    result.append(json.dumps(token, ensure_ascii=False))
+                    idx = end + 2
+                    continue
+
+        result.append(ch)
+        idx += 1
+
+    return "".join(result)
+
+
+def _loads_e2e_json_argv_template(text: str) -> dict[str, Any]:
+    """Load E2E command argv, accepting bare template placeholders as values."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as original_exc:
+        normalized = _normalize_json_template_value_placeholders(text)
+        if normalized == text:
+            raise original_exc
+        try:
+            return json.loads(normalized)
+        except json.JSONDecodeError:
+            raise original_exc
+
 def _parse_e2e_workflow_command(
     *,
     command: str,
@@ -1517,7 +1594,7 @@ def _parse_e2e_workflow_command(
         )
 
     try:
-        argv_template = json.loads(parts[script_idx + 1])
+        argv_template = _loads_e2e_json_argv_template(parts[script_idx + 1])
     except json.JSONDecodeError as exc:
         raise ValueError(
             _e2e_error(
