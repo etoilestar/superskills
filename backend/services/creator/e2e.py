@@ -333,7 +333,7 @@ def _placeholder_root(expr: str) -> str:
 
 def _normalize_e2e_placeholder_expr(expr: str) -> str:
     value = str(expr or "").strip()
-    value = re.sub(r"\[([0-9]+)\]", r".\1", value)
+    value = re.sub(r"\[([^\]]+)\]", r".\1", value)
     return value
 
 
@@ -393,6 +393,26 @@ def _put_typed_spec(specs: dict[str, E2ETypedInputSpec], spec: E2ETypedInputSpec
         specs[spec.name] = spec
 
 
+def _whole_e2e_placeholder_expr(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"\{\{\s*([^{}]+?)\s*\}\}", value.strip())
+    if not match:
+        return None
+    return _normalize_e2e_placeholder_expr(match.group(1))
+
+
+def _e2e_placeholder_uses_index(expr: str) -> bool:
+    return bool(re.search(r"(?:^|\.)\d+(?:\.|$)", _normalize_e2e_placeholder_expr(expr)))
+
+
+def _list_shape_for_item_shape(shape: str) -> str:
+    canonical = _canonical_e2e_shape(shape)
+    if canonical.startswith("list"):
+        return canonical
+    return f"list[{canonical or 'string'}]"
+
+
 def _collect_e2e_typed_inputs_from_graph(
     *,
     commands: list[E2EWorkflowCommand],
@@ -419,6 +439,7 @@ def _collect_e2e_typed_inputs_from_graph(
                 _put_typed_spec(specs, E2ETypedInputSpec(name=str(name), shape=_canonical_e2e_shape(raw_shape), item_shape=_shape_item_shape(_canonical_e2e_shape(raw_shape)), required=True, source="skill_plan_entry", target_file=target_file, confidence="medium"))
 
     for command in commands:
+        command_expected_types: dict[str, str] = {}
         if skill_dir is not None and command.script_path.endswith(".py"):
             script_file = skill_dir / command.script_path
             if script_file.is_file():
@@ -430,13 +451,35 @@ def _collect_e2e_typed_inputs_from_graph(
                 if isinstance(expected_types, dict):
                     for name, raw_shape in expected_types.items():
                         shape = _canonical_e2e_shape(raw_shape)
+                        command_expected_types[str(name)] = shape
                         _put_typed_spec(specs, E2ETypedInputSpec(name=str(name), shape=shape, item_shape=_shape_item_shape(shape), required=True, source="argv_schema", target_file=command.script_path, confidence="high"))
+
+        for argv_key, argv_value in (command.argv_template or {}).items():
+            expr = _whole_e2e_placeholder_expr(argv_value)
+            if not expr:
+                continue
+            root = _placeholder_root(expr)
+            if not root:
+                continue
+            argv_key_text = str(argv_key)
+            expected_shape = command_expected_types.get(argv_key_text)
+            if not expected_shape and argv_key_text in specs:
+                expected_shape = specs[argv_key_text].shape
+            expected_shape = _canonical_e2e_shape(expected_shape or "")
+            uses_index = _e2e_placeholder_uses_index(expr)
+            if uses_index:
+                root_shape = _list_shape_for_item_shape(expected_shape or "string")
+            elif expected_shape.startswith("list"):
+                root_shape = expected_shape
+            else:
+                continue
+            _put_typed_spec(specs, E2ETypedInputSpec(name=root, shape=root_shape, item_shape=_shape_item_shape(root_shape), required=True, source="argv_schema" if command_expected_types.get(argv_key_text) else "placeholder", target_file=command.script_path, confidence="high" if command_expected_types.get(argv_key_text) else "medium"))
 
         for expr in _placeholder_exprs_from_value(command.argv_template):
             normalized = _normalize_e2e_placeholder_expr(expr)
             root = _placeholder_root(normalized)
             if root:
-                shape = "list" if re.search(r"(?:^|\.)\d+(?:\.|$)", normalized) else "string"
+                shape = "list" if _e2e_placeholder_uses_index(normalized) else "string"
                 _put_typed_spec(specs, E2ETypedInputSpec(name=root, shape=shape, item_shape=_shape_item_shape(shape), required=True, source="placeholder", target_file=command.script_path, confidence="low"))
             if normalized.startswith("fields."):
                 parts = normalized.split(".")
@@ -525,7 +568,7 @@ def _resolve_e2e_payload_expr(
             })
 
     if not expr:
-        mark_missing("root_missing")
+        mark_missing("empty_expr")
         return ""
 
     parts = expr.split(".")
@@ -543,7 +586,7 @@ def _resolve_e2e_payload_expr(
             try:
                 index = int(part)
             except ValueError:
-                mark_missing("type_mismatch", root)
+                mark_missing("index_not_integer", root)
                 return ""
             if index < 0 or index >= len(value):
                 mark_missing("index_out_of_range", root)
@@ -783,6 +826,19 @@ def _seed_initial_e2e_payload(
         if not _json_value_non_empty(payload.get(spec.name)):
             payload[spec.name] = _materialize_e2e_sample_value(spec, skill_dir=skill_dir)
 
+    if (
+        isinstance(payload.get("input_files"), list)
+        and payload.get("input_files")
+        and (not isinstance(payload.get("files"), list) or not payload.get("files"))
+    ):
+        payload["files"] = list(payload["input_files"])
+    if (
+        isinstance(payload.get("files"), list)
+        and payload.get("files")
+        and (not isinstance(payload.get("input_files"), list) or not payload.get("input_files"))
+    ):
+        payload["input_files"] = list(payload["files"])
+
     if commands:
         first = commands[0]
         schema: dict[str, Any] = {"expected_types": {}}
@@ -800,8 +856,9 @@ def _seed_initial_e2e_payload(
         fields = payload.get("fields")
         if isinstance(fields, dict):
             for expr in placeholders:
-                parts = str(expr or "").strip().split(".")
-                if len(parts) != 2 or parts[0] != "fields" or not parts[1]:
+                normalized = _normalize_e2e_placeholder_expr(expr)
+                parts = normalized.split(".")
+                if len(parts) < 2 or parts[0] != "fields" or not parts[1]:
                     continue
                 key = parts[1]
                 if _json_value_non_empty(fields.get(key)):

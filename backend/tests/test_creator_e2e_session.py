@@ -354,3 +354,117 @@ def test_e2e_missing_placeholder_reports_empty_list_index_out_of_range():
     assert '"reason": "index_out_of_range"' in message
     assert '"root_shape": "list[0]"' in message
     assert '"expected_shape_from_graph": "list[string]"' in message
+
+
+def test_e2e_infers_indexed_placeholder_root_item_shape_from_argv_file_path(tmp_path):
+    skill_dir = tmp_path / "argv-file-path"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / "consume.py").write_text(
+        "from backend.services.runtime_tools import strict_json_argv_guard\n"
+        "def parse(payload):\n"
+        "    return strict_json_argv_guard(payload, {'file_path': {'type': 'file_path', 'required': True}})\n",
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(1, "SKILL.md", "scripts/consume.py", "python scripts/consume.py '{}'", "python", {"file_path": "{{items[0]}}"})
+
+    specs = e2e._collect_e2e_typed_inputs_from_graph(commands=[command], requirements_by_file={}, skill_plan_entries=None, skill_dir=skill_dir)
+    by_name = {spec.name: spec for spec in specs}
+    payload = e2e._seed_initial_e2e_payload([command], skill_dir=skill_dir)
+
+    assert by_name["items"].shape == "list[file_path]"
+    assert len(payload["items"]) == 2
+    assert all(Path(path).is_file() for path in payload["items"])
+
+
+def test_e2e_infers_indexed_placeholder_root_item_shape_from_argv_object(tmp_path):
+    skill_dir = tmp_path / "argv-object"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / "consume.py").write_text(
+        "from backend.services.runtime_tools import strict_json_argv_guard\n"
+        "def parse(payload):\n"
+        "    return strict_json_argv_guard(payload, {'target_item': {'type': 'object', 'required': True}})\n",
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(1, "SKILL.md", "scripts/consume.py", "python scripts/consume.py '{}'", "python", {"target_item": "{{records[0]}}"})
+
+    specs = e2e._collect_e2e_typed_inputs_from_graph(commands=[command], requirements_by_file={}, skill_plan_entries=None, skill_dir=skill_dir)
+    by_name = {spec.name: spec for spec in specs}
+
+    assert by_name["records"].shape == "list[object]"
+
+
+def test_e2e_infers_unindexed_placeholder_root_shape_from_list_argv(tmp_path):
+    skill_dir = tmp_path / "argv-list"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / "consume.py").write_text(
+        "from backend.services.runtime_tools import strict_json_argv_guard\n"
+        "def parse(payload):\n"
+        "    return strict_json_argv_guard(payload, {'documents': {'type': 'list[string]', 'required': True}})\n",
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(1, "SKILL.md", "scripts/consume.py", "python scripts/consume.py '{}'", "python", {"documents": "{{documents}}"})
+
+    specs = e2e._collect_e2e_typed_inputs_from_graph(commands=[command], requirements_by_file={}, skill_plan_entries=None, skill_dir=skill_dir)
+    by_name = {spec.name: spec for spec in specs}
+    payload = e2e._seed_initial_e2e_payload([command], skill_dir=skill_dir)
+
+    assert by_name["documents"].shape == "list[string]"
+    assert payload["documents"] == ["sample item 1", "sample item 2"]
+
+
+def test_e2e_input_files_files_alias_sync_preserves_non_empty_external_context(tmp_path):
+    skill_dir = tmp_path / "alias-sync"
+    skill_dir.mkdir()
+    commands = [E2EWorkflowCommand(1, "SKILL.md", "scripts/a.py", "python scripts/a.py '{}'", "python", {})]
+
+    reqs = {"scripts/a.py": [e2e.RequirementItem(target_file="scripts/a.py", inputs=["input_files: list[file_path]"])]}
+    payload = e2e._seed_initial_e2e_payload(commands, skill_dir=skill_dir, requirements_by_file=reqs)
+    assert payload["input_files"]
+    assert payload["files"] == payload["input_files"]
+
+    reqs = {"scripts/a.py": [e2e.RequirementItem(target_file="scripts/a.py", inputs=["files: list[file_path]"])]}
+    payload = e2e._seed_initial_e2e_payload(commands, skill_dir=skill_dir, requirements_by_file=reqs)
+    assert payload["files"]
+    assert payload["input_files"] == payload["files"]
+
+    payload = e2e._seed_initial_e2e_payload(
+        commands,
+        skill_dir=skill_dir,
+        requirements_by_file={"scripts/a.py": [e2e.RequirementItem(target_file="scripts/a.py", inputs=["input_files: list[file_path]"])]},
+        external_context={"input_files": ["real-input.txt"], "files": ["real-files.txt"]},
+    )
+    assert payload["input_files"] == ["real-input.txt"]
+    assert payload["files"] == ["real-files.txt"]
+
+
+def test_e2e_fields_fallback_normalizes_bracket_placeholder(tmp_path):
+    dynamic_key = "attachments"
+    skill_dir = tmp_path / "fields-normalized"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / "consume.py").write_text(
+        "from backend.services.runtime_tools import strict_json_argv_guard\n"
+        "def parse(payload):\n"
+        "    return strict_json_argv_guard(payload, {'attachments': {'type': 'list[file_path]', 'required': True}})\n",
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(1, "SKILL.md", "scripts/consume.py", "python scripts/consume.py '{}'", "python", {"first": "{{fields.attachments[0]}}"})
+
+    payload = e2e._seed_initial_e2e_payload([command], skill_dir=skill_dir)
+
+    assert len(payload["fields"][dynamic_key]) == 2
+    assert all(Path(path).is_file() for path in payload["fields"][dynamic_key])
+
+
+def test_e2e_missing_placeholder_reports_index_not_integer_and_empty_expr():
+    missing = []
+    details = []
+    value = e2e._resolve_e2e_payload_expr("items[x]", payload={"items": ["a"]}, missing=missing, missing_details=details)
+    assert value == ""
+    assert details[-1]["reason"] == "index_not_integer"
+    assert details[-1]["root_shape"] == "list[1]<string(non_empty)>"
+
+    missing = []
+    details = []
+    value = e2e._resolve_e2e_payload_expr("   ", payload={}, missing=missing, missing_details=details)
+    assert value == ""
+    assert details[-1]["reason"] == "empty_expr"
