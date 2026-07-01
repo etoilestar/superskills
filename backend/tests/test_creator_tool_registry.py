@@ -452,3 +452,67 @@ def repair_sample_tool(payload, config=None):
     assert validation["status"] == "validated_after_repair"
     assert sample_input == {"q": "demo"}
     assert "boom" not in script_code
+
+
+def test_resolve_sample_input_autofills_required_schema_fields_when_frontend_sends_empty_object():
+    from backend.services.creator_tool_registry import resolve_tool_trial_sample_input
+
+    manifest = {
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string"},
+                "task_type": {"type": "string", "enum": ["summary", "rewrite"]},
+                "count": {"type": "integer"},
+            },
+            "required": ["user_id", "task_type", "count"],
+        }
+    }
+
+    sample_input, notes = resolve_tool_trial_sample_input(manifest, {})
+
+    assert sample_input == {"user_id": "sample_user_id", "task_type": "summary", "count": 1}
+    assert any("auto-filled from input_schema" in note for note in notes)
+
+
+def test_no_additional_secrets_auth_reason_does_not_block_registration():
+    from backend.services import creator_tool_registry as registry
+
+    manifest = registry.build_tool_manifest_draft({
+        "tool_name": "payload_identity_tool",
+        "description": "Uses payload identity only.",
+        "allowed_roles": ["generic_script"],
+    })
+    manifest["auth"] = {
+        "required": "yes",
+        "reason": "Authentication is handled via user_id and task_type in the request data; no additional secrets are required.",
+        "secrets": [],
+    }
+    script = registry.generate_adapter_code(manifest)
+
+    validation = registry.validate_tool_manifest(
+        manifest,
+        adapter_code=script,
+        sample_input={},
+        dynamic=False,
+        require_auth_config=True,
+    )
+
+    assert validation["auth_gate"]["block_registration"] is False
+    assert validation["can_register"] is True
+
+
+def test_script_tool_boundary_reports_hallucinated_tool_call():
+    from backend.services.creator.api import _script_tool_boundary_violations
+
+    violations = _script_tool_boundary_violations(
+        "result = run_registered_tool('missing_tool', {'q': 'demo'})",
+        allowed_tools=["registered_tool"],
+    )
+
+    assert violations == [{
+        "id": "script.hallucinated_tool_call",
+        "layer": "script_tool_boundary",
+        "message": "脚本调用了未注册/未允许的工具：missing_tool",
+        "expected": "只能调用 selected_tools/allowed_tools 中的工具；缺工具时返回 creation_blocker，不能编造工具。",
+    }]

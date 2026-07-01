@@ -11,10 +11,12 @@ from .generation import *  # noqa: F403
 def _tool_names_from_entry_contract(entry: Any) -> list[str]:
     data = entry if isinstance(entry, dict) else getattr(entry, "__dict__", {})
     names: list[str] = []
-    for key in ("required_capabilities", "selected_tools"):
-        raw = data.get(key) if isinstance(data, dict) else None
-        if isinstance(raw, list):
-            names.extend(str(item).strip() for item in raw if str(item).strip())
+    # required_capabilities are capability hints from the skill plan, not proof
+    # that a concrete registered tool exists or is authorized. Only explicit
+    # selected_tools / required_tool_slots may become hard tool requirements.
+    raw_selected = data.get("selected_tools") if isinstance(data, dict) else None
+    if isinstance(raw_selected, list):
+        names.extend(str(item).strip() for item in raw_selected if str(item).strip())
     for slot in (data.get("required_tool_slots") if isinstance(data, dict) else []) or []:
         slot_data = slot if isinstance(slot, dict) else getattr(slot, "__dict__", {})
         for key in ("tool_id", "capability", "slot_id"):
