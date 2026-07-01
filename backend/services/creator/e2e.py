@@ -81,6 +81,18 @@ class E2EFailure:
         }
 
 
+@dataclass(frozen=True)
+class E2ETypedInputSpec:
+    name: str
+    shape: str = "string"
+    item_shape: str = ""
+    required: bool = True
+    source: str = "placeholder"
+    target_file: str = ""
+    confidence: str = "low"
+    properties: dict[str, str] = field(default_factory=dict)
+
+
 def _format_e2e_failure(failure: E2EFailure) -> str:
     return (
         f"E2E_REPAIR_TARGET={failure.target_file}\n"
@@ -313,10 +325,163 @@ def _placeholder_exprs_from_value(value: Any) -> list[str]:
 
 
 def _placeholder_root(expr: str) -> str:
-    expr = str(expr or "").strip()
+    expr = _normalize_e2e_placeholder_expr(expr)
     if not expr:
         return ""
     return re.split(r"[.\[]", expr, maxsplit=1)[0].strip()
+
+
+def _normalize_e2e_placeholder_expr(expr: str) -> str:
+    value = str(expr or "").strip()
+    value = re.sub(r"\[([0-9]+)\]", r".\1", value)
+    return value
+
+
+def _canonical_e2e_shape(raw: Any) -> str:
+    text = str(raw or "").strip().lower()
+    text = text.replace("array", "list").replace("path", "file_path")
+    if not text:
+        return "string"
+    if "list" in text and ("file_path" in text or "file" in text):
+        return "list[file_path]"
+    if "list" in text and ("object" in text or "dict" in text):
+        return "list[object]"
+    if "list" in text and ("str" in text or "string" in text or "text" in text):
+        return "list[string]"
+    if text in {"list", "array"} or "list" in text:
+        return "list"
+    if "file_path" in text or text in {"file", "filepath"}:
+        return "file_path"
+    if text in {"int", "integer"}:
+        return "integer"
+    if text in {"float", "number"}:
+        return "number"
+    if text in {"bool", "boolean"}:
+        return "boolean"
+    if text in {"dict", "object", "json"}:
+        return "object"
+    if text in {"str", "string", "text", "scalar"}:
+        return "string"
+    return text
+
+
+def _shape_item_shape(shape: str) -> str:
+    match = re.fullmatch(r"list\[(.+)\]", str(shape or "").strip())
+    return match.group(1) if match else ""
+
+
+def _parse_typed_name(raw: Any) -> tuple[str, str]:
+    text = str(raw or "").strip()
+    if not text:
+        return "", ""
+    match = re.match(r"^([A-Za-z_][\w.-]*)\s*(?::|\=|\()?\s*([A-Za-z_][\w\[\]-]*(?:\[[^\]]+\])?)?", text)
+    if not match:
+        return text, ""
+    name = (match.group(1) or "").strip()
+    type_text = (match.group(2) or "").strip()
+    if type_text == name:
+        type_text = ""
+    return name, _canonical_e2e_shape(type_text)
+
+
+def _put_typed_spec(specs: dict[str, E2ETypedInputSpec], spec: E2ETypedInputSpec) -> None:
+    if not spec.name:
+        return
+    priority = {"requirement_graph": 5, "skill_plan_entry": 4, "argv_schema": 3, "placeholder": 2, "external_context": 1}
+    old = specs.get(spec.name)
+    if old is None or priority.get(spec.source, 0) > priority.get(old.source, 0):
+        specs[spec.name] = spec
+
+
+def _collect_e2e_typed_inputs_from_graph(
+    *,
+    commands: list[E2EWorkflowCommand],
+    requirements_by_file: dict[str, list[RequirementItem]],
+    skill_plan_entries: dict[str, SkillPlanEntry] | None,
+    skill_dir: Path | None,
+) -> list[E2ETypedInputSpec]:
+    specs: dict[str, E2ETypedInputSpec] = {}
+    for target_file, reqs in (requirements_by_file or {}).items():
+        for req in reqs or []:
+            for raw in getattr(req, "inputs", []) or []:
+                name, shape = _parse_typed_name(raw)
+                if name:
+                    _put_typed_spec(specs, E2ETypedInputSpec(name=name, shape=shape or "string", item_shape=_shape_item_shape(shape), required=True, source="requirement_graph", target_file=target_file, confidence="high"))
+
+    for target_file, entry in (skill_plan_entries or {}).items():
+        for raw in (getattr(entry, "inputs", []) or []) + (getattr(entry, "outputs", []) or []):
+            name, shape = _parse_typed_name(raw)
+            if name:
+                _put_typed_spec(specs, E2ETypedInputSpec(name=name, shape=shape or "string", item_shape=_shape_item_shape(shape), required=True, source="skill_plan_entry", target_file=target_file, confidence="medium"))
+        artifact_contract = getattr(entry, "artifact_contract", None)
+        if isinstance(artifact_contract, dict):
+            for name, raw_shape in artifact_contract.items():
+                _put_typed_spec(specs, E2ETypedInputSpec(name=str(name), shape=_canonical_e2e_shape(raw_shape), item_shape=_shape_item_shape(_canonical_e2e_shape(raw_shape)), required=True, source="skill_plan_entry", target_file=target_file, confidence="medium"))
+
+    for command in commands:
+        if skill_dir is not None and command.script_path.endswith(".py"):
+            script_file = skill_dir / command.script_path
+            if script_file.is_file():
+                try:
+                    schema = extract_python_strict_argv_schema(script_file.read_text(encoding="utf-8"))
+                except Exception:
+                    schema = {}
+                expected_types = schema.get("expected_types") if isinstance(schema, dict) else {}
+                if isinstance(expected_types, dict):
+                    for name, raw_shape in expected_types.items():
+                        shape = _canonical_e2e_shape(raw_shape)
+                        _put_typed_spec(specs, E2ETypedInputSpec(name=str(name), shape=shape, item_shape=_shape_item_shape(shape), required=True, source="argv_schema", target_file=command.script_path, confidence="high"))
+
+        for expr in _placeholder_exprs_from_value(command.argv_template):
+            normalized = _normalize_e2e_placeholder_expr(expr)
+            root = _placeholder_root(normalized)
+            if root:
+                shape = "list" if re.search(r"(?:^|\.)\d+(?:\.|$)", normalized) else "string"
+                _put_typed_spec(specs, E2ETypedInputSpec(name=root, shape=shape, item_shape=_shape_item_shape(shape), required=True, source="placeholder", target_file=command.script_path, confidence="low"))
+            if normalized.startswith("fields."):
+                parts = normalized.split(".")
+                if len(parts) >= 2 and parts[1]:
+                    argv_spec = specs.get(parts[1])
+                    shape = argv_spec.shape if argv_spec else "string"
+                    _put_typed_spec(specs, E2ETypedInputSpec(name=f"fields.{parts[1]}", shape=shape, item_shape=_shape_item_shape(shape), required=True, source=(argv_spec.source if argv_spec else "placeholder"), target_file=command.script_path, confidence=(argv_spec.confidence if argv_spec else "low")))
+    return list(specs.values())
+
+
+def _e2e_sample_file(skill_dir: Path | None, name: str, index: int = 1) -> str:
+    base = (skill_dir / ".creator_e2e" / "samples") if skill_dir is not None else Path(tempfile.mkdtemp(prefix="creator-e2e-samples-"))
+    base.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name or "input")
+    path = base / f"{safe}_{index}.txt"
+    path.write_text(f"Creator E2E sample file for {name} #{index}\n", encoding="utf-8")
+    return str(path)
+
+
+def _materialize_e2e_sample_value(
+    spec: E2ETypedInputSpec,
+    *,
+    skill_dir: Path | None,
+) -> Any:
+    shape = _canonical_e2e_shape(spec.shape)
+    if shape in {"number", "integer"}:
+        return 1
+    if shape == "boolean":
+        return True
+    if shape == "object":
+        return {key: _materialize_e2e_sample_value(E2ETypedInputSpec(name=key, shape=value), skill_dir=skill_dir) for key, value in (spec.properties or {}).items()} or {"value": "sample value"}
+    if shape == "file_path":
+        return _e2e_sample_file(skill_dir, spec.name, 1)
+    if shape.startswith("list"):
+        item_shape = _shape_item_shape(shape) or spec.item_shape or "string"
+        if item_shape == "file_path":
+            return [_e2e_sample_file(skill_dir, spec.name, 1), _e2e_sample_file(skill_dir, spec.name, 2)]
+        if item_shape == "object":
+            return [{"value": "sample item 1"}, {"value": "sample item 2"}]
+        if item_shape in {"number", "integer"}:
+            return [1, 2]
+        if item_shape == "boolean":
+            return [True, False]
+        return ["sample item 1", "sample item 2"]
+    return "sample value"
 
 
 def _collect_placeholders_from_payload_template(template: dict[str, Any]) -> set[str]:
@@ -331,6 +496,8 @@ def _resolve_e2e_payload_expr(
     *,
     payload: dict[str, Any],
     missing: list[str],
+    missing_details: list[dict[str, Any]] | None = None,
+    typed_specs: dict[str, E2ETypedInputSpec] | None = None,
 ) -> Any:
     """Resolve placeholder expression against current runtime payload.
 
@@ -339,16 +506,33 @@ def _resolve_e2e_payload_expr(
     - {{image_paths.0}}
     - {{foo.bar.0}}
     """
-    expr = str(expr or "").strip()
+    original_expr = str(expr or "").strip()
+    expr = _normalize_e2e_placeholder_expr(original_expr)
+
+    def mark_missing(reason: str, root: str = "") -> None:
+        missing.append(original_expr or expr)
+        if missing_details is not None:
+            root_value = payload.get(root) if root else None
+            spec = (typed_specs or {}).get(root) if root else None
+            missing_details.append({
+                "expr": original_expr,
+                "normalized_expr": expr,
+                "root": root,
+                "reason": reason,
+                "root_shape": _json_shape(root_value) if root in payload else "missing",
+                "expected_shape_from_graph": spec.shape if spec else "",
+                "available_payload_shape": _json_object_shape(payload),
+            })
+
     if not expr:
-        missing.append(expr)
+        mark_missing("root_missing")
         return ""
 
     parts = expr.split(".")
     root = parts[0].strip()
 
     if root not in payload:
-        missing.append(expr)
+        mark_missing("root_missing", root)
         return ""
 
     value: Any = payload[root]
@@ -359,22 +543,22 @@ def _resolve_e2e_payload_expr(
             try:
                 index = int(part)
             except ValueError:
-                missing.append(expr)
+                mark_missing("type_mismatch", root)
                 return ""
             if index < 0 or index >= len(value):
-                missing.append(expr)
+                mark_missing("index_out_of_range", root)
                 return ""
             value = value[index]
             continue
 
         if isinstance(value, dict):
             if part not in value:
-                missing.append(expr)
+                mark_missing("key_missing", root)
                 return ""
             value = value[part]
             continue
 
-        missing.append(expr)
+        mark_missing("type_mismatch", root)
         return ""
 
     return value
@@ -424,6 +608,8 @@ def _render_e2e_template_value(
     *,
     payload: dict[str, Any],
     missing: list[str],
+    missing_details: list[dict[str, Any]] | None = None,
+    typed_specs: dict[str, E2ETypedInputSpec] | None = None,
 ) -> Any:
     if isinstance(value, str):
         whole = re.fullmatch(r"\{\{\s*([^{}]+?)\s*\}\}", value.strip())
@@ -432,6 +618,8 @@ def _render_e2e_template_value(
                 whole.group(1),
                 payload=payload,
                 missing=missing,
+                missing_details=missing_details,
+                typed_specs=typed_specs,
             )
 
         def replace_match(match: re.Match[str]) -> str:
@@ -439,6 +627,8 @@ def _render_e2e_template_value(
                 match.group(1),
                 payload=payload,
                 missing=missing,
+                missing_details=missing_details,
+                typed_specs=typed_specs,
             )
             if isinstance(rendered, (dict, list)):
                 return json.dumps(rendered, ensure_ascii=False)
@@ -448,13 +638,13 @@ def _render_e2e_template_value(
 
     if isinstance(value, dict):
         return {
-            str(key): _render_e2e_template_value(item, payload=payload, missing=missing)
+            str(key): _render_e2e_template_value(item, payload=payload, missing=missing, missing_details=missing_details, typed_specs=typed_specs)
             for key, item in value.items()
         }
 
     if isinstance(value, list):
         return [
-            _render_e2e_template_value(item, payload=payload, missing=missing)
+            _render_e2e_template_value(item, payload=payload, missing=missing, missing_details=missing_details, typed_specs=typed_specs)
             for item in value
         ]
 
@@ -466,11 +656,14 @@ def _render_e2e_command_payload(
     *,
     payload: dict[str, Any],
     traces: list[E2EStepTrace] | None = None,
+    typed_input_specs: list[E2ETypedInputSpec] | None = None,
 ) -> dict[str, Any]:
     missing: list[str] = []
+    missing_details: list[dict[str, Any]] = []
+    typed_specs_by_name = {spec.name: spec for spec in (typed_input_specs or [])}
 
     rendered = {
-        str(key): _render_e2e_template_value(value, payload=payload, missing=missing)
+        str(key): _render_e2e_template_value(value, payload=payload, missing=missing, missing_details=missing_details, typed_specs=typed_specs_by_name)
         for key, value in command.argv_template.items()
     }
 
@@ -488,6 +681,7 @@ def _render_e2e_command_payload(
             "missing_placeholders": unique_missing,
             "available_keys": available,
             "source_path": command.source_path,
+            "missing_placeholder_details": missing_details,
         }, ensure_ascii=False, default=str))
 
         raise ValueError(
@@ -500,6 +694,8 @@ def _render_e2e_command_payload(
                     + f"第 {command.ordinal} 步 {command.script_path} 的命令模板引用了当前 payload 中不存在的字段："
                     f"{', '.join(unique_missing)}。\n"
                     f"当前可用字段：{', '.join(available) or '(无)'}。\n"
+                    "missing_placeholder_details="
+                    f"{json.dumps(missing_details, ensure_ascii=False, sort_keys=True, default=str)}\n"
                     "当前可用字段来源：\n"
                     f"{chr(10).join(source_lines) if source_lines else '(仅外部输入或无前序 stdout 来源记录)'}\n"
                     f"命令来源：{command.source_path}\n"
@@ -522,6 +718,8 @@ def _seed_initial_e2e_payload(
     *,
     external_context: dict[str, Any] | None = None,
     skill_dir: Path | None = None,
+    requirements_by_file: dict[str, list[RequirementItem]] | None = None,
+    skill_plan_entries: dict[str, SkillPlanEntry] | None = None,
 ) -> dict[str, Any]:
     """Seed Creator E2E with a non-empty generic external input envelope.
 
@@ -567,6 +765,24 @@ def _seed_initial_e2e_payload(
     if not isinstance(payload.get("files"), list):
         payload["files"] = list(payload.get("input_files") or [])
 
+    typed_specs = _collect_e2e_typed_inputs_from_graph(
+        commands=commands,
+        requirements_by_file=requirements_by_file or {},
+        skill_plan_entries=skill_plan_entries,
+        skill_dir=skill_dir,
+    )
+    for spec in typed_specs:
+        if spec.name in {"fields", "options"} and isinstance(payload.get(spec.name), dict):
+            continue
+        if "." in spec.name:
+            root, child = spec.name.split(".", 1)
+            container = payload.get(root)
+            if isinstance(container, dict) and not _json_value_non_empty(container.get(child)):
+                container[child] = _materialize_e2e_sample_value(spec, skill_dir=skill_dir)
+            continue
+        if not _json_value_non_empty(payload.get(spec.name)):
+            payload[spec.name] = _materialize_e2e_sample_value(spec, skill_dir=skill_dir)
+
     if commands:
         first = commands[0]
         schema: dict[str, Any] = {"expected_types": {}}
@@ -591,18 +807,11 @@ def _seed_initial_e2e_payload(
                 if _json_value_non_empty(fields.get(key)):
                     continue
                 value_type = str(expected_types.get(key) or "").lower()
-                if value_type in {"list", "array"}:
-                    fields[key] = ["__creator_e2e_typed_seed__"]
-                elif value_type in {"dict", "object"}:
-                    fields[key] = {"value": "__creator_e2e_typed_seed__"}
-                elif value_type in {"int", "integer"}:
-                    fields[key] = 1
-                elif value_type in {"float", "number"}:
-                    fields[key] = 1.0
-                elif value_type in {"bool", "boolean"}:
-                    fields[key] = True
-                else:
-                    fields[key] = seed_value
+                shape = _canonical_e2e_shape(value_type)
+                fields[key] = _materialize_e2e_sample_value(
+                    E2ETypedInputSpec(name=key, shape=shape, item_shape=_shape_item_shape(shape), source="argv_schema", target_file=first.script_path, confidence="high"),
+                    skill_dir=skill_dir,
+                )
 
     return payload
 
@@ -1908,10 +2117,24 @@ def _run_skill_workflow_e2e_once(
         requirements_by_file: dict[str, list[RequirementItem]] = {}
         for req in requirement_graph.requirements:
             requirements_by_file.setdefault(req.target_file, []).append(req)
+        skill_plan_entries: dict[str, SkillPlanEntry] = {}
+        for command in commands:
+            try:
+                skill_plan_entries[command.script_path] = _skill_plan_entry_for_file(file_path=command.script_path, blueprint_text=trial_skill_md)
+            except Exception:
+                pass
 
         payload: dict[str, Any] = _seed_initial_e2e_payload(
             commands,
             external_context=external_context,
+            skill_dir=trial_skill_dir,
+            requirements_by_file=requirements_by_file,
+            skill_plan_entries=skill_plan_entries,
+        )
+        typed_input_specs = _collect_e2e_typed_inputs_from_graph(
+            commands=commands,
+            requirements_by_file=requirements_by_file,
+            skill_plan_entries=skill_plan_entries,
             skill_dir=trial_skill_dir,
         )
         traces: list[E2EStepTrace] = []
@@ -2013,6 +2236,7 @@ def _run_skill_workflow_e2e_once(
                     command,
                     payload=payload,
                     traces=traces,
+                    typed_input_specs=typed_input_specs,
                 )
                 if e2e_session is not None:
                     e2e_session.events.append({
@@ -2412,6 +2636,9 @@ async def _repair_existing_file_for_e2e_failure(
             "E2E 只执行 SKILL.md 中的 bash/sh/shell fenced command block，references/*.md 不是执行步骤。\n"
             "只修 workflow/cross-step IO/final output/artifact 相关问题，不修 Markdown 全局格式。\n"
             "修复 command_json_parse/missing_placeholder/argv_schema_error 时，必须参考结构化失败对象中的当前脚本真实 argv schema、可用 payload keys、placeholder 来源；"
+            "字段类型以 RequirementGraph / SkillPlanEntry / strict_json_argv_guard argv schema 为准；不要把 list 输入改成 scalar，不要把 scalar 改成 list；"
+            "不要因为 placeholder missing 就同时改 argv key 和 placeholder root；如果 typed seed 缺失，应报告 infrastructure blocker，不要修改业务文件；"
+            "如果 argv key 期望 list，应传整个 collection（推荐 {{root}}），不要改成 {{root.0}}/{{root[0]}}；只有 scalar/file_path key 才允许索引 collection。\n"
             "如果 script 自身接口自洽而 command argv 不一致，优先只改 SKILL.md 当前失败 command JSON argv。\n"
             "不得改 YAML frontmatter；不得重写整篇 SKILL.md；不得改其它已通过 command；不得改 script；不得新增脚本路径；不得引入 --argv；不得引入 runtime/entrypoint/argv 伪命令对象。\n"
             "不要重写 SKILL.md 正文。\n"
@@ -2429,6 +2656,9 @@ async def _repair_existing_file_for_e2e_failure(
             "第二轮 E2E 的目标是让 workflow 在简单沙盒中真实跑通。\n"
             "只修当前脚本与 SKILL.md 命令块、上游 stdout、下游输入之间的接口对齐问题。\n"
             "修复前核对当前脚本真实 argv schema、可用 payload keys、placeholder 来源；"
+            "字段类型以 RequirementGraph / SkillPlanEntry / strict_json_argv_guard argv schema 为准；不要把 list 输入改成 scalar，不要把 scalar 改成 list；"
+            "不要因为 placeholder missing 就同时改 argv key 和 placeholder root；如果 typed seed 缺失，应报告 infrastructure blocker，不要修改业务文件；"
+            "如果 argv key 期望 list，应传整个 collection（推荐 {{root}}），不要改成 {{root.0}}/{{root[0]}}；只有 scalar/file_path key 才允许索引 collection。\n"
             "strict_json_argv_guard 是接口不对齐探针；不要只改 guard。\n"
             "只允许修改当前脚本中与失败相关的 parse_args / strict_json_argv_guard / run / main / stdout 输出逻辑。\n"
             "不得改 SKILL.md；不得为了适配错误的 SKILL.md 而重命名脚本接口；不得删除 guard；不得删除核心功能；不能通过删除参数降低功能覆盖面；不得通过默认值绕过必需输入。\n"
@@ -2475,6 +2705,7 @@ async def _repair_existing_file_for_e2e_failure(
     max_candidate_attempts = 10
     working_content = (e2e_session.workspace_dir / target_path).read_text(encoding="utf-8")
     consecutive_format_regressions = 0
+    repair_template_history: dict[str, list[str]] = {}
 
     for candidate_attempt in range(1, max_candidate_attempts + 1):
         current_content = working_content
@@ -2615,6 +2846,40 @@ async def _repair_existing_file_for_e2e_failure(
 
             if not sandbox_gate.get("accepted"):
                 gate_errors = sandbox_gate.get("errors") or []
+                failure_signature = _failure_signature_from_error((gate_errors or [""])[0])
+                template_signature = _stable_json_hash([
+                    {"ordinal": c.ordinal, "script_path": c.script_path, "argv_template": c.argv_template}
+                    for c in (session_commands or [])
+                ])
+                history = repair_template_history.setdefault(failure_signature, [])
+                history.append(template_signature)
+                if len(history) >= 3 and history[-1] == history[-3]:
+                    oscillation_message = (
+                        "Detected oscillating E2E repair. This indicates missing/ambiguous typed sample seeding "
+                        "or placeholder diagnostics. Do not continue patching business files."
+                    )
+                    e2e_session.events.append({
+                        **e2e_session.to_event_base(),
+                        "attempt": candidate_attempt,
+                        "target_file": target_path,
+                        "patch_status": "oscillating_repair_blocked",
+                        "status": "blocked",
+                        "failure_signature": failure_signature,
+                        "argv_template_history": history[-4:],
+                        "rejection_reason": oscillation_message,
+                        "failed_checks": gate_errors,
+                        "rerun_status": "failed",
+                        "writeback_status": "candidate_only",
+                    })
+                    if repair_events is not None:
+                        repair_events.extend(e2e_session.events)
+                    return {
+                        "status": "blocked",
+                        "repaired_target": target_path,
+                        "next_target": None,
+                        "next_failure": [oscillation_message],
+                        "attempt": candidate_attempt,
+                    }
                 next_target = _e2e_repair_target_from_errors(gate_errors)
                 has_explicit_next_target = any("E2E_REPAIR_TARGET=" in str(error or "") for error in gate_errors)
                 if has_explicit_next_target and next_target and next_target != target_path:

@@ -296,3 +296,61 @@ def test_e2e_repair_hint_does_not_misdiagnose_bare_value_placeholder_as_quote_es
 
     assert "确定性规范化" in hint
     assert "误诊断为双引号转义问题" in hint
+
+
+def test_e2e_typed_seed_materializes_requirement_shapes(tmp_path):
+    skill_dir = tmp_path / "typed-shapes"
+    skill_dir.mkdir()
+    commands = [E2EWorkflowCommand(1, "SKILL.md", "scripts/a.py", "python scripts/a.py '{}'", "python", {})]
+    reqs = {
+        "scripts/a.py": [
+            e2e.RequirementItem(target_file="scripts/a.py", inputs=[
+                "items: list[string]",
+                "attachments: list[file_path]",
+                "source_file: file_path",
+                "config: object",
+            ])
+        ]
+    }
+
+    payload = e2e._seed_initial_e2e_payload(commands, skill_dir=skill_dir, requirements_by_file=reqs)
+
+    assert payload["items"] == ["sample item 1", "sample item 2"]
+    assert len(payload["attachments"]) == 2
+    assert all(Path(path).is_file() for path in payload["attachments"])
+    assert Path(payload["source_file"]).is_file()
+    assert payload["config"] == {"value": "sample value"}
+
+
+def test_e2e_placeholder_bracket_and_dot_indexes_are_equivalent():
+    payload = {"items": ["first", "second"], "result": {"items": ["nested-first"]}}
+    missing = []
+
+    assert e2e._resolve_e2e_payload_expr("items[0]", payload=payload, missing=missing) == "first"
+    assert e2e._resolve_e2e_payload_expr("items.0", payload=payload, missing=missing) == "first"
+    assert e2e._resolve_e2e_payload_expr("result.items[0]", payload=payload, missing=missing) == "nested-first"
+    assert e2e._resolve_e2e_payload_expr("result.items.0", payload=payload, missing=missing) == "nested-first"
+    assert missing == []
+
+
+def test_e2e_missing_placeholder_reports_empty_list_index_out_of_range():
+    command = E2EWorkflowCommand(
+        1,
+        "SKILL.md",
+        "scripts/a.py",
+        "python scripts/a.py '{}'",
+        "python",
+        {"item": "{{items[0]}}"},
+    )
+
+    with pytest.raises(ValueError) as exc:
+        e2e._render_e2e_command_payload(
+            command,
+            payload={"items": []},
+            typed_input_specs=[e2e.E2ETypedInputSpec(name="items", shape="list[string]", source="requirement_graph")],
+        )
+
+    message = str(exc.value)
+    assert '"reason": "index_out_of_range"' in message
+    assert '"root_shape": "list[0]"' in message
+    assert '"expected_shape_from_graph": "list[string]"' in message
