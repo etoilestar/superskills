@@ -264,7 +264,8 @@ def validate_creator_tool(request: ToolManifestRequest) -> dict[str, Any]:
         adapter_code=request.adapter_code,
         sample_input=request.sample_input,
         dynamic=request.dynamic,
-        real_run=bool(request.real_run or request.allow_external_network),
+        real_run=True,
+        direct_run=True,
     )
 
 
@@ -274,8 +275,9 @@ def register_creator_tool(request: ToolRegisterRequest) -> dict[str, Any]:
         request.manifest,
         adapter_code=request.adapter_code,
         sample_input=request.sample_input,
-        dynamic=request.dynamic,
-        real_run=bool(request.real_run or request.allow_external_network),
+        dynamic=False,
+        real_run=False,
+        direct_run=False,
     )
 
     if not validation["success"]:

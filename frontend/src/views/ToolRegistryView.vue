@@ -270,6 +270,9 @@
             <div class="pane">
               <h3>Sample Input</h3>
               <SmartCodeEditor v-model="sampleInputText" language="json" density="compact" min-height="180px" max-height="320px" />
+              <p v-if="sampleInputParseWarning" class="warn small">
+                {{ sampleInputParseWarning }}
+              </p>
               <div class="actions"><button class="btn-primary" :disabled="busy || !parsedManifest" @click="validateTool">运行验证</button></div>
             </div>
             <div class="pane">
@@ -364,7 +367,7 @@
             <button class="btn-ghost" @click="activeStep = 'adapter'">返回 Adapter</button>
             <button
               class="btn-primary"
-              :disabled="!lastValidation?.success || busy || humanFeedbackText.trim()"
+              :disabled="!canFinalizeAuthoring"
               @click="finalizeAuthoring"
             >
               试运行满意 → 生成 Snippet
@@ -390,6 +393,9 @@
               </button>
             </div>
           </div>
+          <p v-if="registerBlockingReason" class="error small">
+            {{ registerBlockingReason }}
+          </p>
           <SmartCodeEditor v-model="snippetText" language="json" fill placeholder="确认代码后生成 snippet" />
         </section>
       </main>
@@ -628,7 +634,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import CollapsiblePanel from '../components/CollapsiblePanel.vue'
 import SideDrawer from '../components/SideDrawer.vue'
 import SmartCodeEditor from '../components/SmartCodeEditor.vue'
@@ -654,6 +660,8 @@ const steps = [
   { key: 'snippet', index: 5, title: 'Snippet', description: '确认用法' },
 ]
 const busy = ref(false)
+const runningTask = ref('')
+const registerRunning = ref(false)
 const error = ref('')
 const tools = ref([])
 const allowedRolesText = ref('')
@@ -801,7 +809,28 @@ const visibleDebugPanels = computed(() =>
   )
 )
 const parsedManifest = computed(() => { try { return manifestText.value ? JSON.parse(manifestText.value) : null } catch { return null } })
-const parsedSample = computed(() => { try { return sampleInputText.value ? JSON.parse(sampleInputText.value) : {} } catch { return {} } })
+const sampleInputParseWarning = computed(() => {
+  const text = String(sampleInputText.value || '').trim()
+  if (!text) return ''
+
+  try {
+    JSON.parse(text)
+    return ''
+  } catch (err) {
+    return `Sample Input 不是严格 JSON，试运行将使用空样例并交给后端按 schema 自动补全：${err.message || err}`
+  }
+})
+const parsedSample = computed(() => {
+  const text = String(sampleInputText.value || '').trim()
+  if (!text) return {}
+
+  try {
+    const value = JSON.parse(text)
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  } catch {
+    return {}
+  }
+})
 const configExtra = computed(() =>
   Object.fromEntries(
     configExtraFields.value
@@ -1047,13 +1076,19 @@ function normalizeAuthGate(rawGate = {}) {
   const status = String(rawGate.status || 'none').trim() || 'none'
   const blockingStatuses = ['needs_config', 'needs_live_test', 'needs_review', 'blocked']
 
+  const canRegister =
+    rawGate.can_register !== undefined
+      ? Boolean(rawGate.can_register)
+      : !blockingStatuses.includes(status)
+
   return {
     status,
     block_code_generation: Boolean(rawGate.block_code_generation),
     block_registration:
       rawGate.block_registration !== undefined
         ? Boolean(rawGate.block_registration)
-        : blockingStatuses.includes(status),
+        : !canRegister,
+    can_register: canRegister,
     reasons: Array.isArray(rawGate.reasons)
       ? rawGate.reasons.filter(Boolean)
       : rawGate.reason
@@ -1063,6 +1098,11 @@ function normalizeAuthGate(rawGate = {}) {
 }
 
 const authGate = computed(() => {
+  const validationGate = lastValidation.value?.auth_gate
+  if (validationGate && typeof validationGate === 'object') {
+    return normalizeAuthGate(validationGate)
+  }
+
   if (manualAuthOverride.mode === 'force_required') {
     return normalizeAuthGate({
       status: 'needs_config',
@@ -1147,14 +1187,37 @@ const canGenerate = computed(() =>
   !authGate.value.block_code_generation
 )
 
-const canRegister = computed(() =>
+const canFinalizeAuthoring = computed(() =>
   Boolean(lastValidation.value?.success) &&
   !busy.value &&
-  Boolean(parsedManifest.value) &&
   Boolean(effectiveRuntimeCode.value) &&
-  snippetReady.value &&
-  !authGate.value.block_registration
+  Boolean(parsedManifest.value)
 )
+
+const activeRunningTask = computed(() => {
+  if (registerRunning.value) return '正在注册工具'
+  if (liveTestRunning.value) return '正在测试连接'
+  if (reviseRunning.value) return '正在根据反馈修改代码'
+  if (streamController.value) return '正在生成实现'
+  if (busy.value && runningTask.value) return runningTask.value
+  return ''
+})
+
+const registerBlockingReason = computed(() => {
+  if (registerRunning.value) return '正在注册工具，请勿重复点击。'
+  const task = activeRunningTask.value
+  if (task) return `${task}，暂不能注册。`
+  if (!lastValidation.value?.success) return '工具还没有通过验证。'
+  if (!parsedManifest.value) return 'manifest 为空或 JSON 格式错误。'
+  if (!effectiveRuntimeCode.value) return '缺少完整 runtime_code，不能注册。'
+  if (!snippetReady.value) return 'Snippet 还没有生成或不是有效 JSON。'
+  if (authGate.value.block_registration) {
+    return authGate.value.reasons?.join('；') || '认证/配置 gate 未通过，不能注册。'
+  }
+  return ''
+})
+
+const canRegister = computed(() => !registerBlockingReason.value)
 const manualAuthModeLabel = computed(() => {
   if (manualAuthOverride.mode === 'force_required') return '人工要求认证'
   if (manualAuthOverride.mode === 'force_no_auth') return '人工确认无需认证'
@@ -1172,8 +1235,9 @@ function stepStatus(key) {
   if (key === 'snippet' && snippetReady.value) return 'ok'
   return ''
 }
-async function run(task) {
+async function run(task, label = '当前任务') {
   busy.value = true
+  runningTask.value = label
   error.value = ''
 
   try {
@@ -1182,10 +1246,30 @@ async function run(task) {
     error.value = e.message || String(e)
   } finally {
     busy.value = false
+    runningTask.value = ''
     // 不要在 finally 里清空 statusMessage，否则 revise 成功/失败提示会一闪而过。
     // statusMessage.value = ''
   }
 }
+
+function clearStaleBusyForSnippetStep() {
+  if (activeStep.value !== 'snippet') return
+  if (liveTestRunning.value || reviseRunning.value || registerRunning.value) return
+
+  // Step 5 is reached only after generation/finalize has completed. If a previous
+  // stream controller or global busy flag is still around here, it is stale UI
+  // state and must not block registration.
+  streamController.value = null
+  if (busy.value) {
+    busy.value = false
+    runningTask.value = ''
+  }
+}
+
+watch(activeStep, () => {
+  clearStaleBusyForSnippetStep()
+}, { immediate: true })
+
 function logAuthor(event) { const helperMessages = { tool_call_planned: `正在分析需要辅助工具：${event.tool || ''} ${event.reason || ''}`, tool_call_started: `正在调用${event.tool || '辅助工具'}...`, tool_call_requires_input: `等待用户填写${event.tool || '辅助工具'}配置...`, tool_call_result: `${event.tool || '辅助工具'}${event.success ? '完成，继续生成 adapter...' : '需要补充信息或执行失败'}` }; const message = event.message || helperMessages[event.event] || ''; authorLogs.value.push({ time: new Date().toLocaleTimeString(), ...event, message }); if (authorLogs.value.length > 80) authorLogs.value.shift(); if (message) statusMessage.value = message }
 async function loadTools() { const data = await listCreatorTools(); tools.value = data.tools || [] }
 function payload() { return { ...form, allowed_roles: allowedRolesText.value.split(',').map(s => s.trim()).filter(Boolean) } }
@@ -2138,6 +2222,10 @@ function finalizeAuthoring() {
       return
     }
 
+    if (humanFeedbackText.value.trim()) {
+      statusMessage.value = '已忽略未提交的反馈，按当前验证通过版本生成 Snippet。'
+    }
+
     const data = await authorCreatorTool({
       ...authorPayload('finalize'),
 
@@ -2297,8 +2385,8 @@ function validateTool() {
 
       sample_input: parsedSample.value,
       dynamic: true,
-      allow_external_network: allowExternalNetwork.value || Boolean(liveTestResult.value?.success),
-      real_run: allowExternalNetwork.value || Boolean(liveTestResult.value?.success)
+      allow_external_network: true,
+      real_run: true
     })
 
     debugSections.value = mergeDebugSections(
@@ -2330,24 +2418,29 @@ function buildFinalManifestForRegister() {
 
   return manifest
 }
-function registerTool() {
-  return run(async () => {
-    const runtime = effectiveRuntimeCode.value
+async function registerTool() {
+  const runtime = effectiveRuntimeCode.value
+  error.value = ''
 
-    if (!canRegister.value) {
-      error.value = authGate.value.reasons?.length
-        ? authGate.value.reasons.join('；')
-        : '当前工具还未通过认证/配置 gate，不能注册。'
-      return
-    }
+  if (!canRegister.value) {
+    const reason = registerBlockingReason.value || '当前工具不能注册。'
+    error.value = reason
+    statusMessage.value = reason
+    console.warn('[ToolRegistry] register blocked:', reason)
+    return
+  }
 
-    if (!runtime) {
-      error.value = '当前没有完整运行代码，不能注册。'
-      activeStep.value = 'adapter'
-      return
-    }
+  if (!runtime) {
+    error.value = '当前没有完整运行代码，不能注册。'
+    activeStep.value = 'adapter'
+    return
+  }
 
-    await registerCreatorTool({
+  registerRunning.value = true
+  statusMessage.value = '正在注册工具...'
+
+  try {
+    const result = await registerCreatorTool({
       manifest: buildFinalManifestForRegister(),
 
       adapter_code: runtime,
@@ -2360,15 +2453,21 @@ function registerTool() {
       public_api_code: adapterCode.value,
 
       sample_input: parsedSample.value,
-      dynamic: true,
-      allow_external_network: allowExternalNetwork.value || Boolean(liveTestResult.value?.success),
-      real_run: allowExternalNetwork.value || Boolean(liveTestResult.value?.success),
+      dynamic: false,
+      allow_external_network: false,
+      real_run: false,
       enable: true
     })
 
     await loadTools()
+    statusMessage.value = `工具 ${result.tool?.name || parsedManifest.value?.tool_name || parsedManifest.value?.name || 'custom_tool'} 已注册并启用。`
     registryDrawerOpen.value = true
-  })
+  } catch (e) {
+    error.value = e.message || String(e)
+    statusMessage.value = '注册失败，请查看错误信息'
+  } finally {
+    registerRunning.value = false
+  }
 }
 function parseJsonText(text) { try { return text ? JSON.parse(text) : {} } catch { return {} } }
 function splitLines(text) { return text.split('\n').map(s => s.trim()).filter(Boolean) }
