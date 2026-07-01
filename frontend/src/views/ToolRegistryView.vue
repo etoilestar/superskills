@@ -634,7 +634,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import CollapsiblePanel from '../components/CollapsiblePanel.vue'
 import SideDrawer from '../components/SideDrawer.vue'
 import SmartCodeEditor from '../components/SmartCodeEditor.vue'
@@ -660,6 +660,8 @@ const steps = [
   { key: 'snippet', index: 5, title: 'Snippet', description: '确认用法' },
 ]
 const busy = ref(false)
+const runningTask = ref('')
+const registerRunning = ref(false)
 const error = ref('')
 const tools = ref([])
 const allowedRolesText = ref('')
@@ -1192,8 +1194,19 @@ const canFinalizeAuthoring = computed(() =>
   Boolean(parsedManifest.value)
 )
 
+const activeRunningTask = computed(() => {
+  if (registerRunning.value) return '正在注册工具'
+  if (liveTestRunning.value) return '正在测试连接'
+  if (reviseRunning.value) return '正在根据反馈修改代码'
+  if (streamController.value) return '正在生成实现'
+  if (busy.value && runningTask.value) return runningTask.value
+  return ''
+})
+
 const registerBlockingReason = computed(() => {
-  if (busy.value) return '当前仍有任务运行中。'
+  if (registerRunning.value) return '正在注册工具，请勿重复点击。'
+  const task = activeRunningTask.value
+  if (task) return `${task}，暂不能注册。`
   if (!lastValidation.value?.success) return '工具还没有通过验证。'
   if (!parsedManifest.value) return 'manifest 为空或 JSON 格式错误。'
   if (!effectiveRuntimeCode.value) return '缺少完整 runtime_code，不能注册。'
@@ -1222,8 +1235,9 @@ function stepStatus(key) {
   if (key === 'snippet' && snippetReady.value) return 'ok'
   return ''
 }
-async function run(task) {
+async function run(task, label = '当前任务') {
   busy.value = true
+  runningTask.value = label
   error.value = ''
 
   try {
@@ -1232,10 +1246,30 @@ async function run(task) {
     error.value = e.message || String(e)
   } finally {
     busy.value = false
+    runningTask.value = ''
     // 不要在 finally 里清空 statusMessage，否则 revise 成功/失败提示会一闪而过。
     // statusMessage.value = ''
   }
 }
+
+function clearStaleBusyForSnippetStep() {
+  if (activeStep.value !== 'snippet') return
+  if (liveTestRunning.value || reviseRunning.value || registerRunning.value) return
+
+  // Step 5 is reached only after generation/finalize has completed. If a previous
+  // stream controller or global busy flag is still around here, it is stale UI
+  // state and must not block registration.
+  streamController.value = null
+  if (busy.value) {
+    busy.value = false
+    runningTask.value = ''
+  }
+}
+
+watch(activeStep, () => {
+  clearStaleBusyForSnippetStep()
+}, { immediate: true })
+
 function logAuthor(event) { const helperMessages = { tool_call_planned: `正在分析需要辅助工具：${event.tool || ''} ${event.reason || ''}`, tool_call_started: `正在调用${event.tool || '辅助工具'}...`, tool_call_requires_input: `等待用户填写${event.tool || '辅助工具'}配置...`, tool_call_result: `${event.tool || '辅助工具'}${event.success ? '完成，继续生成 adapter...' : '需要补充信息或执行失败'}` }; const message = event.message || helperMessages[event.event] || ''; authorLogs.value.push({ time: new Date().toLocaleTimeString(), ...event, message }); if (authorLogs.value.length > 80) authorLogs.value.shift(); if (message) statusMessage.value = message }
 async function loadTools() { const data = await listCreatorTools(); tools.value = data.tools || [] }
 function payload() { return { ...form, allowed_roles: allowedRolesText.value.split(',').map(s => s.trim()).filter(Boolean) } }
@@ -2384,21 +2418,25 @@ function buildFinalManifestForRegister() {
 
   return manifest
 }
-function registerTool() {
-  return run(async () => {
-    const runtime = effectiveRuntimeCode.value
+async function registerTool() {
+  const runtime = effectiveRuntimeCode.value
+  error.value = ''
 
-    if (!canRegister.value) {
-      error.value = registerBlockingReason.value || '当前工具不能注册。'
-      return
-    }
+  if (!canRegister.value) {
+    error.value = registerBlockingReason.value || '当前工具不能注册。'
+    return
+  }
 
-    if (!runtime) {
-      error.value = '当前没有完整运行代码，不能注册。'
-      activeStep.value = 'adapter'
-      return
-    }
+  if (!runtime) {
+    error.value = '当前没有完整运行代码，不能注册。'
+    activeStep.value = 'adapter'
+    return
+  }
 
+  registerRunning.value = true
+  statusMessage.value = '正在注册工具...'
+
+  try {
     const result = await registerCreatorTool({
       manifest: buildFinalManifestForRegister(),
 
@@ -2421,7 +2459,11 @@ function registerTool() {
     await loadTools()
     statusMessage.value = `工具 ${result.tool?.name || parsedManifest.value?.tool_name || parsedManifest.value?.name || 'custom_tool'} 已注册并启用。`
     registryDrawerOpen.value = true
-  })
+  } catch (e) {
+    error.value = e.message || String(e)
+  } finally {
+    registerRunning.value = false
+  }
 }
 function parseJsonText(text) { try { return text ? JSON.parse(text) : {} } catch { return {} } }
 function splitLines(text) { return text.split('\n').map(s => s.trim()).filter(Boolean) }
