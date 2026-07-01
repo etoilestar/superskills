@@ -724,6 +724,8 @@ class AnalyzeBlueprintResponse(BaseModel):
     final_outputs: list[str] = Field(default_factory=list)
     available_tools: list[dict[str, Any]] = Field(default_factory=list)
     missing_tool_configs: list[dict[str, Any]] = Field(default_factory=list)
+    tool_requirements: list[dict[str, Any]] = Field(default_factory=list)
+    creation_blockers: list[dict[str, Any]] = Field(default_factory=list)
     requirement_graph: RequirementGraph = Field(default_factory=RequirementGraph)
 
     # 这是展示给用户确认的最终蓝图文本。

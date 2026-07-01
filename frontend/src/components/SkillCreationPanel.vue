@@ -36,6 +36,16 @@
       <div v-for="(w, i) in visibleWarnings" :key="i" class="warning-item">⚠️ {{ warningMessage(w) }}</div>
     </div>
 
+    <div v-if="hasCreationBlockers" class="warnings">
+      <div
+        v-for="(blocker, i) in props.creationBlockers"
+        :key="i"
+        class="warning-item"
+      >
+        ❌ {{ blocker.message || blocker.type }}
+      </div>
+    </div>
+
     <!-- File list -->
     <ul class="file-list">
       <li
@@ -191,7 +201,7 @@
         v-if="phase === 'idle'"
         class="btn-primary"
         @click="startCreation"
-        :disabled="localFiles.length === 0"
+        :disabled="localFiles.length === 0 || hasCreationBlockers"
       >
         开始创建
       </button>
@@ -325,6 +335,8 @@ const props = defineProps({
   finalOutputs: { type: Array, default: () => [] },
   requirementGraph: { type: Object, default: null },
   workflowAllocationSummary: { type: String, default: '' },
+  toolRequirements: { type: Array, default: () => [] },
+  creationBlockers: { type: Array, default: () => [] },
 })
 
 const emit = defineEmits(['creation-complete', 'creation-error'])
@@ -393,6 +405,10 @@ const localSkillName = ref(props.skillName)
 const editingName = ref(false)
 const nameError = ref('')
 const nameInputRef = ref(null)
+
+const hasCreationBlockers = computed(() =>
+  (props.creationBlockers || []).some(item => item.blocking !== false)
+)
 
 const visibleWarnings = computed(() => {
   const seen = new Set()
