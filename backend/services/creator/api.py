@@ -8,6 +8,91 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 
+def _tool_names_from_entry_contract(entry: Any) -> list[str]:
+    data = entry if isinstance(entry, dict) else getattr(entry, "__dict__", {})
+    names: list[str] = []
+    # required_capabilities are capability hints from the skill plan, not proof
+    # that a concrete registered tool exists or is authorized. Only explicit
+    # selected_tools / required_tool_slots may become hard tool requirements.
+    raw_selected = data.get("selected_tools") if isinstance(data, dict) else None
+    if isinstance(raw_selected, list):
+        names.extend(str(item).strip() for item in raw_selected if str(item).strip())
+    for slot in (data.get("required_tool_slots") if isinstance(data, dict) else []) or []:
+        slot_data = slot if isinstance(slot, dict) else getattr(slot, "__dict__", {})
+        for key in ("tool_id", "capability", "slot_id"):
+            value = str(slot_data.get(key) or "").strip() if isinstance(slot_data, dict) else ""
+            if value:
+                names.append(value)
+    return list(dict.fromkeys(names))
+
+
+def _creator_tool_readiness_blockers(entry: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    requirements: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    for capability_name in _tool_names_from_entry_contract(entry):
+        cap = get_tool_capability(capability_name)
+        if not cap:
+            blocker = {
+                "type": "tool_not_ready",
+                "capability": capability_name,
+                "tool_name": capability_name,
+                "status": "missing_tool",
+                "blocking": True,
+                "message": f"工具能力 {capability_name} 未注册，Creator 不能编造工具调用。",
+                "details": {},
+            }
+            blockers.append(blocker)
+            requirements.append(blocker)
+            continue
+        status = tool_status(cap)
+        missing_runtime_helpers = status.get("missing_runtime_helpers") or []
+        missing_dependencies = status.get("missing_dependencies") or []
+        status_code = "ready"
+        if not status.get("enabled"):
+            status_code = "disabled"
+        elif not cap.allow_creator_use:
+            status_code = "forbidden_for_creator"
+        elif not status.get("configured"):
+            status_code = "not_authorized"
+        elif missing_runtime_helpers or missing_dependencies:
+            status_code = "not_validated"
+        requirement = {
+            "type": "tool_requirement",
+            "capability": capability_name,
+            "tool_name": cap.name,
+            "status": status_code,
+            "blocking": status_code != "ready",
+            "message": f"工具能力 {capability_name} 已就绪。" if status_code == "ready" else f"工具能力 {capability_name} 未就绪：{status_code}。",
+            "details": status,
+        }
+        requirements.append(requirement)
+        if status_code != "ready":
+            blockers.append({**requirement, "type": "tool_not_ready", "blocking": True})
+    return requirements, blockers
+
+
+def _extract_script_tool_calls(content: str) -> list[str]:
+    text = str(content or "")
+    names: list[str] = []
+    call_pattern = r"\b(?:run_registered_tool|run_tool|call_tool)\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]"
+    names.extend(re.findall(call_pattern, text))
+    import_pattern = r"^\s*from\s+backend\.services\.runtime_tools\.custom_tools\.([A-Za-z_][A-Za-z0-9_]*)\s+import\b"
+    names.extend(re.findall(import_pattern, text, flags=re.MULTILINE))
+    return list(dict.fromkeys(names))
+
+
+def _script_tool_boundary_violations(content: str, allowed_tools: list[str]) -> list[dict[str, Any]]:
+    allowed = {str(name) for name in allowed_tools or []}
+    unexpected = [name for name in _extract_script_tool_calls(content) if name not in allowed]
+    if not unexpected:
+        return []
+    return [{
+        "id": "script.hallucinated_tool_call",
+        "layer": "script_tool_boundary",
+        "message": "脚本调用了未注册/未允许的工具：" + ", ".join(unexpected),
+        "expected": "只能调用 selected_tools/allowed_tools 中的工具；缺工具时返回 creation_blocker，不能编造工具。",
+    }]
+
 
 async def _extract_requirement_graph_with_validator(
     *,
@@ -783,10 +868,16 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     ] + directory_asset_requirements
 
     available_tools = [tool_status(cap) for cap in list_tool_capabilities()]
+    tool_requirements: list[dict[str, Any]] = []
+    creation_blockers: list[dict[str, Any]] = []
+    for file_spec in files_out:
+        entry_requirements, entry_blockers = _creator_tool_readiness_blockers(file_spec.model_dump(mode="json"))
+        tool_requirements.extend(entry_requirements)
+        creation_blockers.extend(entry_blockers)
     required_tool_names = {
-        capability
-        for file_spec in files_out
-        for capability in file_spec.required_capabilities
+        requirement.get("capability")
+        for requirement in tool_requirements
+        if requirement.get("capability")
     }
     missing_tool_configs = []
     def normalize_warning(item: Any) -> dict[str, Any] | None:
@@ -845,6 +936,8 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         final_outputs=_final_outputs_from_plan_entries(list(entries_by_path.values())),
         available_tools=available_tools,
         missing_tool_configs=missing_tool_configs,
+        tool_requirements=tool_requirements,
+        creation_blockers=creation_blockers,
         requirement_graph=requirement_graph,
         blueprint_text=blueprint_text,
         blueprint_refined=False,
@@ -2039,6 +2132,15 @@ async def generate_file(request: GenerateFileRequest):
                 effective_skill_plan_entry = dict(getattr(entry_obj, "__dict__", {}) or {})
                 effective_skill_plan_entry.setdefault("path", request.file_path)
                 effective_skill_plan_entry.setdefault("purpose", request.purpose)
+                _, tool_blockers = _creator_tool_readiness_blockers(effective_skill_plan_entry)
+                if tool_blockers:
+                    yield _file_done_error_sse(
+                        file_path=request.file_path,
+                        role=request.role,
+                        error="required tools are not ready; Creator cannot hallucinate tools",
+                        error_type="tool_not_ready",
+                    )
+                    return
 
             prompt_messages = _build_generate_file_prompt(
                 request.file_path,
@@ -2117,6 +2219,17 @@ async def generate_file(request: GenerateFileRequest):
                 )
 
                 content = candidate
+
+                if request.file_path.startswith("scripts/"):
+                    allowed_tools = list(resolve_tools_for_skill_plan_entry(effective_skill_plan_entry or {}).allowed_tools or [])
+                    boundary_violations = _script_tool_boundary_violations(content, allowed_tools)
+                    if boundary_violations:
+                        first_violation = boundary_violations[0]
+                        raise FileGenerationStageError(
+                            source=first_violation["id"],
+                            layer=first_violation["layer"],
+                            detail=first_violation["message"],
+                        )
 
                 if request.file_path == "SKILL.md":
                     logger.info(

@@ -270,6 +270,9 @@
             <div class="pane">
               <h3>Sample Input</h3>
               <SmartCodeEditor v-model="sampleInputText" language="json" density="compact" min-height="180px" max-height="320px" />
+              <p v-if="sampleInputParseWarning" class="warn small">
+                {{ sampleInputParseWarning }}
+              </p>
               <div class="actions"><button class="btn-primary" :disabled="busy || !parsedManifest" @click="validateTool">运行验证</button></div>
             </div>
             <div class="pane">
@@ -364,7 +367,7 @@
             <button class="btn-ghost" @click="activeStep = 'adapter'">返回 Adapter</button>
             <button
               class="btn-primary"
-              :disabled="!lastValidation?.success || busy || humanFeedbackText.trim()"
+              :disabled="!canFinalizeAuthoring"
               @click="finalizeAuthoring"
             >
               试运行满意 → 生成 Snippet
@@ -390,6 +393,9 @@
               </button>
             </div>
           </div>
+          <p v-if="registerBlockingReason" class="error small">
+            {{ registerBlockingReason }}
+          </p>
           <SmartCodeEditor v-model="snippetText" language="json" fill placeholder="确认代码后生成 snippet" />
         </section>
       </main>
@@ -801,7 +807,28 @@ const visibleDebugPanels = computed(() =>
   )
 )
 const parsedManifest = computed(() => { try { return manifestText.value ? JSON.parse(manifestText.value) : null } catch { return null } })
-const parsedSample = computed(() => { try { return sampleInputText.value ? JSON.parse(sampleInputText.value) : {} } catch { return {} } })
+const sampleInputParseWarning = computed(() => {
+  const text = String(sampleInputText.value || '').trim()
+  if (!text) return ''
+
+  try {
+    JSON.parse(text)
+    return ''
+  } catch (err) {
+    return `Sample Input 不是严格 JSON，试运行将使用空样例并交给后端按 schema 自动补全：${err.message || err}`
+  }
+})
+const parsedSample = computed(() => {
+  const text = String(sampleInputText.value || '').trim()
+  if (!text) return {}
+
+  try {
+    const value = JSON.parse(text)
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  } catch {
+    return {}
+  }
+})
 const configExtra = computed(() =>
   Object.fromEntries(
     configExtraFields.value
@@ -1047,13 +1074,19 @@ function normalizeAuthGate(rawGate = {}) {
   const status = String(rawGate.status || 'none').trim() || 'none'
   const blockingStatuses = ['needs_config', 'needs_live_test', 'needs_review', 'blocked']
 
+  const canRegister =
+    rawGate.can_register !== undefined
+      ? Boolean(rawGate.can_register)
+      : !blockingStatuses.includes(status)
+
   return {
     status,
     block_code_generation: Boolean(rawGate.block_code_generation),
     block_registration:
       rawGate.block_registration !== undefined
         ? Boolean(rawGate.block_registration)
-        : blockingStatuses.includes(status),
+        : !canRegister,
+    can_register: canRegister,
     reasons: Array.isArray(rawGate.reasons)
       ? rawGate.reasons.filter(Boolean)
       : rawGate.reason
@@ -1063,6 +1096,11 @@ function normalizeAuthGate(rawGate = {}) {
 }
 
 const authGate = computed(() => {
+  const validationGate = lastValidation.value?.auth_gate
+  if (validationGate && typeof validationGate === 'object') {
+    return normalizeAuthGate(validationGate)
+  }
+
   if (manualAuthOverride.mode === 'force_required') {
     return normalizeAuthGate({
       status: 'needs_config',
@@ -1147,14 +1185,26 @@ const canGenerate = computed(() =>
   !authGate.value.block_code_generation
 )
 
-const canRegister = computed(() =>
+const canFinalizeAuthoring = computed(() =>
   Boolean(lastValidation.value?.success) &&
   !busy.value &&
-  Boolean(parsedManifest.value) &&
   Boolean(effectiveRuntimeCode.value) &&
-  snippetReady.value &&
-  !authGate.value.block_registration
+  Boolean(parsedManifest.value)
 )
+
+const registerBlockingReason = computed(() => {
+  if (busy.value) return '当前仍有任务运行中。'
+  if (!lastValidation.value?.success) return '工具还没有通过验证。'
+  if (!parsedManifest.value) return 'manifest 为空或 JSON 格式错误。'
+  if (!effectiveRuntimeCode.value) return '缺少完整 runtime_code，不能注册。'
+  if (!snippetReady.value) return 'Snippet 还没有生成或不是有效 JSON。'
+  if (authGate.value.block_registration) {
+    return authGate.value.reasons?.join('；') || '认证/配置 gate 未通过，不能注册。'
+  }
+  return ''
+})
+
+const canRegister = computed(() => !registerBlockingReason.value)
 const manualAuthModeLabel = computed(() => {
   if (manualAuthOverride.mode === 'force_required') return '人工要求认证'
   if (manualAuthOverride.mode === 'force_no_auth') return '人工确认无需认证'
@@ -2138,6 +2188,10 @@ function finalizeAuthoring() {
       return
     }
 
+    if (humanFeedbackText.value.trim()) {
+      statusMessage.value = '已忽略未提交的反馈，按当前验证通过版本生成 Snippet。'
+    }
+
     const data = await authorCreatorTool({
       ...authorPayload('finalize'),
 
@@ -2335,9 +2389,7 @@ function registerTool() {
     const runtime = effectiveRuntimeCode.value
 
     if (!canRegister.value) {
-      error.value = authGate.value.reasons?.length
-        ? authGate.value.reasons.join('；')
-        : '当前工具还未通过认证/配置 gate，不能注册。'
+      error.value = registerBlockingReason.value || '当前工具不能注册。'
       return
     }
 
@@ -2347,7 +2399,7 @@ function registerTool() {
       return
     }
 
-    await registerCreatorTool({
+    const result = await registerCreatorTool({
       manifest: buildFinalManifestForRegister(),
 
       adapter_code: runtime,
@@ -2367,6 +2419,7 @@ function registerTool() {
     })
 
     await loadTools()
+    statusMessage.value = `工具 ${result.tool?.name || parsedManifest.value?.tool_name || parsedManifest.value?.name || 'custom_tool'} 已注册并启用。`
     registryDrawerOpen.value = true
   })
 }

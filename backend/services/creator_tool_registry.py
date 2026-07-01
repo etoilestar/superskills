@@ -233,6 +233,59 @@ def _builtin_sample_path(kind: str) -> Path:
     return PDF_SAMPLE_PATH if kind == "pdf" else IMAGE_SAMPLE_PATH
 
 
+def _sample_value_for_schema(schema: dict[str, Any], field_name: str = "") -> Any:
+    """Generate a safe generic sample value from JSON Schema.
+
+    This is not business-specific. It only follows JSON Schema type/default/enum.
+    """
+    schema = schema if isinstance(schema, dict) else {}
+
+    if "default" in schema:
+        return schema.get("default")
+
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and enum_values:
+        return enum_values[0]
+
+    const_value = schema.get("const")
+    if const_value is not None:
+        return const_value
+
+    field_type = schema.get("type")
+    if isinstance(field_type, list):
+        field_type = next((item for item in field_type if item != "null"), field_type[0] if field_type else "string")
+
+    if field_type == "boolean":
+        return False
+    if field_type == "integer":
+        return 1
+    if field_type == "number":
+        return 1
+    if field_type == "array":
+        item_schema = schema.get("items") if isinstance(schema.get("items"), dict) else {}
+        return [_sample_value_for_schema(item_schema, field_name)]
+    if field_type == "object":
+        props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        required = schema.get("required") if isinstance(schema.get("required"), list) else []
+        return {
+            str(key): _sample_value_for_schema(props.get(str(key), {}), str(key))
+            for key in required
+        }
+
+    fmt = str(schema.get("format") or "").lower()
+    if fmt == "date":
+        return "2026-01-01"
+    if fmt in {"date-time", "datetime"}:
+        return "2026-01-01T00:00:00Z"
+    if fmt == "email":
+        return "user@example.com"
+    if fmt in {"uri", "url"}:
+        return "https://example.com"
+
+    title = str(schema.get("title") or field_name or "value").strip()
+    return f"sample_{title}"
+
+
 def resolve_tool_trial_sample_input(manifest: dict[str, Any], sample_input: dict[str, Any] | None) -> tuple[dict[str, Any], list[str]]:
     """Fill missing PDF/image file inputs from backend/samples based on schema metadata."""
     resolved = dict(sample_input or {}) if isinstance(sample_input, dict) else {}
@@ -252,20 +305,25 @@ def resolve_tool_trial_sample_input(manifest: dict[str, Any], sample_input: dict
             items = field_schema.get("items") if isinstance(field_schema.get("items"), dict) else {}
             target_schema = {**field_schema, **items}
         elif field_type == "object":
-            notes.append(f"sample_input.{field_name}: complex object schema cannot be auto-filled with built-in file samples")
-            continue
+            target_schema = field_schema
         elif isinstance(field_type, list) and "object" in field_type:
-            notes.append(f"sample_input.{field_name}: complex object schema cannot be auto-filled with built-in file samples")
-            continue
+            target_schema = field_schema
         kind = _schema_file_kind(target_schema)
-        if not kind:
+        if kind:
+            sample_path = _builtin_sample_path(kind)
+            if not sample_path.exists():
+                notes.append(f"sample_input.{field_name}: built-in {kind} sample is missing at {sample_path}; not fabricating a path")
+                continue
+            absolute = str(sample_path.resolve())
+            resolved[field_name] = [absolute] if is_array else absolute
             continue
-        sample_path = _builtin_sample_path(kind)
-        if not sample_path.exists():
-            notes.append(f"sample_input.{field_name}: built-in {kind} sample is missing at {sample_path}; not fabricating a path")
-            continue
-        absolute = str(sample_path.resolve())
-        resolved[field_name] = [absolute] if is_array else absolute
+
+        required_fields = schema.get("required") if isinstance(schema.get("required"), list) else []
+        if field_name in {str(item) for item in required_fields}:
+            resolved[field_name] = _sample_value_for_schema(field_schema, field_name)
+            notes.append(
+                f"sample_input.{field_name}: missing required sample value; auto-filled from input_schema for trial run"
+            )
     return resolved, notes
 
 def _simple_cap(name: str, display_name: str, category: str, roles: list[str], **kwargs: Any) -> ToolCapability:
@@ -1255,8 +1313,31 @@ def _normalize_auth_plan(manifest: dict[str, Any] | None, request: dict[str, Any
             secrets.append(record)
 
     if required == "yes" and not secrets:
-        env = _default_secret_env_for_tool(tool_name)
-        secrets.append({"env": env, "name": env, "description": "API key or token required by this tool.", "required": True})
+        reason = str(auth.get("reason") or auth.get("description") or "").strip().lower()
+        no_secret_markers = [
+            "no additional secrets",
+            "no secrets required",
+            "no api key",
+            "no token",
+            "无需密钥",
+            "不需要密钥",
+            "不需要额外密钥",
+            "无需 token",
+            "不需要 token",
+            "无需 api key",
+            "不需要 api key",
+        ]
+
+        if any(marker in reason for marker in no_secret_markers):
+            required = "no"
+        else:
+            env = _default_secret_env_for_tool(tool_name)
+            secrets.append({
+                "env": env,
+                "name": env,
+                "description": "API key or token required by this tool.",
+                "required": True,
+            })
 
     # Only explicit secrets can override a missing/unknown auth decision. Do not let
     # permissions.env or required_env do this.
@@ -2515,7 +2596,10 @@ def _script_tool_spec_errors(manifest: dict[str, Any]) -> list[str]:
             errors.append("manifest.permissions.env must be a list")
     auth = _normalize_auth_plan(manifest)
     if auth.get("required") == "yes" and not auth.get("secrets"):
-        errors.append("manifest.auth.required=yes requires at least one secret/env declaration")
+        errors.append(
+            "manifest.auth.required=yes requires explicit auth.secrets. "
+            "If identity is provided by normal payload fields and no external credential is needed, set auth.required=no."
+        )
     return sorted(set(errors))
 
 
@@ -2902,7 +2986,12 @@ def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None
         else:
             dynamic_result = _run_generated_tool_script(script_code=script_code, manifest=manifest, payload=resolved_sample_input, config={}, trial=not real_run)
             if not dynamic_result.get("success"):
-                errors.extend(dynamic_result.get("errors") or ["dynamic script validation failed"])
+                dyn_errors = dynamic_result.get("errors") or ["dynamic script validation failed"]
+                if sample_notes:
+                    warnings.append(
+                        "dynamic trial used auto-filled sample_input; if the failure is only caused by unrealistic sample values, adjust sample input and rerun validation."
+                    )
+                errors.extend(dyn_errors)
     success = not errors
     block_registration = bool(auth_gate.get("block_registration") or (auth_gate.get("missing_env") and require_auth_config))
     return {
@@ -3048,7 +3137,11 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
                 "For file path inputs, input_schema properties must declare format='file-path'. For PDF inputs also declare contentMediaType='application/pdf' or accepted_extensions=['.pdf']; for image inputs declare contentMediaType='image/png' or accepted_extensions with image extensions. "
                 "Do not invent local test file paths in sample_input; if trial needs PDF/image files, backend will use backend/samples/sample.pdf or backend/samples/sample.png. "
                 "auth must be {required:'yes'|'no'|'unknown', reason:'...', secrets:[{env:'ENV_NAME', description:'...', required:true}]}. "
-                "Only auth.secrets are credentials. permissions.env is only an allow-list for environment variables and must not by itself imply auth. "
+                "Only auth.secrets / required_secrets are credentials. "
+                "Payload fields such as user_id, task_id, task_type, account_id, tenant_id, username, or other request data are normal input fields, not secrets by themselves. "
+                "If identity or routing is provided in payload/request data and no API key/token/password/secret is required, set auth.required='no' and auth.secrets=[]. "
+                "Do not set auth.required='yes' unless an external credential, API key, token, password, OAuth secret, or private key must be configured outside the payload. "
+                "permissions.env is only an allow-list for environment variables and must not by itself imply auth. "
                 "dependencies must be objects: {package:'pip-package-name', imports:['python_import_name'], version:''}. "
                 "permissions must include booleans network/read_files/write_files/subprocess and env list. "
                 "Do not enforce any tool-specific output fields beyond the schema you define."
