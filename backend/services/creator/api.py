@@ -550,6 +550,91 @@ def _script_tool_boundary_violations(content: str, allowed_tools: list[str]) -> 
         "expected": "只能调用 selected_tools/allowed_tools 中的工具；缺工具时返回 creation_blocker，不能编造工具。",
     }]
 
+def _tool_names_from_entry_contract(entry: Any) -> list[str]:
+    data = entry if isinstance(entry, dict) else getattr(entry, "__dict__", {})
+    names: list[str] = []
+    # required_capabilities are capability hints from the skill plan, not proof
+    # that a concrete registered tool exists or is authorized. Only explicit
+    # selected_tools / required_tool_slots may become hard tool requirements.
+    raw_selected = data.get("selected_tools") if isinstance(data, dict) else None
+    if isinstance(raw_selected, list):
+        names.extend(str(item).strip() for item in raw_selected if str(item).strip())
+    for slot in (data.get("required_tool_slots") if isinstance(data, dict) else []) or []:
+        slot_data = slot if isinstance(slot, dict) else getattr(slot, "__dict__", {})
+        for key in ("tool_id", "capability", "slot_id"):
+            value = str(slot_data.get(key) or "").strip() if isinstance(slot_data, dict) else ""
+            if value:
+                names.append(value)
+    return list(dict.fromkeys(names))
+
+
+def _creator_tool_readiness_blockers(entry: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    requirements: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    for capability_name in _tool_names_from_entry_contract(entry):
+        cap = get_tool_capability(capability_name)
+        if not cap:
+            blocker = {
+                "type": "tool_not_ready",
+                "capability": capability_name,
+                "tool_name": capability_name,
+                "status": "missing_tool",
+                "blocking": True,
+                "message": f"工具能力 {capability_name} 未注册，Creator 不能编造工具调用。",
+                "details": {},
+            }
+            blockers.append(blocker)
+            requirements.append(blocker)
+            continue
+        status = tool_status(cap)
+        missing_runtime_helpers = status.get("missing_runtime_helpers") or []
+        missing_dependencies = status.get("missing_dependencies") or []
+        status_code = "ready"
+        if not status.get("enabled"):
+            status_code = "disabled"
+        elif not cap.allow_creator_use:
+            status_code = "forbidden_for_creator"
+        elif not status.get("configured"):
+            status_code = "not_authorized"
+        elif missing_runtime_helpers or missing_dependencies:
+            status_code = "not_validated"
+        requirement = {
+            "type": "tool_requirement",
+            "capability": capability_name,
+            "tool_name": cap.name,
+            "status": status_code,
+            "blocking": status_code != "ready",
+            "message": f"工具能力 {capability_name} 已就绪。" if status_code == "ready" else f"工具能力 {capability_name} 未就绪：{status_code}。",
+            "details": status,
+        }
+        requirements.append(requirement)
+        if status_code != "ready":
+            blockers.append({**requirement, "type": "tool_not_ready", "blocking": True})
+    return requirements, blockers
+
+
+def _extract_script_tool_calls(content: str) -> list[str]:
+    text = str(content or "")
+    names: list[str] = []
+    call_pattern = r"\b(?:run_registered_tool|run_tool|call_tool)\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]"
+    names.extend(re.findall(call_pattern, text))
+    import_pattern = r"^\s*from\s+backend\.services\.runtime_tools\.custom_tools\.([A-Za-z_][A-Za-z0-9_]*)\s+import\b"
+    names.extend(re.findall(import_pattern, text, flags=re.MULTILINE))
+    return list(dict.fromkeys(names))
+
+
+def _script_tool_boundary_violations(content: str, allowed_tools: list[str]) -> list[dict[str, Any]]:
+    allowed = {str(name) for name in allowed_tools or []}
+    unexpected = [name for name in _extract_script_tool_calls(content) if name not in allowed]
+    if not unexpected:
+        return []
+    return [{
+        "id": "script.hallucinated_tool_call",
+        "layer": "script_tool_boundary",
+        "message": "脚本调用了未注册/未允许的工具：" + ", ".join(unexpected),
+        "expected": "只能调用 selected_tools/allowed_tools 中的工具；缺工具时返回 creation_blocker，不能编造工具。",
+    }]
+
 
 async def _extract_requirement_graph_with_validator(
     *,
