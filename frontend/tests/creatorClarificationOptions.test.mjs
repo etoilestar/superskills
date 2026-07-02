@@ -29,12 +29,34 @@ describe('extractClarificationQuestionOptions', () => {
     assert.match(actions[1].value, /选择：B\. JSON \+ 可读 Markdown（推荐）/)
   })
 
-  it('waits for input only on affirmative supplement choices', () => {
+  it('does not assign prepare actions to ordinary business clarification options', () => {
     const actions = extractClarificationQuestionOptions(
-      '还有其他需要补充的要求吗？A. 没有，按上面的选择继续 B. 有，我补充说明'
+      '输入来源希望支持哪种？A. 只支持粘贴文本 B. 只支持上传文件 C. 两者都支持（推荐）',
+      { prepareStage: 'business_clarification' }
     )
 
+    assert.deepEqual(actions.map((action) => action.prepareAction), ['none', 'none', 'none'])
+    assert.deepEqual(actions.map((action) => action.waitForInput), [false, false, false])
+  })
+
+  it('assigns prepare actions only for creation point supplement gates', () => {
+    const actions = extractClarificationQuestionOptions(
+      '以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明',
+      { prepareStage: 'creation_points_confirmation' }
+    )
+
+    assert.equal(actions[0].prepareAction, 'confirm')
     assert.equal(actions[0].waitForInput, false)
+    assert.equal(actions[1].prepareAction, 'request_supplement')
     assert.equal(actions[1].waitForInput, true)
+  })
+
+  it('uses supplement confirmation stage for post-supplement gates', () => {
+    const actions = buildClarificationQuickActions([
+      '已根据补充内容更新创建要点。是否按这些要点继续？A. 没有其他补充，按这些要点继续 B. 继续补充说明',
+    ], { prepareStage: 'supplement_confirmation' })
+
+    assert.equal(actions[0].prepareAction, 'confirm')
+    assert.equal(actions[1].prepareAction, 'request_supplement')
   })
 })

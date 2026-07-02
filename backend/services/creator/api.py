@@ -19,6 +19,7 @@ class PreparePlanRequest(BaseModel):
     uploaded_files: list[dict[str, Any]] = []
     previous_blueprint_text: str = ""
     human_feedback: str = ""
+    prepare_action: Literal["none", "confirm", "request_supplement", "submit_supplement"] = "none"
     model: str | None = None
 
 
@@ -153,23 +154,40 @@ def _prepare_supplement_check_seen(request: PreparePlanRequest) -> bool:
     return any(token in _prepare_history_text(request) for token in ("以上创建要点是否还需要补充", "是否还需要继续补充", "还有其他需要补充"))
 
 
-def _prepare_user_confirmed_no_more_supplement(request: PreparePlanRequest) -> bool:
+def _prepare_feedback_choice_text(request: PreparePlanRequest) -> str:
     text = str(request.human_feedback or "").strip()
+    matches = re.findall(r"(?im)^\s*选择\s*[:：]\s*(.+?)\s*$", text)
+    return matches[-1].strip() if matches else text
+
+
+def _prepare_has_explicit_action(request: PreparePlanRequest) -> bool:
+    return str(getattr(request, "prepare_action", "none") or "none") != "none"
+
+
+def _prepare_user_confirmed_no_more_supplement(request: PreparePlanRequest) -> bool:
+    if _prepare_has_explicit_action(request):
+        return request.prepare_action == "confirm"
+    text = _prepare_feedback_choice_text(request)
     return bool(re.search(r"(没有|无|暫時沒有|暂时没有).{0,12}补充|按(这些|上面|已有)信息继续|按这些要点继续|按上面的选择继续", text))
 
 
 def _prepare_user_wants_to_add_supplement(request: PreparePlanRequest) -> bool:
-    text = str(request.human_feedback or "").strip()
+    if _prepare_has_explicit_action(request):
+        return request.prepare_action == "request_supplement"
+    text = _prepare_feedback_choice_text(request)
     if not text or _prepare_user_confirmed_no_more_supplement(request):
         return False
     return any(marker in text for marker in ("有，我补充说明", "我补充", "有补充", "继续补充"))
 
 
 def _prepare_user_has_provided_supplement_content(request: PreparePlanRequest) -> bool:
-    text = str(request.human_feedback or "").strip()
-    if not text or _prepare_user_confirmed_no_more_supplement(request):
+    if _prepare_has_explicit_action(request):
+        return request.prepare_action == "submit_supplement"
+    full_text = str(request.human_feedback or "").strip()
+    text = _prepare_feedback_choice_text(request)
+    if not full_text or _prepare_user_confirmed_no_more_supplement(request):
         return False
-    return "补充：" in text or (_prepare_user_wants_to_add_supplement(request) and len(text) > 80)
+    return "补充：" in full_text or (_prepare_user_wants_to_add_supplement(request) and len(full_text) > 80)
 
 
 def _count_prepare_supplement_rounds(request: PreparePlanRequest) -> int:
@@ -206,7 +224,9 @@ def _normalize_prepare_clarifying_questions(raw_questions: Any) -> list[str]:
 
 
 def _prepare_feedback_wants_supplement(request: PreparePlanRequest) -> bool:
-    feedback = str(request.human_feedback or "").strip()
+    if _prepare_has_explicit_action(request):
+        return request.prepare_action == "request_supplement"
+    feedback = _prepare_feedback_choice_text(request)
     if not feedback:
         return False
     if re.search(r"(没有|暫時沒有|暂时没有).{0,8}补充", feedback):
@@ -1039,6 +1059,27 @@ async def _normalize_script_purpose_short_contracts(
 
 @router.post("/prepare-plan", response_model=PreparePlanResponse)
 async def prepare_plan(request: PreparePlanRequest):
+    prepare_action = str(request.prepare_action or "none")
+
+    if prepare_action == "request_supplement":
+        return PreparePlanResponse(
+            status="needs_clarification",
+            prepare_stage="creation_points_confirmation",
+            clarifying_questions=["好的，请补充你的其他要求。"],
+            review_summary=PreparePlanReviewSummary(),
+            skill_name=request.skill_name or "",
+        )
+
+    if prepare_action == "submit_supplement":
+        summary = await _prepare_summarize_confirmed_requirements(request=request, prepared={})
+        return PreparePlanResponse(
+            status="needs_clarification",
+            prepare_stage="supplement_confirmation",
+            clarifying_questions=["已根据补充内容更新创建要点。是否按这些要点继续？A. 没有其他补充，按这些要点继续 B. 继续补充说明"],
+            review_summary=_strip_prepare_summary_risks(summary),
+            skill_name=request.skill_name or "",
+        )
+
     try:
         prepared = await _generate_internal_blueprint_or_questions(request)
     except Exception as exc:
@@ -1053,12 +1094,17 @@ async def prepare_plan(request: PreparePlanRequest):
         confirmed = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
         return PreparePlanResponse(status="needs_clarification", prepare_stage="creation_points_confirmation", clarifying_questions=[question], review_summary=_strip_prepare_summary_risks(confirmed), skill_name=skill_name)
 
-    if _prepare_user_confirmed_no_more_supplement(request) and status != "ready":
+    if prepare_action == "confirm" and status != "ready":
         summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
         prepared = await _generate_internal_blueprint_from_confirmed_summary(request=request, summary=summary)
         status = "ready"
         skill_name = str(prepared.get("skill_name") or skill_name)
-    elif _prepare_user_has_provided_supplement_content(request):
+    elif prepare_action == "none" and _prepare_user_confirmed_no_more_supplement(request) and status != "ready":
+        summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
+        prepared = await _generate_internal_blueprint_from_confirmed_summary(request=request, summary=summary)
+        status = "ready"
+        skill_name = str(prepared.get("skill_name") or skill_name)
+    elif prepare_action == "none" and _prepare_user_has_provided_supplement_content(request):
         summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
         current_feedback_has_supplement = "补充：" in str(request.human_feedback or "")
         prior_supplement_rounds = max(0, _count_prepare_supplement_rounds(request) - (1 if current_feedback_has_supplement else 0))
@@ -1074,7 +1120,7 @@ async def prepare_plan(request: PreparePlanRequest):
                 review_summary=_strip_prepare_summary_risks(summary),
                 skill_name=skill_name,
             )
-    elif _prepare_feedback_wants_supplement(request):
+    elif prepare_action == "none" and _prepare_feedback_wants_supplement(request):
         return PreparePlanResponse(
             status="needs_clarification",
             prepare_stage="creation_points_confirmation",
@@ -1097,7 +1143,7 @@ async def prepare_plan(request: PreparePlanRequest):
     if status == "blocked":
         return await summarize_and_confirm("系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明")
 
-    if status == "ready" and not _prepare_supplement_check_seen(request) and not _prepare_user_confirmed_no_more_supplement(request):
+    if status == "ready" and prepare_action != "confirm" and not _prepare_user_confirmed_no_more_supplement(request):
         summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
         return PreparePlanResponse(
             status="needs_clarification",

@@ -295,3 +295,60 @@ async def test_confirm_after_supplement_generates_blueprint(monkeypatch):
     assert resp.status == "ready"
     assert resp.prepare_stage == "ready"
     assert calls and calls[0].strict is True
+
+@pytest.mark.asyncio
+async def test_prepare_action_confirm_ignores_full_question_ab_text(monkeypatch):
+    calls = []
+    async def fake_generate(_request):
+        return {"status": "needs_clarification", "clarifying_questions": ["输入？A. 文本 B. 文件"]}
+    async def fake_summary(**kwargs):
+        return api.PreparePlanReviewSummary(goal="确认后的要点", input="输入", output="JSON", risks=[])
+    async def fake_blueprint(**kwargs):
+        return {"status": "ready", "internal_blueprint_text": _ready_blueprint(), "skill_name": "demo-skill"}
+    async def fake_analyze(request):
+        calls.append(request)
+        return _plan(path="SKILL.md")
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "_prepare_summarize_confirmed_requirements", fake_summary)
+    monkeypatch.setattr(api, "_generate_internal_blueprint_from_confirmed_summary", fake_blueprint)
+    monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
+    feedback = "问题：以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明\n选择：A. 没有，按这些要点继续"
+    resp = await api.prepare_plan(_request(human_feedback=feedback, prepare_action="confirm"))
+    assert resp.status == "ready"
+    assert resp.prepare_stage == "ready"
+    assert calls
+    assert "请补充你的其他要求" not in resp.clarifying_questions
+
+
+@pytest.mark.asyncio
+async def test_prepare_action_request_supplement_ignores_a_text_and_skips_analyze(monkeypatch):
+    async def fake_generate(_request):
+        raise AssertionError("model should not run while waiting for supplement text")
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    feedback = "问题：以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明\n选择：B. 有，我补充说明"
+    resp = await api.prepare_plan(_request(human_feedback=feedback, prepare_action="request_supplement"))
+    assert resp.status == "needs_clarification"
+    assert "请补充你的其他要求" in resp.clarifying_questions[0]
+    assert resp.files == []
+
+
+@pytest.mark.asyncio
+async def test_prepare_action_submit_supplement_resummarizes_without_analyze(monkeypatch):
+    async def fake_generate(_request):
+        raise AssertionError("model blueprint generation should not run for submitted supplement confirmation")
+    async def fake_summary(**kwargs):
+        return api.PreparePlanReviewSummary(goal="更新后的创建要点", input="补充后的输入", output="JSON", risks=[])
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "_prepare_summarize_confirmed_requirements", fake_summary)
+    resp = await api.prepare_plan(_request(human_feedback="补充：增加 CSV 输入", prepare_action="submit_supplement"))
+    assert resp.status == "needs_clarification"
+    assert resp.prepare_stage == "supplement_confirmation"
+    assert resp.review_summary.goal == "更新后的创建要点"
+    assert resp.files == []
+
+
+def test_legacy_choice_line_prevents_question_option_b_from_overriding_a():
+    feedback = "问题：以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明\n选择：A. 没有，按这些要点继续"
+    request = _request(human_feedback=feedback)
+    assert api._prepare_user_confirmed_no_more_supplement(request)
+    assert not api._prepare_feedback_wants_supplement(request)

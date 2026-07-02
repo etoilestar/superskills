@@ -7,26 +7,46 @@
 
 
 
-export function extractClarificationQuestionOptions(question) {
+function isSupplementGatePrepareStage(prepareStage) {
+  return prepareStage === 'creation_points_confirmation' || prepareStage === 'supplement_confirmation'
+}
+
+function inferPrepareActionFromOptionLabel(label, { isSupplementGate = false, optionIndex = -1 } = {}) {
+  if (!isSupplementGate) return 'none'
+
+  const text = String(label || '')
+  if (/补充|我补充|继续补充/.test(text) && !/没有.*补充|无.*补充|暂时没有/.test(text)) {
+    return 'request_supplement'
+  }
+  if (optionIndex === 0) {
+    return 'confirm'
+  }
+  return 'none'
+}
+
+export function extractClarificationQuestionOptions(question, { prepareStage = '' } = {}) {
   const text = String(question || '')
+  const isSupplementGate = isSupplementGatePrepareStage(prepareStage)
   const optionPattern = /(?:^|[\s？?])([A-D])[\.\)、]\s*([\s\S]*?)(?=(?:\s+[A-D][\.\)、]\s*)|$)/g
   return [...text.matchAll(optionPattern)]
-    .map((match) => {
+    .map((match, index) => {
       const label = `${match[1]}. ${String(match[2] || '').trim()}`.trim()
       if (label.length <= 3) return null
+      const prepareAction = inferPrepareActionFromOptionLabel(label, { isSupplementGate, optionIndex: index })
       return {
         text: label,
         value: `问题：${text}\n选择：${label}`,
         question: text,
-        waitForInput: /有.*补充|补充说明|我补充/.test(label) && !/没有补充|暂时没有/.test(label),
+        waitForInput: prepareAction === 'request_supplement',
+        prepareAction,
       }
     })
     .filter(Boolean)
 }
 
-export function buildClarificationQuickActions(questions) {
+export function buildClarificationQuickActions(questions, { prepareStage = '' } = {}) {
   return (questions || [])
-    .flatMap((question) => extractClarificationQuestionOptions(question))
+    .flatMap((question) => extractClarificationQuestionOptions(question, { prepareStage }))
     .slice(0, 8)
 }
 

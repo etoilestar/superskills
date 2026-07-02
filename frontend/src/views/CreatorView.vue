@@ -198,6 +198,7 @@ const showInternalBlueprint = ref(false)
 const skillName = ref('')
 const selectedExistingSkillName = ref('')
 const pendingSupplementQuestion = ref('')
+const pendingPrepareAction = ref('none')
 const reviewSummaryStage = ref('')
 const reviewSummaryTitle = computed(() => {
   if (creationPlan.value) return '创建要点'
@@ -242,12 +243,11 @@ async function handleQuickAction(value) {
   if (!action.value || streaming.value) return
   // Clear previous quick actions
   quickActions.value = []
-  if (action.waitForInput) {
-    input.value = ''
+  pendingPrepareAction.value = action.prepareAction || 'none'
+  if (action.prepareAction === 'request_supplement') {
+    input.value = action.value
+    await send()
     pendingSupplementQuestion.value = action.value
-    messages.value.push({ role: 'user', content: action.value })
-    messages.value.push({ role: 'assistant', content: '好的，请补充你的其他要求。' })
-    await scrollBottom()
     return
   }
   // Send the value as user input
@@ -266,7 +266,9 @@ async function send() {
   if (pendingSupplementQuestion.value) {
     text = `${pendingSupplementQuestion.value}\n补充：${text}`
     pendingSupplementQuestion.value = ''
+    pendingPrepareAction.value = 'submit_supplement'
   }
+  const currentPrepareAction = pendingPrepareAction.value || 'none'
 
   error.value = ''
   quickActions.value = []
@@ -294,10 +296,16 @@ async function send() {
       conversation_history: chatHistory.value,
       previous_blueprint_text: previousBlueprintText,
       human_feedback: humanFeedback,
+      prepare_action: currentPrepareAction,
       uploaded_files: collectUploadedFileMetadata(),
       model: null,
     }
     const plan = await prepareCreationPlan(payload)
+    if (currentPrepareAction === 'request_supplement') {
+      pendingSupplementQuestion.value = text
+    } else if (currentPrepareAction === 'confirm' || currentPrepareAction === 'submit_supplement') {
+      pendingPrepareAction.value = 'none'
+    }
     const summary = plan.review_summary || null
     const question = (plan.clarifying_questions || [])[0]
     const hasSummaryContent = summary && (summary.goal || summary.input || summary.output || summary.workflow?.length || summary.files_to_create_or_update?.length || summary.assets_to_upload?.length || summary.changes?.length)
@@ -315,7 +323,7 @@ async function send() {
 
 ${question || '请补充当前最阻塞创建计划的信息。'}`,
       })
-      quickActions.value = buildClarificationQuickActions(question ? [question] : [])
+      quickActions.value = buildClarificationQuickActions(question ? [question] : [], { prepareStage: stage })
       return
     }
 
@@ -327,6 +335,16 @@ ${question || '请补充当前最阻塞创建计划的信息。'}`,
 
 ${blockers.map((b, i) => `${i + 1}. ${typeof b === 'string' ? b : (b.message || JSON.stringify(b))}`).join('\n')}`,
       })
+      return
+    }
+
+    if (plan.status === 'ready' && currentPrepareAction !== 'confirm') {
+      console.warn('[Creator] blocked ready prepare-plan response without explicit confirm action', { prepareAction: currentPrepareAction })
+      messages.value.push({
+        role: 'assistant',
+        content: '系统已整理出创建要点，请先确认是否按这些要点继续。',
+      })
+      quickActions.value = buildClarificationQuickActions([question || '以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明'], { prepareStage: plan.prepare_stage || '' })
       return
     }
 
