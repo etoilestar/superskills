@@ -7,6 +7,24 @@
 
 
 
+function isPrepareGateQuestion(question) {
+  const text = String(question || '')
+  return /创建要点|按这些要点继续|是否还需要补充|继续补充/.test(text)
+}
+
+function inferPrepareActionFromOptionLabel(label, question) {
+  if (!isPrepareGateQuestion(question)) return 'none'
+
+  const text = String(label || '')
+  if (/^(A|Ａ)[\.\)、]|没有|无|暂时没有|沒有|按这些要点继续|按推荐方式继续/.test(text) && !/继续补充|我补充/.test(text)) {
+    return 'confirm'
+  }
+  if (/补充|我补充|继续补充/.test(text) && !/没有补充|暂时没有/.test(text)) {
+    return 'request_supplement'
+  }
+  return 'none'
+}
+
 export function extractClarificationQuestionOptions(question) {
   const text = String(question || '')
   const optionPattern = /(?:^|[\s？?])([A-D])[\.\)、]\s*([\s\S]*?)(?=(?:\s+[A-D][\.\)、]\s*)|$)/g
@@ -14,11 +32,13 @@ export function extractClarificationQuestionOptions(question) {
     .map((match) => {
       const label = `${match[1]}. ${String(match[2] || '').trim()}`.trim()
       if (label.length <= 3) return null
+      const prepareAction = inferPrepareActionFromOptionLabel(label, text)
       return {
         text: label,
         value: `问题：${text}\n选择：${label}`,
         question: text,
-        waitForInput: /有.*补充|补充说明|我补充/.test(label) && !/没有补充|暂时没有/.test(label),
+        waitForInput: prepareAction === 'request_supplement',
+        prepareAction,
       }
     })
     .filter(Boolean)
