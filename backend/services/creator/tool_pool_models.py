@@ -32,6 +32,14 @@ class ToolPoolGateEvent(BaseModel):
     decision: GateDecision
     tool_id: str
     target_file: str
+    # intent_id and slot_id link this gate event back to the ToolSlot/ToolIntent
+    # that triggered the candidate request.  Empty when triggered outside a
+    # structured ToolSlot flow (e.g. legacy capability recall).
+    intent_id: str = ''
+    slot_id: str = ''
+    candidate_tool_id: str = ''
+    score: float = 0.0
+    matched_features: list[str] = Field(default_factory=list)
     allowed_helper_imports: list[str] = Field(default_factory=list)
     allowed_import_paths: list[str] = Field(default_factory=list)
     allowed_function_imports: list[str] = Field(default_factory=list)

@@ -389,6 +389,12 @@ def _tool_slots_for_requirements(contract: CanonicalFileContract, manifests: lis
 
 _EMBEDDING_INDEX_CACHE: tuple[tuple[str, ...], list[tuple[str, list[float]]]] | None = None
 
+# Module-level cache for the local BGE model to avoid repeated disk loads.
+_LOCAL_EMBEDDING_MODEL: "Any | None" = None
+_LOCAL_EMBEDDING_MODEL_TRIED: bool = False
+
+_LOCAL_MODEL_PATH = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "bge-large-zh-v1.5")
+
 
 def _tool_card_text(cap: ToolCapability, manifest: CallableToolManifest) -> str:
     return "\n".join([
@@ -402,9 +408,8 @@ def _tool_card_text(cap: ToolCapability, manifest: CallableToolManifest) -> str:
     ])
 
 
-def _embed_texts(texts: list[str]) -> list[list[float]]:
-    if not texts:
-        return []
+def _embed_texts_remote(texts: list[str]) -> list[list[float]]:
+    """Call remote embedding endpoint.  Raises on any failure."""
     model = settings.embedding_model or ""
     if not model:
         raise RuntimeError("EMBEDDING_MODEL is not configured")
@@ -412,7 +417,7 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     headers = {"Content-Type": "application/json"}
     key = settings.openai_api_key or settings.llm_api_key
     if key:
-        headers["Authorization"] = f"Bearer {key}"
+        headers["Authorization"] = f"******"
     with httpx.Client(timeout=10.0) as client:
         response = client.post(url, headers=headers, json={"model": model, "input": texts})
         response.raise_for_status()
@@ -420,8 +425,62 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     return [list(map(float, item.get("embedding") or [])) for item in data]
 
 
+def _load_local_embedding_model() -> "Any | None":
+    """Try to load the local BGE model from disk.  Returns None on any failure."""
+    global _LOCAL_EMBEDDING_MODEL, _LOCAL_EMBEDDING_MODEL_TRIED
+    if _LOCAL_EMBEDDING_MODEL_TRIED:
+        return _LOCAL_EMBEDDING_MODEL
+    _LOCAL_EMBEDDING_MODEL_TRIED = True
+    import os
+    if not os.path.isdir(_LOCAL_MODEL_PATH):
+        logger.debug("local_embedding_model_not_found path=%s", _LOCAL_MODEL_PATH)
+        return None
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+        _LOCAL_EMBEDDING_MODEL = SentenceTransformer(_LOCAL_MODEL_PATH)
+        logger.info("local_embedding_model_loaded path=%s", _LOCAL_MODEL_PATH)
+    except Exception as exc:
+        logger.warning("local_embedding_model_load_failed path=%s error=%s", _LOCAL_MODEL_PATH, exc)
+        _LOCAL_EMBEDDING_MODEL = None
+    return _LOCAL_EMBEDDING_MODEL
+
+
+def _embed_texts_local(texts: list[str]) -> list[list[float]]:
+    """Embed texts using the local model.  Raises if unavailable."""
+    model = _load_local_embedding_model()
+    if model is None:
+        raise RuntimeError("local embedding model not available")
+    vecs = model.encode(texts, normalize_embeddings=True)
+    return [list(map(float, v)) for v in vecs]
+
+
+def _embed_texts(texts: list[str]) -> list[list[float]]:
+    """Embed texts with remote -> local -> error fallback chain.
+
+    Logs structured events so callers can observe which path was taken:
+    - remote_embedding_success
+    - remote_embedding_failed  + local_embedding_success
+    - remote_embedding_failed  + local_embedding_failed  -> raises
+    """
+    if not texts:
+        return []
+    try:
+        result = _embed_texts_remote(texts)
+        logger.info("remote_embedding_success count=%d", len(texts))
+        return result
+    except Exception as remote_exc:
+        logger.warning("remote_embedding_failed error=%s", remote_exc)
+        try:
+            result = _embed_texts_local(texts)
+            logger.info("local_embedding_success count=%d", len(texts))
+            return result
+        except Exception as local_exc:
+            logger.warning("local_embedding_failed error=%s", local_exc)
+            raise
+
+
 def _embedding_candidate_tool_ids(requirements: list[str], *, top_k: int = 5) -> set[str]:
-    """Return semantic-recall candidates only; failures intentionally fall back to no candidates."""
+    """Return semantic-recall candidates; logs embedding path; falls back to empty on all failures."""
     global _EMBEDDING_INDEX_CACHE
     reqs = [r for r in requirements if r]
     if not reqs:
@@ -444,7 +503,7 @@ def _embedding_candidate_tool_ids(requirements: list[str], *, top_k: int = 5) ->
                 scored.append((_cosine(q, emb), tool_id))
         return {tool_id for _, tool_id in sorted(scored, reverse=True)[:max(1, top_k)]}
     except Exception as exc:
-        logger.warning("Creator tool embedding recall unavailable; falling back to structural matching: %s", exc)
+        logger.warning("lexical_schema_fallback reason=embedding_unavailable error=%s", exc)
         return set()
 
 
