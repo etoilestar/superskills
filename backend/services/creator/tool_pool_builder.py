@@ -1,9 +1,12 @@
 from __future__ import annotations
+import logging
 from typing import Any
 from backend.services.creator_tool_registry import get_tool_capability
 from .tool_pool_models import ToolPoolModel, ToolPoolTool, ToolPoolFileBinding, ToolPoolDeniedRequest, ToolPoolMissingRequest
 from .tool_pool_explorer import explore_tool_pool
 from .tool_pool_gate import gate_tool_request
+
+logger = logging.getLogger(__name__)
 
 CORE_HELPERS = ['strict_json_argv_guard']
 
@@ -16,14 +19,43 @@ def _uniq(values: list[Any]) -> list[Any]:
 def build_tool_pool(*, skill_name: str = '', user_request: str = '', blueprint_text: str = '', file_specs: list[dict[str, Any]] | None = None, uploaded_files: list[dict[str, Any]] | None = None) -> ToolPoolModel:
     pool=ToolPoolModel(skill_name=skill_name)
     bindings: dict[str, ToolPoolFileBinding] = {}
+
+    # Log tool_intent_extracted for each scripts/** file spec so the audit trail
+    # shows that intents were derived from the SkillPlan, not hard-coded routes.
     for spec in file_specs or []:
         target=str(spec.get('path') or spec.get('target_file') or '')
         if target.startswith('scripts/'):
+            slots = spec.get('required_tool_slots') or []
+            intents = [
+                s.get('functional_requirement') or s.get('slot_id') or ''
+                if isinstance(s, dict) else str(s)
+                for s in slots
+            ]
+            logger.info(
+                "tool_intent_extracted target_file=%s slot_count=%d intents=%s",
+                target, len(slots), intents,
+            )
             bindings[target]=ToolPoolFileBinding(target_file=target, allowed_tool_ids=['script_argv_guard'], primary_tool_ids=['script_argv_guard'], allowed_helper_imports=list(CORE_HELPERS), input_schema=spec.get('inputs') if isinstance(spec.get('inputs'), dict) else {}, output_schema=spec.get('outputs') if isinstance(spec.get('outputs'), dict) else {})
+
     exploration=explore_tool_pool(user_request=user_request, blueprint_text=blueprint_text, file_specs=file_specs, uploaded_files=uploaded_files)
     pool.exploration_candidates = list(getattr(exploration, 'scored_candidates', []) or [])
     pool.scored_candidates = list(getattr(exploration, 'scored_candidates', []) or [])
     pool.uploaded_file_triggers = list(getattr(exploration, 'uploaded_file_triggers', []) or [])
+
+    # Log registry_semantic_recall summary
+    logger.info(
+        "registry_semantic_recall candidate_count=%d reason=%s",
+        len(exploration.candidate_tool_requests), exploration.reason or '',
+    )
+
+    # Log candidate_scored for each scored candidate
+    for row in (exploration.scored_candidates or []):
+        logger.info(
+            "candidate_scored tool_id=%s target_file=%s score=%.1f features=%s",
+            row.get('tool_id'), row.get('target_file'), row.get('score', 0.0),
+            (row.get('matched_features') or [])[:4],
+        )
+
     grouped: dict[tuple[str,str], list[Any]] = {}
     for req in exploration.candidate_tool_requests:
         grouped.setdefault((req.target_file, req.requested_capability or req.candidate_tool_id), []).append(req)
@@ -56,5 +88,15 @@ def build_tool_pool(*, skill_name: str = '', user_request: str = '', blueprint_t
                 pool.missing_requests.append(ToolPoolMissingRequest(target_file=req.target_file, tool_id=event.tool_id, missing_env=event.missing_env, missing_dependencies=event.missing_dependencies, reason='; '.join(event.messages)))
             else:
                 pool.denied_requests.append(ToolPoolDeniedRequest(target_file=req.target_file, tool_id=event.tool_id, helper_imports=event.denied_helper_imports, reason=event.decision, messages=event.messages, suggested_replacements=event.suggested_replacements))
+
     pool.file_bindings=list(bindings.values())
+
+    # Log file_binding_created for each scripts/** binding
+    for fb in pool.file_bindings:
+        if fb.target_file.startswith('scripts/'):
+            logger.info(
+                "file_binding_created target_file=%s allowed_tools=%s allowed_helpers=%s",
+                fb.target_file, fb.allowed_tool_ids, fb.allowed_helper_imports,
+            )
+
     return pool

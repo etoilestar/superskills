@@ -10,21 +10,21 @@
         },
         "auth_header_name": "${ENV:TOOLCFG_TOOL_AUTH_HEADER}",
         "auth_placement": "header",
-        "auth_query_param": "${ENV:TOOLCFG_TOOL_AUTH_QUERY_PARAM}",
+        "auth_query_param": "${ENV:TOOLCFG_TOOL_AUTH_QUER***_PARAM}",
         "auth_type": "api_key",
         "base_url": "${ENV:TOOLCFG_TOOL_BASE_URL}",
         "headers_template": {
-          "Content-Type": "application/json"
+          "Content-Type": "appli***ion/json"
         },
         "headers_template_env": "TOOLCFG_TOOL_HEADERS_TEMPLATE_JSON",
         "json_body_template": {
           "q": "apple inc"
         },
-        "json_body_template_env": "TOOLCFG_TOOL_BODY_TEMPLATE_JSON",
+        "json_body_template_env": "TOOLCFG_TOOL_BOD***_TEMPLATE_JSON",
         "method": "${ENV:TOOLCFG_TOOL_METHOD}",
-        "original_secret_env": "SERPER_API_KEY",
+        "original_secret_env": "SERPER_API_KE***",
         "platform_env_prefix": "TOOLCFG_TOOL",
-        "query_template_env": "TOOLCFG_TOOL_QUERY_TEMPLATE_JSON",
+        "query_template_env": "TOOLCFG_TOOL_QUER***_TEMPLATE_JSON",
         "secret_env": "TOOLCFG_TOOL_SECRET"
       },
       "config_refs": {
@@ -69,30 +69,13 @@
     },
     "default": {
       "auth_override": {},
-      "config": {
-        "auth_header_name": "X-API-KEY",
-        "auth_placement": "header",
-        "auth_query_param": "api_key",
-        "auth_type": "none",
-        "method": "GET",
-        "query_template": {
-          "extract_strategy": "auto",
-          "output_format": "text",
-          "timeout": 15,
-          "url": "https://example.com"
-        }
-      },
+      "config": {},
       "config_refs": {},
       "configured_env": [],
       "configured_secrets": [],
-      "sample_input": {
-        "extract_strategy": "auto",
-        "output_format": "text",
-        "timeout": 15,
-        "url": "https://example.com"
-      },
-      "tool_name": "web_content_scraper",
-      "updated_at": "2026-06-16T10:00:59.737128+00:00"
+      "sample_input": {},
+      "tool_name": "custom_tool",
+      "updated_at": "2026-07-04T02:23:28.657241+00:00"
     },
     "https_google_serper_dev_search": {
       "config": {
@@ -104,21 +87,21 @@
         },
         "auth_header_name": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_HEADER}",
         "auth_placement": "header",
-        "auth_query_param": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_QUERY_PARAM}",
+        "auth_query_param": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_QUER***_PARAM}",
         "auth_type": "api_key",
         "base_url": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BASE_URL}",
         "headers_template": {
-          "Content-Type": "application/json"
+          "Content-Type": "appli***ion/json"
         },
         "headers_template_env": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_HEADERS_TEMPLATE_JSON",
         "json_body_template": {
           "q": "apple inc"
         },
-        "json_body_template_env": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BODY_TEMPLATE_JSON",
+        "json_body_template_env": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BOD***_TEMPLATE_JSON",
         "method": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_METHOD}",
-        "original_secret_env": "SERPER_API_KEY",
+        "original_secret_env": "SERPER_API_KE***",
         "platform_env_prefix": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH",
-        "query_template_env": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_QUERY_TEMPLATE_JSON",
+        "query_template_env": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_QUER***_TEMPLATE_JSON",
         "secret_env": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_SECRET"
       },
       "config_refs": {
@@ -169,7 +152,7 @@
         "updated_at": ""
       },
       "config": {
-        "auth_header_name": "X-API-KEY",
+        "auth_header_name": "X-API-KE***",
         "auth_placement": "header",
         "auth_query_param": "api_key",
         "auth_type": "none",
@@ -179,7 +162,7 @@
           "output_md_file": "output/result.md",
           "pdf_file": "backend/samples/sample.pdf",
           "task_type": "pdf_to_md",
-          "user_id": "user123"
+          "user_id": "user***2***"
         }
       },
       "config_refs": {},
@@ -203,7 +186,7 @@
         "updated_at": ""
       },
       "config": {
-        "auth_header_name": "X-API-KEY",
+        "auth_header_name": "X-API-KE***",
         "auth_placement": "header",
         "auth_query_param": "api_key",
         "auth_type": "none",
@@ -213,7 +196,7 @@
           "output_format": "markdown",
           "pdf_path": "backend/samples/sample.pdf",
           "task_type": "pdf_extraction",
-          "user_id": "user123"
+          "user_id": "user***2***"
         }
       },
       "config_refs": {},
@@ -237,7 +220,7 @@
         "updated_at": ""
       },
       "config": {
-        "auth_header_name": "X-API-KEY",
+        "auth_header_name": "X-API-KE***",
         "auth_placement": "header",
         "auth_query_param": "api_key",
         "auth_type": "none",
@@ -247,7 +230,7 @@
           "output_md_path": "output/result.md",
           "pdf_path": "backend/samples/sample.pdf",
           "task_type": "pdf_to_md",
-          "user_id": "user123"
+          "user_id": "user***2***"
         }
       },
       "config_refs": {},
@@ -273,21 +256,21 @@
         },
         "auth_header_name": "${ENV:TOOLCFG_SEARCH_AUTH_HEADER}",
         "auth_placement": "header",
-        "auth_query_param": "${ENV:TOOLCFG_SEARCH_AUTH_QUERY_PARAM}",
+        "auth_query_param": "${ENV:TOOLCFG_SEARCH_AUTH_QUER***_PARAM}",
         "auth_type": "api_key",
         "base_url": "${ENV:TOOLCFG_SEARCH_BASE_URL}",
         "headers_template": {
-          "Content-Type": "application/json"
+          "Content-Type": "appli***ion/json"
         },
         "headers_template_env": "TOOLCFG_SEARCH_HEADERS_TEMPLATE_JSON",
         "json_body_template": {
           "q": "apple inc"
         },
-        "json_body_template_env": "TOOLCFG_SEARCH_BODY_TEMPLATE_JSON",
+        "json_body_template_env": "TOOLCFG_SEARCH_BOD***_TEMPLATE_JSON",
         "method": "${ENV:TOOLCFG_SEARCH_METHOD}",
-        "original_secret_env": "SEARCH_API_KEY",
+        "original_secret_env": "SEARCH_API_KE***",
         "platform_env_prefix": "TOOLCFG_SEARCH",
-        "query_template_env": "TOOLCFG_SEARCH_QUERY_TEMPLATE_JSON",
+        "query_template_env": "TOOLCFG_SEARCH_QUER***_TEMPLATE_JSON",
         "secret_env": "TOOLCFG_SEARCH_SECRET"
       },
       "config_refs": {
@@ -340,7 +323,7 @@
         "updated_at": ""
       },
       "config": {
-        "auth_header_name": "X-API-KEY",
+        "auth_header_name": "X-API-KE***",
         "auth_placement": "header",
         "auth_query_param": "api_key",
         "auth_type": "none",
@@ -362,6 +345,22 @@
       "tool_name": "serper_search",
       "updated_at": "2026-06-17T06:27:59.351335+00:00"
     },
+    "serper_auth": {
+      "auth_override": {},
+      "config": {},
+      "config_refs": {
+        "SERPER_API_KEY": "env:SERPER_API_KEY"
+      },
+      "configured_env": [
+        "SERPER_API_KEY"
+      ],
+      "configured_secrets": [
+        "SERPER_API_KEY"
+      ],
+      "sample_input": {},
+      "tool_name": "serper_search",
+      "updated_at": "2026-07-04T02:23:28.820941+00:00"
+    },
     "svm": {
       "auth_override": {
         "mode": "auto",
@@ -370,7 +369,7 @@
         "updated_at": ""
       },
       "config": {
-        "auth_header_name": "X-API-KEY",
+        "auth_header_name": "X-API-KE***",
         "auth_placement": "header",
         "auth_query_param": "api_key",
         "auth_type": "none",
@@ -476,18 +475,18 @@
         },
         "auth_header_name": "${ENV:TOOLCFG_TRUE_AUTH_HEADER}",
         "auth_placement": "header",
-        "auth_query_param": "${ENV:TOOLCFG_TRUE_AUTH_QUERY_PARAM}",
+        "auth_query_param": "${ENV:TOOLCFG_TRUE_AUTH_QUER***_PARAM}",
         "auth_type": "api_key",
         "base_url": "${ENV:TOOLCFG_TRUE_BASE_URL}",
         "headers_template_env": "TOOLCFG_TRUE_HEADERS_TEMPLATE_JSON",
-        "json_body_template_env": "TOOLCFG_TRUE_BODY_TEMPLATE_JSON",
+        "json_body_template_env": "TOOLCFG_TRUE_BOD***_TEMPLATE_JSON",
         "method": "${ENV:TOOLCFG_TRUE_METHOD}",
-        "original_secret_env": "SERPER_API_KEY",
+        "original_secret_env": "SERPER_API_KE***",
         "platform_env_prefix": "TOOLCFG_TRUE",
         "query_template": {
           "q": "apple inc"
         },
-        "query_template_env": "TOOLCFG_TRUE_QUERY_TEMPLATE_JSON",
+        "query_template_env": "TOOLCFG_TRUE_QUER***_TEMPLATE_JSON",
         "secret_env": "TOOLCFG_TRUE_SECRET"
       },
       "config_refs": {
@@ -530,6 +529,22 @@
       "tool_name": "True",
       "updated_at": "2026-06-13T11:38:44.313149+00:00"
     },
+    "weather": {
+      "auth_override": {},
+      "config": {},
+      "config_refs": {
+        "WEATHER_API_KEY": "env:WEATHER_API_KEY"
+      },
+      "configured_env": [
+        "WEATHER_API_KEY"
+      ],
+      "configured_secrets": [
+        "WEATHER_API_KEY"
+      ],
+      "sample_input": {},
+      "tool_name": "weather_lookup",
+      "updated_at": "2026-07-04T02:23:28.890396+00:00"
+    },
     "web": {
       "config": {
         "auth": {
@@ -540,21 +555,21 @@
         },
         "auth_header_name": "${ENV:TOOLCFG_WEB_AUTH_HEADER}",
         "auth_placement": "header",
-        "auth_query_param": "${ENV:TOOLCFG_WEB_AUTH_QUERY_PARAM}",
+        "auth_query_param": "${ENV:TOOLCFG_WEB_AUTH_QUER***_PARAM}",
         "auth_type": "api_key",
         "base_url": "${ENV:TOOLCFG_WEB_BASE_URL}",
         "headers_template": {
-          "Content-Type": "application/json"
+          "Content-Type": "appli***ion/json"
         },
         "headers_template_env": "TOOLCFG_WEB_HEADERS_TEMPLATE_JSON",
         "json_body_template": {
           "q": "apple inc"
         },
-        "json_body_template_env": "TOOLCFG_WEB_BODY_TEMPLATE_JSON",
+        "json_body_template_env": "TOOLCFG_WEB_BOD***_TEMPLATE_JSON",
         "method": "${ENV:TOOLCFG_WEB_METHOD}",
-        "original_secret_env": "SERPER_API_KEY",
+        "original_secret_env": "SERPER_API_KE***",
         "platform_env_prefix": "TOOLCFG_WEB",
-        "query_template_env": "TOOLCFG_WEB_QUERY_TEMPLATE_JSON",
+        "query_template_env": "TOOLCFG_WEB_QUER***_TEMPLATE_JSON",
         "secret_env": "TOOLCFG_WEB_SECRET"
       },
       "config_refs": {
@@ -598,6 +613,6 @@
       "updated_at": "2026-06-13T15:39:05.150623+00:00"
     }
   },
-  "updated_at": "2026-07-01T06:39:16.799127+00:00",
+  "updated_at": "2026-07-04T02:23:28.895046+00:00",
   "version": 1
 }

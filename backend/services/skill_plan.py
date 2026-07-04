@@ -160,11 +160,25 @@ class RoleClassification:
 
 @dataclass(frozen=True)
 class ToolSlot:
-    """Structured interface need resolved after blueprint normalization."""
+    """Structured interface need for one capability, resolved after blueprint normalization.
+
+    Key design constraints:
+    - ``tool_id`` starts empty and is filled only by resolver/gate; the blueprint
+      model must never hard-write a concrete tool_id here.
+    - ``functional_requirement`` is an abstract capability description used as the
+      semantic query for registry recall.
+    - ``constraints`` declares runtime safety requirements (read_only, network, etc.)
+      that must be compatible with every candidate tool.
+    - ``required`` indicates whether this slot must be satisfied before code generation
+      proceeds; optional slots may fall back to local implementation.
+    """
 
     slot_id: str
     functional_requirement: str = ""
+    # tool_id is intentionally empty at blueprint time; resolver/gate fills it.
     tool_id: str = ""
+    required: bool = True
+    constraints: dict[str, object] = field(default_factory=dict)
     call_template: dict[str, object] = field(default_factory=dict)
     input_construction: dict[str, object] = field(default_factory=dict)
     output_consumption: dict[str, object] = field(default_factory=dict)
@@ -215,9 +229,15 @@ class ScriptRuntimeSpec:
 class SkillPlanEntry:
     """Normalized contract for one file that Creator will generate.
 
-    ``role`` is retained as a component hint for prompts/UI/backwards
-    compatibility. Hard execution semantics are carried by file_kind, I/O, tool
-    slots, runtime_contract, and artifact_contract.
+    ``role`` is a component_hint for prompts/UI/backwards compatibility only.
+    It must NOT be used as a hard tool-selection condition.  Hard execution
+    semantics are carried by file_kind, I/O, required_tool_slots,
+    runtime_contract, and artifact_contract.
+
+    ``required_capabilities`` is a legacy natural-language hint only.  It may
+    seed the initial semantic query for tool recall, but must never be used as
+    the final tool-binding contract.  Concrete tool binding comes exclusively
+    from the resolver/gate pipeline operating on required_tool_slots.
     """
 
     path: str
@@ -230,6 +250,7 @@ class SkillPlanEntry:
     outputs: list[str] = field(default_factory=list)
     default_values: dict[str, object] = field(default_factory=dict)
     dependencies: list[str] = field(default_factory=list)
+    # Legacy natural-language hint only; do not use as final tool-binding contract.
     required_capabilities: list[str] = field(default_factory=list)
     raw_capability_hints: list[str] = field(default_factory=list)
     optional_capabilities: list[str] = field(default_factory=list)

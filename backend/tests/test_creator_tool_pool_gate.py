@@ -25,5 +25,9 @@ def test_gate_rejects_reference_runtime_tool():
 
 
 def test_gate_role_mismatch_for_custom_tool():
+    # gate must NOT reject a valid scripts/** tool just because file_role is an
+    # unknown/non-matching component_hint (e.g. 'image_generator').
+    # Role is only a logging hint; the allow/deny decision must be driven by
+    # tool availability, helper exports, and path policy alone.
     event = gate_tool_request({'target_file': 'scripts/a.py', 'candidate_tool_id': 'pdf_to_md_mineru'}, file_role='image_generator')
-    assert event.decision == 'role_mismatch'
+    assert event.decision == 'allow'

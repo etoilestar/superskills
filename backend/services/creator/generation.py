@@ -503,8 +503,11 @@ def _script_generation_skeleton(
         "        raise ValueError('missing JSON argv')\n"
         "    payload = json.loads(sys.argv[1])\n"
         "    return strict_json_argv_guard(payload, {\n"
-        "        # Replace input_text with args actually used by run(args). Use {} for true no-input scripts.\n"
-        "        'input_text': {'type': str, 'required': True},\n"
+        "        # Fill spec with the actual argv keys used by run(args).\n"
+        "        # Use {} for true no-input scripts.\n"
+        "        # Key names must match the business fields declared in the SkillPlan\n"
+        "        # (e.g. input_file, topic, query) -- never use runtime placeholder names\n"
+        "        # such as __RUNTIME_INPUT_FILE__ as spec keys.\n"
         "    })\n\n"
         "def run(args: dict) -> dict:\n"
         "    # TODO: implement the canonical contract using selected tools or real local logic.\n"
@@ -942,7 +945,7 @@ def _build_script_generate_file_prompt_variant(
         "script 可以有 optional/default/config 参数；这些参数不需要来自平台 IO，也不需要出现在 recommended_inputs。required 参数必须能由 SKILL.md command 提供非空值；optional/default 参数应在 guard spec 或 run/main 默认逻辑中自洽。",
         "硬性 argv guard 规则：strict_json_argv_guard 必须在核心逻辑前 fail-fast 校验 unknown/missing/empty/type；参数错误时不得输出成功 JSON。",
         "硬性 argv guard 规则：run() 只能使用 strict_json_argv_guard 返回的 args；run() 不得重新 json.loads(sys.argv[1])，不得直接使用未校验 payload。",
-        "硬性 argv guard 规则：骨架 spec 中的 input_text 只是示例，必须替换为 run(args) 实际读取的参数；禁止保留 input_text/example/TODO/ellipsis 占位 spec；确实无输入时也必须调用 strict_json_argv_guard(payload, {})。",
+        "硬性 argv guard 规则：strict_json_argv_guard spec 必须由 run(args) 实际读取的业务 argv key 决定；禁止在 spec 中保留 input_text、example、TODO、ellipsis 等占位 key；确实无输入时也必须调用 strict_json_argv_guard(payload, {})。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
         "必须读取输入并输出符合 stdout_schema.required 的非空字段；不要通过 error 字段、{}、空文件或空路径绕过运行和产物校验。",
         "只根据轻量上下文实现：script_goal、inputs、outputs、coverage_requirements、available_tools、tool_function_cards、tool_snippets、tool_snippet_prompt、resource_refs、output_contract、runtime_envelope、rules。",

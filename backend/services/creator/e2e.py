@@ -3271,12 +3271,18 @@ def _run_skill_workflow_e2e_once(
                                 "target_file": command.script_path,
                                 "import_guard_result": import_guard_result.model_dump(mode="json"),
                             })
+                        # Unbound helper imports must be treated as a pre-E2E tool-binding
+                        # error.  E2E is not allowed to add new tools or explore the tool
+                        # pool; the failure is surfaced so the caller can re-run the
+                        # pre-generation resolver/gate phase.
                         raise ValueError(_e2e_error(
                             target=command.script_path,
-                            layer="runtime_import_guard",
+                            layer="pre_e2e_tool_binding_error",
                             message=(
-                                f"第 {command.ordinal} 步 {command.script_path} runtime_import_guard 失败，已跳过脚本执行："
-                                f"{json.dumps(import_guard_result.model_dump(mode='json'), ensure_ascii=False, default=str)}"
+                                f"第 {command.ordinal} 步 {command.script_path} "
+                                "runtime_import_guard 失败：脚本导入了未经 gate 授权的 helper，"
+                                "E2E 阶段不允许补充工具，请重新走 resolver/gate 阶段。"
+                                f" detail={json.dumps(import_guard_result.model_dump(mode='json'), ensure_ascii=False, default=str)}"
                             ),
                         ))
 
