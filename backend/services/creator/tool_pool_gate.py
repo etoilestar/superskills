@@ -282,8 +282,8 @@ def gate_tool_request(
     )
     logger.info(
         "gate_decision tool_id=%s target_file=%s decision=%s role_hint=%s intent_id=%s slot_id=%s "
-        "allowed_helpers=%s missing_env=%s missing_deps=%s",
+        "allowed_helpers=%s missing_env_count=%d missing_deps=%s",
         evt.tool_id, evt.target_file, evt.decision, _role_hint, intent_id, slot_id,
-        helper_imports, missing_env, missing_deps,
+        helper_imports, len(missing_env), missing_deps,
     )
     return evt
