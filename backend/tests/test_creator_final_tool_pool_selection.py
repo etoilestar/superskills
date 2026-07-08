@@ -78,3 +78,57 @@ def test_embedding_recall_keeps_exact_match_plus_top_k_union_contract():
     assert "exact Registry capability matches" in source
     assert "UNION" in source
     assert "per-query embedding top-k" in source
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_final_tool_selector_runs_one_convergence_revision(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(api, "_recall_creator_tool_candidates", lambda file_specs, top_k: ([{"tool_id":"callable_alpha","functions":[{"function_name":"run","import_path":"x"}]}], "test"))
+    monkeypatch.setattr(api, "_apply_planner_tool_pool_patch", lambda **kwargs: {"patch_present": True})
+
+    async def fake_json(**kwargs):
+        calls.append(kwargs)
+        if kwargs["phase"] == "final_tool_selection":
+            return {"decisions":{"callable_alpha": False}}
+        return {"decisions":{"callable_alpha": True}}
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_json)
+    result = await api._plan_final_tool_pool(skill_name="demo", file_specs=[{"path":"scripts/a.py","required":True}], responsibility_graph={"dataflow_edges":[],"items":[{}]})
+    assert [call["phase"] for call in calls] == ["final_tool_selection", "final_tool_selection_convergence"]
+    assert calls[1]["messages"][1]["content"].find('"draft_decisions"') >= 0
+    assert result["desired_tool_ids"] == ["callable_alpha"]
+
+
+@pytest.mark.asyncio
+async def test_tool_selector_convergence_replaces_draft_decisions(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(api, "_recall_creator_tool_candidates", lambda file_specs, top_k: ([{"tool_id":"callable_alpha","functions":[{"function_name":"run","import_path":"x"}]},{"tool_id":"callable_beta","functions":[{"function_name":"run","import_path":"x"}]}], "test"))
+    monkeypatch.setattr(api, "_apply_planner_tool_pool_patch", lambda **kwargs: {"patch_present": True})
+
+    async def fake_json(**kwargs):
+        if kwargs["phase"] == "final_tool_selection":
+            return {"decisions":{"callable_alpha": False, "callable_beta": True}}
+        return {"decisions":{"callable_alpha": True, "callable_beta": True}}
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_json)
+    result = await api._plan_final_tool_pool(skill_name="demo", file_specs=[{"path":"scripts/a.py","required":True}])
+    assert result["desired_tool_ids"] == ["callable_alpha", "callable_beta"]
+
+
+@pytest.mark.asyncio
+async def test_tool_convergence_cannot_expand_candidate_catalog(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(api, "_recall_creator_tool_candidates", lambda file_specs, top_k: ([{"tool_id":"callable_alpha","functions":[{"function_name":"run","import_path":"x"}]}], "test"))
+    monkeypatch.setattr(api, "_apply_planner_tool_pool_patch", lambda **kwargs: {"patch_present": True})
+
+    async def fake_json(**kwargs):
+        if kwargs["phase"] == "final_tool_selection":
+            return {"decisions":{"callable_alpha": False}}
+        return {"decisions":{"callable_alpha": True, "callable_extra": True}}
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_json)
+    result = await api._plan_final_tool_pool(skill_name="demo", file_specs=[{"path":"scripts/a.py","required":True}])
+    assert result["desired_tool_ids"] == []
