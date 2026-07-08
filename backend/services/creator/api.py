@@ -6461,6 +6461,10 @@ Only output strict JSON object. Do not output Markdown or explanation.
         raise ValueError(
             "Planner convergence ready response must explicitly include responsibility_edges"
         )
+    if data.get("responsibility_edges") is None:
+        raise ValueError(
+            "Planner convergence ready response responsibility_edges must not be null"
+        )
     missing_transport_fields = sorted(
         field
         for field
@@ -6471,6 +6475,26 @@ Only output strict JSON object. Do not output Markdown or explanation.
         raise ValueError(
             "Planner convergence returned incomplete ready response; "
             f"missing fields: {missing_transport_fields}"
+        )
+    invalid_transport_fields = []
+    if not isinstance(data.get("status"), str):
+        invalid_transport_fields.append("status")
+    if not isinstance(data.get("clarifying_questions"), list):
+        invalid_transport_fields.append("clarifying_questions")
+    if not isinstance(data.get("review_summary"), dict):
+        invalid_transport_fields.append("review_summary")
+    if not isinstance(data.get("internal_blueprint_text"), str):
+        invalid_transport_fields.append("internal_blueprint_text")
+    if not isinstance(data.get("skill_name"), str):
+        invalid_transport_fields.append("skill_name")
+    if not isinstance(data.get("blockers"), list):
+        invalid_transport_fields.append("blockers")
+    if not isinstance(data.get("responsibility_edges"), list):
+        invalid_transport_fields.append("responsibility_edges")
+    if invalid_transport_fields:
+        raise ValueError(
+            "Planner convergence returned invalid transport field shapes; "
+            f"invalid fields: {sorted(invalid_transport_fields)}"
         )
     if str(data.get("status") or "") != "ready":
         raise ValueError("Planner convergence must return a complete ready plan")
