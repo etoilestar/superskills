@@ -6448,6 +6448,30 @@ Only output strict JSON object. Do not output Markdown or explanation.
     data.pop("tool_pool_patch", None)
     data.pop("selected_tools", None)
     data.pop("required_tool_slots", None)
+    required_transport_fields = {
+        "status",
+        "clarifying_questions",
+        "review_summary",
+        "internal_blueprint_text",
+        "skill_name",
+        "blockers",
+        "responsibility_edges",
+    }
+    if "responsibility_edges" not in data:
+        raise ValueError(
+            "Planner convergence ready response must explicitly include responsibility_edges"
+        )
+    missing_transport_fields = sorted(
+        field
+        for field
+        in required_transport_fields
+        if field not in data
+    )
+    if missing_transport_fields:
+        raise ValueError(
+            "Planner convergence returned incomplete ready response; "
+            f"missing fields: {missing_transport_fields}"
+        )
     if str(data.get("status") or "") != "ready":
         raise ValueError("Planner convergence must return a complete ready plan")
     normalized_edges = normalize_structured_responsibility_edges(

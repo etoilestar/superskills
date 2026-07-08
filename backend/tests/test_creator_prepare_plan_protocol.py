@@ -855,3 +855,40 @@ def test_planner_and_tool_convergence_do_not_loop():
     assert planner.count("_converge_ready_executable_plan") == 1
     assert "while " not in helper
     assert selector.count("final_tool_selection_convergence") <= 3
+
+
+@pytest.mark.asyncio
+async def test_planner_convergence_missing_responsibility_edges_keeps_draft(monkeypatch):
+    import json
+    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"incomplete","skill_name":"demo","blockers":[]},
+    ]
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result["internal_blueprint_text"] == "draft"
+    assert result["responsibility_edges"] == [draft_edge]
+
+
+@pytest.mark.asyncio
+async def test_planner_convergence_incomplete_transport_fields_keeps_draft(monkeypatch):
+    import json
+    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    revised_edge = {"from_node":"scripts/a.py","from_output":"result_beta","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
+        {"status":"ready","clarifying_questions":[],"internal_blueprint_text":"incomplete","skill_name":"demo","blockers":[],"responsibility_edges":[revised_edge]},
+    ]
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result["internal_blueprint_text"] == "draft"
+    assert result["responsibility_edges"] == [draft_edge]
