@@ -769,3 +769,162 @@ def test_frontend_clear_chat_clears_pending_responsibility_edges():
     source = Path('frontend/src/views/CreatorView.vue').read_text(encoding='utf-8')
     clear_source = source[source.index('function clearChat()'):source.index('</script>')]
     assert 'pendingResponsibilityEdges.value = []' in clear_source
+
+@pytest.mark.asyncio
+async def test_ready_planner_result_runs_one_convergence_revision(monkeypatch):
+    calls = []
+    edge = {"from_node":"scripts/a.py","from_output":"alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        return '{"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[' + __import__('json').dumps(edge) + ']}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    await api._generate_internal_blueprint_or_questions(_request())
+    assert len(calls) == 2
+
+    calls.clear()
+    async def fake_needs(messages, model):
+        calls.append(messages)
+        return '{"status":"needs_clarification","clarifying_questions":["q"],"blockers":[],"responsibility_edges":[]}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_needs)
+    await api._generate_internal_blueprint_or_questions(_request())
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_planner_convergence_replaces_draft_with_complete_revised_plan(monkeypatch):
+    import json
+    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"scripts/b.py","to_input":"result_alpha","purpose":"handoff","constraints":[]}
+    revised_edges = [draft_edge, {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"scripts/c.py","to_input":"result_alpha","purpose":"handoff","constraints":[]}]
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"revised","skill_name":"demo","blockers":[],"responsibility_edges":revised_edges},
+    ]
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result["internal_blueprint_text"] == "revised"
+    assert result["responsibility_edges"] == revised_edges
+
+
+@pytest.mark.asyncio
+async def test_planner_convergence_uses_structured_edges_as_source_of_truth(monkeypatch):
+    import json
+    structured = {"from_node":"scripts/a.py","from_output":"structured_alpha","to_node":"scripts/b.py","to_input":"structured_alpha","purpose":"structured","constraints":[]}
+    legacy_text = '### ResponsibilityEdges [{"from_node":"scripts/wrong.py","from_output":"wrong","to_node":"scripts/b.py","to_input":"wrong","purpose":"markdown","constraints":[]}]'
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[structured]},
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":legacy_text,"skill_name":"demo","blockers":[],"responsibility_edges":[structured]},
+    ]
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result["responsibility_edges"] == [structured]
+
+
+@pytest.mark.asyncio
+async def test_creator_does_not_add_missing_responsibility_edges_itself(monkeypatch):
+    import json
+    edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"scripts/b.py","to_input":"result_alpha","purpose":"handoff","constraints":[]}
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[edge]},
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"unchanged","skill_name":"demo","blockers":[],"responsibility_edges":[edge]},
+    ]
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result["responsibility_edges"] == [edge]
+
+
+def test_planner_and_tool_convergence_do_not_loop():
+    import inspect
+    planner = inspect.getsource(api._generate_internal_blueprint_or_questions)
+    helper = inspect.getsource(api._converge_ready_executable_plan)
+    selector = inspect.getsource(api._plan_final_tool_pool)
+    assert planner.count("_converge_ready_executable_plan") == 1
+    assert "while " not in helper
+    assert selector.count("final_tool_selection_convergence") <= 3
+
+
+@pytest.mark.asyncio
+async def test_planner_convergence_missing_responsibility_edges_keeps_draft(monkeypatch):
+    import json
+    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"incomplete","skill_name":"demo","blockers":[]},
+    ]
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result["internal_blueprint_text"] == "draft"
+    assert result["responsibility_edges"] == [draft_edge]
+
+
+@pytest.mark.asyncio
+async def test_planner_convergence_incomplete_transport_fields_keeps_draft(monkeypatch):
+    import json
+    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    revised_edge = {"from_node":"scripts/a.py","from_output":"result_beta","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
+        {"status":"ready","clarifying_questions":[],"internal_blueprint_text":"incomplete","skill_name":"demo","blockers":[],"responsibility_edges":[revised_edge]},
+    ]
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result["internal_blueprint_text"] == "draft"
+    assert result["responsibility_edges"] == [draft_edge]
+
+
+@pytest.mark.asyncio
+async def test_planner_convergence_null_responsibility_edges_keeps_draft(monkeypatch):
+    import json
+    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"null edges","skill_name":"demo","blockers":[],"responsibility_edges":None},
+    ]
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result["internal_blueprint_text"] == "draft"
+    assert result["responsibility_edges"] == [draft_edge]
+
+
+@pytest.mark.asyncio
+async def test_planner_convergence_invalid_transport_shape_keeps_draft(monkeypatch):
+    import json
+    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
+        {"status":"ready","clarifying_questions":"not-a-list","review_summary":[],"internal_blueprint_text":"bad shape","skill_name":"demo","blockers":{},"responsibility_edges":[]},
+    ]
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result["internal_blueprint_text"] == "draft"
+    assert result["responsibility_edges"] == [draft_edge]

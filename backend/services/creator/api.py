@@ -3665,17 +3665,136 @@ ToolPool is optional candidate pool / whitelist. selected=true does not force a 
                 },
             )
 
+        draft_decisions = {
+            tool_id: raw_decisions.get(tool_id) is True
+            for tool_id
+            in ordered_candidate_tool_ids
+        }
+
+        convergence_prompt = """
+You are the same Creator Final Tool Selector that just emitted these draft ToolPool decisions.
+
+You are revising your own draft ToolPool decisions.
+This is not a Tool Judge, Tool Gate, repair model, or separate semantic authority.
+
+The candidate set is fixed.
+Do not add tools outside candidate_tool_catalog.
+Do not remove candidate ids from the decisions object.
+Do not re-run recall.
+Do not search the Registry.
+Only revise boolean decisions for existing candidate ids.
+
+Replay the connected ResponsibilityGraph using the exact draft decisions.
+
+For each FunctionItem:
+1. Identify the actual actions owned by the FunctionItem.
+2. Identify the outgoing semantic results the FunctionItem must actually produce.
+3. Inspect the selected=true callable tool contracts.
+4. Consider deterministic stdlib implementation where appropriate.
+5. Determine whether the FunctionItem still has reasonable implementation means for every explicit owned action that cannot reasonably be implemented by deterministic local code alone.
+6. If a draft false decision removes all reasonable callable means for such an owned action, revise the decisions.
+7. Do not select unrelated tools merely because they are available.
+8. Do not grant responsibility ownership based on tool availability.
+
+Return only the existing schema: {"decisions": {"tool_id": true_or_false}}.
+No reasons, coverage reports, violations, or explanations.
+""".strip()
+
+        convergence_payload = {
+            "task": "final_tool_selection_convergence",
+            "normalized_script_contracts": script_contracts,
+            "responsibility_graph": responsibility_graph or {},
+            "candidate_tool_catalog": candidate_catalog,
+            "draft_decisions": draft_decisions,
+        }
+
+        final_raw_decisions = raw_decisions
+        try:
+            converged_selector_output = await _complete_creator_json_object_once(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": convergence_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            convergence_payload,
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                    },
+                ],
+                model=route.model,
+                phase="final_tool_selection_convergence",
+                response_schema=response_schema,
+            )
+            converged_decisions = converged_selector_output.get("decisions")
+            if not isinstance(converged_decisions, dict):
+                raise ValueError("Tool convergence response must include decisions object")
+            missing_converged = [
+                tool_id
+                for tool_id
+                in ordered_candidate_tool_ids
+                if tool_id not in converged_decisions
+            ]
+            extra_converged = [
+                str(tool_id)
+                for tool_id
+                in converged_decisions
+                if str(tool_id) not in candidate_tool_ids
+            ]
+            invalid_converged = [
+                tool_id
+                for tool_id, value
+                in converged_decisions.items()
+                if not isinstance(value, bool)
+            ]
+            if missing_converged or extra_converged or invalid_converged:
+                raise ValueError(
+                    "Tool convergence returned invalid decisions: "
+                    f"missing={missing_converged} extra={extra_converged} invalid={invalid_converged}"
+                )
+            selector_output = converged_selector_output
+            final_raw_decisions = converged_decisions
+        except Exception as exc:
+            logger.warning(
+                "[Creator][tool_selection_convergence_failed] skill=%s error=%s",
+                skill_name,
+                f"{type(exc).__name__}: {exc}",
+            )
+
         desired_tool_ids = {
             tool_id
             for tool_id
             in ordered_candidate_tool_ids
-            if (
-                raw_decisions.get(
-                    tool_id
-                )
-                is True
-            )
+            if final_raw_decisions.get(tool_id) is True
         }
+
+        graph_edges_for_log = []
+        graph_items_for_log = []
+        if isinstance(responsibility_graph, dict):
+            graph_edges_for_log = list(responsibility_graph.get("dataflow_edges") or [])
+            graph_items_for_log = list(responsibility_graph.get("requirements") or responsibility_graph.get("items") or [])
+        draft_selected_tool_ids = sorted(
+            tool_id
+            for tool_id, selected
+            in draft_decisions.items()
+            if selected is True
+        )
+        final_selected_tool_ids = sorted(desired_tool_ids)
+        logger.info(
+            "[Creator][final_tool_selection][convergence] %s",
+            json.dumps({
+                "event": "creator_final_tool_selection_convergence",
+                "draft_selected_tool_ids": draft_selected_tool_ids,
+                "final_selected_tool_ids": final_selected_tool_ids,
+                "added_by_convergence": sorted(set(final_selected_tool_ids) - set(draft_selected_tool_ids)),
+                "removed_by_convergence": sorted(set(draft_selected_tool_ids) - set(final_selected_tool_ids)),
+                "function_item_count": len(graph_items_for_log),
+                "edge_count": len(graph_edges_for_log),
+            }, ensure_ascii=False, default=str),
+        )
 
     add_tool_ids = sorted(
         desired_tool_ids
@@ -3840,21 +3959,6 @@ ToolPool is optional candidate pool / whitelist. selected=true does not force a 
         ),
     )
 
-    graph_edges_for_log = []
-    graph_items_for_log = []
-    if isinstance(responsibility_graph, dict):
-        graph_edges_for_log = list(responsibility_graph.get("dataflow_edges") or [])
-        graph_items_for_log = list(responsibility_graph.get("requirements") or responsibility_graph.get("items") or [])
-    logger.info(
-        "[Creator][final_tool_selection][graph_replay] %s",
-        json.dumps({
-            "event": "creator_final_tool_selection_graph_replay",
-            "function_item_count": len(graph_items_for_log),
-            "edge_count": len(graph_edges_for_log),
-            "selected_tool_ids": sorted(desired_tool_ids),
-            "candidate_tool_ids": ordered_candidate_tool_ids,
-        }, ensure_ascii=False, default=str),
-    )
 
     return {
         "planner_output": (
@@ -6223,6 +6327,194 @@ def _blocked_prepare_response(request: PreparePlanRequest, summary: PreparePlanR
     )
 
 
+
+
+def _responsibility_edge_endpoint_pairs(edges: object) -> list[list[object]]:
+    if not isinstance(edges, list):
+        return []
+    pairs: list[list[object]] = []
+    for edge in edges:
+        if isinstance(edge, dict):
+            pairs.append([edge.get("from_node"), edge.get("to_node")])
+    return pairs
+
+
+async def _converge_ready_executable_plan(
+    *,
+    request: PreparePlanRequest,
+    current_planner_result: dict[str, Any],
+    planner_model: str,
+) -> dict[str, Any]:
+    """Run one same-Planner revision over an already-ready executable plan.
+
+    This is still Blueprint Planner work: the same semantic authority revises
+    its own emitted plan once. The backend does not infer missing business
+    semantics and does not apply patches.
+    """
+
+    draft_edges = list(current_planner_result.get("responsibility_edges") or [])
+    logger.info(
+        "[Creator][planner_convergence][draft] %s",
+        json.dumps({
+            "event": "creator_planner_convergence_draft",
+            "skill_name": str(current_planner_result.get("skill_name") or request.skill_name or ""),
+            "draft_edge_count": len(draft_edges),
+            "draft_endpoint_pairs": _responsibility_edge_endpoint_pairs(draft_edges),
+        }, ensure_ascii=False, default=str),
+    )
+
+    prompt = """
+You are the same Blueprint Planner that just emitted this already-ready executable plan.
+
+You are revising your own already-ready executable plan.
+This is not a new planning task.
+This is not a judge, validator, gate, repair model, or separate semantic authority.
+
+Preserve:
+- confirmed user decisions;
+- user goal;
+- required final outputs;
+- confirmed core actions;
+- chosen workflow intent.
+
+Do not add a new business requirement.
+Do not remove a confirmed business requirement.
+Do not simplify the goal to fit tools.
+Do not reconsider tool availability.
+Do not use Tool Registry, ToolPool, candidate tools, or implementation convenience.
+
+Your only task is to make the emitted executable plan internally consistent.
+
+Replay the exact workflow, SkillPlan script responsibilities, and responsibility_edges in the current draft.
+Revise the draft itself before returning.
+
+For each FunctionItem:
+1. What semantic inputs does this FunctionItem declare?
+2. For every cross-responsibility business input, which incoming ResponsibilityEdge provides it?
+3. If a declared input has no upstream producer, determine whether it is truly local/default/config/resource. If not, revise the plan.
+4. What semantic results does this FunctionItem actually produce?
+5. Does every outgoing ResponsibilityEdge transport a result the source FunctionItem actually produces?
+6. Does every downstream FunctionItem receive all upstream business results required for its owned action?
+7. Do platform input edges agree with the plan's declared runtime/user input?
+8. Do platform output edges deliver every required final result?
+9. Do required_capabilities describe the actual actions owned by each FunctionItem?
+10. Are workflow correctness requirements represented in the owning FunctionItem.constraints or relevant ResponsibilityEdge.constraints?
+
+A produced semantic result may have multiple downstream consumers.
+If multiple FunctionItems independently require the same upstream result, the emitted ResponsibilityEdges must represent every required cross-responsibility consumption.
+Do not assume that transporting a result to one consumer implicitly makes it available to other consumers.
+
+Platform input edges must represent a real input dependency of the emitted executable plan.
+Do not create a platform input edge merely because a platform input slot exists.
+If the emitted plan declares that execution requires no business input, do not invent a platform-input dependency.
+If a script uses a default or internal configuration value, do not model that default as a semantic result transported from an unrelated platform input slot.
+
+Do not merely describe a detected inconsistency.
+Revise internal_blueprint_text and responsibility_edges so the returned plan is internally consistent.
+
+Return the complete Planner response with the same schema:
+{
+  "status": "ready",
+  "clarifying_questions": [],
+  "review_summary": {...},
+  "internal_blueprint_text": "...",
+  "skill_name": "...",
+  "blockers": [],
+  "responsibility_edges": [...]
+}
+Only output strict JSON object. Do not output Markdown or explanation.
+""".strip()
+
+    payload = {
+        "task": "prepare_plan_convergence",
+        "current_planner_result": current_planner_result,
+        "platform_io_contract": platform_io_contract_prompt_text(),
+        "confirmed_decision_context": {
+            "conversation_history": request.conversation_history,
+            "human_feedback": request.human_feedback,
+            "previous_blueprint_text": request.previous_blueprint_text,
+            "skill_name": request.skill_name,
+        },
+    }
+
+    text = await complete_chat_once(
+        [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+        ],
+        planner_model,
+    )
+    data = _parse_prepare_plan_json(text)
+    data.pop("tool_pool_patch", None)
+    data.pop("selected_tools", None)
+    data.pop("required_tool_slots", None)
+    required_transport_fields = {
+        "status",
+        "clarifying_questions",
+        "review_summary",
+        "internal_blueprint_text",
+        "skill_name",
+        "blockers",
+        "responsibility_edges",
+    }
+    if "responsibility_edges" not in data:
+        raise ValueError(
+            "Planner convergence ready response must explicitly include responsibility_edges"
+        )
+    if data.get("responsibility_edges") is None:
+        raise ValueError(
+            "Planner convergence ready response responsibility_edges must not be null"
+        )
+    missing_transport_fields = sorted(
+        field
+        for field
+        in required_transport_fields
+        if field not in data
+    )
+    if missing_transport_fields:
+        raise ValueError(
+            "Planner convergence returned incomplete ready response; "
+            f"missing fields: {missing_transport_fields}"
+        )
+    invalid_transport_fields = []
+    if not isinstance(data.get("status"), str):
+        invalid_transport_fields.append("status")
+    if not isinstance(data.get("clarifying_questions"), list):
+        invalid_transport_fields.append("clarifying_questions")
+    if not isinstance(data.get("review_summary"), dict):
+        invalid_transport_fields.append("review_summary")
+    if not isinstance(data.get("internal_blueprint_text"), str):
+        invalid_transport_fields.append("internal_blueprint_text")
+    if not isinstance(data.get("skill_name"), str):
+        invalid_transport_fields.append("skill_name")
+    if not isinstance(data.get("blockers"), list):
+        invalid_transport_fields.append("blockers")
+    if not isinstance(data.get("responsibility_edges"), list):
+        invalid_transport_fields.append("responsibility_edges")
+    if invalid_transport_fields:
+        raise ValueError(
+            "Planner convergence returned invalid transport field shapes; "
+            f"invalid fields: {sorted(invalid_transport_fields)}"
+        )
+    if str(data.get("status") or "") != "ready":
+        raise ValueError("Planner convergence must return a complete ready plan")
+    normalized_edges = normalize_structured_responsibility_edges(
+        data.get("responsibility_edges"),
+        source="planner",
+    )
+    data["responsibility_edges"] = normalized_edges
+    logger.info(
+        "[Creator][planner_convergence][result] %s",
+        json.dumps({
+            "event": "creator_planner_convergence_result",
+            "skill_name": str(data.get("skill_name") or request.skill_name or ""),
+            "final_edge_count": len(normalized_edges),
+            "final_endpoint_pairs": _responsibility_edge_endpoint_pairs(normalized_edges),
+            "constraint_count": sum(len(edge.get("constraints") or []) for edge in normalized_edges),
+        }, ensure_ascii=False, default=str),
+    )
+    return data
+
 async def _generate_internal_blueprint_or_questions(
     request: PreparePlanRequest,
 ) -> dict[str, Any]:
@@ -7163,6 +7455,20 @@ Blueprint Planner 只规划业务责任。
                 "constraint_count": sum(len(edge.get("constraints") or []) for edge in normalized_edges),
             }, ensure_ascii=False, default=str),
         )
+
+    if str(data.get("status") or "") == "ready":
+        try:
+            data = await _converge_ready_executable_plan(
+                request=request,
+                current_planner_result=data,
+                planner_model=route.model,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Creator][planner_convergence_failed] skill=%s error=%s",
+                str(data.get("skill_name") or request.skill_name or ""),
+                f"{type(exc).__name__}: {exc}",
+            )
 
     return data
 
