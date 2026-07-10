@@ -757,6 +757,10 @@ async function send() {
             : []
           return
         }
+        if (event.event === 'file_plan_ready') {
+          currentStatus.value = { message: '文件规划已完成，正在绑定责任图谱…' }
+          return
+        }
         if (event.event === 'graph_resolved') {
           currentStatus.value = { message: '责任图谱已校验' }
           return
