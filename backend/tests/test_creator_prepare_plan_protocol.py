@@ -515,6 +515,219 @@ def test_preflight_missing_skill_plan_message_includes_path():
     assert issue["path"] == "references/test-missing-preflight.md"
     assert "references/test-missing-preflight.md" in issue["message"]
 
+
+def _script_plan_block(path: str) -> str:
+    return (
+        f"- path: `{path}`\n"
+        "  role: generic_script\n"
+        "  inputs: []\n"
+        "  outputs: [result]\n"
+        "  dependencies: []\n"
+        "  required_capabilities: []\n"
+        "  forbidden_capabilities: []\n"
+        "  references: []\n"
+        "  constraints: []"
+    )
+
+
+def _skill_plan_block(extra_blocks: str) -> str:
+    return (
+        "- path: `SKILL.md`\n"
+        "  role: skill_overview\n"
+        "  inputs: []\n"
+        "  outputs: []\n"
+        "  dependencies: []\n"
+        "  required_capabilities: []\n"
+        "  forbidden_capabilities: []\n"
+        "  references: []\n"
+        "  constraints: []\n"
+        f"{extra_blocks}"
+    )
+
+
+def _ready_payload(blueprint: str) -> dict:
+    return {
+        "status": "ready",
+        "clarifying_questions": [],
+        "review_summary": {},
+        "internal_blueprint_text": blueprint,
+        "skill_name": "demo",
+        "blockers": [],
+    }
+
+
+def _function_item(path: str) -> dict:
+    return {
+        "target_file": path,
+        "role": "generic_script",
+        "purpose": f"run {path}",
+        "inputs": [],
+        "outputs": ["result"],
+        "required_capabilities": [],
+        "constraints": [],
+    }
+
+
+def _output_edge(path: str) -> dict:
+    return {
+        "from_node": path,
+        "from_output": "result",
+        "to_node": "platform_output_node",
+        "to_input": "file_outputs",
+        "purpose": "deliver result",
+        "constraints": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_incomplete_binding_target_set_does_not_emit_draft_and_convergence_can_fix(monkeypatch):
+    import json
+
+    blueprint = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py") + "\n" + _script_plan_block("scripts/b.py")))
+    responses = [
+        _ready_payload(blueprint),
+        {
+            "function_items": [_function_item("scripts/a.py")],
+            "responsibility_edges": [_output_edge("scripts/a.py")],
+        },
+        {
+            **_ready_payload("ignored convergence blueprint"),
+            "function_items": [_function_item("scripts/a.py"), _function_item("scripts/b.py")],
+            "responsibility_edges": [_output_edge("scripts/a.py"), _output_edge("scripts/b.py")],
+        },
+    ]
+    events = []
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    async def emit(event):
+        events.append(event)
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request(), event_emitter=emit)
+
+    assert "planner_draft" not in [event["event"] for event in events]
+    assert result["function_items"] == [_function_item("scripts/a.py"), _function_item("scripts/b.py")]
+    assert result["internal_blueprint_text"] != "ignored convergence blueprint"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_binding_target_set_does_not_fallback_when_convergence_fails(monkeypatch):
+    import json
+
+    blueprint = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py") + "\n" + _script_plan_block("scripts/b.py")))
+    responses = [
+        _ready_payload(blueprint),
+        {
+            "function_items": [_function_item("scripts/a.py")],
+            "responsibility_edges": [_output_edge("scripts/a.py")],
+        },
+        {
+            **_ready_payload("ignored bad convergence"),
+            "function_items": [_function_item("scripts/a.py")],
+            "responsibility_edges": [_output_edge("scripts/a.py")],
+        },
+    ]
+    events = []
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    async def emit(event):
+        events.append(event)
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    with pytest.raises(api.PreparePlanProtocolError):
+        await api._generate_internal_blueprint_or_questions(_request(), event_emitter=emit)
+
+    assert "planner_draft" not in [event["event"] for event in events]
+
+
+@pytest.mark.asyncio
+async def test_unexpected_binding_target_does_not_emit_draft_or_fallback(monkeypatch):
+    import json
+
+    blueprint = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py")))
+    responses = [
+        _ready_payload(blueprint),
+        {
+            "function_items": [_function_item("scripts/a.py"), _function_item("scripts/fake.py")],
+            "responsibility_edges": [_output_edge("scripts/a.py"), _output_edge("scripts/fake.py")],
+        },
+        {
+            **_ready_payload("ignored bad convergence"),
+            "function_items": [_function_item("scripts/a.py"), _function_item("scripts/fake.py")],
+            "responsibility_edges": [_output_edge("scripts/a.py"), _output_edge("scripts/fake.py")],
+        },
+    ]
+    events = []
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    async def emit(event):
+        events.append(event)
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    with pytest.raises(api.PreparePlanProtocolError):
+        await api._generate_internal_blueprint_or_questions(_request(), event_emitter=emit)
+
+    assert "planner_draft" not in [event["event"] for event in events]
+
+
+@pytest.mark.asyncio
+async def test_binding_uses_post_repair_file_plan_targets(monkeypatch):
+    import json
+
+    pre_repair_blueprint = _ready_blueprint(
+        _skill_plan_block(
+            "\n"
+            "- path: `scripts/pre_repair.py`\n"
+            "  role: generic_script\n"
+            "  inputs: []\n"
+            "  outputs: [result]\n"
+            "  dependencies: [references/missing.md]\n"
+            "  required_capabilities: []\n"
+            "  forbidden_capabilities: []\n"
+            "  references: []\n"
+            "  constraints: []"
+        )
+    )
+    repaired_blueprint = _ready_blueprint(
+        _skill_plan_block("\n" + _script_plan_block("scripts/repaired.py"))
+    )
+    calls = []
+    responses = [
+        _ready_payload(pre_repair_blueprint),
+        {"internal_blueprint_text": repaired_blueprint},
+        {
+            "function_items": [_function_item("scripts/repaired.py")],
+            "responsibility_edges": [_output_edge("scripts/repaired.py")],
+        },
+        {
+            **_ready_payload("ignored convergence blueprint"),
+            "function_items": [_function_item("scripts/repaired.py")],
+            "responsibility_edges": [_output_edge("scripts/repaired.py")],
+        },
+    ]
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+
+    binding_payload = next(
+        json.loads(call[1]["content"])
+        for call in calls
+        if json.loads(call[1]["content"]).get("task") == "bind_executable_responsibilities"
+    )
+    assert binding_payload["allowed_function_item_targets"] == ["scripts/repaired.py"]
+    assert "scripts/pre_repair.py" not in result["internal_blueprint_text"]
+    assert result["function_items"] == [_function_item("scripts/repaired.py")]
+
 @pytest.mark.asyncio
 async def test_blueprint_planner_prompt_includes_constraints_serialization_contract(monkeypatch):
     captured = []

@@ -268,6 +268,33 @@ def _paths_declared_in_shape(
     }
 
 
+def exact_file_plan_paths_from_strict_skillplan(
+    blueprint_text: str,
+) -> list[str]:
+    """Return exact paths from explicit SkillPlan path blocks only.
+
+    This is a structural extractor for already-strict Creator blueprints. It
+    reads only SkillPlan ``path`` blocks and intentionally does not consult
+    workflow prose, purpose text, capabilities, resource semantics, or any
+    path-ignore heuristics used by later semantic normalization.
+    """
+
+    text = blueprint_text or ""
+    section_match = re.search(
+        r"(?ms)^\s*###\s+SkillPlan / 文件职责计划\s*$"
+        r"(?P<body>.*?)(?=^\s*###\s+|\Z)",
+        text,
+    )
+    section_body = section_match.group("body") if section_match else ""
+
+    paths: list[str] = []
+    for path in _extract_skillplan_blocks(section_body):
+        normalized = str(path or "").strip().replace("\\", "/")
+        if normalized and normalized not in paths:
+            paths.append(normalized)
+    return paths
+
+
 def validate_blueprint_shape_for_creator(
     blueprint_text: str,
 ) -> None:
