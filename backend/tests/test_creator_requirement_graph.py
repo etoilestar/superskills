@@ -1337,42 +1337,80 @@ def test_missing_evidence_is_required_for_blocking_requirement_failure():
 
 
 
-def test_reference_contract_checks_own_semantic_purpose_not_fixed_sections():
+def test_reference_backend_hard_contract_does_not_judge_semantic_purpose_coverage():
     from backend.services.creator.contracts import _check_reference_file_contract
 
-    good = """---
-title: Tone Guide
-description: Brand voice reference
+    content = """---
+title: Operator Notes
+description: Static reference
 ---
-# Voice Notes
+# Operator Notes
 
-## Narrative cues
-- Brand voice should stay concise, warm, and evidence-oriented.
-- Typography examples should distinguish heading, label, and body usage.
-- Use contrast rules and spacing notes when adapting layouts.
+## Procedure
 
-## Review hints
-Confirm that every sample paragraph follows the brand voice and typography constraints.
+Use concise examples for converting source records into normalized destinations.
+Keep each note reusable and independent from any creation-time workflow.
 """
-    good_failed = {r.id for r in _check_reference_file_contract("references/tone.md", good, purpose="brand voice typography constraints") if not r.passed}
-    assert "reference.content.covers_own_semantic_purpose" not in good_failed
+    failed = {r.id for r in _check_reference_file_contract("references/tone.md", content, purpose="specialized transformation guidance") if not r.passed}
+    assert "reference.content.covers_own_semantic_purpose" not in failed
 
-    generic = """---
-title: Generic Guide
-description: Generic reference
+
+def test_reference_backend_hard_contract_accepts_short_nonempty_valid_markdown():
+    from backend.services.creator.contracts import _check_reference_file_contract
+
+    content = """---
+title: Short Guide
+description: Short valid reference
 ---
-# General Notes
+# Short Guide
 
-## Rules
-- Provide useful information.
-- Keep the content organized.
-- Include examples when needed.
-
-## Checks
-Make sure the document is clear and complete for future users.
+Use two reusable notes.
 """
-    generic_failed = {r.id for r in _check_reference_file_contract("references/tone.md", generic, purpose="brand voice typography constraints") if not r.passed}
-    assert "reference.content.covers_own_semantic_purpose" in generic_failed
+    failed = {r.id for r in _check_reference_file_contract("references/short.md", content, purpose="brief notes") if not r.passed}
+    assert "reference.content.has_reference_value" not in failed
+
+
+def test_reference_empty_body_still_fails_hard_contract():
+    from backend.services.creator.contracts import _check_reference_file_contract
+
+    content = """---
+title: Empty
+description: Empty body
+---
+"""
+    failed = {r.id for r in _check_reference_file_contract("references/empty.md", content) if not r.passed}
+    assert {"reference.not_empty", "markdown.body.missing"} & failed
+
+
+def test_reference_unclosed_fence_still_fails_hard_contract():
+    from backend.services.creator.contracts import _check_reference_file_contract
+
+    content = """---
+title: Fence
+description: Broken fence
+---
+# Fence
+
+```json
+{"a": 1}
+"""
+    failed = {r.id for r in _check_reference_file_contract("references/fence.md", content) if not r.passed}
+    assert {"reference.markdown.fences_balanced", "markdown.fences.unclosed"} & failed
+
+
+def test_reference_malformed_frontmatter_still_fails_hard_contract():
+    from backend.services.creator.contracts import _check_reference_file_contract
+
+    content = """---
+title: [broken
+description: Broken
+---
+# Broken
+
+Body.
+"""
+    failed = {r.id for r in _check_reference_file_contract("references/broken.md", content) if not r.passed}
+    assert any("frontmatter" in item for item in failed)
 
 
 def test_reference_placeholder_matches_include_details_and_sanitizer_preserves_frontmatter():
