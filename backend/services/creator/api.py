@@ -21,6 +21,7 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
+from ..blueprint_parser import exact_file_plan_paths_from_strict_skillplan, parse_blueprint
 from ..skill_plan import normalize_structured_function_items, normalize_structured_responsibility_edges, validate_structured_responsibility_edge_transport
 
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
@@ -6436,7 +6437,7 @@ def _render_structured_responsibility_view(blueprint_text: str, function_items: 
     }
 
     def replace_section(source: str, heading: str, replacement_lines: list[str]) -> str:
-        pattern = re.compile(rf"(?ms)^### {re.escape(heading)}\s*$.*?(?=^### |\Z)")
+        pattern = re.compile(rf"(?ms)^\s*###\s+{re.escape(heading)}\s*$.*?(?=^\s*###\s+|\Z)")
         replacement = "\n".join(replacement_lines).rstrip() + "\n"
         if pattern.search(source):
             return pattern.sub(replacement, source, count=1)
@@ -6444,13 +6445,16 @@ def _render_structured_responsibility_view(blueprint_text: str, function_items: 
 
     text = replace_section(text, "工作流逻辑", workflow_lines)
 
-    skillplan_pattern = re.compile(r"(?ms)^### SkillPlan / 文件职责计划\s*$.*?(?=^### |\Z)")
+    skillplan_pattern = re.compile(r"(?ms)^\s*###\s+SkillPlan / 文件职责计划\s*$.*?(?=^\s*###\s+|\Z)")
     skillplan_match = skillplan_pattern.search(text)
     existing_blocks: list[tuple[str, str]] = []
     if skillplan_match:
         body = skillplan_match.group(0).split("\n", 1)[1] if "\n" in skillplan_match.group(0) else ""
-        for block_match in re.finditer(r"(?ms)^- path:\s*`?([^`\n]+)`?.*?(?=^- path:|\Z)", body):
-            path = str(block_match.group(1) or "").strip()
+        block_pattern = re.compile(
+            r"(?ms)^\s*-\s*path\s*:\s*`?([^`\n]+)`?\s*\n.*?(?=^\s*-\s*path\s*:|\Z)"
+        )
+        for block_match in block_pattern.finditer(body):
+            path = str(block_match.group(1) or "").strip().strip("`'\"，,。.;；").replace("\\", "/")
             block = block_match.group(0).rstrip()
             if path:
                 existing_blocks.append((path, block))
@@ -6461,7 +6465,7 @@ def _render_structured_responsibility_view(blueprint_text: str, function_items: 
         if path in script_items_by_target:
             rendered_blocks.append(overlay_function_item_fields(block, script_items_by_target[path]))
             emitted.add(path)
-        elif not path.startswith("scripts/"):
+        else:
             rendered_blocks.append(block)
     for target, item in script_items_by_target.items():
         if target not in emitted:
@@ -6487,6 +6491,7 @@ async def _converge_ready_executable_plan(
     request: PreparePlanRequest,
     current_planner_result: dict[str, Any],
     planner_model: str,
+    allowed_function_item_targets: list[str],
     draft_transport_error: str = "",
 ) -> dict[str, Any]:
     """Run one same-Planner revision over an already-ready executable plan.
@@ -6542,10 +6547,19 @@ Do not reconsider tool availability.
 Do not use Tool Registry, ToolPool, candidate tools, or implementation convenience.
 
 Your first task is requirement fidelity: keep the executable plan aligned with the exact user request and confirmed decisions.
-Your second task is internal consistency: make FunctionItems, ResponsibilityEdges, and Blueprint view describe the same plan.
-Planner-derived FunctionItems, workflow, topology, and edges may be changed when required for requirement fidelity or consistency.
+Your second task is internal consistency: make FunctionItems and ResponsibilityEdges describe the same executable plan.
+
+The FilePlan is immutable.
+Do not add, remove, rename, split, or merge FilePlan entries.
+Only revise FunctionItem responsibility fields and ResponsibilityEdges.
 
 ResponsibilityEdge transport schema is exact.
+
+The FilePlan target domain is frozen.
+Every FunctionItem.target_file must be copied exactly from allowed_function_item_targets.
+Do not add, rename, or invent FunctionItem targets.
+Do not revise the FilePlan target set in this convergence pass.
+If an executable responsibility is inconsistent, revise its responsibility fields and ResponsibilityEdges.
 
 FunctionItems and ResponsibilityEdges are two parts of one executable responsibility plan.
 Do not revise FunctionItems and ResponsibilityEdges independently.
@@ -6557,7 +6571,8 @@ Return one complete revised executable plan.
 
 Every function_items item must be a JSON object with exactly:
 target_file, role, purpose, inputs, outputs, required_capabilities, constraints.
-target_file must be scripts/**. inputs, outputs, required_capabilities must be string arrays.
+target_file must exactly equal one item from allowed_function_item_targets.
+inputs, outputs, required_capabilities must be string arrays.
 constraints must be a JSON array of objects.
 
 Every responsibility_edges item must be a JSON object
@@ -6651,9 +6666,10 @@ If the emitted plan declares that execution requires no business input, do not i
 If a script uses a default or internal configuration value, do not model that default as a semantic result transported from an unrelated platform input slot.
 
 Do not merely describe a detected inconsistency.
-Revise function_items, responsibility_edges, and internal_blueprint_text so the returned plan is internally consistent.
+Revise function_items and responsibility_edges so the returned graph is internally consistent.
 
-Return the complete Planner response with the same schema:
+Return the complete Planner response with this schema.
+The backend will consume only function_items and responsibility_edges from this convergence response:
 {
   "status": "ready",
   "clarifying_questions": [],
@@ -6671,6 +6687,7 @@ Only output strict JSON object. Do not output Markdown or explanation.
         "task": "prepare_plan_convergence",
         "current_planner_result": current_planner_result,
         "draft_transport_error": draft_transport_error,
+        "allowed_function_item_targets": allowed_function_item_targets,
         "platform_io_contract": platform_io_contract_prompt_text(),
         "confirmed_decision_context": {
             "conversation_history": request.conversation_history,
@@ -6768,6 +6785,10 @@ Only output strict JSON object. Do not output Markdown or explanation.
         data.get("function_items"),
         source="planner",
     )
+    _validate_function_item_targets_in_allowed_domain(
+        normalized_function_items,
+        allowed_function_item_targets,
+    )
     normalized_edges = validate_structured_responsibility_edge_transport(
         data.get("responsibility_edges"),
         function_items=normalized_function_items,
@@ -6790,6 +6811,147 @@ Only output strict JSON object. Do not output Markdown or explanation.
         }, ensure_ascii=False, default=str),
     )
     return data
+
+
+def _resolve_allowed_function_item_targets_from_blueprint(
+    internal_blueprint_text: str,
+) -> list[str]:
+    """Freeze executable target domain from strict SkillPlan file topology."""
+
+    return [
+        path
+        for path in exact_file_plan_paths_from_strict_skillplan(
+            internal_blueprint_text
+        )
+        if path.startswith("scripts/")
+    ]
+
+
+def _validate_function_item_targets_in_allowed_domain(
+    function_items: list[dict[str, Any]],
+    allowed_function_item_targets: list[str],
+) -> None:
+    allowed = set(allowed_function_item_targets)
+    actual = {
+        str(item.get("target_file") or "").strip()
+        for item in function_items
+        if str(item.get("target_file") or "").strip()
+    }
+    unexpected_targets = sorted(actual - allowed)
+    missing_targets = sorted(allowed - actual)
+    if unexpected_targets or missing_targets:
+        raise ValueError(
+            "Planner FunctionItem target_file set does not match frozen "
+            "FilePlan target domain exactly; "
+            f"unexpected_targets={unexpected_targets}; "
+            f"missing_targets={missing_targets}; "
+            f"allowed_function_item_targets={allowed_function_item_targets}"
+        )
+    blank_targets = [
+        str(item.get("target_file") or "").strip()
+        for item in function_items
+        if not str(item.get("target_file") or "").strip()
+    ]
+    if blank_targets:
+        raise ValueError(
+            "Planner emitted FunctionItem with blank target_file; "
+            f"blank_target_count={len(blank_targets)}"
+        )
+
+
+async def _bind_executable_responsibility_plan(
+    *,
+    request: PreparePlanRequest,
+    current_planner_result: dict[str, Any],
+    planner_model: str,
+    allowed_function_item_targets: list[str],
+) -> dict[str, Any]:
+    """Ask the same Planner to bind executable graph transport onto FilePlan."""
+
+    prompt = """
+You are the same Blueprint Planner.
+
+The business plan and FilePlan were produced by you in the immediately preceding planning pass.
+
+This is not a new planning task.
+This is not a judge, validator, gate, repair model, or separate semantic authority.
+
+The FilePlan is frozen for this binding pass.
+
+Do not add files.
+Do not remove files.
+Do not rename files.
+Do not reinterpret the user's goal.
+
+Your only task is to bind executable responsibilities and cross-responsibility transport onto the frozen FilePlan.
+
+FunctionItems are executable responsibility nodes.
+
+Every target_file must be copied exactly from allowed_function_item_targets.
+Do not invent a target path.
+Do not use SKILL.md, references, assets, configs, or any other file unless it appears exactly in allowed_function_item_targets.
+Every executable responsibility owned by a script in the frozen FilePlan must be represented by its FunctionItem.
+Do not move file-local metadata into FunctionItems.
+
+Every FunctionItem must be a JSON object with exactly:
+target_file, role, purpose, inputs, outputs, required_capabilities, constraints.
+inputs, outputs, required_capabilities must be string arrays.
+constraints must be a JSON array of objects.
+
+ResponsibilityEdges connect FunctionItems and immutable platform boundary nodes only:
+- platform_input_node
+- current FunctionItem.target_file values
+- platform_output_node
+
+Every non-platform from_node and to_node must exactly equal one FunctionItem.target_file.
+Resource usage remains in FilePlan dependencies/references/resource metadata.
+
+Every ResponsibilityEdge must be a JSON object with exactly:
+from_node, from_output, to_node, to_input, purpose, constraints.
+Do not use aliases or alternate graph dialects.
+constraints must be a JSON array of objects.
+
+Use platform_io_contract as an exact immutable boundary contract.
+For platform_input_node, from_output must be an actual platform input source slot.
+For platform_output_node, to_input must be an actual platform final output terminal slot.
+
+Return only:
+{
+  "function_items": [],
+  "responsibility_edges": []
+}
+Only output strict JSON object. Do not output Markdown or explanation.
+""".strip()
+
+    payload = {
+        "task": "bind_executable_responsibilities",
+        "current_file_plan": current_planner_result,
+        "allowed_function_item_targets": allowed_function_item_targets,
+        "confirmed_decision_context": {
+            "conversation_history": request.conversation_history,
+            "user_request": request.user_request,
+            "human_feedback": request.human_feedback,
+            "previous_blueprint_text": request.previous_blueprint_text,
+            "skill_name": request.skill_name,
+        },
+        "platform_io_contract": platform_io_contract_prompt_text(),
+    }
+    text = await complete_chat_once(
+        [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+        ],
+        planner_model,
+    )
+    data = _parse_prepare_plan_json(text)
+    if not isinstance(data.get("function_items"), list):
+        raise ValueError("Planner binding response must include function_items list")
+    if not isinstance(data.get("responsibility_edges"), list):
+        raise ValueError("Planner binding response must include responsibility_edges list")
+    return {
+        "function_items": data.get("function_items") or [],
+        "responsibility_edges": data.get("responsibility_edges") or [],
+    }
 
 async def _generate_internal_blueprint_or_questions(
     request: PreparePlanRequest,
@@ -6828,18 +6990,20 @@ async def _generate_internal_blueprint_or_questions(
 不要 Markdown。
 不要解释 JSON 外文本。
 
-当前阶段只负责：
+当前阶段是第一段 FilePlan / Blueprint planning pass，只负责：
 
 1. 判断业务需求是否已经足够明确；
 2. 信息不足时提出一个真正阻塞创建计划的业务问题；
-3. 信息足够时先生成 structured executable plan；
-4. 在同一次 Planner response 中同步输出 function_items、responsibility_edges 与 internal_blueprint_text。
+3. 信息足够时生成完整业务 Blueprint；
+4. 生成 SkillPlan / FilePlan 文件拓扑与 file-local metadata。
 
-Top-level function_items and responsibility_edges together are the structured executable plan source of truth.
-internal_blueprint_text is the human-readable Blueprint view of that same structured executable plan.
-The Blueprint must not define a second independent script-responsibility model.
+Do not emit FunctionItems in this first pass.
+Do not emit ResponsibilityEdges in this first pass.
+Do not plan the ResponsibilityGraph in this first pass.
 
-Top-level function_items and responsibility_edges are Creator-owned graph transport and must be emitted as structured JSON, not recovered from internal_blueprint_text.
+internal_blueprint_text is the human-readable Blueprint view and must contain the complete SkillPlan file responsibility information: path, role, purpose, inputs, outputs, dependencies, required_capabilities, forbidden_capabilities, references, constraints, and existing file-local metadata.
+
+The first pass only follows the FilePlan protocol. It may plan SKILL.md, scripts/**, references/**, assets/**, and config files.
 
 review_summary 只是同一响应中的临时展示摘要。
 后端不会使用 review_summary 重建蓝图。
@@ -6999,142 +7163,45 @@ composite_generator 或 generic_script。
 
 必须结合整个工作流判断。
 
-## ResponsibilityGraph and FunctionItem semantics
+## Executable responsibility binding is deferred
 
-ResponsibilityGraph is the executable responsibility chain of scripts/** only.
+Do not generate function_items in this FilePlan pass.
+Do not generate responsibility_edges in this FilePlan pass.
+Do not decide which files can become graph nodes beyond declaring the FilePlan itself.
 
-A FunctionItem is the complete target-local executable responsibility owned by one script.
+FunctionItems and ResponsibilityEdges will be bound in a second protocol binding pass by the same Blueprint Planner after the backend freezes the exact executable target domain from this FilePlan.
 
-One script responsibility equals one FunctionItem.
-
-SKILL.md, references/** and assets/** are not FunctionItems.
-
-references/** may support a script as reference material.
-
-A reference may influence how a script performs its FunctionItem.
-
-A reference cannot own or execute a core action.
-
-A reference cannot be the producer of a required final result.
-
-## ResponsibilityEdge semantics
-
-A ResponsibilityEdge describes how one executable responsibility result
-is consumed by the next executable responsibility.
-
-FunctionItem owns target-local script responsibility.
-
-ResponsibilityEdge owns cross-FunctionItem responsibility transport.
-
-ResponsibilityGraph nodes are only:
-
-- platform_input_node
-- current FunctionItem.target_file values
-- platform_output_node
-
-ResponsibilityEdges connect FunctionItems and immutable platform boundary nodes only.
-
-References, assets, SKILL.md, configs, and other FilePlan resources are not ResponsibilityGraph nodes.
-
-References and assets may be used by scripts, but cannot become FunctionItems
-and cannot become ResponsibilityEdge endpoints.
-
+In this pass, FilePlan owns file topology and file-local metadata.
+Declare script file responsibilities inside SkillPlan entries only.
 Resource usage remains in FilePlan dependencies/references/resource metadata.
 
-Ready Planner JSON must include a top-level responsibility_edges field.
-Ready Planner JSON must include a top-level function_items field.
-When status=ready, function_items must be a JSON array of objects.
-When status=needs_clarification, function_items must be [].
-When status=ready, responsibility_edges must be a JSON array of objects.
-When status=needs_clarification, responsibility_edges must be [].
-internal_blueprint_text may also display a ### ResponsibilityEdges section for human review, but that display text is not the graph transport source of truth.
-Each edge may contain only from_node, from_output, to_node, to_input, purpose, and constraints.
-Do not add semantic fields such as cardinality, granularity, source_granularity, target_granularity, mechanism, iteration, aggregation, correspondence, ordering, single, collection, or per_item.
-If those ideas affect workflow correctness, express them as model-owned objects inside edge.constraints.
-constraints is a JSON array of objects. Legal empty constraints: []. Illegal: constraints: ["..."].
-Example constraint object: {"name":"custom_requirement","kind":"workflow_requirement","value":"arbitrary model-owned semantic requirement","comparator":"describes","required":true}.
+## core action fidelity in FilePlan
 
-Top-level responsibility_edges: [{"from_node":"platform_input_node","from_output":"semantic input name","to_node":"scripts/a.py","to_input":"semantic input name","purpose":"Describe why this result is transported to the downstream responsibility.","constraints":[]},{"from_node":"scripts/a.py","from_output":"semantic result name","to_node":"scripts/b.py","to_input":"semantic input name","purpose":"Describe the cross-responsibility handoff.","constraints":[]}]
-
-Top-level function_items: [{"target_file":"scripts/a.py","role":"...","purpose":"...","inputs":[],"outputs":[],"required_capabilities":[],"constraints":[]}]
-
-function_items and responsibility_edges are two parts of one executable responsibility plan.
-You must plan them together in the same response.
-Do not first produce a Blueprint and later infer FunctionItems.
-Do not plan ResponsibilityEdges as an independent graph.
-FunctionItems are the responsibility nodes.
-ResponsibilityEdges connect results produced and consumed by those exact FunctionItems.
-
-Planning order:
-1. Understand the confirmed requirement.
-2. Identify the concrete results that must actually exist.
-3. Identify executable responsibility closures.
-4. Emit the FunctionItems that own those responsibilities.
-5. Define each FunctionItem's inputs, produced results, required capabilities, and constraints.
-6. Connect those exact FunctionItems using ResponsibilityEdges.
-7. Trace the required final result to platform_output_node.
-8. Render the Blueprint view from that same plan.
-
-## read-only platform boundary contract
-
-Use the provided platform_io_contract as read-only planning context.
-platform_input_node.from_output must use an existing platform input slot from that contract.
-platform_output_node.to_input must use an existing platform output slot from that contract.
-For script → script edges, exact semantic field-name matching is not required.
-
-## responsibility graph replay
-
-Before returning status=ready, internally start from platform_input_node and replay the complete workflow in execution order.
-For each workflow responsibility: identify the owning script FunctionItem; identify what semantic results it needs; identify the upstream node providing each cross-boundary result; create the ResponsibilityEdge; preserve any correctness-affecting cross-responsibility requirement in the edge constraints; identify the results produced by the FunctionItem; continue to downstream FunctionItems.
-Finally trace every required final result to platform_output_node.
-
-Do not only verify that every script has a purpose.
-Verify that the connected FunctionItems and ResponsibilityEdges can represent the complete executable workflow.
-If the workflow contains a cross-script requirement, do not leave it only in workflow prose. It must enter the owning FunctionItem or ResponsibilityEdge constraints.
-script-local requirement → FunctionItem.constraints
-cross-responsibility requirement → ResponsibilityEdge.constraints
-Do not build a fixed requirement classifier; use full workflow understanding.
-
-## core action fidelity
-
-规划 workflow 和 script responsibilities 时，
-必须区分：
-
-- core action
-- action preparation
-- action description
-- final delivery
+规划 workflow 和 script file responsibilities 时，
+必须区分 core action、action preparation、action description 和 final delivery。
 
 如果用户要求或已确认的是某个 core action，
-Blueprint 中必须存在真正拥有并执行该 action 的 responsibility。
+Blueprint / FilePlan 中必须存在真正拥有并执行该 action 的 scripts/** file responsibility。
 
-仅生成该 action 的：
-
-- description
-- prompt
-- instruction
-- metadata
-- plan
-- placeholder
-- recommendation
-
-不能视为已经执行 core action。
-
+仅生成 description、prompt、instruction、metadata、plan、placeholder 或 recommendation，
+不能视为已经执行 core action，
 除非用户明确要求的本来就是这些准备结果。
 
 对每一个已确认 core action，
 必须回答：
 
-1. Which script FunctionItem owns and executes this action? owner 必须是 scripts/**。
-2. 该 script 的 purpose 是否明确声明该 action？
-3. required_capabilities 是否描述该 script 实际执行的抽象能力？
+1. Which scripts/** file owns and executes this action?
+2. 该 file purpose 是否明确声明该 action？
+3. required_capabilities 是否描述该 file 实际执行的抽象能力？
 4. 该 action 的真实结果是否进入后续 workflow 或最终交付？
 
 如果四项中任何一项无法回答，
-当前 Blueprint 尚未形成责任闭包，
+当前 Blueprint 尚未形成 FilePlan 责任闭包，
 不得返回 status=ready。
 
-## 多脚本责任所有权规则
+## file-local responsibility metadata
+
+每个 SkillPlan entry 都必须显式包含 path、role、purpose、inputs、outputs、dependencies、required_capabilities、forbidden_capabilities、references、constraints 以及现有 file-local metadata。
 
 每个 script 必须具有一个清晰的主要业务职责。
 
@@ -7146,184 +7213,40 @@ purpose 必须说明：
 
 不要让多个 script 重复拥有同一个核心业务动作。
 
-如果上游 script 已负责产生某项业务结果：
-
-- 下游 script 可以消费、整理、组合、
-  映射或交付该结果；
-
-- 下游 script 不应再次实现
-  上游已经拥有的核心生成或处理责任，
-  除非其自身 SkillPlan purpose
-  明确声明了不同的业务处理责任。
-
-如果下游 script 消费上游结果：
-
-- 上游 outputs 与下游 inputs
-  必须在语义上形成可追踪关系；
-
-- 字段名不要求逐字一致；
-
-- 不得用固定示例值、空列表或无来源常量
-  伪造下游输入。
-
-如果一个值由当前 script 内部产生，
-并且只在当前 script 内部继续消费，
-它属于内部中间值。
-
-不要把这种内部中间值
-声明成当前 script 的 required external input。
-
-只有：
-
-- 用户或 runtime 在脚本启动前提供的值；
-- 静态 resource；
-- 或其他 script 已经产生的前序结果；
-
-才应成为该 script 的语义 inputs。
-
-## responsibility constraints
-
-任何会影响当前 script 实现是否正确、结果是否完整、
-处理方式是否符合 workflow 的明确要求，
-都必须保留为 responsibility constraint。
-
-如果两个实现具有相同 purpose、inputs、outputs 和 capabilities，
-但只有一个满足某个明确 workflow requirement，
-那么该 requirement 必须作为 constraint 保留。
-
-constraint 是开放语义数据。
-不要限制 constraint 类型。
-不要创造用户或 workflow 未要求的新属性。
+如果上游 script 已负责产生某项业务结果，
+下游 script 可以消费、整理、组合、映射或交付该结果，
+但不应再次实现上游已经拥有的核心生成或处理责任，
+除非其自身 SkillPlan purpose 明确声明了不同的业务处理责任。
 
 constraints is generic file-local constraint data.
-
-对于 scripts/**：
-
-script constraints
-→ owning FunctionItem.constraints
-
-对于 SKILL.md、references/** 和 assets/**：
-constraints remain file-local planning/generation constraints.
-
-这些 non-script constraints 不得：
-
-- create FunctionItem
-- enter ResponsibilityGraph
-- own core action
-- own final delivery
-
-Constraint transport is generic.
-
-FunctionItem projection is script-only.
-
 Planner 负责把 constraint 放到拥有该责任的 SkillPlan entry。
 不要广播到所有 scripts。
 不要广播到所有 entries。
-将每个 target-local constraint 写入对应 SkillPlan entry 的 constraints 字段；
 constraints 必须是单行合法 JSON array。
+没有额外 responsibility constraint 时：constraints: []。
 
-每个 SkillPlan entry 都必须显式输出 constraints 字段。
-
-没有额外 responsibility constraint 时：
-
-constraints: []
-
-不得省略该字段。
-
-不得把应该进入 constraints 的明确 requirement
-仅留在 workflow prose、说明段或 review_summary 中。
-
-如果一个明确 requirement 会影响当前 script
-实现是否正确或结果是否完整，
-但 purpose / inputs / outputs / capabilities
-不能完整表达它，
-必须写入当前 target file 的 constraints。
-
-## 内部处理与脚本拆分
+## internal processing and script splitting
 
 当前平台没有显式 loop/map/foreach runtime node。
-
-内部遍历、批处理、逐项处理、
-顺序映射和局部聚合
-应由拥有该业务责任的 script 内部实现。
-
-内部循环本身：
-
-- 不构成拆脚本理由；
-- 不代表 script boundary input 必须变成集合；
-- 不代表 script boundary output 必须变成集合。
-
-纯局部：
-
-- 字段适配；
-- 数据整理；
-- 格式转换；
-- 参数映射；
-- 小型 deterministic helper 逻辑；
-
-如果只服务于当前责任，
-应保留在所属 script 内部，
-不要单独创建脚本。
+内部遍历、批处理、逐项处理、顺序映射和局部聚合应由拥有该业务责任的 script 内部实现。
+内部循环本身不构成拆脚本理由，也不改变 script boundary。
+只服务于当前责任的字段适配、数据整理、格式转换、参数映射和小型 deterministic helper 逻辑，应保留在所属 script 内部。
 
 ## Capability 声明规则
 
-每个 script 的 required_capabilities
-必须来自该 script 实际执行动作。
+每个 script 的 required_capabilities 必须来自该 script 实际执行动作。
 
 动作方向必须一致：
 
 - generate/create/build 与 parse/read/extract 不等价；
+- 生成某类 artifact 不自动需要该 artifact 的解析能力；
+- 生成图片不自动需要视觉理解能力；
+- 只有脚本确实消费并语义理解已有图片时，才声明图像或视觉理解能力；
+- capability 不得根据相邻概念、文件名或最终 artifact 类型机械扩展。
 
-- 生成某类 artifact
-  不自动需要该 artifact 的解析能力；
-
-- 生成图片
-  不自动需要视觉理解能力；
-
-- 只有脚本确实消费并语义理解已有图片时，
-  才声明图像或视觉理解能力；
-
-- capability 不得根据相邻概念、
-  文件名或最终 artifact 类型机械扩展。
-
-required_capabilities 只属于
-真正执行对应动作的 script。
-
-不要因为下游消费了上游产物，
-就把上游 generation capability
-重复声明给下游。
-
+required_capabilities 只属于真正执行对应动作的 script。
+不要因为下游消费了上游产物，就把上游 generation capability 重复声明给下游。
 不得填写具体 Registry tool_id。
-
-Blueprint planning 不得根据当前 Registry、
-ToolPool、helper、SDK 或已知实现便利性
-反向修改用户业务要求。
-
-正确顺序：
-
-user requirement
-↓
-confirmed decisions
-↓
-workflow responsibilities
-↓
-script responsibilities
-↓
-abstract required_capabilities
-↓
-后续 Tool planning
-
-错误顺序：
-
-available tools
-↓
-选择容易实现的动作
-↓
-降低 Blueprint 业务目标
-
-Planner 可以声明抽象 capability。
-
-具体工具选择仍由后续 Final Tool Selector 完成。
 
 ## final delivery closure
 
@@ -7333,7 +7256,7 @@ workflow 最终交付描述和 SkillPlan script outputs
 
 对于顶层声明的每一个 required final result：
 
-必须能找到一个 required script FunctionItem producer
+必须能找到一个 required scripts/** file producer
 明确生产或最终交付该结果。
 
 不得出现：
@@ -7359,67 +7282,38 @@ workflow 最终交付描述和 SkillPlan script outputs
 
 不得依赖后续 global contract 或 E2E 猜测补齐。
 
-## final executable-plan convergence
+## FilePlan ready self-check
 
-Before returning status=ready, replay the exact FunctionItems and ResponsibilityEdges that will be emitted in the current response.
-Do not replay an imagined workflow that differs from the emitted plan.
-For each FunctionItem check:
-1. What core actions does this FunctionItem actually own?
-2. Do required_capabilities describe these actual owned actions?
-3. Are declared semantic inputs truly results crossing a responsibility boundary into this script?
-4. A semantic value produced and consumed entirely inside one FunctionItem is a local intermediate. A local intermediate is not a cross-FunctionItem input and does not require a ResponsibilityEdge. Do not declare a local intermediate as an external FunctionItem input unless another graph node actually provides it.
-5. What cross-boundary results does this FunctionItem actually produce?
-6. Does every outgoing ResponsibilityEdge.from_output describe a result the source FunctionItem actually owns and produces?
-7. Does every incoming ResponsibilityEdge provide an upstream result needed by the target FunctionItem responsibility?
-8. Does each workflow requirement affecting cross-responsibility correctness appear in relevant ResponsibilityEdge.constraints?
-9. Does each workflow requirement affecting only one script appear in the owning FunctionItem.constraints?
-10. Does every final result reach platform_output_node along ResponsibilityEdges?
-
-For every declared FunctionItem semantic input, either it is provided by an incoming ResponsibilityEdge, or it is a local/default/config/resource concern explicitly handled inside the FunctionItem contract. Do not invent an upstream business result that has no producer. Static resource use continues through dependencies, references, or assets, not ResponsibilityEdge nodes.
-
-An outgoing ResponsibilityEdge must transport a semantic result that the source FunctionItem actually owns and produces.
-An incoming ResponsibilityEdge must transport a result that the target FunctionItem actually consumes in its owned responsibility.
-If graph replay discovers that an edge requires a different result than the current FunctionItem contract declares, revise the FunctionItem or the edge before returning ready.
-Do not leave the mismatch for downstream Creator normalization.
-This is semantic self-consistency, not a Python field gate; judge same semantic result, same owned action, same executable plan.
-
-## ready consistency self-check
-
-返回 status=ready 前，
-在内部逐项完成以下检查：
+Before returning status=ready, check only the FilePlan / Blueprint contract:
 
 A. confirmed decisions
 - 原始用户要求中的核心业务动作是否仍存在？
 - 每个已回答 clarification 的明确 decision 是否仍存在？
 - 是否把任何执行动作弱化为描述、提示或占位结果？
 
-B. FunctionItem ownership
-- 每个 core action 是否有 owning script FunctionItem？
-- 每个 required script 是否形成一个完整 FunctionItem？
-- 是否两个 FunctionItems 重复拥有同一 core action？
-- 是否有 core action 只存在于 workflow prose/reference 中，
-  但没有进入任何 script FunctionItem purpose？
+B. file topology
+- 每个 required file 是否有清晰 role/purpose？
+- 每个 scripts/** file 是否有完整 file-local responsibility metadata？
+- 是否两个 scripts/** files 重复拥有同一核心业务责任？
+- 是否有 core action 只存在于 workflow prose/reference 中，但没有进入任何 script file purpose？
 
 C. capability alignment
-- 每个 script required_capabilities
-  是否来自该 script 实际执行动作？
+- 每个 script required_capabilities 是否来自该 script 实际执行动作？
 - 是否遗漏了 script 明确执行的抽象能力？
 - 是否为了迎合当前已知 tools 而删除业务 capability？
 
 D. constraint preservation
 - 每个 SkillPlan entry 是否显式包含 constraints？
 - 无 constraint 时是否为 []？
-- 明确 implementation requirement
-  是否只存在于 prose 而没有进入 owning script constraint？
+- 明确 implementation requirement 是否只存在于 prose 而没有进入 owning script constraint？
 
 E. final delivery closure
-- 每个 required final result 是否存在 producer？
-- 顶层 output、workflow final delivery、
-  script purpose 和 script outputs 是否语义一致？
+- 每个 required final result 是否存在 script file producer？
+- 顶层 output、workflow final delivery、script purpose 和 script outputs 是否语义一致？
 
 如果任一项失败：
 
-先修改 Blueprint。
+先修改 Blueprint / FilePlan。
 
 不得输出 status=ready。
 
@@ -7440,9 +7334,7 @@ E. final delivery closure
   },
   "internal_blueprint_text": "status=ready 时填写 provisional Skill 架构蓝图",
   "skill_name": "可选",
-  "blockers": [],
-  "function_items": [],
-  "responsibility_edges": []
+  "blockers": []
 }
 
 ## confirmed decision preservation
@@ -7738,9 +7630,17 @@ Blueprint Planner 只规划业务责任。
     )
 
     status = str(data.get("status") or "").strip()
+    data.pop("function_items", None)
+    data.pop("responsibility_edges", None)
+    first_planner_result = dict(data)
+    frozen_blueprint_text = str(
+        first_planner_result.get("internal_blueprint_text")
+        or ""
+    )
     normalized_ready_draft: dict[str, Any] | None = None
     draft_edge_error: Exception | None = None
     draft_function_item_error: Exception | None = None
+    allowed_function_item_targets: list[str] = []
 
     if status == "needs_clarification":
         if data.get("function_items") is None:
@@ -7758,27 +7658,52 @@ Blueprint Planner 只规划业务责任。
         data["responsibility_edges"] = normalized_edges
     elif status == "ready":
         normalized_function_items = None
+        binding_data: dict[str, Any] = {
+            "function_items": [],
+            "responsibility_edges": [],
+        }
         try:
-            if "function_items" not in data:
-                raise ValueError("planner.function_items must be explicitly present")
-            if data.get("function_items") is None:
-                raise ValueError("planner.function_items must not be null")
+            allowed_function_item_targets = (
+                _resolve_allowed_function_item_targets_from_blueprint(
+                    frozen_blueprint_text
+                )
+            )
+            if event_emitter is not None:
+                await event_emitter({
+                    "event": "file_plan_ready",
+                    "allowed_function_item_targets": allowed_function_item_targets,
+                })
+            binding_data = await _bind_executable_responsibility_plan(
+                request=request,
+                current_planner_result=first_planner_result,
+                planner_model=route.model,
+                allowed_function_item_targets=allowed_function_item_targets,
+            )
             normalized_function_items = normalize_structured_function_items(
-                data.get("function_items"),
+                binding_data.get("function_items"),
                 source="planner",
+            )
+            _validate_function_item_targets_in_allowed_domain(
+                normalized_function_items,
+                allowed_function_item_targets,
             )
         except Exception as exc:
             draft_function_item_error = exc
         try:
             normalized_edges = validate_structured_responsibility_edge_transport(
-                data.get("responsibility_edges"),
+                binding_data.get("responsibility_edges"),
                 function_items=normalized_function_items,
                 source="planner",
             )
             if normalized_function_items is not None:
-                normalized_ready_draft = dict(data)
+                normalized_ready_draft = dict(first_planner_result)
                 normalized_ready_draft["function_items"] = normalized_function_items
                 normalized_ready_draft["responsibility_edges"] = normalized_edges
+                normalized_ready_draft["internal_blueprint_text"] = _render_structured_responsibility_view(
+                    frozen_blueprint_text,
+                    normalized_function_items,
+                    normalized_edges,
+                )
                 if event_emitter is not None:
                     await event_emitter({
                         "event": "planner_draft",
@@ -7809,10 +7734,11 @@ Blueprint Planner 只规划业务责任。
             else data
         )
         try:
-            data = await _converge_ready_executable_plan(
+            convergence_result = await _converge_ready_executable_plan(
                 request=request,
                 current_planner_result=convergence_input,
                 planner_model=route.model,
+                allowed_function_item_targets=allowed_function_item_targets,
                 draft_transport_error=(
                     "; ".join(
                         part for part in [
@@ -7822,6 +7748,20 @@ Blueprint Planner 只规划业务责任。
                         if part
                     )
                 ),
+            )
+            normalized_converged_function_items = list(
+                convergence_result.get("function_items") or []
+            )
+            normalized_converged_edges = list(
+                convergence_result.get("responsibility_edges") or []
+            )
+            data = dict(first_planner_result)
+            data["function_items"] = normalized_converged_function_items
+            data["responsibility_edges"] = normalized_converged_edges
+            data["internal_blueprint_text"] = _render_structured_responsibility_view(
+                frozen_blueprint_text,
+                normalized_converged_function_items,
+                normalized_converged_edges,
             )
             if event_emitter is not None:
                 await event_emitter({
