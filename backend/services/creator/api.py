@@ -4940,15 +4940,25 @@ def _project_summary_from_intent_anchor(
         ],
         *[str(item or "").strip() for item in intent_anchor.explicit_constraints],
     ]
-    if any(goal_parts):
-        summary.goal = "；".join(item for item in goal_parts if item)
-    if input_parts:
-        summary.input = "；".join(item for item in input_parts if item)
-    if output_parts:
-        summary.output = "；".join(item for item in output_parts if item)
-    if workflow_parts:
-        summary.workflow = [item for item in workflow_parts if item]
+    summary.goal = "；".join(item for item in goal_parts if item)
+    summary.input = "；".join(item for item in input_parts if item)
+    summary.output = "；".join(item for item in output_parts if item)
+    summary.workflow = [item for item in workflow_parts if item]
     return summary
+
+
+def _intent_anchor_has_semantic_content(intent_anchor: UserIntentAnchor | None) -> bool:
+    if intent_anchor is None:
+        return False
+    return any([
+        str(intent_anchor.primary_goal or "").strip(),
+        *(str(item or "").strip() for item in intent_anchor.required_user_outcomes),
+        *(str(item or "").strip() for item in intent_anchor.user_provided_inputs),
+        *(str(item or "").strip() for item in intent_anchor.system_expected_actions),
+        *(str(item or "").strip() for item in intent_anchor.final_deliverables),
+        *(str(item or "").strip() for item in intent_anchor.explicit_constraints),
+        *(str(choice.scope or choice.decision or "").strip() for choice in intent_anchor.confirmed_choices),
+    ])
 
 
 async def _extract_user_intent_anchor(
@@ -5924,7 +5934,7 @@ Check only whether the candidate Blueprint preserves the provided UserIntentAnch
 Do not check script path, script count, role, capability, tool, FunctionItem, ResponsibilityEdge, from_output, to_input, argv, stdout, runtime, or code implementation.
 Do not repair the Blueprint. Return only the strict JSON object.
 """.strip()
-    route = route_model("creator_prepare_plan", requested_model=model, reason="creator intent coverage review")
+    route = route_model(VALIDATOR_TASK, requested_model=model, reason="creator intent coverage review")
     data = await _complete_creator_json_object_once(
         messages=[
             {"role": "system", "content": prompt},
@@ -5938,9 +5948,10 @@ Do not repair the Blueprint. Return only the strict JSON object.
         response_schema=response_schema,
     )
     issues = data.get("issues") if isinstance(data, dict) else []
+    issues = issues if isinstance(issues, list) else []
     return {
-        "passed": bool(data.get("passed")) if isinstance(data, dict) else False,
-        "issues": issues if isinstance(issues, list) else [],
+        "passed": (bool(data.get("passed")) if isinstance(data, dict) else False) and not issues,
+        "issues": issues,
     }
 
 
@@ -5974,9 +5985,17 @@ async def _repair_blueprint_from_intent_anchor(
 不要 Markdown，不要解释。
 """
     )
+    response_schema = {
+        "type": "object",
+        "properties": {
+            "internal_blueprint_text": {"type": "string"},
+        },
+        "required": ["internal_blueprint_text"],
+        "additionalProperties": False,
+    }
     route = route_model("creator_prepare_plan", requested_model=model, reason="creator intent anchor blueprint repair")
-    text = await complete_chat_once(
-        [
+    data = await _complete_creator_json_object_once(
+        messages=[
             {"role": "system", "content": prompt},
             {"role": "user", "content": json.dumps({
                 "user_intent_anchor": intent_anchor.model_dump(mode="json"),
@@ -5984,10 +6003,16 @@ async def _repair_blueprint_from_intent_anchor(
                 "blueprint_text": blueprint_text,
             }, ensure_ascii=False, default=str)},
         ],
-        route.model,
+        model=route.model,
+        phase="intent_anchor_blueprint_repair",
+        response_schema=response_schema,
     )
-    data = _parse_prepare_plan_json(text)
-    return str(data.get("internal_blueprint_text") or "").strip()
+    repaired = str(data.get("internal_blueprint_text") or "").strip()
+    if not repaired:
+        raise PreparePlanProtocolError(
+            "intent_anchor_repair_returned_empty_blueprint"
+        )
+    return repaired
 
 
 async def _ensure_blueprint_covers_intent_anchor(
@@ -5997,6 +6022,8 @@ async def _ensure_blueprint_covers_intent_anchor(
     model: str | None,
 ) -> str:
     current = str(blueprint_text or "").strip()
+    if not _intent_anchor_has_semantic_content(intent_anchor):
+        return current
     for attempt in range(_MAX_INTENT_COVERAGE_REPAIR_ATTEMPTS + 1):
         review = await _review_blueprint_against_intent_anchor(
             intent_anchor=intent_anchor,
@@ -7483,6 +7510,17 @@ In this pass, FilePlan owns file topology and file-local metadata.
 Declare script file responsibilities inside SkillPlan entries only.
 Resource usage remains in FilePlan dependencies/references/resource metadata.
 
+## ResponsibilityGraph and FunctionItem semantics
+
+ResponsibilityGraph and FunctionItem binding is deferred to the second pass.
+The executable graph domain is scripts/** only.
+One script responsibility equals one FunctionItem.
+references/** are resources, not FunctionItems.
+A reference cannot own or execute a core action.
+A reference cannot be the producer of a required final result.
+The later binding pass must cover the complete workflow through graph replay,
+using platform_input_node and platform_output_node for immutable platform boundaries.
+
 ## core action fidelity in FilePlan
 
 规划 workflow 和 script file responsibilities 时，
@@ -7507,7 +7545,7 @@ Blueprint / FilePlan 中必须存在真正拥有并执行该 action 的 scripts/
 当前 Blueprint 尚未形成 FilePlan 责任闭包，
 不得返回 status=ready。
 
-## file-local responsibility metadata
+## responsibility constraints
 
 每个 SkillPlan entry 都必须显式包含 path、role、purpose、inputs、outputs、dependencies、required_capabilities、forbidden_capabilities、references、constraints 以及现有 file-local metadata。
 
@@ -7528,12 +7566,15 @@ purpose 必须说明：
 
 constraints is generic file-local constraint data.
 Planner 负责把 constraint 放到拥有该责任的 SkillPlan entry。
+将每个 target-local constraint 写入对应 SkillPlan entry 的 constraints 字段。
+每个 SkillPlan entry 都必须显式输出 constraints 字段。
+不要限制 constraint 类型。
 不要广播到所有 scripts。
 不要广播到所有 entries。
 constraints 必须是单行合法 JSON array。
 没有额外 responsibility constraint 时：constraints: []。
 
-## internal processing and script splitting
+## 内部处理与脚本拆分
 
 当前平台没有显式 loop/map/foreach runtime node。
 内部遍历、批处理、逐项处理、顺序映射和局部聚合应由拥有该业务责任的 script 内部实现。
@@ -8488,6 +8529,15 @@ async def _prepare_summarize_confirmed_requirements(
         intent_anchor=intent_anchor,
     )
 
+
+async def _generate_internal_blueprint_from_confirmed_summary(
+    **_: Any,
+) -> dict[str, Any]:
+    """Compatibility hook for legacy tests; production flow freezes full blueprint."""
+    raise PreparePlanProtocolError(
+        "confirmed_summary_blueprint_generation_is_disabled"
+    )
+
 def _tool_names_from_entry_contract(entry: Any) -> list[str]:
     data = entry if isinstance(entry, dict) else getattr(entry, "__dict__", {})
     names: list[str] = []
@@ -9257,6 +9307,8 @@ async def _prepare_plan_impl(
     confirmed_prepare = (
         prepare_action == "confirm"
         or (
+            bool(str(request.previous_blueprint_text or "").strip())
+            and
             _prepare_user_confirmed_no_more_supplement(
                 request
             )
@@ -9382,6 +9434,7 @@ async def _prepare_plan_impl(
     if (
         prepare_action
         == "request_supplement"
+        or _prepare_feedback_wants_supplement(request)
     ):
         if previous_blueprint_text:
             summary = await project_summary(
@@ -9916,30 +9969,31 @@ async def _prepare_plan_impl(
                 ],
             )
 
-        # First complete blueprint:
-        #
-        # project it for display and freeze it in the
-        # response so the frontend can send it back on
-        # confirmation.
-        return await confirmation_response(
-            current_blueprint_text=(
-                blueprint_text
-            ),
+        if not _prepare_user_confirmed_no_more_supplement(request):
+            # First complete blueprint:
+            #
+            # project it for display and freeze it in the
+            # response so the frontend can send it back on
+            # confirmation.
+            return await confirmation_response(
+                current_blueprint_text=(
+                    blueprint_text
+                ),
 
-            current_prepared=prepared,
+                current_prepared=prepared,
 
-            current_skill_name=(
-                skill_name
-            ),
+                current_skill_name=(
+                    skill_name
+                ),
 
-            prepare_stage=(
-                "creation_points_confirmation"
-            ),
+                prepare_stage=(
+                    "creation_points_confirmation"
+                ),
 
-            question=(
-                _PREPARE_SUPPLEMENT_QUESTION
-            ),
-        )
+                question=(
+                    _PREPARE_SUPPLEMENT_QUESTION
+                ),
+            )
 
     # ------------------------------------------------------------------
     # From here on, the user has confirmed an existing full blueprint.

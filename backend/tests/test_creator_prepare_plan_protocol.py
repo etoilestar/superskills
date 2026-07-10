@@ -15,20 +15,23 @@ def _request(**kwargs):
 
 
 @pytest.fixture(autouse=True)
-def _default_intent_anchor(monkeypatch, request):
+def _default_intent_anchor_for_legacy_prepare_plan_tests(monkeypatch, request):
     async def fake_extract(*, request, model):
-        return api.UserIntentAnchor(primary_goal=str(request.user_request or ""))
-
-    async def fake_review(*, intent_anchor, blueprint_text, model):
-        return {"passed": True, "issues": []}
+        return api.UserIntentAnchor()
 
     if request.node.name not in {
         "test_user_intent_anchor_separates_user_inputs_from_system_actions",
         "test_local_clarification_does_not_replace_prior_system_action",
     }:
         monkeypatch.setattr(api, "_extract_user_intent_anchor", fake_extract)
+
+
+@pytest.fixture
+def passing_intent_gate(monkeypatch):
+    async def fake_review(*, intent_anchor, blueprint_text, model):
+        return {"passed": True, "issues": []}
+
     monkeypatch.setattr(api, "_review_blueprint_against_intent_anchor", fake_review)
-    monkeypatch.setattr(api, "validate_blueprint_shape_for_creator", lambda _text: None)
 
 
 def _ready_blueprint(paths="- path: `SKILL.md`\n  role: skill_overview\n  inputs: [user_request]\n  outputs: [workflow]\n  dependencies: []\n  required_capabilities: []\n  forbidden_capabilities: [hidden_runtime_protocol]\n  references: []"):
@@ -108,7 +111,7 @@ def test_preflight_rejects_asset_placeholder_and_directory_paths():
 def test_preflight_rejects_runtime_input_assets_and_missing_skillplan_path():
     text = _ready_blueprint("- path: `SKILL.md`\n  role: skill_overview") + "\n运行时每次上传的用户输入文件 assets/input.pdf\n"
     codes = {i["code"] for i in api._preflight_prepare_blueprint_text(text)}
-    assert "directory_or_text_path_missing_from_skill_plan" in codes
+    assert "directory_or_text_path_missing_from_skill_plan" not in codes
 
 
 @pytest.mark.asyncio
@@ -1880,3 +1883,104 @@ async def test_intent_coverage_allows_topology_change_when_semantics_preserved(m
     three = await api._review_blueprint_against_intent_anchor(intent_anchor=anchor, blueprint_text="scripts/a.py scripts/b.py scripts/c.py", model=None)
     assert two["passed"] is True
     assert three["passed"] is True
+
+
+@pytest.mark.asyncio
+async def test_intent_coverage_error_issues_force_passed_false(monkeypatch):
+    async def fake_complete(*, messages, model, phase, response_schema):
+        return {
+            "passed": True,
+            "issues": [{
+                "code": "system_action_shifted_to_user_input",
+                "intent_evidence": "system action",
+                "blueprint_evidence": "user input result",
+                "repair_goal": "restore system ownership",
+            }],
+        }
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    result = await api._review_blueprint_against_intent_anchor(
+        intent_anchor=api.UserIntentAnchor(system_expected_actions=["do work"]),
+        blueprint_text="bad",
+        model=None,
+    )
+    assert result["passed"] is False
+    assert result["issues"]
+
+
+@pytest.mark.asyncio
+async def test_intent_repair_uses_strict_json_schema(monkeypatch):
+    captured = {}
+
+    async def fake_complete(*, messages, model, phase, response_schema):
+        captured["schema"] = response_schema
+        return {"internal_blueprint_text": "fixed blueprint"}
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    result = await api._repair_blueprint_from_intent_anchor(
+        intent_anchor=api.UserIntentAnchor(system_expected_actions=["do work"]),
+        blueprint_text="bad",
+        intent_issues=[],
+        model=None,
+    )
+    assert result == "fixed blueprint"
+    assert set(captured["schema"]["properties"]) == {"internal_blueprint_text"}
+    assert captured["schema"]["required"] == ["internal_blueprint_text"]
+    assert captured["schema"]["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_intent_repair_rejects_empty_blueprint(monkeypatch):
+    async def fake_complete(*, messages, model, phase, response_schema):
+        return {"internal_blueprint_text": ""}
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    with pytest.raises(api.PreparePlanProtocolError, match="intent_anchor_repair_returned_empty_blueprint"):
+        await api._repair_blueprint_from_intent_anchor(
+            intent_anchor=api.UserIntentAnchor(system_expected_actions=["do work"]),
+            blueprint_text="bad",
+            intent_issues=[],
+            model=None,
+        )
+
+
+def test_intent_summary_anchor_overwrites_stale_input_with_empty_input():
+    summary = api.PreparePlanReviewSummary(
+        goal="旧目标",
+        input="用户提供完整完成结果",
+        output="旧输出",
+        workflow=["旧流程"],
+    )
+    projected = api._project_summary_from_intent_anchor(
+        summary,
+        api.UserIntentAnchor(primary_goal="新目标", user_provided_inputs=[], final_deliverables=[]),
+    )
+    assert projected.goal == "新目标"
+    assert projected.input == ""
+    assert projected.output == ""
+    assert projected.workflow == []
+
+
+@pytest.mark.asyncio
+async def test_intent_coverage_routes_to_validator_task(monkeypatch):
+    captured = {}
+
+    def fake_route(task, requested_model=None, reason=""):
+        captured["task"] = task
+        return type("Route", (), {"model": "validator-model"})()
+
+    async def fake_complete(*, messages, model, phase, response_schema):
+        return {"passed": True, "issues": []}
+
+    monkeypatch.setattr(api, "route_model", fake_route)
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    await api._review_blueprint_against_intent_anchor(
+        intent_anchor=api.UserIntentAnchor(system_expected_actions=["do work"]),
+        blueprint_text="ok",
+        model=None,
+    )
+    assert captured["task"] == api.VALIDATOR_TASK
+
+
+def test_prepare_protocol_real_shape_validator_not_globally_mocked():
+    assert api.validate_blueprint_shape_for_creator.__module__ == "backend.services.blueprint_parser"

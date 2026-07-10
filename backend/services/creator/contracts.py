@@ -2477,34 +2477,6 @@ def _sanitize_reference_placeholders(content: str) -> str:
     return frontmatter_match.group(1).rstrip() + "\n" + new_body
 
 
-def _semantic_reference_tokens(text: str) -> set[str]:
-    """Extract lightweight semantic tokens without business-specific wordlists."""
-    raw = str(text or "").lower()
-    tokens = {m.group(0) for m in re.finditer(r"[a-z0-9_][a-z0-9_./-]{2,}", raw)}
-    cjk = "".join(re.findall(r"[\u4e00-\u9fff]", raw))
-    if len(cjk) >= 2:
-        tokens.update(cjk[i:i + 2] for i in range(len(cjk) - 1))
-    generic = {
-        "参考", "文档", "规则", "格式", "示例", "质量", "标准", "内容", "输出", "输入",
-        "reference", "guide", "format", "example", "quality", "content", "output", "input",
-    }
-    return {token for token in tokens if token not in generic and len(token.strip()) >= 2}
-
-
-def _reference_covers_own_semantic_purpose(*, purpose: str, body: str) -> tuple[bool, dict[str, Any]]:
-    purpose_tokens = _semantic_reference_tokens(purpose)
-    if not purpose_tokens:
-        return True, {"reason": "no_specific_purpose_tokens"}
-    body_tokens = _semantic_reference_tokens(body)
-    matched = sorted(purpose_tokens & body_tokens)
-    # This is not a fixed-section or field-name gate. It only catches the
-    # obvious case where a reference has generic document shape but no lexical
-    # evidence of covering its declared own semantic responsibility.
-    return bool(matched), {
-        "purpose_tokens": sorted(purpose_tokens)[:20],
-        "matched_tokens": matched[:20],
-    }
-
 def _check_reference_file_contract(file_path: str, content: str, *, purpose: str = "") -> list[ContractCheckResult]:
     raw_failures = _basic_markdown_format_failures(
         file_path,
@@ -2577,23 +2549,6 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
         minimal_edit="补齐或删除未闭合的 ```/~~~ fenced block。",
     ))
 
-    declares_runtime_protocol = bool(re.search(
-        r"(?im)^\s*(?:runtime_contract|artifact_contract|required_tool_slots|implementation_strategy|command_template)\s*[:=]",
-        stripped,
-    ))
-    results.append(ContractCheckResult(
-        id="reference.no_runtime_protocol",
-        passed=not declares_runtime_protocol,
-        target=file_path,
-        message=(
-            "reference 未声明运行时协议。"
-            if not declares_runtime_protocol
-            else f"{file_path} 不应声明 runtime/tool/artifact 执行协议。"
-        ),
-        expected="reference 只提供文档上下文；运行时协议属于 normalized plan / scripts。",
-        minimal_edit="删除 runtime_contract、artifact_contract、required_tool_slots、implementation_strategy 或 command_template 等运行时协议字段。",
-    ))
-
     results.append(ContractCheckResult(
         id="reference.not_empty",
         passed=bool(stripped),
@@ -2617,93 +2572,10 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
         minimal_edit="把正文改写为真正的参考资料文档，添加标题，并围绕当前 purpose 提供规则、示例、约束或质量标准。",
     ))
 
-    # 3. minimum reference-value gate
-    compact_body = re.sub(r"\s+", "", stripped)
-    nonempty_lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    paragraph_count = len([
-        chunk for chunk in re.split(r"\n\s*\n", stripped)
-        if chunk.strip() and not chunk.strip().startswith("#")
-    ])
-    has_list = bool(re.search(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+\S", stripped))
-    has_table = bool(re.search(r"(?m)^\s*\|.+\|\s*$", stripped))
-    has_fenced_block = "```" in stripped or "~~~" in stripped
-    has_subheading = bool(re.search(r"(?m)^#{2,6}\s+\S", stripped))
-
-    has_reference_value = (
-        has_heading
-        and len(compact_body) >= 160
-        and (
-            has_subheading
-            or has_list
-            or has_table
-            or has_fenced_block
-            or paragraph_count >= 2
-            or len(nonempty_lines) >= 6
-        )
-    )
-    reference_semantic_passed, reference_semantic_details = _reference_covers_own_semantic_purpose(
-        purpose=purpose,
-        body=stripped,
-    )
-
-    results.append(ContractCheckResult(
-        id="reference.content.has_reference_value",
-        passed=has_reference_value,
-        target=file_path,
-        message=(
-            "reference 正文具备基本参考资料结构和信息量。"
-            if has_reference_value
-            else f"{file_path} 正文信息量或文档结构不足，不应作为 reference 通过。"
-        ),
-        expected=(
-            "reference 必须是可复用参考资料；"
-            "应包含 Markdown 标题，并提供规则、约束、示例、格式说明、风格要求、质量标准或其它参考信息。"
-        ),
-        minimal_edit=(
-            "将当前正文改写为真正的参考资料文档；"
-            "不要输出聊天式澄清、确认选项、状态说明或计划询问；"
-            "正文应围绕当前 reference purpose 提供可复用规则、示例、约束或质量标准。"
-        ),
-        details={
-            "body_chars_without_space": len(compact_body),
-            "nonempty_lines": len(nonempty_lines),
-            "paragraph_count": paragraph_count,
-            "has_heading": has_heading,
-            "has_subheading": has_subheading,
-            "has_list": has_list,
-            "has_table": has_table,
-            "has_fenced_block": has_fenced_block,
-        },
-    ))
-
-    results.append(ContractCheckResult(
-        id="reference.content.covers_own_semantic_purpose",
-        passed=reference_semantic_passed,
-        target=file_path,
-        message=(
-            "reference 正文覆盖自身参考内容职责。"
-            if reference_semantic_passed
-            else f"{file_path} 正文具有通用文档外壳，但缺少覆盖自身 purpose 的语义证据。"
-        ),
-        expected="reference 第一轮只按自身语义职责判断；不要求固定章节名或字段名，但正文必须覆盖 purpose 指向的参考内容。",
-        minimal_edit="只补当前 reference 缺失的参考内容职责，例如与 purpose 对应的规则、格式、示例、约束或质量标准；不要改成固定章节名。",
-        details=reference_semantic_details,
-    ))
-
-    creator_flow_leak = bool(_CREATOR_FLOW_LEAK_RE.search(content))
-    results.append(ContractCheckResult(
-        id="reference.no_creator_flow",
-        passed=not creator_flow_leak,
-        target=file_path,
-        message=(
-            "未包含 Creator 创建流程文案。"
-            if not creator_flow_leak
-            else f"{file_path} 包含 Creator 创建流程/确认清单/点击开始创建等平台流程文案。"
-        ),
-        expected="不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
-        minimal_edit="删除平台创建流程文案，只保留 metadata 和参考资料正文。",
-    ))
-
+    # 3. structural single-file packaging checks. Semantic adequacy, reference
+    # value, Creator-flow leakage, placeholder quality, and runtime-protocol
+    # responsibility are model semantic review concerns, not deterministic
+    # backend hard facts.
     # 允许正文提到 scripts/*.py；只禁止真正的多文件打包/写入文件标签。
     # 注意：这里只扫描 frontmatter 之后的正文 stripped，不能扫描完整 content。
     # 否则 metadata.creator.path: references/... 会被误判为“写入文件标签”。
@@ -2761,53 +2633,6 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
             "但不得包含 ```bash/```sh/```shell 中调用 scripts/** 的可执行命令。"
         ),
         minimal_edit="把 reference 中的可执行命令示例改为 ```text，或改写为普通说明，不要使用 bash/sh/shell fence。",
-    ))
-
-    capability_contract_patterns = [
-        r"(?i)\brequired_capabilities\b",
-        r"(?i)\bforbidden_capabilities\b",
-        r"(?i)\btext_generation\b",
-        r"(?i)\bimage_generation\b",
-        r"(?i)\bpdf_generation\b",
-        r"(?i)\bruntime_execution\b",
-    ]
-    mentions_script_capability_contract = bool(
-        re.search(r"scripts/[A-Za-z0-9_./-]+\.py", stripped)
-        and any(re.search(pattern, stripped) for pattern in capability_contract_patterns)
-    )
-    results.append(ContractCheckResult(
-        id="reference.no_script_capability_redefinition",
-        passed=not mentions_script_capability_contract,
-        target=file_path,
-        message=(
-            "reference 未重新定义脚本能力边界。"
-            if not mentions_script_capability_contract
-            else f"{file_path} 在 reference 正文中重新定义 scripts/*.py 的能力边界。"
-        ),
-        expected=(
-            "reference 只能描述内容结构、格式、风格和质量标准；"
-            "scripts/*.py 的 required_capabilities/forbidden_capabilities 只能来自 SkillPlan。"
-        ),
-        minimal_edit=(
-            "删除 reference 中关于某个脚本必须/禁止 text_generation、image_generation、pdf_generation、"
-            "runtime_execution 的描述，改为内容规范或输出格式要求。"
-        ),
-    ))
-
-    placeholder_matches = _reference_placeholder_matches(stripped)
-    has_placeholder = bool(placeholder_matches)
-    results.append(ContractCheckResult(
-        id="reference.no_placeholder_phrases",
-        passed=not has_placeholder,
-        target=file_path,
-        message=(
-            "参考资料正文未包含占位短语。"
-            if not has_placeholder
-            else f"{file_path} 正文包含 placeholder/TODO/待补充等占位短语。"
-        ),
-        expected="不要使用 placeholder、TODO、待补充、将要生成等占位表达。",
-        minimal_edit="删除占位短语并替换为实际任务规则和示例。",
-        details={"matches": placeholder_matches, "banned_terms": sorted(set(match["term"] for match in placeholder_matches))},
     ))
 
     return results
