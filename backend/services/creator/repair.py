@@ -3067,28 +3067,6 @@ def _parse_validator_json_object(text: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _deterministic_failed_check_ids(failed_checks_text: str) -> set[str]:
-    ids: set[str] = set()
-    for match in re.finditer(r"^-\s+([^\s]+)\s+target=", failed_checks_text or "", re.M):
-        ids.add(match.group(1))
-    return ids
-
-
-def _filter_validator_failed_checks(failed_checks: list[Any], failed_checks_text: str) -> list[Any]:
-    """Keep only model failed_checks backed by deterministic failed checks."""
-    allowed_ids = _deterministic_failed_check_ids(failed_checks_text)
-    if not allowed_ids:
-        return []
-    filtered: list[Any] = []
-    for check in failed_checks:
-        if not isinstance(check, dict):
-            continue
-        check_id = str(check.get("id") or "")
-        if check_id in allowed_ids:
-            filtered.append(check)
-    return filtered
-
-
 _MISSING_SKILL_SCRIPT_BLOCK_RE = re.compile(
     r"SKILL\.md 缺少调用 (?P<script>scripts/[A-Za-z0-9_./-]+) 的可执行 Markdown 命令块"
 )
@@ -3181,14 +3159,6 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "不要求文件末尾追加 ---。只修文件开头 frontmatter。"
             )
 
-        if "蓝图意图不一致" in error_text or "intent" in error_text or "workflow" in error_text or "file_plan" in error_text:
-            return (
-                "按模型审查意见最小修复 SKILL.md：必须覆盖蓝图真实规划任务、真实 scripts、真实 references、真实 assets、workflow 顺序和最终产物类型；第一轮不要证明内部 stdout/placeholder 闭环；"
-                "真实脚本必须使用 ```bash fenced code block；"
-                "JSON 配置或 stdout 示例必须使用 ```json fenced code block；"
-                "不要把示例/反例路径当成真实文件。"
-            )
-
         return (
             "修复 SKILL.md：保持其作为最终 Skill 使用说明；覆盖蓝图真实任务和 workflow；"
             "删除 Creator 创建流程；确保真实脚本命令块使用 ```bash fence，JSON 示例使用 ```json fence。"
@@ -3208,28 +3178,6 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "如果失败字段确实是 pdf_path/image_path/docx_path/pptx_path/html_path/file_paths/file_outputs 等产物字段，"
                 "请只修当前脚本的真实文件写入路径和 stdout 路径映射，确保返回路径对应的文件真实存在且内容非空。"
                 "如果当前脚本只输出普通业务数据，则应保持普通 JSON 字段，并等待后端 artifact 字段语义修复；不要改 SKILL.md、SkillPlan 或其它脚本。"
-            )
-
-        if (
-            "script_functional" in error_text
-            or "职责" in error_text
-            or "responsibility" in lower_error
-            or "content_responsibility" in lower_error
-        ):
-            return (
-                "当前失败属于第一轮当前脚本自身语义职责失败，不是 script_smoke 运行失败，也不是 E2E 字段链路失败。"
-                "第一轮修复只补当前脚本缺失的语义输入消费、语义产物生成或明确无效内容；"
-                "只修当前脚本中校验信息指出的函数、行号或代码区域；"
-                "保留已经通过的 import、parse_args/main 入口、strict JSON argv guard、stdout 字段名和文件输出协议；不要把修复变成固定字段名改名；"
-                "如果缺少 mandatory guard，必须只修当前脚本：添加 strict_json_argv_guard import，在 parse_args/入口中调用 strict_json_argv_guard(payload, spec)，spec 根据 run() 真实使用参数填写；不要内联 helper，不要改 SKILL.md，不要引入脱离核心逻辑的全局字段词表；"
-                "不要一刀切删除 .get/default；但 required 参数不得用 .get(..., default) 或 .get(...) or default 继续执行，"
-                "可选/defaulted 参数必须在入口 guard spec 中显式声明；默认值可以由 guard spec 的 default 或 SKILL.md command JSON 明确提供，但不要破坏合法 optional/defaulted 逻辑；"
-                "禁止保留 input_text/example placeholder、ellipsis、set(...)、{...}、TODO schema 或 placeholder schema；"
-                "不得改 SKILL.md、其它脚本或 SkillPlan；不得进入全量重写；"
-                "不得通过 try/except 吞错后输出假成功、固定模板、空值或 mock 数据。"
-                "核心 stdout 字段必须具有 provenance：来自 argv JSON、上游 stdout、reference/assets、工具结果、模型结果或确定性计算。"
-                "如果脚本调用了模型/工具，模型/工具结果必须参与核心 declared_stdout_fields 或文件产物内容构造；"
-                "不得只调用工具生成一个 text，然后硬编码其它业务字段。"
             )
 
         if (
@@ -3612,8 +3560,7 @@ async def _run_generated_file_validator_round(
         }
 
     issues = data.get("issues") if isinstance(data.get("issues"), list) else []
-    raw_failed_checks = data.get("failed_checks") if isinstance(data.get("failed_checks"), list) else []
-    failed_checks = _filter_validator_failed_checks(raw_failed_checks, failed_checks_text)
+    failed_checks = data.get("failed_checks") if isinstance(data.get("failed_checks"), list) else []
 
     instructions = str(data.get("repair_instructions") or data.get("feedback") or "")
     filtered_issues, filtered_instructions = _filter_validator_model_call_misjudgements(
@@ -3649,14 +3596,22 @@ def _filter_validator_model_call_misjudgements(
     issues: list[Any],
     instructions: str,
 ) -> tuple[list[str], str]:
-    """Ignore model-invented blocking issues.
+    """Pass through validator structured semantic feedback.
 
-    The backend has already produced structured checks and filtered model
-    failed_checks to deterministic ids. Free-form model issues are kept out of
-    blocking/repair decisions so the model can explain existing results without
-    inventing new failure items.
+    The repair layer no longer reclassifies semantic failures from backend
+    error text or filters semantic validator issues through deterministic
+    check-id allowlists. Backend deterministic checks still own hard facts;
+    validator-provided issues/localization/preserve/repair_instructions are
+    carried as structured semantic repair context when the validator does not
+    delegate to the backend contract.
     """
-    return [], instructions or deterministic_error
+    safe_issues: list[str] = []
+    for issue in issues:
+        if isinstance(issue, (dict, list)):
+            safe_issues.append(json.dumps(issue, ensure_ascii=False, default=str))
+        elif issue not in (None, "", [], {}):
+            safe_issues.append(str(issue))
+    return safe_issues, instructions or deterministic_error
 
 
 def _format_file_validator_feedback(
@@ -3749,35 +3704,30 @@ def _format_file_validator_feedback(
             json.dumps(safe_localizations, ensure_ascii=False, indent=2, default=str),
         ])
 
-    advisory_only_report = (
-        isinstance(validator_report, dict)
-        and (validator_report.get("passed") is True or validator_report.get("failure_type") in {"none", None, ""})
-        and not validator_report.get("issues")
-    )
-    repair_text = str(validator_report.get("repair_instructions") or "").strip() if isinstance(validator_report, dict) else ""
-    issues_for_repair = validator_report.get("issues") if isinstance(validator_report, dict) else []
-    has_structured_blocking_issue = any(
-        isinstance(item, dict)
-        and str(item.get("requirement_id") or "").strip()
-        and isinstance(item.get("missing_evidence"), list)
-        and bool(item.get("missing_evidence"))
-        for item in (issues_for_repair if isinstance(issues_for_repair, list) else [])
-    )
-    failure_type = str(validator_report.get("failure_type") or "") if isinstance(validator_report, dict) else ""
-    if failure_type in {"script_requirement_validator_error", "script_requirement_validator_incomplete", "validator_error", "validator_incomplete"}:
-        advisory_only_report = True
-    if (
-        not delegate_to_backend_contract
-        and isinstance(validator_report, dict)
-        and repair_text
-        and not advisory_only_report
-        and has_structured_blocking_issue
-    ):
-        parts.extend([
-            "",
-            "校验模型给出的辅助 repair_instructions，仅作为定位参考，不得覆盖 deterministic_error：",
-            repair_text,
-        ])
+    if not delegate_to_backend_contract and isinstance(validator_report, dict):
+        issues_for_repair = validator_report.get("issues")
+        if isinstance(issues_for_repair, list) and issues_for_repair:
+            parts.extend([
+                "",
+                "Validator structured semantic issues（直接传递，不经后端关键词分类或 deterministic check-id 白名单过滤）：",
+                json.dumps(issues_for_repair, ensure_ascii=False, indent=2, default=str),
+            ])
+
+        preserve_for_repair = validator_report.get("preserve")
+        if isinstance(preserve_for_repair, list) and preserve_for_repair:
+            parts.extend([
+                "",
+                "Validator preserve constraints（必须保留）：",
+                json.dumps(preserve_for_repair, ensure_ascii=False, indent=2, default=str),
+            ])
+
+        repair_text = str(validator_report.get("repair_instructions") or "").strip()
+        if repair_text:
+            parts.extend([
+                "",
+                "Validator repair_instructions（语义修复目标，直接来自 Validator）：",
+                repair_text,
+            ])
 
     parts.extend([
         "",
@@ -4785,14 +4735,13 @@ async def _run_script_responsibility_review(
     """
 
     req_items = _coerce_requirement_items(requirements) or _coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
-    deterministic_issues = (deterministic_issues or []) + _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-    deterministic_issues += detect_requirement_evidence_static(script_content, req_items, getattr(skill_plan_entry, "outputs", []))
-    deterministic_issues += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
-    # Detect empty-shell functions and branches; stub implementations are a hard
-    # responsibility failure regardless of other checks.
-    stub_issues = _detect_stub_implementations(script_content, skill_plan_entry)
-    if stub_issues:
-        deterministic_issues += stub_issues
+    deterministic_issues = (
+        deterministic_issues or []
+    ) + _runtime_tool_contract_static_blockers(
+        script_content,
+        skill_plan_entry,
+        req_items,
+    )
     review_context = review_context if isinstance(review_context, dict) else {}
     current_file_tool_binding = (
         review_context.get(
@@ -4864,7 +4813,7 @@ async def _run_script_responsibility_review(
         return {
             "passed": False,
             "issues": deterministic_issues,
-            "repair_instructions": "按确定性工具合同/功能责任检查结果修复当前脚本源码。",
+            "repair_instructions": "按确定性工具合同检查结果修复当前脚本源码。",
             "failure_type": "script_requirement_failed",
             "model": "deterministic",
         }
@@ -5063,12 +5012,11 @@ async def _run_script_responsibility_review(
             if review_attempt < 2:
                 continue
             static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-            static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
             if static_blockers:
                 return {
                     "passed": False,
                     "issues": static_blockers,
-                    "repair_instructions": "按确定性工具合同/功能责任检查结果修复当前脚本源码。",
+                    "repair_instructions": "按确定性工具合同检查结果修复当前脚本源码。",
                     "failure_type": "script_requirement_failed",
                     "model": "deterministic",
                 }
@@ -5097,7 +5045,6 @@ async def _run_script_responsibility_review(
             if not parsed_review.get("passed"):
                 if parsed_review.get("failure_type") in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
                     static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-                    static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
                     if static_blockers:
                         logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
                             "event": "script_responsibility_failed",
@@ -5108,7 +5055,7 @@ async def _run_script_responsibility_review(
                         return {
                             "passed": False,
                             "issues": static_blockers,
-                            "repair_instructions": "按确定性工具合同/功能责任检查结果修复当前脚本源码。",
+                            "repair_instructions": "按确定性工具合同检查结果修复当前脚本源码。",
                             "failure_type": "script_requirement_failed",
                             "model": "deterministic",
                             "raw_review": parsed_review.get("raw_review"),
@@ -5122,7 +5069,6 @@ async def _run_script_responsibility_review(
                 }, ensure_ascii=False, default=str))
                 return parsed_review
             static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-            static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
             if static_blockers:
                 logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
                     "event": "script_responsibility_failed",
@@ -5133,7 +5079,7 @@ async def _run_script_responsibility_review(
                 return {
                     "passed": False,
                     "issues": static_blockers,
-                    "repair_instructions": "按确定性工具合同/功能责任检查结果修复当前脚本源码。",
+                    "repair_instructions": "按确定性工具合同检查结果修复当前脚本源码。",
                     "failure_type": "script_requirement_failed",
                     "model": "deterministic",
                     "raw_review": parsed_review.get("raw_review"),

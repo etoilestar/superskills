@@ -2611,30 +2611,6 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
         minimal_edit="删除其它文件完整内容和写入文件标签，只保留当前 reference metadata 和正文。",
     ))
 
-    executable_reference_blocks: list[str] = []
-    for info, fenced_body in _iter_markdown_fenced_blocks(stripped):
-        if _is_shell_fence_info(info) and re.search(
-            r"(?m)^\s*(?:python|python3|node|bash|sh)\s+scripts/[A-Za-z0-9_./-]+\b",
-            fenced_body,
-        ):
-            executable_reference_blocks.append(fenced_body.strip())
-
-    results.append(ContractCheckResult(
-        id="reference.no_executable_script_blocks",
-        passed=not executable_reference_blocks,
-        target=file_path,
-        message=(
-            "reference 未包含可执行 scripts/** shell 命令块。"
-            if not executable_reference_blocks
-            else f"{file_path} 包含可执行 scripts/** shell 命令块，reference 只能作为说明资源。"
-        ),
-        expected=(
-            "references/*.md 可以包含 ```json 或 ```text 示例，"
-            "但不得包含 ```bash/```sh/```shell 中调用 scripts/** 的可执行命令。"
-        ),
-        minimal_edit="把 reference 中的可执行命令示例改为 ```text，或改写为普通说明，不要使用 bash/sh/shell fence。",
-    ))
-
     return results
 
 
@@ -2675,50 +2651,8 @@ def _anti_example_sections(content: str) -> str:
 
 
 def _check_reference_skillplan_redefinitions(file_path: str, content: str, entry: SkillPlanEntry) -> list[ContractCheckResult]:
-    """Ensure references do not invent a second script interface contract."""
-    results: list[ContractCheckResult] = []
-    declared_role = _declared_role_in_text(content)
-    role_ok = declared_role is None or declared_role == entry.role
-    results.append(ContractCheckResult(
-        id="reference.role.matches_skillplan",
-        passed=role_ok,
-        target=f"{file_path}#{entry.path}",
-        message=("reference 未重新定义冲突 role。" if role_ok else f"reference 重新定义 role={declared_role}，与 SkillPlan.role={entry.role} 冲突。"),
-        expected=f"reference 默认不要定义 role；如提及只能是 role={entry.role}。",
-        minimal_edit="删除 reference 中的 role/能力合同定义，改写为写作规范、风格要求、示例和质量标准。",
-    ))
-    for field_name, expected_values in (
-        ("inputs", entry.inputs or ["payload"]),
-        ("outputs", entry.outputs),
-        ("required_capabilities", entry.required_capabilities),
-        ("forbidden_capabilities", entry.forbidden_capabilities),
-    ):
-        declared = _declared_list_in_text(field_name, content)
-        ok = declared is None or declared == expected_values
-        results.append(ContractCheckResult(
-            id=f"reference.{field_name}.matches_skillplan",
-            passed=ok,
-            target=f"{file_path}#{entry.path}",
-            message=(f"reference 未重新定义冲突 {field_name}。" if ok else f"reference {field_name}={declared} 与 SkillPlan {field_name}={expected_values} 冲突。"),
-            expected=f"reference 默认不要定义 {field_name}；如提及必须逐字等于 SkillPlan: {expected_values}。",
-            minimal_edit=f"删除或修正 {field_name} 小节，避免产生第二套接口合同。",
-        ))
-    anti = _anti_example_sections(content)
-    correct_command_in_anti = bool(anti and entry.command_template and entry.command_template in anti)
-    correct_keys_in_anti = False
-    for command in re.findall(r"```(?:bash|sh|shell)?\s*\n([\s\S]*?)\n```", anti, flags=re.I):
-        keys = _command_payload_keys(command.strip(), entry.path)
-        if keys == set(entry.inputs or ["payload"]):
-            correct_keys_in_anti = True
-    results.append(ContractCheckResult(
-        id="reference.anti_example.not_skillplan_command",
-        passed=not correct_command_in_anti and not correct_keys_in_anti,
-        target=f"{file_path}#anti-examples",
-        message=("reference 未把 SkillPlan 正确命令/JSON keys 写成反例。" if not correct_command_in_anti and not correct_keys_in_anti else "reference 把 SkillPlan.command_template 或正确 JSON keys 写入反例，导致合同冲突。"),
-        expected="反例只能展示 extra key、缺失 key、错误 runner 或非 JSON argv；不得否定 SkillPlan.command_template。",
-        minimal_edit="从反例中移除正确命令，改为错误示例例如 extra 参数或 payload 包装。",
-    ))
-    return results
+    """Reference/SkillPlan semantic conflicts are model-review concerns."""
+    return []
 
 def _validate_reference_file_contract(file_path: str, content: str, purpose: str = "") -> None:
     results = _check_reference_file_contract(file_path, content, purpose)
@@ -2781,11 +2715,10 @@ def _asset_extension_check(file_path: str, stripped: str) -> tuple[bool, str, st
             "PDF asset 必须是有效、非空 PDF 内容。",
         )
     if ext in {".md", ".txt"}:
-        quality_ok = len(stripped) >= 40 and not _REFERENCE_PLACEHOLDER_RE.search(stripped)
         return (
-            quality_ok,
-            "Markdown/text asset 满足最低质量要求。" if quality_ok else f"{file_path} 文本资源过短或包含占位短语。",
-            "Markdown/text asset 至少 40 个字符且不能包含占位短语。",
+            True,
+            "Markdown/text asset 非空。",
+            "Markdown/text asset 必须是非空文本；内容质量由 semantic reviewer 判断。",
         )
     return True, "asset 格式可解析。", "当前 asset 文件内容必须符合其扩展名对应格式。"
 
@@ -2821,7 +2754,6 @@ def _image_dimensions(data: bytes) -> tuple[int, int] | None:
 
 def _check_asset_file_contract(file_path: str, content: str) -> list[ContractCheckResult]:
     stripped = content.strip()
-    has_runtime_code = bool(_PLATFORM_IMAGE_HELPER_RE.search(stripped))
     parse_ok, parse_message, parse_expected = _asset_extension_check(file_path, stripped)
     return [
         ContractCheckResult(
@@ -2839,18 +2771,6 @@ def _check_asset_file_contract(file_path: str, content: str) -> list[ContractChe
             message=parse_message,
             expected=parse_expected,
             minimal_edit="按文件扩展名修正格式：JSON/YAML/CSV/image/PDF/Markdown 文本必须可解析且非空。",
-        ),
-        ContractCheckResult(
-            id="asset.no_runtime_capability",
-            passed=not has_runtime_code,
-            target=file_path,
-            message=(
-                "asset 未包含运行时图片生成能力。"
-                if not has_runtime_code
-                else f"{file_path} 是 asset，但包含图片生成 helper/运行时代码。"
-            ),
-            expected="asset 只能是模板或静态资源，不得执行 image_generation 等能力。",
-            minimal_edit="删除运行时代码或将该职责拆分为 scripts/ 文件。",
         ),
     ]
 

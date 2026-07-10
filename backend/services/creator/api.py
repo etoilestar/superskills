@@ -8530,14 +8530,6 @@ async def _prepare_summarize_confirmed_requirements(
     )
 
 
-async def _generate_internal_blueprint_from_confirmed_summary(
-    **_: Any,
-) -> dict[str, Any]:
-    """Compatibility hook for legacy tests; production flow freezes full blueprint."""
-    raise PreparePlanProtocolError(
-        "confirmed_summary_blueprint_generation_is_disabled"
-    )
-
 def _tool_names_from_entry_contract(entry: Any) -> list[str]:
     data = entry if isinstance(entry, dict) else getattr(entry, "__dict__", {})
     names: list[str] = []
@@ -9582,27 +9574,20 @@ async def _prepare_plan_impl(
 
     else:
         try:
-            try:
-                prepared = (
-                    await (
-                        _generate_internal_blueprint_or_questions(
-                            request,
-                            event_emitter=event_emitter,
-                            intent_anchor=intent_anchor,
-                        )
-                        if event_emitter is not None
-                        else _generate_internal_blueprint_or_questions(
-                            request,
-                            intent_anchor=intent_anchor,
-                        )
+            prepared = (
+                await (
+                    _generate_internal_blueprint_or_questions(
+                        request,
+                        event_emitter=event_emitter,
+                        intent_anchor=intent_anchor,
+                    )
+                    if event_emitter is not None
+                    else _generate_internal_blueprint_or_questions(
+                        request,
+                        intent_anchor=intent_anchor,
                     )
                 )
-            except TypeError as exc:
-                if "intent_anchor" not in str(exc):
-                    raise
-                prepared = await _generate_internal_blueprint_or_questions(
-                    request
-                )
+            )
 
         except PreparePlanProtocolError as exc:
             return PreparePlanResponse(
