@@ -1628,6 +1628,61 @@ python scripts/run.py '{"payload":"{{payload}}"}'
     assert any("network_disabled" in warning for warning in plan.warnings)
 
 
+def test_exact_file_plan_paths_ignore_path_blocks_outside_skillplan_section():
+    from backend.services.blueprint_parser import exact_file_plan_paths_from_strict_skillplan
+    from backend.services.creator.api import _resolve_allowed_function_item_targets_from_blueprint
+
+    blueprint = """
+## 📋 Skill 架构蓝图
+- **Skill 名称**: strict-path-demo
+
+### 目录结构
+- SKILL.md
+- scripts/: `scripts/real.py`
+
+### 其它说明
+- path: `scripts/fake.py`
+  role: leaked_example
+
+### SkillPlan / 文件职责计划
+- path: `SKILL.md`
+  role: skill_overview
+  inputs: []
+  outputs: []
+  dependencies: []
+  required_capabilities: []
+  forbidden_capabilities: []
+  references: []
+  constraints: []
+- path: `scripts/real.py`
+  role: generic_script
+  inputs: [topic]
+  outputs: [result]
+  dependencies: []
+  required_capabilities: []
+  forbidden_capabilities: []
+  references: []
+  constraints: []
+
+### 宿主执行方式
+```bash
+python scripts/real.py
+```
+
+### 附录
+- path: `scripts/also_fake.py`
+  role: leaked_appendix
+"""
+
+    assert exact_file_plan_paths_from_strict_skillplan(blueprint) == [
+        "SKILL.md",
+        "scripts/real.py",
+    ]
+    assert _resolve_allowed_function_item_targets_from_blueprint(blueprint) == [
+        "scripts/real.py",
+    ]
+
+
 
 def test_blueprint_parser_strips_confirmation_ui_from_blueprint_body():
     from backend.services.blueprint_parser import parse_blueprint
