@@ -1,3 +1,4 @@
+import json
 import re
 
 import pytest
@@ -11,6 +12,23 @@ def _request(**kwargs):
     data = {"user_request": "做一个工具", "human_feedback": "", "model": None}
     data.update(kwargs)
     return api.PreparePlanRequest(**data)
+
+
+@pytest.fixture(autouse=True)
+def _default_intent_anchor(monkeypatch, request):
+    async def fake_extract(*, request, model):
+        return api.UserIntentAnchor(primary_goal=str(request.user_request or ""))
+
+    async def fake_review(*, intent_anchor, blueprint_text, model):
+        return {"passed": True, "issues": []}
+
+    if request.node.name not in {
+        "test_user_intent_anchor_separates_user_inputs_from_system_actions",
+        "test_local_clarification_does_not_replace_prior_system_action",
+    }:
+        monkeypatch.setattr(api, "_extract_user_intent_anchor", fake_extract)
+    monkeypatch.setattr(api, "_review_blueprint_against_intent_anchor", fake_review)
+    monkeypatch.setattr(api, "validate_blueprint_shape_for_creator", lambda _text: None)
 
 
 def _ready_blueprint(paths="- path: `SKILL.md`\n  role: skill_overview\n  inputs: [user_request]\n  outputs: [workflow]\n  dependencies: []\n  required_capabilities: []\n  forbidden_capabilities: [hidden_runtime_protocol]\n  references: []"):
@@ -1640,3 +1658,225 @@ def test_validate_structured_responsibility_edge_transport_accepts_function_item
         function_items=function_items,
         source="planner",
     ) == [edge]
+
+
+@pytest.mark.asyncio
+async def test_user_intent_anchor_separates_user_inputs_from_system_actions(monkeypatch):
+    captured = {}
+
+    async def fake_complete(*, messages, model, phase, response_schema):
+        captured["messages"] = messages
+        captured["schema"] = response_schema
+        return {
+            "primary_goal": "分析上传的数据并生成报告",
+            "required_user_outcomes": ["获得报告"],
+            "user_provided_inputs": ["上传数据"],
+            "system_expected_actions": ["分析数据", "生成报告"],
+            "confirmed_choices": [],
+            "final_deliverables": ["报告"],
+            "explicit_constraints": [],
+        }
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    anchor = await api._extract_user_intent_anchor(request=_request(user_request="分析上传的数据并生成报告"), model=None)
+    assert anchor.user_provided_inputs == ["上传数据"]
+    assert anchor.system_expected_actions == ["分析数据", "生成报告"]
+    prompt = captured["messages"][0]["content"]
+    assert "Do not convert the expected result of a system action into a required user input" in prompt
+    assert set(captured["schema"]["properties"]) == {
+        "primary_goal",
+        "required_user_outcomes",
+        "user_provided_inputs",
+        "system_expected_actions",
+        "confirmed_choices",
+        "final_deliverables",
+        "explicit_constraints",
+    }
+
+
+@pytest.mark.asyncio
+async def test_planner_prompt_places_intent_anchor_before_fileplan_contract(monkeypatch):
+    captured = []
+
+    async def fake_complete(messages, model):
+        captured.extend(messages)
+        return '{"status":"needs_clarification","clarifying_questions":["输入来源？A. 粘贴 B. 上传"],"blockers":[]}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    anchor = api.UserIntentAnchor(primary_goal="完成目标", system_expected_actions=["系统动作"])
+    await api._generate_internal_blueprint_or_questions(_request(), intent_anchor=anchor)
+    prompt = captured[0]["content"]
+    assert prompt.index("CONFIRMED USER INTENT") < prompt.index("FilePlan / Blueprint planning pass")
+    assert "Do not move a system_expected_action into user_provided_inputs" in prompt
+
+
+@pytest.mark.asyncio
+async def test_same_intent_anchor_is_reused_through_prepare_execution(monkeypatch):
+    anchor = api.UserIntentAnchor(primary_goal="锚点目标", final_deliverables=["交付物"])
+    calls = {"extract": 0, "summary_anchor_ids": [], "generate_anchor_ids": [], "coverage_anchor_ids": []}
+
+    async def fake_extract(*, request, model):
+        calls["extract"] += 1
+        return anchor
+
+    async def fake_generate(request, event_emitter=None, intent_anchor=None):
+        calls["generate_anchor_ids"].append(id(intent_anchor))
+        return {"status": "ready", "internal_blueprint_text": _ready_blueprint(), "skill_name": "demo-skill"}
+
+    async def fake_summary(**kwargs):
+        calls["summary_anchor_ids"].append(id(kwargs.get("intent_anchor")))
+        return api.PreparePlanReviewSummary(goal=kwargs["intent_anchor"].primary_goal, output="交付物")
+
+    async def fake_review(*, intent_anchor, blueprint_text, model):
+        calls["coverage_anchor_ids"].append(id(intent_anchor))
+        return {"passed": True, "issues": []}
+
+    monkeypatch.setattr(api, "_extract_user_intent_anchor", fake_extract)
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "_prepare_summarize_confirmed_requirements", fake_summary)
+    monkeypatch.setattr(api, "_review_blueprint_against_intent_anchor", fake_review)
+    resp = await api.prepare_plan(_request())
+    assert resp.status == "needs_clarification"
+    assert calls["extract"] == 1
+    assert calls["generate_anchor_ids"] == [id(anchor)]
+    assert calls["summary_anchor_ids"] == [id(anchor)]
+
+
+@pytest.mark.asyncio
+async def test_local_clarification_does_not_replace_prior_system_action(monkeypatch):
+    async def fake_complete(*, messages, model, phase, response_schema):
+        return {
+            "primary_goal": "生成学习计划并导出文档",
+            "required_user_outcomes": [],
+            "user_provided_inputs": [],
+            "system_expected_actions": ["生成学习计划", "导出文档"],
+            "confirmed_choices": [{"scope": "计划粒度", "decision": "按周"}],
+            "final_deliverables": ["文档"],
+            "explicit_constraints": [],
+        }
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    anchor = await api._extract_user_intent_anchor(
+        request=_request(
+            user_request="生成学习计划并导出文档",
+            conversation_history=[
+                {"role": "assistant", "content": "按周还是按天？"},
+                {"role": "user", "content": "按周。"},
+            ],
+        ),
+        model=None,
+    )
+    assert anchor.system_expected_actions == ["生成学习计划", "导出文档"]
+    assert anchor.confirmed_choices[0].scope == "计划粒度"
+    assert "完整学习计划" not in anchor.user_provided_inputs
+
+
+@pytest.mark.asyncio
+async def test_intent_coverage_rejects_system_action_shifted_to_user_input(monkeypatch):
+    repair_calls = []
+    reviews = iter([
+        {"passed": False, "issues": [{"code": "system_action_shifted_to_user_input", "intent_evidence": "系统生成", "blueprint_evidence": "用户输入完整结果", "repair_goal": "恢复系统责任"}]},
+        {"passed": True, "issues": []},
+    ])
+
+    async def fake_review(**kwargs):
+        return next(reviews)
+
+    async def fake_repair(**kwargs):
+        repair_calls.append(kwargs)
+        return "repaired blueprint"
+
+    monkeypatch.setattr(api, "_review_blueprint_against_intent_anchor", fake_review)
+    monkeypatch.setattr(api, "_repair_blueprint_from_intent_anchor", fake_repair)
+    result = await api._ensure_blueprint_covers_intent_anchor(
+        intent_anchor=api.UserIntentAnchor(
+            system_expected_actions=["根据产品需求生成测试内容"],
+            user_provided_inputs=["产品需求"],
+        ),
+        blueprint_text="用户输入完整测试内容，系统负责格式化输出",
+        model=None,
+    )
+    assert result == "repaired blueprint"
+    assert repair_calls
+
+
+@pytest.mark.asyncio
+async def test_intent_repair_runs_before_fileplan_freeze(monkeypatch):
+    events = []
+    captured_targets = []
+    reviews = iter([
+        {"passed": False, "issues": [{"code": "system_action_dropped", "intent_evidence": "x", "blueprint_evidence": "y", "repair_goal": "z"}]},
+        {"passed": True, "issues": []},
+    ])
+    pre = _ready_blueprint("- path: `scripts/pre_intent.py`\n  role: script\n  purpose: pre\n  inputs: []\n  outputs: []\n  dependencies: []\n  required_capabilities: []\n  forbidden_capabilities: []\n  references: []\n  constraints: []")
+    post = _ready_blueprint("- path: `scripts/post_intent.py`\n  role: script\n  purpose: post\n  inputs: []\n  outputs: []\n  dependencies: []\n  required_capabilities: []\n  forbidden_capabilities: []\n  references: []\n  constraints: []")
+
+    async def fake_complete(messages, model):
+        return json.dumps({"status": "ready", "internal_blueprint_text": pre, "skill_name": "demo-skill"})
+
+    async def fake_review(**kwargs):
+        return next(reviews)
+
+    async def fake_repair(**kwargs):
+        return post
+
+    async def fake_bind(**kwargs):
+        captured_targets.extend(kwargs["allowed_function_item_targets"])
+        return {"function_items": [], "responsibility_edges": []}
+
+    async def fake_converge(**kwargs):
+        return {"function_items": [], "responsibility_edges": []}
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    monkeypatch.setattr(api, "_review_blueprint_against_intent_anchor", fake_review)
+    monkeypatch.setattr(api, "_repair_blueprint_from_intent_anchor", fake_repair)
+    monkeypatch.setattr(api, "_bind_executable_responsibility_plan", fake_bind)
+    monkeypatch.setattr(api, "_converge_ready_executable_plan", fake_converge)
+    async def emit(event):
+        events.append(event)
+    await api._generate_internal_blueprint_or_questions(
+        _request(),
+        event_emitter=emit,
+        intent_anchor=api.UserIntentAnchor(system_expected_actions=["x"]),
+    )
+    assert "scripts/post_intent.py" in captured_targets
+    assert "scripts/pre_intent.py" not in captured_targets
+
+
+@pytest.mark.asyncio
+async def test_intent_coverage_failure_stops_before_binding(monkeypatch):
+    calls = {"bind": 0}
+
+    async def fake_review(**kwargs):
+        return {"passed": False, "issues": [{"code": "system_action_dropped", "intent_evidence": "x", "blueprint_evidence": "y", "repair_goal": "z"}]}
+
+    async def fake_repair(**kwargs):
+        return kwargs["blueprint_text"]
+
+    async def fake_bind(**kwargs):
+        calls["bind"] += 1
+        return {"function_items": [], "responsibility_edges": []}
+
+    monkeypatch.setattr(api, "_review_blueprint_against_intent_anchor", fake_review)
+    monkeypatch.setattr(api, "_repair_blueprint_from_intent_anchor", fake_repair)
+    monkeypatch.setattr(api, "_bind_executable_responsibility_plan", fake_bind)
+    with pytest.raises(api.PreparePlanProtocolError, match="intent_anchor_coverage_failed"):
+        await api._ensure_blueprint_covers_intent_anchor(
+            intent_anchor=api.UserIntentAnchor(system_expected_actions=["x"]),
+            blueprint_text="bad",
+            model=None,
+        )
+    assert calls["bind"] == 0
+
+
+@pytest.mark.asyncio
+async def test_intent_coverage_allows_topology_change_when_semantics_preserved(monkeypatch):
+    async def fake_complete(*, messages, model, phase, response_schema):
+        return {"passed": True, "issues": []}
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    anchor = api.UserIntentAnchor(system_expected_actions=["完成语义动作"])
+    two = await api._review_blueprint_against_intent_anchor(intent_anchor=anchor, blueprint_text="scripts/a.py scripts/b.py", model=None)
+    three = await api._review_blueprint_against_intent_anchor(intent_anchor=anchor, blueprint_text="scripts/a.py scripts/b.py scripts/c.py", model=None)
+    assert two["passed"] is True
+    assert three["passed"] is True

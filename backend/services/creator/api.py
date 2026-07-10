@@ -49,6 +49,23 @@ class PreparePlanProtocolError(ValueError):
     """Planner prepare-plan structured transport failed validation."""
 
 
+class ConfirmedIntentChoice(BaseModel):
+    scope: str = ""
+    decision: str = ""
+
+
+class UserIntentAnchor(BaseModel):
+    primary_goal: str = ""
+    required_user_outcomes: list[str] = Field(default_factory=list)
+    user_provided_inputs: list[str] = Field(default_factory=list)
+    system_expected_actions: list[str] = Field(default_factory=list)
+    confirmed_choices: list[ConfirmedIntentChoice] = Field(default_factory=list)
+    final_deliverables: list[str] = Field(default_factory=list)
+    explicit_constraints: list[str] = Field(default_factory=list)
+
+
+_MAX_INTENT_COVERAGE_REPAIR_ATTEMPTS = 2
+
 
 _NOT_SUPPORTED_MARKERS = (
     "not supported in current implementation",
@@ -4866,6 +4883,138 @@ def _coerce_prepare_summary(data: Any) -> PreparePlanReviewSummary:
     )
 
 
+def _intent_anchor_json(intent_anchor: UserIntentAnchor | None) -> str:
+    if intent_anchor is None:
+        return "{}"
+    return json.dumps(
+        intent_anchor.model_dump(mode="json"),
+        ensure_ascii=False,
+        default=str,
+        indent=2,
+    )
+
+
+def _intent_anchor_planner_prefix(intent_anchor: UserIntentAnchor | None) -> str:
+    return (
+        "## CONFIRMED USER INTENT — HIGHEST PRIORITY SEMANTIC SOURCE\n\n"
+        f"{_intent_anchor_json(intent_anchor)}\n\n"
+        "## INTENT OWNERSHIP RULES\n\n"
+        "* UserIntentAnchor defines what the user expects the Skill to accomplish.\n"
+        "* Every system_expected_action must remain assigned to the system/Skill unless the user explicitly revoked it.\n"
+        "* Do not move a system_expected_action into user_provided_inputs.\n"
+        "* Do not require the user to provide a result that the intent anchor assigns the system to produce.\n"
+        "* confirmed_choices are scoped user decisions and must be preserved.\n"
+        "* final_deliverables must remain represented in the Blueprint.\n"
+        "* Implementation topology is the Planner's responsibility.\n"
+        "* User semantic intent is not the Planner's responsibility to rewrite.\n\n"
+        "## SYSTEM RESPONSIBILITY MUST NOT SHIFT TO USER INPUT\n\n"
+        "For every system_expected_action in UserIntentAnchor:\n"
+        "- The Planner may choose any valid implementation topology.\n"
+        "- The Planner may split, merge, rename, or reorganize scripts.\n"
+        "- But the Planner must not satisfy the action by changing the Blueprint so that the user is required to provide the already-completed result of that action.\n"
+        "- If the user asks the system to analyze raw data, do not change that into requiring the user to provide analysis results.\n"
+        "- If the user asks the system to generate test content, do not change that into requiring the user to provide complete test content.\n"
+        "- If the user asks the system to transform input, do not change that into requiring the user to provide the transformed result.\n\n"
+        "## END CONFIRMED USER INTENT\n\n"
+    )
+
+
+def _project_summary_from_intent_anchor(
+    summary: PreparePlanReviewSummary,
+    intent_anchor: UserIntentAnchor | None,
+) -> PreparePlanReviewSummary:
+    if intent_anchor is None:
+        return summary
+    goal_parts = [
+        str(intent_anchor.primary_goal or "").strip(),
+        *[str(item or "").strip() for item in intent_anchor.required_user_outcomes],
+    ]
+    input_parts = [str(item or "").strip() for item in intent_anchor.user_provided_inputs]
+    output_parts = [str(item or "").strip() for item in intent_anchor.final_deliverables]
+    workflow_parts = [
+        *[str(item or "").strip() for item in intent_anchor.system_expected_actions],
+        *[
+            f"{choice.scope}: {choice.decision}".strip(": ")
+            for choice in intent_anchor.confirmed_choices
+            if str(choice.scope or choice.decision or "").strip()
+        ],
+        *[str(item or "").strip() for item in intent_anchor.explicit_constraints],
+    ]
+    if any(goal_parts):
+        summary.goal = "；".join(item for item in goal_parts if item)
+    if input_parts:
+        summary.input = "；".join(item for item in input_parts if item)
+    if output_parts:
+        summary.output = "；".join(item for item in output_parts if item)
+    if workflow_parts:
+        summary.workflow = [item for item in workflow_parts if item]
+    return summary
+
+
+async def _extract_user_intent_anchor(
+    *,
+    request: PreparePlanRequest,
+    model: str | None,
+) -> UserIntentAnchor:
+    response_schema = UserIntentAnchor.model_json_schema()
+    response_schema["additionalProperties"] = False
+    prompt = """
+You are the Creator User Intent Anchor extractor. Your only task is to extract what the user expects the system/Skill to accomplish from the original user request and the chronological clarification conversation.
+
+Do not design files, scripts, DAGs, tools, capabilities, argv/stdout, implementation strategy, or Blueprint topology.
+Do not put implementation details into intent.
+
+Distinguish user_provided_inputs from system_expected_actions:
+- user_provided_inputs records only content the user explicitly says they will provide, or content that the original request naturally and explicitly provides as input.
+- Do not assume the user will provide the completed result merely because completing the work needs data.
+- system_expected_actions records actions the user expects the Skill/system to perform for them.
+- If the user asks the system to produce, derive, analyze, generate, transform, extract, compose, organize, or otherwise perform an action, that responsibility remains a system_expected_action unless the user explicitly transfers that responsibility back to themselves.
+- Do not convert the expected result of a system action into a required user input.
+
+Clarification answers are scoped evidence.
+A clarification answer resolves only the ambiguity directly asked by that clarification question.
+A recent clarification answer must not silently replace unrelated intent established earlier in the conversation.
+When later user feedback does not explicitly revoke or replace an earlier requirement, preserve the earlier requirement.
+Do not infer that the user will provide an intermediate or final result merely because a later clarification discusses how that result should be processed, formatted, illustrated, grouped, ordered, or delivered.
+
+中文规则：
+局部澄清回答只解决该问题直接询问的歧义。
+用户回答最近一个局部问题，不代表重新定义整个 Skill。
+除非用户明确撤销、替换或改变此前需求，否则此前已经成立的核心目标继续有效。
+后续讨论某个结果应如何处理，不代表用户承诺提前提供该结果。
+
+Return only the strict JSON object required by the schema. Arrays may be empty. Do not add workflow, scripts, files, roles, capabilities, tools, or implementation_strategy.
+""".strip()
+    route = route_model("creator_prepare_plan", requested_model=model, reason="creator user intent anchor extraction")
+    data = await _complete_creator_json_object_once(
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": json.dumps({
+                "user_request": request.user_request,
+                "conversation_history": request.conversation_history,
+                "human_feedback": request.human_feedback,
+            }, ensure_ascii=False, default=str)},
+        ],
+        model=route.model,
+        phase="user_intent_anchor_extraction",
+        response_schema=response_schema,
+    )
+    anchor = UserIntentAnchor.model_validate(data)
+    logger.info(
+        "[Creator][intent_anchor][extracted] %s",
+        json.dumps({
+            "primary_goal_present": bool(str(anchor.primary_goal or "").strip()),
+            "outcome_count": len(anchor.required_user_outcomes),
+            "user_input_count": len(anchor.user_provided_inputs),
+            "system_action_count": len(anchor.system_expected_actions),
+            "confirmed_choice_count": len(anchor.confirmed_choices),
+            "deliverable_count": len(anchor.final_deliverables),
+            "constraint_count": len(anchor.explicit_constraints),
+        }, ensure_ascii=False),
+    )
+    return anchor
+
+
 def _is_concrete_prepare_summary_file_path(path: str, *, asset_source: str = "") -> bool:
     normalized = _normalize_skill_path(str(path or ""))
     if not normalized:
@@ -5725,6 +5874,162 @@ Creator 协议边界：
             break
 
     return repaired
+
+
+async def _review_blueprint_against_intent_anchor(
+    *,
+    intent_anchor: UserIntentAnchor,
+    blueprint_text: str,
+    model: str | None,
+) -> dict[str, Any]:
+    issue_schema = {
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "enum": [
+                    "system_action_dropped",
+                    "system_action_shifted_to_user_input",
+                    "confirmed_choice_lost",
+                    "final_deliverable_drift",
+                    "material_unconfirmed_assumption",
+                ],
+            },
+            "intent_evidence": {"type": "string"},
+            "blueprint_evidence": {"type": "string"},
+            "repair_goal": {"type": "string"},
+        },
+        "required": ["code", "intent_evidence", "blueprint_evidence", "repair_goal"],
+        "additionalProperties": False,
+    }
+    response_schema = {
+        "type": "object",
+        "properties": {
+            "passed": {"type": "boolean"},
+            "issues": {"type": "array", "items": issue_schema},
+        },
+        "required": ["passed", "issues"],
+        "additionalProperties": False,
+    }
+    prompt = """
+You are a lightweight Creator intent coverage reviewer. You are not a Planner, graph validator, tool selector, or code reviewer.
+
+Check only whether the candidate Blueprint preserves the provided UserIntentAnchor before FilePlan freeze:
+1. Every system_expected_action remains owned by the Skill/system.
+2. No completed result of a system_expected_action has been changed into a required user input.
+3. confirmed_choices are preserved.
+4. final_deliverables are preserved.
+5. The Blueprint does not add an unconfirmed assumption that materially changes the user/system responsibility boundary.
+
+Do not check script path, script count, role, capability, tool, FunctionItem, ResponsibilityEdge, from_output, to_input, argv, stdout, runtime, or code implementation.
+Do not repair the Blueprint. Return only the strict JSON object.
+""".strip()
+    route = route_model("creator_prepare_plan", requested_model=model, reason="creator intent coverage review")
+    data = await _complete_creator_json_object_once(
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": json.dumps({
+                "user_intent_anchor": intent_anchor.model_dump(mode="json"),
+                "blueprint_text": blueprint_text,
+            }, ensure_ascii=False, default=str)},
+        ],
+        model=route.model,
+        phase="intent_anchor_coverage_review",
+        response_schema=response_schema,
+    )
+    issues = data.get("issues") if isinstance(data, dict) else []
+    return {
+        "passed": bool(data.get("passed")) if isinstance(data, dict) else False,
+        "issues": issues if isinstance(issues, list) else [],
+    }
+
+
+async def _repair_blueprint_from_intent_anchor(
+    *,
+    intent_anchor: UserIntentAnchor,
+    blueprint_text: str,
+    intent_issues: list[dict[str, Any]],
+    model: str | None,
+) -> str:
+    prompt = (
+        load_kernel_creator_for_phase("prepare_plan")
+        + """
+当前 Blueprint 在 FilePlan freeze 前没有完整保持 CONFIRMED USER INTENT。
+
+根据 UserIntentAnchor 和 structured intent issues 对当前 Blueprint 做最小必要修复。
+不要重新设计无关部分。
+恢复被遗漏的 system_expected_actions。
+如果某个 system_expected_action 被错误转移成 user_provided_input，恢复正确责任边界。
+保留 confirmed_choices。
+保留 final_deliverables。
+如果恢复用户意图需要改变尚未 freeze 的 SkillPlan topology，允许修改 SkillPlan entries。
+此时 FilePlan 尚未 freeze。
+不得输出 function_items。
+不得输出 responsibility_edges。
+
+只输出严格 JSON object：
+{
+  "internal_blueprint_text": "修复后的完整 internal_blueprint_text"
+}
+不要 Markdown，不要解释。
+"""
+    )
+    route = route_model("creator_prepare_plan", requested_model=model, reason="creator intent anchor blueprint repair")
+    text = await complete_chat_once(
+        [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": json.dumps({
+                "user_intent_anchor": intent_anchor.model_dump(mode="json"),
+                "intent_issues": intent_issues,
+                "blueprint_text": blueprint_text,
+            }, ensure_ascii=False, default=str)},
+        ],
+        route.model,
+    )
+    data = _parse_prepare_plan_json(text)
+    return str(data.get("internal_blueprint_text") or "").strip()
+
+
+async def _ensure_blueprint_covers_intent_anchor(
+    *,
+    intent_anchor: UserIntentAnchor,
+    blueprint_text: str,
+    model: str | None,
+) -> str:
+    current = str(blueprint_text or "").strip()
+    for attempt in range(_MAX_INTENT_COVERAGE_REPAIR_ATTEMPTS + 1):
+        review = await _review_blueprint_against_intent_anchor(
+            intent_anchor=intent_anchor,
+            blueprint_text=current,
+            model=model,
+        )
+        issue_codes = [
+            str(issue.get("code") or "")
+            for issue in (review.get("issues") or [])
+            if isinstance(issue, dict) and str(issue.get("code") or "")
+        ]
+        logger.info(
+            "[Creator][intent_anchor][coverage] %s",
+            json.dumps({"passed": bool(review.get("passed")), "issue_codes": issue_codes, "attempt": attempt}, ensure_ascii=False),
+        )
+        if review.get("passed") is True:
+            return current
+        if attempt >= _MAX_INTENT_COVERAGE_REPAIR_ATTEMPTS:
+            raise PreparePlanProtocolError(
+                "intent_anchor_coverage_failed: Blueprint did not preserve confirmed user intent before FilePlan freeze"
+            )
+        repaired = await _repair_blueprint_from_intent_anchor(
+            intent_anchor=intent_anchor,
+            blueprint_text=current,
+            intent_issues=list(review.get("issues") or []),
+            model=model,
+        )
+        logger.info(
+            "[Creator][intent_anchor][repair] %s",
+            json.dumps({"attempt": attempt + 1, "issue_codes": issue_codes, "blueprint_changed": repaired != current}, ensure_ascii=False),
+        )
+        current = _normalize_prepare_blueprint_references(repaired)
+    return current
 
 def _requirements_for_generated_file(
     *,
@@ -6956,6 +7261,7 @@ Only output strict JSON object. Do not output Markdown or explanation.
 async def _generate_internal_blueprint_or_questions(
     request: PreparePlanRequest,
     event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    intent_anchor: UserIntentAnchor | None = None,
 ) -> dict[str, Any]:
     """Judge business requirement maturity and produce the provisional blueprint.
 
@@ -6980,6 +7286,8 @@ async def _generate_internal_blueprint_or_questions(
     )
 
     system_prompt = (
+        _intent_anchor_planner_prefix(intent_anchor)
+        +
         load_kernel_creator_for_phase(
             "prepare_plan"
         )
@@ -7510,6 +7818,12 @@ Blueprint Planner 只规划业务责任。
     )
 
     payload = {
+        "confirmed_user_intent": (
+            intent_anchor.model_dump(mode="json")
+            if intent_anchor is not None
+            else {}
+        ),
+
         "mode": request.mode,
 
         "skill_name": (
@@ -7662,6 +7976,20 @@ Blueprint Planner 只规划业务责任。
             "function_items": [],
             "responsibility_edges": [],
         }
+        frozen_blueprint_text = await _ensure_blueprint_covers_intent_anchor(
+            intent_anchor=(
+                intent_anchor
+                if intent_anchor is not None
+                else UserIntentAnchor()
+            ),
+            blueprint_text=frozen_blueprint_text,
+            model=route.model,
+        )
+        first_planner_result = {
+            **first_planner_result,
+            "internal_blueprint_text": frozen_blueprint_text,
+        }
+        data = dict(first_planner_result)
         protocol_errors = []
         try:
             validate_blueprint_shape_for_creator(
@@ -7858,6 +8186,7 @@ async def _project_prepare_review_summary_from_blueprint(
     request: PreparePlanRequest,
     blueprint_text: str,
     prepared: dict[str, Any] | None = None,
+    intent_anchor: UserIntentAnchor | None = None,
 ) -> PreparePlanReviewSummary:
     """Project the full internal blueprint into a user-facing review summary.
 
@@ -7872,7 +8201,9 @@ async def _project_prepare_review_summary_from_blueprint(
     - code generation;
     - E2E.
 
-    Projection input is the full blueprint only.
+    When provided, UserIntentAnchor is the upstream semantic source for the
+    user-visible goal/input/output projection. The blueprint remains the source
+    for file list projection.
     """
 
     source_blueprint = str(
@@ -7908,7 +8239,10 @@ async def _project_prepare_review_summary_from_blueprint(
             )
         ]
 
-        return fallback
+        return _project_summary_from_intent_anchor(
+            fallback,
+            intent_anchor,
+        )
 
     response_schema: dict[
         str,
@@ -8134,7 +8468,25 @@ changes：
 
     summary.risks = []
 
-    return summary
+    return _project_summary_from_intent_anchor(
+        summary,
+        intent_anchor,
+    )
+
+
+async def _prepare_summarize_confirmed_requirements(
+    *,
+    request: PreparePlanRequest,
+    blueprint_text: str,
+    prepared: dict[str, Any] | None = None,
+    intent_anchor: UserIntentAnchor | None = None,
+) -> PreparePlanReviewSummary:
+    return await _project_prepare_review_summary_from_blueprint(
+        request=request,
+        blueprint_text=blueprint_text,
+        prepared=prepared,
+        intent_anchor=intent_anchor,
+    )
 
 def _tool_names_from_entry_contract(entry: Any) -> list[str]:
     data = entry if isinstance(entry, dict) else getattr(entry, "__dict__", {})
@@ -8934,6 +9286,11 @@ async def _prepare_plan_impl(
         previous_blueprint_text
     )
 
+    intent_anchor = await _extract_user_intent_anchor(
+        request=request,
+        model=request.model,
+    )
+
     async def project_summary(
         current_blueprint_text: str,
         current_prepared: (
@@ -8941,7 +9298,7 @@ async def _prepare_plan_impl(
         ) = None,
     ) -> PreparePlanReviewSummary:
         return (
-            await _project_prepare_review_summary_from_blueprint(
+            await _prepare_summarize_confirmed_requirements(
                 request=request,
 
                 blueprint_text=(
@@ -8951,6 +9308,8 @@ async def _prepare_plan_impl(
                 prepared=(
                     current_prepared
                 ),
+
+                intent_anchor=intent_anchor,
             )
         )
 
@@ -9170,18 +9529,27 @@ async def _prepare_plan_impl(
 
     else:
         try:
-            prepared = (
-                await (
-                    _generate_internal_blueprint_or_questions(
-                        request,
-                        event_emitter=event_emitter,
-                    )
-                    if event_emitter is not None
-                    else _generate_internal_blueprint_or_questions(
-                        request
+            try:
+                prepared = (
+                    await (
+                        _generate_internal_blueprint_or_questions(
+                            request,
+                            event_emitter=event_emitter,
+                            intent_anchor=intent_anchor,
+                        )
+                        if event_emitter is not None
+                        else _generate_internal_blueprint_or_questions(
+                            request,
+                            intent_anchor=intent_anchor,
+                        )
                     )
                 )
-            )
+            except TypeError as exc:
+                if "intent_anchor" not in str(exc):
+                    raise
+                prepared = await _generate_internal_blueprint_or_questions(
+                    request
+                )
 
         except PreparePlanProtocolError as exc:
             return PreparePlanResponse(
@@ -9584,6 +9952,29 @@ async def _prepare_plan_impl(
             blueprint_text
         )
     )
+
+    try:
+        blueprint_text = await _ensure_blueprint_covers_intent_anchor(
+            intent_anchor=intent_anchor,
+            blueprint_text=blueprint_text,
+            model=request.model,
+        )
+    except PreparePlanProtocolError as exc:
+        return PreparePlanResponse(
+            status="blocked",
+            prepare_stage="blueprint_protocol_failed",
+            clarifying_questions=[],
+            review_summary=PreparePlanReviewSummary(),
+            blueprint_text=blueprint_text,
+            skill_name=skill_name,
+            creation_blockers=[
+                _prepare_protocol_issue(
+                    "intent_anchor_coverage_failed",
+                    str(exc),
+                    field="internal_blueprint_text",
+                )
+            ],
+        )
 
     protocol_errors = (
         _preflight_prepare_blueprint_text(
