@@ -21,7 +21,7 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
-from ..blueprint_parser import parse_blueprint
+from ..blueprint_parser import exact_file_plan_paths_from_strict_skillplan, parse_blueprint
 from ..skill_plan import normalize_structured_function_items, normalize_structured_responsibility_edges, validate_structured_responsibility_edge_transport
 
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
@@ -6437,7 +6437,7 @@ def _render_structured_responsibility_view(blueprint_text: str, function_items: 
     }
 
     def replace_section(source: str, heading: str, replacement_lines: list[str]) -> str:
-        pattern = re.compile(rf"(?ms)^### {re.escape(heading)}\s*$.*?(?=^### |\Z)")
+        pattern = re.compile(rf"(?ms)^\s*###\s+{re.escape(heading)}\s*$.*?(?=^\s*###\s+|\Z)")
         replacement = "\n".join(replacement_lines).rstrip() + "\n"
         if pattern.search(source):
             return pattern.sub(replacement, source, count=1)
@@ -6445,13 +6445,16 @@ def _render_structured_responsibility_view(blueprint_text: str, function_items: 
 
     text = replace_section(text, "工作流逻辑", workflow_lines)
 
-    skillplan_pattern = re.compile(r"(?ms)^### SkillPlan / 文件职责计划\s*$.*?(?=^### |\Z)")
+    skillplan_pattern = re.compile(r"(?ms)^\s*###\s+SkillPlan / 文件职责计划\s*$.*?(?=^\s*###\s+|\Z)")
     skillplan_match = skillplan_pattern.search(text)
     existing_blocks: list[tuple[str, str]] = []
     if skillplan_match:
         body = skillplan_match.group(0).split("\n", 1)[1] if "\n" in skillplan_match.group(0) else ""
-        for block_match in re.finditer(r"(?ms)^- path:\s*`?([^`\n]+)`?.*?(?=^- path:|\Z)", body):
-            path = str(block_match.group(1) or "").strip()
+        block_pattern = re.compile(
+            r"(?ms)^\s*-\s*path\s*:\s*`?([^`\n]+)`?\s*\n.*?(?=^\s*-\s*path\s*:|\Z)"
+        )
+        for block_match in block_pattern.finditer(body):
+            path = str(block_match.group(1) or "").strip().strip("`'\"，,。.;；").replace("\\", "/")
             block = block_match.group(0).rstrip()
             if path:
                 existing_blocks.append((path, block))
@@ -6462,7 +6465,7 @@ def _render_structured_responsibility_view(blueprint_text: str, function_items: 
         if path in script_items_by_target:
             rendered_blocks.append(overlay_function_item_fields(block, script_items_by_target[path]))
             emitted.add(path)
-        elif not path.startswith("scripts/"):
+        else:
             rendered_blocks.append(block)
     for target, item in script_items_by_target.items():
         if target not in emitted:
@@ -6544,8 +6547,11 @@ Do not reconsider tool availability.
 Do not use Tool Registry, ToolPool, candidate tools, or implementation convenience.
 
 Your first task is requirement fidelity: keep the executable plan aligned with the exact user request and confirmed decisions.
-Your second task is internal consistency: make FunctionItems, ResponsibilityEdges, and Blueprint view describe the same plan.
-Planner-derived FunctionItems, workflow, topology, and edges may be changed when required for requirement fidelity or consistency.
+Your second task is internal consistency: make FunctionItems and ResponsibilityEdges describe the same executable plan.
+
+The FilePlan is immutable.
+Do not add, remove, rename, split, or merge FilePlan entries.
+Only revise FunctionItem responsibility fields and ResponsibilityEdges.
 
 ResponsibilityEdge transport schema is exact.
 
@@ -6660,9 +6666,10 @@ If the emitted plan declares that execution requires no business input, do not i
 If a script uses a default or internal configuration value, do not model that default as a semantic result transported from an unrelated platform input slot.
 
 Do not merely describe a detected inconsistency.
-Revise function_items, responsibility_edges, and internal_blueprint_text so the returned plan is internally consistent.
+Revise function_items and responsibility_edges so the returned graph is internally consistent.
 
-Return the complete Planner response with the same schema:
+Return the complete Planner response with this schema.
+The backend will consume only function_items and responsibility_edges from this convergence response:
 {
   "status": "ready",
   "clarifying_questions": [],
@@ -6811,18 +6818,13 @@ def _resolve_allowed_function_item_targets_from_blueprint(
 ) -> list[str]:
     """Freeze executable target domain from strict SkillPlan file topology."""
 
-    plan = parse_blueprint(
-        [{"role": "assistant", "content": internal_blueprint_text}],
-        strict=True,
-    )
-    skill_plan = getattr(plan, "skill_plan", None)
-    entries = list(getattr(skill_plan, "files", []) or []) if skill_plan else []
-    targets: list[str] = []
-    for entry in entries:
-        path = str(getattr(entry, "path", "") or "").strip()
-        if path.startswith("scripts/") and path not in targets:
-            targets.append(path)
-    return targets
+    return [
+        path
+        for path in exact_file_plan_paths_from_strict_skillplan(
+            internal_blueprint_text
+        )
+        if path.startswith("scripts/")
+    ]
 
 
 def _validate_function_item_targets_in_allowed_domain(
@@ -6830,16 +6832,30 @@ def _validate_function_item_targets_in_allowed_domain(
     allowed_function_item_targets: list[str],
 ) -> None:
     allowed = set(allowed_function_item_targets)
-    invalid = [
+    actual = {
         str(item.get("target_file") or "").strip()
         for item in function_items
-        if str(item.get("target_file") or "").strip() not in allowed
-    ]
-    if invalid:
+        if str(item.get("target_file") or "").strip()
+    }
+    unexpected_targets = sorted(actual - allowed)
+    missing_targets = sorted(allowed - actual)
+    if unexpected_targets or missing_targets:
         raise ValueError(
-            "Planner emitted FunctionItem target_file outside frozen FilePlan "
-            f"target domain: {sorted(set(invalid))}; "
+            "Planner FunctionItem target_file set does not match frozen "
+            "FilePlan target domain exactly; "
+            f"unexpected_targets={unexpected_targets}; "
+            f"missing_targets={missing_targets}; "
             f"allowed_function_item_targets={allowed_function_item_targets}"
+        )
+    blank_targets = [
+        str(item.get("target_file") or "").strip()
+        for item in function_items
+        if not str(item.get("target_file") or "").strip()
+    ]
+    if blank_targets:
+        raise ValueError(
+            "Planner emitted FunctionItem with blank target_file; "
+            f"blank_target_count={len(blank_targets)}"
         )
 
 
@@ -7614,6 +7630,13 @@ Blueprint Planner 只规划业务责任。
     )
 
     status = str(data.get("status") or "").strip()
+    data.pop("function_items", None)
+    data.pop("responsibility_edges", None)
+    first_planner_result = dict(data)
+    frozen_blueprint_text = str(
+        first_planner_result.get("internal_blueprint_text")
+        or ""
+    )
     normalized_ready_draft: dict[str, Any] | None = None
     draft_edge_error: Exception | None = None
     draft_function_item_error: Exception | None = None
@@ -7642,7 +7665,7 @@ Blueprint Planner 只规划业务责任。
         try:
             allowed_function_item_targets = (
                 _resolve_allowed_function_item_targets_from_blueprint(
-                    str(data.get("internal_blueprint_text") or "")
+                    frozen_blueprint_text
                 )
             )
             if event_emitter is not None:
@@ -7652,7 +7675,7 @@ Blueprint Planner 只规划业务责任。
                 })
             binding_data = await _bind_executable_responsibility_plan(
                 request=request,
-                current_planner_result=data,
+                current_planner_result=first_planner_result,
                 planner_model=route.model,
                 allowed_function_item_targets=allowed_function_item_targets,
             )
@@ -7673,11 +7696,11 @@ Blueprint Planner 只规划业务责任。
                 source="planner",
             )
             if normalized_function_items is not None:
-                normalized_ready_draft = dict(data)
+                normalized_ready_draft = dict(first_planner_result)
                 normalized_ready_draft["function_items"] = normalized_function_items
                 normalized_ready_draft["responsibility_edges"] = normalized_edges
                 normalized_ready_draft["internal_blueprint_text"] = _render_structured_responsibility_view(
-                    str(normalized_ready_draft.get("internal_blueprint_text") or ""),
+                    frozen_blueprint_text,
                     normalized_function_items,
                     normalized_edges,
                 )
@@ -7711,7 +7734,7 @@ Blueprint Planner 只规划业务责任。
             else data
         )
         try:
-            data = await _converge_ready_executable_plan(
+            convergence_result = await _converge_ready_executable_plan(
                 request=request,
                 current_planner_result=convergence_input,
                 planner_model=route.model,
@@ -7726,10 +7749,19 @@ Blueprint Planner 只规划业务责任。
                     )
                 ),
             )
+            normalized_converged_function_items = list(
+                convergence_result.get("function_items") or []
+            )
+            normalized_converged_edges = list(
+                convergence_result.get("responsibility_edges") or []
+            )
+            data = dict(first_planner_result)
+            data["function_items"] = normalized_converged_function_items
+            data["responsibility_edges"] = normalized_converged_edges
             data["internal_blueprint_text"] = _render_structured_responsibility_view(
-                str(data.get("internal_blueprint_text") or ""),
-                data.get("function_items") or [],
-                data.get("responsibility_edges") or [],
+                frozen_blueprint_text,
+                normalized_converged_function_items,
+                normalized_converged_edges,
             )
             if event_emitter is not None:
                 await event_emitter({
