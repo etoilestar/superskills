@@ -367,12 +367,12 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "- 对蓝图真实规划的每个脚本，SKILL.md 应提供一个独立的 ```bash fenced code block。",
         "- 每个 ```bash block 内只能放一条真实 shell 命令。",
         "- 命令必须直接调用真实 scripts/*.py 路径。",
-        "- Creator 默认产物必须使用统一 JSON argv 协议：脚本路径后跟一个 shell-quoted JSON object argv。",
-        "- JSON argv 必须能被 json.loads 解析为 object；动态 placeholder 必须作为 JSON 字符串值出现。",
-        "- 外部已有脚本若使用其它 CLI 风格，应先由包装脚本适配为 JSON argv，再在 SKILL.md 调用该包装入口。",
+        "- 命令必须在脚本路径后直接传入一个完整、shell-quoted 的 JSON object 位置参数。",
+        "- 该 JSON object 必须能被 json.loads 解析为 object；动态 placeholder 必须作为 JSON 字符串值出现。",
+        "- 外部已有脚本若使用其它 CLI 风格，应先由包装脚本适配为上述输入 JSON 形式，再在 SKILL.md 调用该包装入口。",
         "- 不得固定套用 payload/user_request/fields/options/input_files 等模板字段。",
         "- 禁止在 ```bash block 内直接写 JSON 配置对象。",
-        "- 禁止在 ```bash block 内写 runner/script/argv 伪命令对象。",
+        "- 禁止在 ```bash block 内写 runner/script/输入 JSON 伪命令对象。",
         "- 禁止在 ```bash block 内写说明文字、列表、多条命令或 `<真实参数>` 这类占位说明。",
         "",
         "D. workflow / 平台边界:",
@@ -421,10 +421,10 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "A. 命令块静态形态:",
         "- 对蓝图真实规划的 scripts/ 文件，使用标准 Markdown 独立 ```bash fenced code block。",
         "- 每个 fence 内只放一条命令；命令必须直接调用 scripts/ 路径。",
-        "- 脚本路径后传入 json.loads 可解析的 JSON object argv；所有动态 {{placeholder}} 必须作为 JSON 字符串值出现。",
+        "- 脚本路径后直接传入一个完整、shell-quoted、json.loads 可解析为 object 的 JSON 位置参数；所有动态 {{placeholder}} 必须作为 JSON 字符串值出现。",
         "- 第一条命令只能引用平台 guaranteed input envelope 中存在的字段；结构化业务参数必须使用平台结构化输入 root 与图谱/schema 派生的目标字段组成整值占位符。",
         "- 命令 placeholder 优先引用 external envelope 字段：user_request、input、text、payload、input_files、files、resources、fields、options，或显式 input_binding。",
-        "- 禁止在 command JSON argv 中写动态用户内容、前序产物内容、运行时文件路径或 E2E seed 值；这些动态数据只能由图谱边派生的占位符表达。",
+        "- 禁止在命令输入 JSON 中写动态用户内容、前序产物内容、运行时文件路径或 E2E seed 值；这些动态数据只能由图谱边派生的占位符表达。",
         "- 允许写入图谱/schema 明确声明为静态配置的 literal 常量；不得用 literal 冒充用户输入、stdout 或产物路径。",
         "- 蓝图语义为可选/建议/若不指定/可以提供/默认的用户参数，不要写成必填 placeholder；入口脚本应存在则读，不存在则默认化。",
         "- 后续命令只能引用由前序 stdout 字段和图谱边派生的占位符；不得写 literal 充当前序 stdout。",
@@ -466,9 +466,9 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
             f"   suggested inputs: {', '.join(input_keys) if input_keys else '无显式输入字段'}",
             "   command shape（只说明形态，实际参数必须由脚本真实接口决定）:",
             "```bash",
-            json_command if payload else "# 待 E2E dataflow binding 修复：缺少 graph edge / command_arg_bindings 时不要发明 argv。",
+            json_command if payload else "# 待 E2E dataflow binding 修复：缺少 graph edge / command_arg_bindings 时不要发明输入字段。",
             "```",
-            "   Creator 默认生成只使用上述 JSON argv 命令形态；外部已有 CLI 应由包装入口适配。",
+            "   Creator 默认生成只使用上述输入 JSON 命令形态；外部已有 CLI 应由包装入口适配。",
         ])
 
     if reference_paths:
@@ -484,7 +484,7 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "",
         "E. 第二轮 E2E 责任边界:",
         "- placeholder 来源、前后脚本 stdout 字段闭环、最终 stdout 平台输出字段，不在第一轮 SKILL.md prompt 中证明。",
-        "- 第二轮 E2E 会按真实运行链路严格检查已选择字段名是否对齐：argv key、脚本读取 key、上游 stdout key、下游 placeholder 不能错位。",
+        "- 第二轮 E2E 会按真实运行链路严格检查已选择字段名是否对齐：输入字段、脚本读取字段、上游 stdout 字段、下游 placeholder 不能错位。",
         "- 如果这些内容不一致，第二轮 E2E 真实执行会基于实际 stdout/文件产物反馈修复 SKILL.md 或脚本。",
     ])
 
@@ -1203,6 +1203,127 @@ def _skill_md_reviewer_schema_error(data: Any) -> str:
                         return "SKILL.md semantic reviewer protocol contradiction: passed=true with nested blocking/error issue."
     return ""
 
+
+
+
+def _collect_skill_md_review_script_paths(
+    *,
+    blueprint_text: str,
+    skill_plan_entry: dict[str, Any] | None = None,
+    requirement_graph: Any = None,
+) -> list[str]:
+    """Collect true script paths from blueprint, SkillPlan-like payloads, and graph facts."""
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        path = str(value or "").replace("\\", "/").strip().strip("`")
+        if not path.startswith("scripts/") or not path.endswith(".py") or path in seen:
+            return
+        seen.add(path)
+        paths.append(path)
+
+    for path in _extract_declared_skill_paths(blueprint_text):
+        add(path)
+
+    def walk_skill_plan(value: Any) -> None:
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(mode="json")
+        if isinstance(value, dict):
+            add(value.get("path") or value.get("target_file") or value.get("entrypoint"))
+            for key in ("files", "skill_plan", "dependencies", "scripts", "steps", "items", "requirements"):
+                child = value.get(key)
+                if isinstance(child, (dict, list, tuple)):
+                    walk_skill_plan(child)
+                elif isinstance(child, str):
+                    add(child)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                walk_skill_plan(item)
+        elif isinstance(value, str):
+            add(value)
+
+    walk_skill_plan(skill_plan_entry or {})
+
+    raw_graph = requirement_graph
+    if hasattr(raw_graph, "model_dump"):
+        raw_graph = raw_graph.model_dump(mode="json")
+    if isinstance(raw_graph, dict):
+        for item in raw_graph.get("requirements") or raw_graph.get("function_items") or []:
+            if hasattr(item, "model_dump"):
+                item = item.model_dump(mode="json")
+            if isinstance(item, dict):
+                add(item.get("target_file") or item.get("path"))
+        for edge in raw_graph.get("dataflow_edges") or []:
+            if isinstance(edge, dict):
+                add(edge.get("from_node"))
+                add(edge.get("to_node"))
+
+    return paths
+
+def _skill_md_script_interface_context_for_review(
+    *,
+    skill_name: str,
+    script_paths: Iterable[str],
+    requirement_graph: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Project existing script argv contracts and local graph facts for SKILL.md review.
+
+    This is not a standalone validator and does not infer or rewrite command
+    argv mappings. It gives the existing SKILL.md review model the same factual
+    script interface + FunctionItem edge context used during generation, so it
+    can block only when the evidence is explicit.
+    """
+    try:
+        skill_dir = settings.skills_path / _validate_skill_name(skill_name)
+    except Exception:
+        return []
+
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_path in script_paths or []:
+        script_path = str(raw_path or "").replace("\\", "/").strip().strip("`")
+        if (
+            not script_path.startswith("scripts/")
+            or not script_path.endswith(".py")
+            or script_path in seen
+        ):
+            continue
+        seen.add(script_path)
+
+        abs_path = skill_dir / script_path
+        if not abs_path.is_file():
+            continue
+
+        try:
+            content = abs_path.read_text(encoding="utf-8")
+            schema = extract_python_strict_argv_schema(content)
+        except Exception as exc:
+            content = ""
+            schema = {"error": f"{type(exc).__name__}: {exc}"}
+
+        try:
+            run_analysis = _python_run_args_analysis(content)
+        except Exception:
+            run_analysis = {}
+
+        try:
+            function_execution_context = build_function_execution_context(
+                graph=requirement_graph,
+                target_file=script_path,
+            )
+        except Exception as exc:
+            function_execution_context = {"error": f"{type(exc).__name__}: {exc}"}
+
+        items.append({
+            "script_path": script_path,
+            "strict_json_argv_schema": schema,
+            "run_args_analysis": run_analysis,
+            "function_execution_context": function_execution_context,
+        })
+
+    return items
+
 async def _review_skill_md_blueprint_intent_with_model(
     *,
     skill_name: str,
@@ -1237,6 +1358,16 @@ async def _review_skill_md_blueprint_intent_with_model(
     )
 
     parser_paths = _extract_declared_skill_paths(blueprint_text)
+    review_script_paths = _collect_skill_md_review_script_paths(
+        blueprint_text=blueprint_text,
+        skill_plan_entry=skill_plan_entry,
+        requirement_graph=requirement_graph,
+    )
+    script_interface_context = _skill_md_script_interface_context_for_review(
+        skill_name=skill_name,
+        script_paths=review_script_paths,
+        requirement_graph=requirement_graph,
+    )
 
     prompt = (
         "你是 superskills Creator 的第一轮 SKILL.md 语义覆盖审查器，只输出严格 JSON object。\n\n"
@@ -1267,11 +1398,13 @@ async def _review_skill_md_blueprint_intent_with_model(
         "SKILL.md bash command block 语义审查规则：\n"
         "- bash command block 是运行模板，不是示例调用；普通说明文字可以出现示例，但不要扫描普通说明文字里的示例。\n"
         "- 只检查 ```bash fenced command block 内部，不扫描普通 Markdown 说明文字。\n"
-        "- requirement_graph / workflow_allocation 的 inputs/outputs 是强语义参考，不是字段名硬合同；不要要求 argv key 逐字等于 graph.inputs，也不要要求 placeholder 逐字等于 graph.outputs。\n"
-        "- 第一轮保留平台边界接口证明：平台 source slots 到第一个可执行 command 仍属于接口契约，第一个 command 不得用固定字面值完全替代平台动态输入。\n"
-        "- 第一轮只做命令块机械格式检查：fenced block 合法、runner 合法、script path 真实、脚本路径后 exactly one JSON object argv、JSON 可解析。\n"
-        "- 不审查内部脚本间 placeholder 精确来自哪个 stdout、argv key 是否等于 FunctionItem input、placeholder 是否等于上游 output、list/string/file_path 序列化、内部字段来源链、optional/default 运行时行为。\n"
-        "- 不要建议把脚本间 stdout 字段改成平台原始输入 sentinel；内部流转由第二轮 E2E 真实执行验证。\n"
+        "- 复用下方【已生成脚本接口与局部图谱事实】：strict_json_argv_schema 是目标脚本实际 guard 接口，function_execution_context.function_item/incoming_edges/outgoing_edges 是同一份局部图谱事实。\n"
+        "- command JSON key 只允许按目标脚本实际 strict_json_argv_guard/run(args) 接口判断；不要要求 key 等于 FunctionItem inputs，也不要把平台字段名当 argv key 白名单。\n"
+        "- command JSON value 只在证据明确时检查来源：应与对应 incoming_edges.from_output、platform_input_node 输出字段、或平台运行上下文来源一致。\n"
+        "- 证据明确时才输出 error：例如 command key 明显不在脚本 allowed/required key 中，或 required key 明确缺失，或 value 明确绑定到不存在的 incoming_edges.from_output/平台输入来源。\n"
+        "- 证据不足、字段别名不明确、类型序列化/list-string/file_path 细节不明确、内部字段来源链不完整时，不要猜测、不要阻断，passed=true 或最多 warning，继续交给现有 E2E 暴露和局部修复。\n"
+        "- 对这种证据明确的 command mapping 错误，category 必须写 command_mapping_explicit_evidence，并在 evidence 中同时引用脚本探针字段（strict_json_argv_schema/run_args_analysis）和图谱边字段（incoming_edges.from_output 或 platform_input_node）。\n"
+        "- 不要新增 validator/normalizer/repair/E2E/JSON 格式协议；这里只给现有 SKILL.md 审查模型做单点定位，repair_ops 仅限证据明确的 SKILL.md command block 最小替换。\n"
         "- 最终平台输出契约仍保持不变；final stdout 到 platform output 的 platform_io 问题仍可阻断。\n\n"
         "结构化 issue 字段规范：\n"
         "- blocking 可选；若该问题不影响执行闭环/资源角色/平台 IO/最终产物契约/用户关键要求传递，必须明确 blocking=false。\n"
@@ -1306,7 +1439,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         '      "severity": "error|warning",\n'
         '      "blocking": true,\n'
         '      "contract_impact": {"execution_closure": false, "resource_role": false, "platform_io": false, "final_artifact": false, "user_requirement_transfer": false},\n'
-        '      "category": "command_template_source_proof|null",\n'
+        '      "category": "command_template_source_proof|command_mapping_explicit_evidence|null",\n'
         '      "field": "intent|file_plan|workflow|capabilities|resources|user_facing",\n'
         '      "message": "不一致点",\n'
         '      "evidence": "引用 SKILL.md 或蓝图中的证据",\n'
@@ -1330,6 +1463,9 @@ async def _review_skill_md_blueprint_intent_with_model(
 
         "【compact requirement_graph 上下文，仅用于大致理解流程；不得用于阻断跨步骤精确字段/placeholder 来源】\n"
         f"{json.dumps(graph_context, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
+
+        "【已生成脚本接口与局部图谱事实，仅供 command key/value 审查；不得猜测或改写】\n"
+        f"{json.dumps(script_interface_context, ensure_ascii=False, indent=2, default=str)[:16000]}\n\n"
 
         "【蓝图原文】\n"
         f"{(blueprint_text or '')[-18000:]}\n\n"
@@ -1620,6 +1756,44 @@ def _review_issue_is_detail_or_proof_request(issue: dict[str, Any]) -> bool:
     return any(term in text for term in _DETAIL_OR_PROOF_REVIEW_TERMS)
 
 
+
+def _review_issue_is_explicit_command_mapping_error(issue: dict[str, Any]) -> bool:
+    """Allow only evidence-backed command argv mapping errors to bypass proof filtering."""
+    category = str(issue.get("category") or issue.get("claim_type") or "").strip().lower()
+    text = _review_issue_text(issue).lower()
+    if category != "command_mapping_explicit_evidence" and "command mapping" not in text and "argv" not in text:
+        return False
+
+    has_script_probe = any(token in text for token in (
+        "strict_json_argv_schema",
+        "run_args_analysis",
+        "allowed_keys",
+        "required_keys",
+        "required_read_keys",
+        "actual guard",
+        "actual run",
+        "脚本探针",
+    ))
+    has_graph_edge = any(token in text for token in (
+        "incoming_edges",
+        "from_output",
+        "to_input",
+        "platform_input_node",
+        "图谱边",
+        "入边",
+    ))
+    is_mapping_error = any(token in text for token in (
+        "command",
+        "json argv",
+        "argv key",
+        "argv value",
+        "placeholder",
+        "stdout",
+        "命令",
+        "参数映射",
+    ))
+    return has_script_probe and has_graph_edge and is_mapping_error
+
 def _review_issue_is_command_template_source_proof_error(issue: dict[str, Any]) -> bool:
     category = str(issue.get("category") or issue.get("claim_type") or "").strip().lower()
     field = str(issue.get("field") or "").strip().lower()
@@ -1668,6 +1842,9 @@ def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
     if _review_issue_is_command_template_source_proof_error(issue):
         impact = issue.get("contract_impact") or issue.get("impact")
         return bool(isinstance(impact, dict) and impact.get("platform_io") is True)
+
+    if _review_issue_is_explicit_command_mapping_error(issue):
+        return True
 
     if _review_issue_is_detail_or_proof_request(issue):
         return False

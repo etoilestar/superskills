@@ -113,11 +113,11 @@ _SKILL_MD_MARKDOWN_EXECUTION_GUIDE = """
 - 如果确实需要运行 scripts/ 下的脚本，必须使用标准 Markdown fenced code block，且 info string 必须是 bash。
 - 每个 ```bash block 内只能有一条真实 shell 命令。
 - 脚本命令必须直接调用 scripts/ 下的真实脚本，例如 `python scripts/example.py ...`。
-- 命令参数形态必须由脚本真实接口决定：如果脚本读取 JSON argv，则传入一个 json.loads 可解析的 JSON object 字符串；如果脚本使用 argparse，则使用对应 flags；如果脚本无需参数，可以不传参数。
+- 命令输入形态必须由脚本真实接口决定：如果脚本读取输入 JSON，则在脚本路径后直接传入一个完整、shell-quoted、json.loads 可解析为 object 的 JSON 位置参数；如果脚本使用 argparse，则使用对应 flags；如果脚本无需输入，可以不传参数。
 - 不得固定套用 payload/user_request/fields/options/input_files 等模板字段。
-- 禁止在 ```bash block 内直接写 JSON 配置对象、runner/script/argv 伪命令对象、说明文字、列表、多条命令或 `<真实参数>` 这类占位说明。
+- 禁止在 ```bash block 内直接写 JSON 配置对象、runner/script/输入 JSON 伪命令对象、说明文字、列表、多条命令或 `<真实参数>` 这类占位说明。
 - 机器可读 JSON 示例、配置、stdout 示例如果需要展示，必须使用 ```json fenced code block，不得伪装成 ```bash。
-- 命令示例必须与脚本真实接口一致：脚本读 JSON argv 时，示例就传 JSON；脚本读 stdin 时，正文就说明 stdin 内容。禁止让运行时主模型根据脚本名临时猜 CLI flags。
+- 命令示例必须与脚本真实接口一致：脚本读输入 JSON 时，示例就传 JSON；脚本读 stdin 时，正文就说明 stdin 内容。禁止让运行时主模型根据脚本名临时猜 CLI flags。
 - 参数映射用普通 Markdown 列表说明通用来源：命令示例应从用户输入、显式字段、默认值、上传文件、前序 stdout 中选择当前脚本真正需要的值。第一轮 SKILL.md 只约束可解析命令形态，不要求证明后续 placeholder 来自前序 stdout。
 - 只有 assistant 在 Sandbox 当轮回复中输出的 fenced code block 才会被宿主解析和执行；SKILL.md 中的 block 是运行说明/示例，不会在加载时自动执行。
 - 如果需要写文件，用普通 Markdown 说明 assistant 应输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放在紧随其后的 fenced code block。
@@ -2803,6 +2803,73 @@ def _complete_chat_once_sync_for_e2e(messages: list[dict[str, str]], model: str)
         future = executor.submit(_runner)
         return future.result()
 
+
+
+def _python_run_args_analysis(content: str) -> dict[str, Any]:
+    """Best-effort factual AST analysis for the script's run(args) body only.
+
+    Required interface mismatches should be inferred from required reads like
+    args["key"], not optional reads such as args.get("key"). parse_args/main
+    may read sys.argv to parse the initial JSON; sys.argv reads inside run(args)
+    are a script interface error.
+    """
+    result: dict[str, Any] = {
+        "required_read_keys": [],
+        "optional_read_keys": [],
+        "reads_sys_argv": False,
+    }
+    try:
+        tree = ast.parse(content or "")
+    except SyntaxError:
+        return result
+
+    run_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run":
+            run_node = node
+            break
+    if run_node is None or not run_node.args.args:
+        return result
+
+    arg_names = {run_node.args.args[0].arg}
+    # Common aliases inside run(args): payload = args
+    for node in ast.walk(run_node):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id in arg_names:
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    arg_names.add(target.id)
+
+    required: set[str] = set()
+    optional: set[str] = set()
+    reads_sys_argv = False
+    for node in ast.walk(run_node):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "argv"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sys"
+        ):
+            reads_sys_argv = True
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id in arg_names:
+            key_node = node.slice
+            if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+                required.add(key_node.value)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in arg_names
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            optional.add(node.args[0].value)
+
+    result["required_read_keys"] = sorted(required)
+    result["optional_read_keys"] = sorted(optional)
+    result["reads_sys_argv"] = reads_sys_argv
+    return result
 
 __all__ = [name for name in globals() if not name.startswith("__")]
 

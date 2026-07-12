@@ -11111,13 +11111,13 @@ _SKILL_MD_BODY_FORMAT_REQUIREMENTS = """SKILL.md body_region 格式硬要求：
 4. 每个 ```bash block 内只能包含一条真实 shell 命令。
 5. ```bash block 内禁止出现多条命令、说明文字、列表、注释、JSON 配置对象或伪命令对象。
 6. 命令必须直接调用真实 scripts/*.py 路径。
-7. 默认命令格式是：python scripts/<file>.py '<JSON object argv>'。
-8. JSON argv 必须是 shell-quoted 的 JSON object 字符串。
+7. 默认命令格式是：python scripts/<file>.py '<JSON object>'，脚本路径后直接传入一个完整、shell-quoted 的 JSON object 位置参数。
+8. 该 JSON object 是输入 JSON，必须作为脚本路径后的第一个位置参数传入，对应 Python 脚本中的 `sys.argv[1]`。
 9. 动态 placeholder 必须作为 JSON 字符串值出现。
-10. 禁止在 ```bash block 内放 runtime/entrypoint/argv JSON 对象。
-11. 禁止在 ```bash block 内放 runner/script/argv JSON 对象。
-12. 禁止使用 --argv，除非当前脚本源码明确实现了 --argv。
-13. Creator 默认脚本协议是 sys.argv[1] JSON object。
+10. 禁止在 ```bash block 内放 runtime/entrypoint/输入 JSON 伪配置对象。
+11. 禁止在 ```bash block 内放 runner/script/输入 JSON 伪命令对象。
+12. 不要把输入 JSON 理解为 --argv 等命令行选项；除非当前脚本源码明确实现，否则禁止新增这类调用参数。
+13. 不要新增额外调用参数或把输入 JSON 改写成命令行选项。
 14. compact_requirement_graph 只是职责上下文，不是命令块格式。
 15. 不得把 compact_requirement_graph 条目复制成 JSON block。
 16. 不得把 runtime、target_file、inputs、outputs 这些图谱字段原样写成 bash block 内容。"""
@@ -11132,16 +11132,16 @@ references/*.md 是参考资料正文，不是执行步骤。
 
 _SKILL_MD_COMMAND_TEMPLATE_SEMANTIC_RULES = """SKILL.md bash command block 语义规则：
 1. bash command block 是运行模板，不是示例调用。
-2. requirement_graph / workflow_allocation 的 inputs/outputs 是强语义参考，不是字段名硬合同；argv key 可以与图谱字段不逐字一致。
-3. 生成 JSON argv 时必须先语义理解图谱中的输入、输出和依赖关系。
-4. argv key/value 必须语义上可追踪到用户输入、上游脚本 stdout、当前脚本配置或蓝图明确常量。
+2. requirement_graph / workflow_allocation 的 inputs/outputs 是强语义参考，不是字段名硬合同；输入字段可以与图谱字段不逐字一致。
+3. 生成输入 JSON 时必须先语义理解图谱中的输入、输出和依赖关系。
+4. 输入字段和值必须语义上可追踪到用户输入、上游脚本 stdout、当前脚本配置或蓝图明确常量。
 5. 不得为了让命令看起来完整而编造无来源字面值或占位参数。
 6. 不得把示例调用、示例值或说明性样例写进 bash command block。
 7. 不得把下游脚本输入写成无来源字面值；应语义上来自上游 stdout，字段名可由第二轮 E2E 对齐。
 8. 不得把用户输入写成字面值；应引用平台输入 placeholder 或传入通用 payload。
 9. 如果不确定具体字段名，优先使用通用 user_request/input/payload，由脚本解析。
 10. 第一轮只判断是否语义可追踪、是否明显示例调用、是否明显无来源占位、是否完全脱离图谱 IO 语义。
-11. 第一轮不得要求 argv key 必须逐字等于 graph.inputs，也不得要求 placeholder 必须逐字等于 graph.outputs。
+11. 第一轮不得要求输入字段必须逐字等于 graph.inputs，也不得要求 placeholder 必须逐字等于 graph.outputs。
 12. compact_requirement_graph 只是职责上下文，不是命令块 JSON schema；不得把条目机械复制成 JSON block。"""
 
 
@@ -11364,7 +11364,8 @@ def _build_markdown_format_full_rewrite_prompt(
                 "5. frontmatter 必须完整闭合。\n"
                 "6. 所有 fenced block 必须成对闭合。\n"
                 "7. 不要把 repair proposal JSON 嵌进 Markdown。\n"
-                "8. 不要混入 command argv / 字段对齐 / workflow dataflow 的局部修复；格式合法后由后续校验处理。\n\n"
+                "8. 格式重写只修复 JSON 的引号、分组和完整性，以及 Markdown fence/frontmatter 闭合问题；不要混入输入字段对齐或 workflow dataflow 的局部修复。\n"
+                "9. 保持现有脚本调用形式；输入 JSON 仍是脚本路径后的第一个位置参数，对应 Python 脚本中的 `sys.argv[1]`；不要把输入 JSON 理解为 --argv 等命令行选项，不要新增调用参数；格式合法后由后续校验处理。\n\n"
                 "蓝图上下文：\n"
                 f"{(blueprint_text or '')[:8000]}\n\n"
                 "当前文件内容：\n"

@@ -492,3 +492,30 @@ async def test_repair_model_uses_new_canonical_context_instead_of_old_writer_too
     assert "fresh.tool" in captured["task_context"]
     assert "new canonical" in captured["task_context"]
     assert "old_writer_tool_context" not in captured["task_context"]
+
+
+def test_skill_md_and_markdown_rewrite_prompts_use_input_json_position_arg_wording():
+    from backend.services.creator import generation
+
+    generation_messages = generation._build_generate_file_prompt(
+        file_path="SKILL.md",
+        skill_name="demo",
+        purpose="demo skill",
+        blueprint_text="目录结构:\n- scripts/main.py\n",
+        conversation_history=[],
+    )
+    generation_prompt = "\n".join(str(message.get("content") or "") for message in generation_messages)
+
+    rewrite_messages = creator_api._build_markdown_format_full_rewrite_prompt(
+        file_path="SKILL.md",
+        skill_name="demo",
+        blueprint_text="目录结构:\n- scripts/main.py\n",
+        deterministic_error="command JSON quotes broken",
+        current_content="```bash\npython scripts/main.py '{bad json}'\n```",
+    )
+    rewrite_prompt = "\n".join(str(message.get("content") or "") for message in rewrite_messages)
+
+    for prompt in (generation_prompt, rewrite_prompt):
+        assert "输入 JSON" in prompt
+        assert "第一个位置参数" in prompt
+        assert "sys.argv[1]" in prompt
