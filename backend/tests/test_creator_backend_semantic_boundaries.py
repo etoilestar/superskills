@@ -186,6 +186,7 @@ from types import SimpleNamespace
 
 from backend.services.creator.common import (
     ResponsibilityGraph,
+    _platform_boundary_nodes,
     build_function_execution_context,
     validate_responsibility_graph_schema,
 )
@@ -193,6 +194,32 @@ from backend.services.creator.generation import _script_local_contract_payload
 from backend.services.creator.api import generate_file
 from backend.services.creator import api as creator_api
 from backend.services.creator import e2e as creator_e2e
+
+def _graph(requirements=None, edges=None, *, include_input=True, include_output=True):
+    platform_input, platform_output = _platform_boundary_nodes()
+    return ResponsibilityGraph(
+        requirements=requirements or [],
+        platform_input_node=platform_input if include_input else {},
+        platform_output_node=platform_output if include_output else {},
+        dataflow_edges=edges or [
+            {
+                "from_node": "platform_input_node",
+                "from_output": "text",
+                "to_node": "scripts/main.py",
+                "to_input": "payload",
+                "purpose": "receive input",
+                "constraints": [],
+            },
+            {
+                "from_node": "scripts/main.py",
+                "from_output": "result",
+                "to_node": "platform_output_node",
+                "to_input": "text",
+                "purpose": "return output",
+                "constraints": [],
+            },
+        ],
+    )
 
 
 def test_skill_md_generate_file_source_no_early_success_return_before_format_gate():
@@ -274,22 +301,49 @@ def test_writer_and_judge_use_json_equivalent_function_execution_context(monkeyp
 
 def test_responsibility_graph_rejects_non_python_scripts_and_accepts_python():
     files = [SimpleNamespace(path="scripts/main.py", purpose="do x")]
-    graph = ResponsibilityGraph(requirements=[_req()])
+    graph = _graph(requirements=[_req()])
     assert validate_responsibility_graph_schema(graph, files).function_items
 
     for bad in ("scripts/main.js", "scripts/run.sh"):
-        bad_graph = ResponsibilityGraph(requirements=[RequirementItem(target_file=bad, purpose="bad")])
+        bad_graph = _graph(requirements=[RequirementItem(target_file=bad, purpose="bad")])
         try:
             validate_responsibility_graph_schema(bad_graph, [SimpleNamespace(path=bad, purpose="bad")])
         except Exception as exc:
-            assert "scripts/**/*.py" in str(exc)
+            assert "executable FilePlan scripts" in str(exc)
         else:
             raise AssertionError(f"{bad} should not be a FunctionItem target")
 
 
-def test_scriptless_responsibility_graph_still_valid():
-    graph = ResponsibilityGraph(requirements=[])
-    assert validate_responsibility_graph_schema(graph, [SimpleNamespace(path="SKILL.md", purpose="docs")]).function_items == []
+def test_responsibility_graph_rejects_function_item_outside_file_plan_scripts():
+    graph = _graph(requirements=[_req()])
+    with pytest.raises(Exception) as exc:
+        validate_responsibility_graph_schema(graph, [SimpleNamespace(path="SKILL.md", purpose="docs")])
+    assert getattr(exc.value, "code", "") == "responsibility_graph_file_plan_conflict"
+
+
+def test_responsibility_graph_rejects_missing_platform_input_node():
+    graph = _graph(requirements=[_req()], include_input=False)
+    with pytest.raises(Exception) as exc:
+        validate_responsibility_graph_schema(graph, [SimpleNamespace(path="scripts/main.py", purpose="do x")])
+    assert getattr(exc.value, "code", "") == "responsibility_graph_platform_io_conflict"
+
+
+def test_responsibility_graph_rejects_missing_platform_output_node():
+    graph = _graph(requirements=[_req()], include_output=False)
+    with pytest.raises(Exception) as exc:
+        validate_responsibility_graph_schema(graph, [SimpleNamespace(path="scripts/main.py", purpose="do x")])
+    assert getattr(exc.value, "code", "") == "responsibility_graph_platform_io_conflict"
+
+
+@pytest.mark.parametrize("target", ["SKILL.md", "references/guide.md", "assets/logo.png"])
+def test_responsibility_graph_rejects_non_execution_resource_nodes(target):
+    graph = _graph(
+        requirements=[RequirementItem(target_file=target, purpose="not executable")],
+        edges=[],
+    )
+    with pytest.raises(Exception) as exc:
+        validate_responsibility_graph_schema(graph, [SimpleNamespace(path=target, purpose="not executable")])
+    assert getattr(exc.value, "code", "") == "responsibility_graph_file_plan_conflict"
 
 
 def test_e2e_source_does_not_call_semantic_judge_or_toolpool_planning():

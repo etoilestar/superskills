@@ -426,6 +426,40 @@ async def test_ready_does_not_add_summary_hallucinated_file_to_execution_plan(mo
     assert any(w.get("code") == "summary_files_not_in_skill_plan" and "scripts/extra.py" in w.get("files", []) for w in resp.warnings)
 
 
+def test_summary_hallucinated_asset_is_not_projected_to_uploads():
+    summary = api.PreparePlanReviewSummary(
+        files_to_create_or_update=["SKILL.md"],
+        assets_to_upload=["assets/hallucinated.png"],
+    )
+
+    warnings = api._sync_prepare_summary_files_from_skill_plan(
+        summary,
+        [_file("SKILL.md")],
+    )
+
+    assert summary.assets_to_upload == []
+    assert any(w.get("code") == "summary_asset_not_in_file_plan" and "assets/hallucinated.png" in w.get("files", []) for w in warnings)
+
+
+def test_required_user_upload_asset_missing_is_detectable_before_ready():
+    missing = api._required_file_plan_user_upload_asset_paths(
+        [_file("SKILL.md"), _file("assets/template.png", asset_source="user_upload")]
+    )
+
+    assert missing == ["assets/template.png"]
+
+
+def test_no_user_upload_asset_keeps_assets_to_upload_empty():
+    summary = api.PreparePlanReviewSummary(assets_to_upload=["assets/bundled.png"])
+
+    api._sync_prepare_summary_files_from_skill_plan(
+        summary,
+        [_file("SKILL.md"), _file("assets/bundled.png", asset_source="bundled")],
+    )
+
+    assert summary.assets_to_upload == []
+
+
 def test_sync_prepare_summary_files_filters_directories_and_dynamic_paths():
     summary = api.PreparePlanReviewSummary(files_to_create_or_update=["SKILL.md"])
     warnings = api._sync_prepare_summary_files_from_skill_plan(summary, [
