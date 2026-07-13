@@ -4110,6 +4110,7 @@ class PreparePlanResponse(BaseModel):
         "blueprint_protocol_failed",
         "blueprint_analyze_failed",
         "tool_pool_closure_failed",
+        "asset_upload_required",
     ] = "business_clarification"
 
     clarifying_questions: list[str] = (
@@ -4333,21 +4334,35 @@ def _sync_prepare_summary_files_from_skill_plan(
         for path in (summary.files_to_create_or_update or [])
         if str(path or "").strip()
     ]
+    original_summary_assets = [
+        _normalize_skill_path(str(path or ""))
+        for path in (summary.assets_to_upload or [])
+        if str(path or "").strip()
+    ]
     authoritative: list[str] = []
+    authoritative_upload_assets: list[str] = []
     for file_spec in plan_files or []:
         path = _normalize_skill_path(str(getattr(file_spec, "path", "") or ""))
         asset_source = str(getattr(file_spec, "asset_source", "") or "").strip()
         if _is_concrete_prepare_summary_file_path(path, asset_source=asset_source) and path not in authoritative:
             authoritative.append(path)
+        if path.startswith("assets/") and asset_source == "user_upload" and path not in authoritative_upload_assets:
+            authoritative_upload_assets.append(path)
     summary.files_to_create_or_update = authoritative
+    summary.assets_to_upload = authoritative_upload_assets
     extra_summary_files = [
         path
         for path in original_summary_files
         if path and path not in set(authoritative) and _is_concrete_prepare_summary_file_path(path, asset_source="bundled" if path.startswith("assets/") else "")
     ]
-    if not extra_summary_files:
-        return []
-    return [{
+    extra_summary_assets = [
+        path
+        for path in original_summary_assets
+        if path and path not in set(authoritative_upload_assets)
+    ]
+    warnings: list[dict[str, Any]] = []
+    if extra_summary_files:
+        warnings.append({
         "severity": "planning_warning",
         "code": "summary_files_not_in_skill_plan",
         "source": "prepare_plan",
@@ -4355,7 +4370,29 @@ def _sync_prepare_summary_files_from_skill_plan(
         "field": "review_summary.files_to_create_or_update",
         "files": extra_summary_files,
         "message": "review_summary listed files not present in analyzed SkillPlan; ignored because SkillPlan is authoritative.",
-    }]
+        })
+    if extra_summary_assets:
+        warnings.append({
+            "severity": "planning_warning",
+            "code": "summary_asset_not_in_file_plan",
+            "source": "prepare_plan",
+            "path": "",
+            "field": "review_summary.assets_to_upload",
+            "files": extra_summary_assets,
+            "message": "review_summary listed assets not present in analyzed FilePlan user-upload assets; ignored because FilePlan is authoritative.",
+        })
+    return warnings
+
+
+def _required_file_plan_user_upload_asset_paths(plan_files: list[Any] | None) -> list[str]:
+    paths: list[str] = []
+    for file_spec in plan_files or []:
+        path = _normalize_skill_path(str(getattr(file_spec, "path", "") or ""))
+        asset_source = str(getattr(file_spec, "asset_source", "") or "").strip()
+        required = bool(getattr(file_spec, "required", False)) and not bool(getattr(file_spec, "can_skip", False))
+        if path.startswith("assets/") and asset_source == "user_upload" and required and path not in paths:
+            paths.append(path)
+    return paths
 
 
 MAX_PREPARE_BUSINESS_CLARIFICATION_ROUNDS = 2
@@ -9374,6 +9411,67 @@ async def _prepare_plan_impl(
         in confirmed_uploaded_assets
     }
 
+    required_upload_assets = (
+        _required_file_plan_user_upload_asset_paths(
+            plan.files
+        )
+    )
+    missing_required_upload_assets = [
+        path
+        for path
+        in required_upload_assets
+        if path not in confirmed_asset_paths
+    ]
+
+    if missing_required_upload_assets:
+        final_blueprint_text = (
+            plan.blueprint_text
+            or blueprint_text
+        )
+        summary = await project_summary(
+            final_blueprint_text,
+            prepared,
+        )
+        summary_sync_warnings = (
+            _sync_prepare_summary_files_from_skill_plan(
+                summary,
+                plan.files,
+            )
+        )
+        summary.assets_to_upload = missing_required_upload_assets
+        return PreparePlanResponse(
+            status="needs_clarification",
+            prepare_stage="asset_upload_required",
+            clarifying_questions=[
+                "请先上传创建该 Skill 必需的静态资源文件，然后继续。"
+            ],
+            review_summary=(
+                _strip_prepare_summary_risks(
+                    summary
+                )
+            ),
+            blueprint_text=final_blueprint_text,
+            skill_name=plan.skill_name,
+            files=plan.files,
+            warnings=[
+                *(
+                    plan.warnings
+                    or []
+                ),
+                *summary_sync_warnings,
+            ],
+            asset_requirements=plan.asset_requirements,
+            creation_blockers=[
+                {
+                    "code": "required_asset_not_uploaded",
+                    "type": "required_asset_not_uploaded",
+                    "blocking": True,
+                    "assets_to_upload": missing_required_upload_assets,
+                    "message": "Required user-upload assets from the FilePlan have not been uploaded.",
+                }
+            ],
+        )
+
     plan.files = [
         file_spec
         for file_spec
@@ -9457,59 +9555,6 @@ async def _prepare_plan_impl(
             plan.files,
         )
     )
-
-    summary.assets_to_upload = [
-        str(
-            getattr(
-                asset,
-                "path",
-                "",
-            )
-            or ""
-        ).strip()
-        for asset
-        in (
-            plan.asset_requirements
-            or []
-        )
-        if (
-            str(
-                getattr(
-                    asset,
-                    "path",
-                    "",
-                )
-                or ""
-            ).strip()
-            and str(
-                getattr(
-                    asset,
-                    "source",
-                    "",
-                )
-                or ""
-            ).strip()
-            in {
-                "user_upload",
-                "bundled",
-            }
-            and not re.search(
-                (
-                    r"运行时|每次上传|"
-                    r"用户输入|runtime"
-                ),
-                str(
-                    getattr(
-                        asset,
-                        "description",
-                        "",
-                    )
-                    or ""
-                ),
-                re.I,
-            )
-        )
-    ]
 
     graph_payload = (
         plan.requirement_graph.model_dump(

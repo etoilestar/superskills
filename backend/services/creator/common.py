@@ -452,6 +452,49 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
         for item in graph.requirements
         if is_python_function_item_target(str(item.target_file or ""))
     }
+    incoming_by_node: dict[str, set[str]] = {}
+    outgoing_by_node: dict[str, set[str]] = {}
+    for edge in graph.dataflow_edges or []:
+        from_node = str(edge.get("from_node") or "")
+        to_node = str(edge.get("to_node") or "")
+        if from_node and to_node:
+            outgoing_by_node.setdefault(from_node, set()).add(to_node)
+            incoming_by_node.setdefault(to_node, set()).add(from_node)
+
+    if not platform_input:
+        raise ResponsibilityGraphValidationError(
+            "ResponsibilityGraph must include platform_input_node.",
+            code="responsibility_graph_platform_io_conflict",
+        )
+    if not platform_output:
+        raise ResponsibilityGraphValidationError(
+            "ResponsibilityGraph must include platform_output_node.",
+            code="responsibility_graph_platform_io_conflict",
+        )
+    if incoming_by_node.get(platform_input_id):
+        raise ResponsibilityGraphValidationError(
+            "platform_input_node must not have incoming edges.",
+            code="responsibility_graph_platform_io_conflict",
+            details={"node": platform_input_id},
+        )
+    if not outgoing_by_node.get(platform_input_id):
+        raise ResponsibilityGraphValidationError(
+            "platform_input_node must have at least one outgoing edge.",
+            code="responsibility_graph_platform_io_conflict",
+            details={"node": platform_input_id},
+        )
+    if outgoing_by_node.get(platform_output_id):
+        raise ResponsibilityGraphValidationError(
+            "platform_output_node must not have outgoing edges.",
+            code="responsibility_graph_platform_io_conflict",
+            details={"node": platform_output_id},
+        )
+    if not incoming_by_node.get(platform_output_id):
+        raise ResponsibilityGraphValidationError(
+            "platform_output_node must have at least one incoming edge.",
+            code="responsibility_graph_platform_io_conflict",
+            details={"node": platform_output_id},
+        )
     outputs_by_script: dict[str, set[str]] = {
         str(item.target_file): {str(field) for field in (item.outputs or []) if str(field or "").strip()}
         for item in graph.requirements
@@ -516,14 +559,14 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
         if from_node in {platform_output_id} or to_node in {platform_input_id}:
             raise ResponsibilityGraphValidationError(
                 "Dataflow edge uses a platform boundary node in an invalid direction.",
-                code="dataflow_edge_invalid",
+                code="responsibility_graph_platform_io_conflict",
                 details={"index": idx, "from_node": from_node, "to_node": to_node},
             )
 
         if from_node not in script_nodes or to_node not in script_nodes:
             raise ResponsibilityGraphValidationError(
                 "Script-to-script dataflow edge references a missing script node.",
-                code="dataflow_edge_invalid",
+                code="responsibility_graph_file_plan_conflict",
                 details={"index": idx, "from_node": from_node, "to_node": to_node},
             )
         if not all(isinstance(c, dict) for c in (edge.get("constraints") or [])):
@@ -532,6 +575,39 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
                 code="dataflow_edge_invalid",
                 details={"index": idx},
             )
+
+    reachable_from_input: set[str] = set()
+    queue = list(outgoing_by_node.get(platform_input_id, set()))
+    while queue:
+        node = queue.pop(0)
+        if node in reachable_from_input:
+            continue
+        reachable_from_input.add(node)
+        queue.extend(sorted(outgoing_by_node.get(node, set()) - reachable_from_input))
+    can_reach_output: set[str] = set()
+    queue = list(incoming_by_node.get(platform_output_id, set()))
+    while queue:
+        node = queue.pop(0)
+        if node in can_reach_output:
+            continue
+        can_reach_output.add(node)
+        queue.extend(sorted(incoming_by_node.get(node, set()) - can_reach_output))
+    disconnected_required = sorted(
+        str(item.target_file)
+        for item in graph.requirements
+        if item.required
+        and is_python_function_item_target(str(item.target_file or ""))
+        and (
+            str(item.target_file) not in reachable_from_input
+            or str(item.target_file) not in can_reach_output
+        )
+    )
+    if disconnected_required:
+        raise ResponsibilityGraphValidationError(
+            "Required FunctionItems must be on a platform_input_node to platform_output_node path.",
+            code="responsibility_graph_platform_io_conflict",
+            details={"targets": disconnected_required},
+        )
 
 
 def _file_spec_has_substantive_responsibility(file_spec: Any) -> bool:
@@ -886,7 +962,13 @@ def normalize_responsibility_graph(data: dict[str, Any] | ResponsibilityGraph) -
 
 
 def validate_responsibility_graph_schema(graph: ResponsibilityGraph, files: list[Any]) -> ResponsibilityGraph:
+    original_graph = graph
     graph = normalize_responsibility_graph(graph)
+    if isinstance(original_graph, ResponsibilityGraph):
+        graph = graph.model_copy(update={
+            "platform_input_node": original_graph.platform_input_node,
+            "platform_output_node": original_graph.platform_output_node,
+        })
     script_targets = {
         str(getattr(file_spec, "path", "") or "").strip()
         for file_spec in files or []
@@ -899,15 +981,15 @@ def validate_responsibility_graph_schema(graph: ResponsibilityGraph, files: list
         path = str(item.target_file or "").strip()
         if not is_python_function_item_target(path):
             raise ResponsibilityGraphValidationError(
-                "ResponsibilityGraph FunctionItems must target scripts/**/*.py only.",
-                code="validator_incomplete",
+                "ResponsibilityGraph FunctionItems must reference executable FilePlan scripts only.",
+                code="responsibility_graph_file_plan_conflict",
                 details={"target_file": path},
             )
         if path not in script_targets:
             raise ResponsibilityGraphValidationError(
                 "FunctionItem target_file must reference "
                 "an existing script FileSpec.",
-                code="validator_incomplete",
+                code="responsibility_graph_file_plan_conflict",
                 details={"target_file": path},
             )
         target_counts[path] = target_counts.get(path, 0) + 1
