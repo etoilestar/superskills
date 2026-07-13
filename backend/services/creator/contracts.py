@@ -2821,7 +2821,7 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
         ),
         expected="只输出当前 reference 文件内容；不能包含其它文件的完整内容或写入文件标签。",
         minimal_edit="删除其它文件完整内容和写入文件标签，只保留当前 reference metadata 和正文。",
-        layer="markdown_format",
+        layer="reference_contract",
     ))
 
     return results

@@ -838,3 +838,82 @@ def test_skill_md_review_blocks_explicit_command_mapping_evidence():
     results = _skill_md_blueprint_review_to_contract_results(review)
     assert len(results) == 1
     assert results[0].id.startswith("skill_md.blueprint_alignment.workflow")
+
+
+
+def _reference_content(body: str) -> str:
+    return f"---\ntitle: Guide\ndescription: Demo\n---\n\n{body}"
+
+
+def test_reference_single_file_content_contract_routes_to_patch_layer():
+    from backend.services.creator.api import is_markdown_hard_format_error
+    from backend.services.creator.common import FileGenerationStageError
+    from backend.services.creator.contracts import ContractValidationError, _check_reference_file_contract
+
+    content = _reference_content("# Guide\n\nFile: scripts/other.py\n```python\nprint('do not include full file')\n```\n")
+    result = next(r for r in _check_reference_file_contract("references/guide.md", content) if r.id == "reference.single_file")
+
+    assert not result.passed
+    assert result.layer == "reference_contract"
+
+    stage_error = FileGenerationStageError(
+        source="content_review",
+        layer=result.layer,
+        detail=result.message,
+        original=ContractValidationError("reference", [result]),
+    )
+    assert not is_markdown_hard_format_error(stage_error)
+
+
+def test_reference_real_frontmatter_damage_still_requires_full_rewrite():
+    from backend.services.creator.api import is_markdown_hard_format_error
+    from backend.services.creator.common import FileGenerationStageError
+    from backend.services.creator.contracts import ContractValidationError, _check_reference_file_contract
+
+    results = _check_reference_file_contract("references/guide.md", "---\ntitle: Guide\n# Body\n")
+    failed = [r for r in results if not r.passed]
+    assert any(r.id == "markdown.frontmatter.unclosed" for r in failed)
+
+    stage_error = FileGenerationStageError(
+        source="content_review",
+        layer="content_review",
+        detail="frontmatter damage",
+        original=ContractValidationError("format", failed),
+    )
+    assert is_markdown_hard_format_error(stage_error)
+
+
+def test_reference_invalid_yaml_still_requires_full_rewrite():
+    from backend.services.creator.api import is_markdown_hard_format_error
+    from backend.services.creator.common import FileGenerationStageError
+    from backend.services.creator.contracts import ContractValidationError, _check_reference_file_contract
+
+    results = _check_reference_file_contract("references/guide.md", "---\ntitle: [broken\n---\n\n# Body\n")
+    failed = [r for r in results if not r.passed]
+    assert any(r.id == "markdown.frontmatter.invalid_yaml" for r in failed)
+
+    stage_error = FileGenerationStageError(
+        source="content_review",
+        layer="content_review",
+        detail="invalid yaml",
+        original=ContractValidationError("format", failed),
+    )
+    assert is_markdown_hard_format_error(stage_error)
+
+
+def test_reference_unclosed_fence_still_requires_full_rewrite():
+    from backend.services.creator.api import is_markdown_hard_format_error
+    from backend.services.creator.common import FileGenerationStageError
+    from backend.services.creator.contracts import ContractValidationError, _check_reference_file_contract
+
+    results = _check_reference_file_contract("references/guide.md", _reference_content("# Guide\n\n```text\nunclosed\n"))
+    failed = [r for r in results if not r.passed]
+    assert any(r.id == "markdown.fences.unclosed" for r in failed)
+
+    stage_error = FileGenerationStageError(
+        source="content_review",
+        layer="content_review",
+        detail="unclosed fence",
+        original=ContractValidationError("format", failed),
+    )
+    assert is_markdown_hard_format_error(stage_error)

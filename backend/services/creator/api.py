@@ -12619,7 +12619,6 @@ async def generate_file(request: GenerateFileRequest):
                         "保持已通过的 YAML frontmatter 和 Markdown 格式；"
                         "按 reference semantic judge 的 issues 修正当前参考资料职责。"
                     )
-
                 contract_text = _build_generated_file_contract_text(
                     request.file_path,
                     request.blueprint_text,
