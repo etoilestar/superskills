@@ -838,3 +838,118 @@ def test_skill_md_review_blocks_explicit_command_mapping_evidence():
     results = _skill_md_blueprint_review_to_contract_results(review)
     assert len(results) == 1
     assert results[0].id.startswith("skill_md.blueprint_alignment.workflow")
+
+
+def _reference_content(body: str) -> str:
+    return f"---\ntitle: Guide\ndescription: Demo\n---\n\n{body}"
+
+
+def test_reference_single_file_is_not_hard_format():
+    from backend.services.creator.api import is_markdown_hard_format_error
+    from backend.services.creator.common import FileGenerationStageError
+    from backend.services.creator.contracts import ContractValidationError, _check_reference_file_contract
+
+    content = _reference_content("# Guide\n\nFile: scripts/other.py\n```python\nprint('do not include full file')\n```\n")
+    result = next(r for r in _check_reference_file_contract("references/guide.md", content) if r.id == "reference.single_file")
+
+    assert not result.passed
+    assert result.layer == "reference_contract"
+    assert result.details["repair_strategy"] == "localized_patch"
+    assert result.details["model_patch_allowed"] is True
+    assert result.details["region"] == "body_region"
+
+    stage_error = FileGenerationStageError(
+        source="content_review",
+        layer=result.layer,
+        detail=result.message,
+        original=ContractValidationError("reference", [result]),
+    )
+    assert not is_markdown_hard_format_error(stage_error)
+
+
+def test_reference_single_file_explicit_localized_patch_overrides_markdown_text():
+    from backend.services.creator.api import is_markdown_hard_format_error
+    from backend.services.creator.common import FileGenerationStageError
+    from backend.services.creator.contracts import ContractCheckResult, ContractValidationError
+
+    result = ContractCheckResult(
+        id="reference.single_file",
+        passed=False,
+        target="references/guide.md",
+        message="legacy text mentions markdown_format but this is content evidence",
+        expected="only this reference",
+        minimal_edit="remove the local offending block",
+        details={"repair_strategy": "localized_patch", "model_patch_allowed": True, "region": "body_region"},
+        layer="markdown_format",
+    )
+    stage_error = FileGenerationStageError(
+        source="content_review",
+        layer="markdown_format",
+        detail=result.message,
+        original=ContractValidationError("reference", [result]),
+    )
+
+    assert not is_markdown_hard_format_error(stage_error)
+
+
+def test_reference_single_file_allows_paths_and_workflow_descriptions():
+    from backend.services.creator.contracts import _check_reference_file_contract
+
+    content = _reference_content(
+        "# Workflow notes\n\n"
+        "scripts/analyze.py reads inputs and writes JSON for scripts/report.py.\n"
+        "See references/style.md for tone and assets/logo.png for branding.\n"
+        "Example command output paths may include /tmp/result.json.\n"
+    )
+    failed = {r.id for r in _check_reference_file_contract("references/guide.md", content) if not r.passed}
+
+    assert "reference.single_file" not in failed
+
+
+def test_reference_single_file_blocks_explicit_multifile_content_and_write_labels():
+    from backend.services.creator.contracts import _check_reference_file_contract
+
+    packaged = _reference_content("# Guide\n\nscripts/other.py\n```python\nprint('full file')\n```\n")
+    write_label = _reference_content("# Guide\n\nPath: scripts/other.py\n")
+
+    packaged_result = next(r for r in _check_reference_file_contract("references/guide.md", packaged) if r.id == "reference.single_file")
+    write_label_result = next(r for r in _check_reference_file_contract("references/guide.md", write_label) if r.id == "reference.single_file")
+
+    assert not packaged_result.passed
+    assert packaged_result.details["evidence"][0]["type"] == "packaged_file_block"
+    assert not write_label_result.passed
+    assert write_label_result.details["evidence"][0]["type"] == "write_file_directive"
+
+
+def test_true_reference_markdown_damage_still_requires_full_rewrite():
+    from backend.services.creator.api import is_markdown_hard_format_error
+    from backend.services.creator.common import FileGenerationStageError
+    from backend.services.creator.contracts import ContractValidationError, _check_reference_file_contract
+
+    results = _check_reference_file_contract("references/guide.md", "---\ntitle: Guide\n# Body\n")
+    failed = [r for r in results if not r.passed]
+    assert any(r.id == "markdown.frontmatter.unclosed" for r in failed)
+    stage_error = FileGenerationStageError(
+        source="content_review",
+        layer="markdown_format",
+        detail="frontmatter damage",
+        original=ContractValidationError("format", failed),
+    )
+
+    assert is_markdown_hard_format_error(stage_error)
+
+
+def test_reference_single_file_local_patch_can_preserve_frontmatter_and_unrelated_body():
+    from backend.services.creator.contracts import _check_reference_file_contract
+
+    before = _reference_content(
+        "# Guide\n\nKeep this paragraph.\n\nscripts/other.py\n```python\nprint('remove me')\n```\n\nKeep this ending.\n"
+    )
+    result = next(r for r in _check_reference_file_contract("references/guide.md", before) if r.id == "reference.single_file")
+    assert not result.passed
+
+    after = before.replace("\nscripts/other.py\n```python\nprint('remove me')\n```\n", "\n")
+    assert after.startswith("---\ntitle: Guide\ndescription: Demo\n---")
+    assert "Keep this paragraph." in after
+    assert "Keep this ending." in after
+    assert all(r.passed for r in _check_reference_file_contract("references/guide.md", after) if r.id == "reference.single_file")
