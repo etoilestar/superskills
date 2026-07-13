@@ -2639,19 +2639,29 @@ def _build_generated_file_contract_text(
         return _build_asset_file_contract_text(file_path, purpose)
     return ""
 
-def _reference_contains_write_file_directive(markdown_body: str) -> bool:
-    """Detect whether a reference body contains an actual write-file directive.
+def _reference_write_file_directive_evidence(markdown_body: str) -> list[dict[str, Any]]:
+    """Return explicit write-file directive evidence in a reference body.
 
     只扫描 reference 正文，不扫描 YAML frontmatter。
     避免 metadata.creator.path 被误判成 Path/File 写入标签。
 
     这里检测的是通用文件写入指令语法，不绑定具体业务案例。
     """
+    evidence: list[dict[str, Any]] = []
     body = markdown_body or ""
-    return bool(re.search(
-        r"(?m)^\s*(?:写入文件|创建文件|保存为|File|Filename|Path)\s*[:：]\s*(?:SKILL\.md|scripts/|references/|assets/)",
-        body,
-    ))
+    pattern = re.compile(
+        r"(?m)^\s*(?:写入文件|创建文件|保存为|File|Filename|Path)\s*[:：]\s*(?:SKILL\.md|scripts/|references/|assets/)"
+    )
+    lines = body.splitlines()
+    for match in pattern.finditer(body):
+        line_no = body.count("\n", 0, match.start()) + 1
+        snippet = lines[line_no - 1].strip() if 0 <= line_no - 1 < len(lines) else match.group(0).strip()
+        evidence.append({"type": "write_file_directive", "line": line_no, "snippet": snippet})
+    return evidence
+
+
+def _reference_contains_write_file_directive(markdown_body: str) -> bool:
+    return bool(_reference_write_file_directive_evidence(markdown_body))
 
 
 
@@ -2798,18 +2808,21 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
         layer="markdown_format",
     ))
 
-    has_write_file_label = _reference_contains_write_file_directive(stripped)
-    has_packaged_file_block = False
+    single_file_evidence = _reference_write_file_directive_evidence(stripped)
     lines = stripped.splitlines()
     for idx, line in enumerate(lines):
         line_text = line.strip()
         if re.match(r"^(?:#{1,6}\s*)?(?:SKILL\.md|scripts/[^\s]+|references/[^\s]+|assets/[^\s]+)\s*$", line_text):
             following = "\n".join(lines[idx + 1: idx + 4])
             if "```" in following or "~~~" in following:
-                has_packaged_file_block = True
+                single_file_evidence.append({
+                    "type": "packaged_file_block",
+                    "line": idx + 1,
+                    "snippet": "\n".join(lines[idx: idx + 4]).strip(),
+                })
                 break
 
-    single_file_ok = not has_write_file_label and not has_packaged_file_block
+    single_file_ok = not single_file_evidence
     results.append(ContractCheckResult(
         id="reference.single_file",
         passed=single_file_ok,
