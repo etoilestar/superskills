@@ -98,3 +98,37 @@ def test_dynamic_baseline_uses_recent_failure_not_initial_failure():
     assert _e2e_candidate_improved([progressed], [progressed], target_file="scripts/x.py") is False
     assert _e2e_behavior_fingerprint(progressed, target_file="scripts/x.py") == _e2e_behavior_fingerprint(progressed, target_file="scripts/x.py")
     assert _artifact_runtime_state({"created_files": [], "modified_files": [], "reported_paths": [], "resolved_reported_paths": []})["created_count"] == 0
+
+
+def test_non_artifact_temp_file_does_not_count_as_progress():
+    old = _failure({
+        "created_files": [],
+        "modified_files": [],
+        "reported_paths": [],
+        "resolved_reported_paths": [],
+    }, code="script_exit")
+    new = _failure({
+        "created_files": [{"relative_path": "tmp/cache.tmp"}],
+        "modified_files": [],
+        "reported_paths": [],
+        "resolved_reported_paths": [],
+    }, code="script_exit")
+
+    assert _e2e_candidate_improved([old], [new], target_file="scripts/x.py") is False
+
+
+def test_artifact_created_file_counts_as_progress_for_artifact_failure():
+    old = _failure({
+        "created_files": [],
+        "modified_files": [],
+        "reported_paths": [],
+        "resolved_reported_paths": [],
+    }, code="artifact_not_created")
+    new = _failure({
+        "created_files": [{"relative_path": "outputs/result.dat"}],
+        "modified_files": [],
+        "reported_paths": ["missing/result.dat"],
+        "resolved_reported_paths": [{"raw_path": "missing/result.dat", "exists": False}],
+    }, code="artifact_return_path_mismatch")
+
+    assert _e2e_candidate_improved([old], [new], target_file="scripts/x.py") is True

@@ -539,6 +539,11 @@ def _artifact_runtime_state_improved(old_state: dict[str, Any], new_state: dict[
     return new_rank > old_rank >= 0
 
 
+def _failure_code_from_structured(structured: dict[str, Any] | None) -> str:
+    details = structured.get("details") if isinstance(structured, dict) else {}
+    return str((details or {}).get("failure_code") or "")
+
+
 def _format_json_shape(obj: dict[str, Any]) -> str:
     if not obj:
         return "{}"
@@ -2053,6 +2058,7 @@ def _write_step_checkpoint(
     value_provenance: dict[str, Any] | None = None,
     filesystem_diff: dict[str, Any] | None = None,
     verified_bindings: dict[str, str] | None = None,
+    runtime_binding_trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     checkpoint = {
         "e2e_session_id": session.e2e_session_id,
@@ -2081,6 +2087,7 @@ def _write_step_checkpoint(
         "value_provenance": value_provenance or {},
         "filesystem_diff": filesystem_diff or {},
         "verified_bindings": verified_bindings or {},
+        "runtime_binding_trace": runtime_binding_trace or {},
         "status": "passed",
         "passed": True,
     }
@@ -2210,13 +2217,16 @@ def _e2e_candidate_improved(original_errors: list[str], new_errors: list[str], *
     new_structured = _structured_failure_from_errors([(new_errors or [""])[0]])
     old_fs = ((old_structured.get("details") or {}).get("filesystem_trace") or {}) if old_structured else {}
     new_fs = ((new_structured.get("details") or {}).get("filesystem_trace") or {}) if new_structured else {}
+    old_code = _failure_code_from_structured(old_structured)
+    new_code = _failure_code_from_structured(new_structured)
+    is_artifact_failure = old_code.startswith("artifact_") or new_code.startswith("artifact_")
     old_pos = _e2e_failure_position((original_errors or [""])[0])
     new_pos = _e2e_failure_position((new_errors or [""])[0])
-    if old_pos == new_pos and (old_fs or new_fs):
+    if old_pos == new_pos and is_artifact_failure:
         old_state = _artifact_runtime_state(old_fs)
         new_state = _artifact_runtime_state(new_fs)
         return _artifact_runtime_state_improved(old_state, new_state)
-    if old_fs or new_fs:
+    if is_artifact_failure:
         old_missing = any(not item.get("exists") for item in (old_fs.get("resolved_reported_paths") or []))
         new_missing = any(not item.get("exists") for item in (new_fs.get("resolved_reported_paths") or []))
         if old_missing and new_missing and _stable_json_hash(old_fs.get("created_files") or []) == _stable_json_hash(new_fs.get("created_files") or []):
@@ -2981,7 +2991,6 @@ def _parse_e2e_stdout_json(
         "modified_files": (filesystem_diff or {}).get("modified_files") or [],
         "deleted_files": (filesystem_diff or {}).get("deleted_files") or [],
     }
-    filesystem_trace["failure_code"] = _artifact_failure_code(filesystem_trace)
     variable_trace = {
         "related_fields": sorted(str(k) for k in (rendered_payload or {}).keys()),
         "binding_chain": [
@@ -3111,6 +3120,9 @@ def _parse_e2e_stdout_json(
         )
     except ValueError as exc:
         artifact_code = _artifact_failure_code(filesystem_trace)
+        failure_code = artifact_code if "artifact" in str(exc).lower() or filesystem_trace.get("reported_paths") or filesystem_trace.get("created_files") else "stdout_contract"
+        if failure_code.startswith("artifact_"):
+            filesystem_trace["failure_code"] = failure_code
         raise ValueError(
             _format_e2e_failure(
                 E2EFailure(
@@ -3140,7 +3152,7 @@ def _parse_e2e_stdout_json(
                         "variable_trace": variable_trace,
                         "filesystem_trace": filesystem_trace,
                         "runtime_binding_trace": runtime_binding_trace or {},
-                        "failure_code": artifact_code if "artifact" in str(exc).lower() or filesystem_trace.get("reported_paths") or filesystem_trace.get("created_files") else "stdout_contract",
+                        "failure_code": failure_code,
                     },
                 )
             )
@@ -3602,6 +3614,7 @@ def _run_skill_workflow_e2e_once(
                     argv_shape=dict(checkpoint.get("argv_shape") or {}),
                     stdout_shape=dict(checkpoint.get("stdout_shape") or {}),
                     rendered_argv_preview=_preview_object(checkpoint.get("argv_json") or {}),
+                    placeholder_bindings=dict(checkpoint.get("runtime_binding_trace") or {}),
                     stdout_preview=_preview_object(checkpoint.get("stdout_json") or {}),
                     value_provenance=dict(checkpoint.get("value_provenance") or {}),
                     created_files=list((checkpoint.get("filesystem_diff") or {}).get("created_files") or []),
@@ -3823,6 +3836,7 @@ def _run_skill_workflow_e2e_once(
                         value_provenance=value_provenance,
                         filesystem_diff=filesystem_diff,
                         verified_bindings=verified_bindings,
+                        runtime_binding_trace=runtime_binding_trace,
                     )
                     if verified_bindings:
                         e2e_session.verified_bindings_by_script.setdefault(command.script_path, {}).update(verified_bindings)
