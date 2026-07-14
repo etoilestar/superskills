@@ -2,6 +2,7 @@
 
 from .common import *  # noqa: F403
 from typing import Any, Iterable, Mapping
+from .command_normalizer import parse_skill_md_bash_command_blocks
 from .tool_pool_models import (ToolPoolModel, ToolPoolTool, ToolPoolFileBinding, ToolPoolGateEvent, ToolPoolDeniedRequest, ToolPoolMissingRequest, ToolPoolPatch, ToolPoolAddToolRequest, RuntimeImportGuardResult)
 
 @dataclass(frozen=True)
@@ -1116,7 +1117,11 @@ def _deterministic_skill_md_blueprint_alignment_checks(
 
 
 def _compact_requirement_graph_for_skill_md_review(raw_graph: Any) -> dict[str, Any]:
-    """Keep only source-proof context needed by the SKILL.md semantic reviewer."""
+    """Keep only high-level responsibility facts for the SKILL.md semantic reviewer.
+
+    Field-level edge transport is intentionally excluded. First-round command
+    argv/key/value/source checks are handled later by per-block reviewers.
+    """
     if raw_graph is None:
         return {"requirements": []}
     if hasattr(raw_graph, "model_dump"):
@@ -1159,6 +1164,31 @@ def _compact_requirement_graph_for_skill_md_review(raw_graph: Any) -> dict[str, 
         })
     return {"requirements": requirements}
 
+
+def _skill_md_overall_semantic_repair_scope(issue: dict[str, Any]) -> str:
+    return (
+        "只允许修改 SKILL.md 的说明文字、职责说明、文件清单、资源说明和最终产物说明；"
+        "不得修改任何 ```bash/sh/shell fenced command block。"
+    )
+
+
+def _skill_md_command_block_repair_scope(script_path: str) -> str:
+    return (
+        f"只允许 exact-replace 修改当前失败的 {script_path} command block；"
+        "不得修改其他 command block、SKILL.md 说明区域、scripts、references、assets 或责任图谱。"
+    )
+
+
+def _skill_md_block_locator(block: Any) -> dict[str, Any]:
+    start = int(getattr(block, "start", -1))
+    end = int(getattr(block, "end", -1))
+    content = str(getattr(block, "content", "") or "")
+    return {
+        "start": start,
+        "end": end,
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "content_excerpt": content[:1000],
+    }
 
 
 def _skill_md_reviewer_issue_contradicts_passed_true(issue: Any) -> bool:
@@ -1358,27 +1388,18 @@ async def _review_skill_md_blueprint_intent_with_model(
     )
 
     parser_paths = _extract_declared_skill_paths(blueprint_text)
-    review_script_paths = _collect_skill_md_review_script_paths(
-        blueprint_text=blueprint_text,
-        skill_plan_entry=skill_plan_entry,
-        requirement_graph=requirement_graph,
-    )
-    script_interface_context = _skill_md_script_interface_context_for_review(
-        skill_name=skill_name,
-        script_paths=review_script_paths,
-        requirement_graph=requirement_graph,
-    )
 
     prompt = (
         "你是 superskills Creator 的第一轮 SKILL.md 语义覆盖审查器，只输出严格 JSON object。\n\n"
 
-        "审查目标：回答 SKILL.md 是否基本表达了这个 Skill 的语义责任，并校验 bash command JSON value 的第一轮来源闭环。\n"
-        "第一轮只看：这个 skill 是做什么的、用户输入是什么、大致执行哪些脚本、真实路径有没有提到、最终产物是什么、reference/asset 的角色有没有明显写反，以及 command 映射是否只使用脚本探针和责任图谱中真实存在的来源。\n"
-        "不要审查证明是否足够细；不要审查第二轮 E2E 才能通过真实执行发现的问题；但可由 strict_json_argv_schema/run_args_analysis/function_execution_context/责任图谱/前序 stdout/平台输入 envelope 直接判断的 command 来源错误必须在第一轮阻断。\n\n"
+        "审查目标：只回答 SKILL.md 整体语义是否符合用户需求和蓝图责任。\n"
+        "第一轮整体语义只看：这个 skill 是做什么的、用户输入是什么、大致执行哪些脚本、文件计划是否完整、脚本职责和执行顺序是否合理、references/assets 职责是否正确、最终产物是什么、是否引入蓝图外能力或文件。\n"
+        "不得审查 command JSON key、placeholder、argv schema、stdout 字段、incoming/outgoing edge 字段映射、类型序列化、静态值或动态值来源。\n"
+        "不要审查证明是否足够细；不要审查第二轮 E2E 才能通过真实执行发现的问题。\n\n"
 
         "输出 error 必须满足以下任一条件：\n"
         "1. 该问题会导致用户无法理解或无法启动这个 Skill，且不能交给第二轮 E2E 验证；\n"
-        "2. 该问题是证据明确的 command JSON key/value 来源闭环错误。\n"
+        "2. 文件计划、资源角色、最终产物或蓝图外能力存在明显整体语义错误。\n"
         "不满足以上条件时，必须 passed=true 或最多输出 warning；warning 不进入修复。\n\n"
 
         "只有以下明显语义责任失败才能 error：\n"
@@ -1387,37 +1408,22 @@ async def _review_skill_md_blueprint_intent_with_model(
         "- 最终产物缺失；\n"
         "- reference/asset 角色明显写反；\n"
         "- 引入蓝图外能力、脚本、资源、外部 API、伪 key、伪数据库或 Creator UI 流程；\n"
-        "- 证据明确的 command JSON key/value 来源闭环错误。\n\n"
 
         "以下情况必须 passed=true 或最多 warning，不能 error，不能提出 blocking repair：\n"
         "- 说明不够细、资源用途说法不够精确、只是想优化措辞；\n"
-        "- 没证明字段如何序列化/解析、JSON 运行时类型是否完全闭环，且现有探针/图谱无法直接判定 command 来源错误；\n"
+        "- command JSON key、placeholder、argv schema、stdout 字段、edge 字段映射、类型序列化、静态值或动态值来源问题；\n"
         "- 没证明哪个脚本读取哪个 reference/asset；\n"
         "- 没写 role/source/dependencies/bundled 等内部 manifest 字段；\n"
         "- 触发词、章节模板、固定话术没有逐字一致。\n\n"
-        "不要为了让文案更精确而提出 blocking repair；不要要求 SKILL.md 写内部 manifest 字段。\n\n"
-        "SKILL.md bash command block 语义审查规则：\n"
-        "- bash command block 是运行模板，不是示例调用；普通说明文字可以出现示例，但不要扫描普通说明文字里的示例。\n"
-        "- 只检查 ```bash fenced command block 内部，不扫描普通 Markdown 说明文字。\n"
-        "- 复用下方【已生成脚本接口与局部图谱事实】：strict_json_argv_schema 是目标脚本实际 guard 接口，run_args_analysis 是脚本 run(args) 的读取事实，function_execution_context.function_item/incoming_edges/outgoing_edges 是同一份局部图谱事实；它们是 command 映射事实依据，不是建议参考。\n"
-        "- command JSON key 只允许按目标脚本实际 strict_json_argv_guard/run(args) 接口判断；不要要求 key 等于 FunctionItem inputs，也不要把平台字段名当 argv key 白名单。\n"
-        "- 必须校验每个 command JSON value 的来源：第一条命令的动态 placeholder 只能引用平台输入 envelope 或明确静态来源；后续命令的动态 placeholder 只能引用平台输入 envelope、责任图谱 incoming edge 或已排序前序 stdout 中真实存在的字段；reference_file、asset_file、literal_default、runtime_constant、script_default 可以使用明确静态值。\n"
-        "- 必填动态参数如果是没有 `{{...}}` 的普通字符串，或字符串值只是重复参数名/字段名，必须判定为无意义样例字符串而不是有效流转。\n"
-        "- placeholder 根节点不存在于平台输入 envelope、责任图谱 incoming edge 或前序 stdout 时，必须判定失败；已有前序 stdout 来源时改用运行时输入文件 sentinel，也必须判定失败。\n"
-        "- 证据明确时必须输出 error：例如 command key 明显不在脚本 allowed/required key 中，required key 明确缺失，required dynamic value 是普通样例字符串，placeholder 绑定到不存在的来源，或 incoming edge/前序 stdout 来源被替换为 runtime sentinel。\n"
-        "- 这些 command value 来源错误必须返回 severity=error、blocking=true，并设置 contract_impact.execution_closure=true；不能返回 warning。\n"
-        "- 证据不足、字段别名不明确、类型序列化/list-string/file_path 细节不明确且无法由探针/图谱直接判定时，不要猜测、不要阻断，passed=true 或最多 warning，继续交给现有 E2E 暴露和局部修复。\n"
-        "- 对这种证据明确的 command mapping 错误，category 必须写 command_mapping_explicit_evidence，并在 evidence 中同时引用脚本探针字段（strict_json_argv_schema/run_args_analysis）和图谱边字段（incoming_edges.from_output、前序 stdout 或 platform_input_node）。\n"
-        "- 修复建议只能使用脚本探针、function_execution_context、incoming/outgoing ResponsibilityEdges、已排序前序 stdout 字段和平台输入 envelope 中真实存在的来源字段；禁止自行编造业务字段，禁止用 runtime sentinel 代替前序 stdout。\n"
-        "- 不要新增 validator/normalizer/repair/E2E/JSON 格式协议；这里只给现有 SKILL.md 审查模型做单点定位，repair_ops 仅限证据明确的 SKILL.md command block 最小替换。\n"
-        "- 最终平台输出契约仍保持不变；final stdout 到 platform output 的 platform_io 问题仍可阻断。\n\n"
+        "不要为了让文案更精确而提出 blocking repair；不要要求 SKILL.md 写内部 manifest 字段。\n"
+        "整体语义失败时，repair 只能定位说明文字、职责说明、文件清单、资源说明和最终产物说明；不得要求修改 bash command block。\n\n"
         "结构化 issue 字段规范：\n"
-        "- blocking 可选；若该问题不影响执行闭环/资源角色/平台 IO/最终产物契约/用户关键要求传递，必须明确 blocking=false。\n"
-        "- contract_impact 可选 object；只用布尔字段表达是否影响 execution_closure/resource_role/platform_io/final_artifact/user_requirement_transfer。\n"
+        "- blocking 可选；若该问题不影响资源角色/最终产物契约/用户关键要求传递，必须明确 blocking=false。\n"
+        "- contract_impact 可选 object；只用布尔字段表达是否影响 resource_role/final_artifact/user_requirement_transfer。\n"
         "- resource_role 仅在资源职责问题时填写 reference|asset，否则可省略。\n"
-        "- claim_type 仅在资源职责问题时填写 forbid_read|execution_step|artifact|asset_material|model_generated|modifiable|write_asset 之一。\n"
-        "- category 可选；平台边界来源证明问题可使用 command_template_source_proof；证据明确的 command JSON key/value 来源闭环错误必须使用 command_mapping_explicit_evidence 且 blocking=true。\n"
-        "- repair_ops 可选；只有可确定的机械修复才填写，op 只能是 replace/delete/append_after/append_before，必须带 anchor/evidence，不能把自然语言 minimal_edit 当 repair_ops。\n\n"
+        "- category 可选；不得使用 command_mapping_explicit_evidence，整体 reviewer 不处理 command mapping。\n"
+        "- repair_ops 可选；只能定位非 command 说明区域，不能把自然语言 minimal_edit 当 repair_ops。\n\n"
+
         "真实文件和资源角色判断原则：\n"
         "- 出现在目录结构、SkillPlan path、dependencies、reference_files、asset_source 中的路径是真实文件。\n"
         "- 出现在“例如/示例/反例/不要这样写/禁止”等语境中的路径不是实际文件，除非也出现在目录结构或 SkillPlan path 中。\n"
@@ -1443,7 +1449,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         '      "severity": "error|warning",\n'
         '      "blocking": true,\n'
         '      "contract_impact": {"execution_closure": false, "resource_role": false, "platform_io": false, "final_artifact": false, "user_requirement_transfer": false},\n'
-        '      "category": "command_template_source_proof|command_mapping_explicit_evidence|null",\n'
+        '      "category": "semantic_alignment|null",\n'
         '      "field": "intent|file_plan|workflow|capabilities|resources|user_facing",\n'
         '      "message": "不一致点",\n'
         '      "evidence": "引用 SKILL.md 或蓝图中的证据",\n'
@@ -1467,9 +1473,6 @@ async def _review_skill_md_blueprint_intent_with_model(
 
         "【compact requirement_graph 上下文，仅用于大致理解流程；不得用于阻断跨步骤精确字段/placeholder 来源】\n"
         f"{json.dumps(graph_context, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
-
-        "【已生成脚本接口与局部图谱事实，仅供 command key/value 审查；不得猜测或改写】\n"
-        f"{json.dumps(script_interface_context, ensure_ascii=False, indent=2, default=str)[:16000]}\n\n"
 
         "【蓝图原文】\n"
         f"{(blueprint_text or '')[-18000:]}\n\n"
@@ -1684,8 +1687,9 @@ def _skill_md_blueprint_review_to_contract_results(
             issue.get("minimal_edit")
             or issue.get("fix")
             or issue.get("suggested_fix")
-            or "只修改 SKILL.md 中与该蓝图不一致相关的小节、列表项或 fenced block。"
+            or "只修改 SKILL.md 中与该蓝图不一致相关的小节、列表项；不得修改 bash command block。"
         ).strip()
+        minimal_edit = f"{minimal_edit}\n{_skill_md_overall_semantic_repair_scope(issue)}"
 
         results.append(ContractCheckResult(
             id=f"skill_md.blueprint_alignment.{safe_field}.{idx}",
@@ -1704,6 +1708,268 @@ def _skill_md_blueprint_review_to_contract_results(
             layer="skill_md_blueprint_alignment",
         ))
 
+    return results
+
+
+
+def _skill_md_block_check_failed(check: Any) -> bool:
+    if not isinstance(check, dict):
+        return True
+    if check.get("passed") is False:
+        return True
+    result = str(check.get("result") or check.get("status") or "").strip().lower()
+    return result in {"fail", "failed", "error", "blocking", "invalid", "missing"}
+
+
+def _skill_md_block_check_schema_error(check: Any, *, check_type: str, index: int) -> str:
+    if not isinstance(check, dict):
+        return f"{check_type}_checks[{index}] must be object."
+    if not any(str(check.get(key) or "").strip() for key in ("object", "check_object", "target", "field", "key", "value_path", "subject", "path")):
+        return f"{check_type}_checks[{index}] missing checked object."
+    if "passed" not in check and not str(check.get("result") or check.get("status") or "").strip():
+        return f"{check_type}_checks[{index}] missing result."
+    if "passed" in check and not isinstance(check.get("passed"), bool):
+        return f"{check_type}_checks[{index}] passed must be bool when present."
+    if not str(check.get("evidence") or "").strip():
+        return f"{check_type}_checks[{index}] missing evidence."
+    return ""
+
+
+def _skill_md_block_review_schema_error(data: Any) -> str:
+    if not isinstance(data, dict) or not data:
+        return "SKILL.md block reviewer did not return a JSON object."
+    if not isinstance(data.get("passed"), bool):
+        return "SKILL.md block reviewer field passed must be bool."
+    if not str(data.get("target_script_path") or "").strip():
+        return "SKILL.md block reviewer missing target_script_path."
+    for check_type in ("key", "value", "type"):
+        key = f"{check_type}_checks"
+        checks = data.get(key)
+        if not isinstance(checks, list):
+            return f"SKILL.md block reviewer field {key} must be list."
+        for index, check in enumerate(checks):
+            error = _skill_md_block_check_schema_error(check, check_type=check_type, index=index)
+            if error:
+                return error
+    issues = data.get("issues")
+    if issues is None:
+        data["issues"] = []
+        issues = data["issues"]
+    if not isinstance(issues, list):
+        return "SKILL.md block reviewer field issues must be list."
+    if "repair_suggestions" in data and not isinstance(data.get("repair_suggestions"), str):
+        return "SKILL.md block reviewer field repair_suggestions must be string when present."
+    if data.get("passed") is True:
+        failed_checks = [
+            check
+            for key in ("key_checks", "value_checks", "type_checks")
+            for check in (data.get(key) or [])
+            if _skill_md_block_check_failed(check)
+        ]
+        if failed_checks:
+            return "SKILL.md block reviewer protocol contradiction: passed=true with failed check."
+        for issue in issues:
+            if _skill_md_reviewer_issue_contradicts_passed_true(issue):
+                return "SKILL.md block reviewer protocol contradiction: passed=true with blocking/error issue."
+    return ""
+
+
+def _skill_md_block_review_failed_checks(review: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    failed: list[tuple[str, dict[str, Any]]] = []
+    for check_type in ("key", "value", "type"):
+        for check in review.get(f"{check_type}_checks") or []:
+            if _skill_md_block_check_failed(check):
+                failed.append((check_type, dict(check)))
+    return failed
+
+
+async def _review_skill_md_command_block_with_model(
+    *,
+    skill_name: str,
+    script_path: str,
+    command_block: str,
+    ordinal: int,
+    prior_stdout: list[str],
+    requirement_graph: Any,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Review exactly one real SKILL.md script command block.
+
+    The context is deliberately local: one script path, one command block, that
+    script's argv/read facts, local graph context, incoming edges, prior stdout,
+    and allowed platform/static sources. It never receives the full SKILL.md,
+    full graph, or unrelated script interfaces.
+    """
+    script_context = _skill_md_script_interface_context_for_review(
+        skill_name=skill_name,
+        script_paths=[script_path],
+        requirement_graph=requirement_graph,
+    )
+    local = script_context[0] if script_context else {
+        "script_path": script_path,
+        "strict_json_argv_schema": {},
+        "run_args_analysis": {},
+        "function_execution_context": {},
+    }
+    function_context = local.get("function_execution_context") or {}
+    incoming_edges = function_context.get("incoming_edges") if isinstance(function_context, dict) else []
+    payload = {
+        "script_path": script_path,
+        "command_block": command_block,
+        "ordinal": ordinal,
+        "argv_schema": local.get("strict_json_argv_schema") or {},
+        "run_args_analysis": local.get("run_args_analysis") or {},
+        "local_graph": {
+            "function_item": (function_context or {}).get("function_item", {}) if isinstance(function_context, dict) else {},
+            "outgoing_edges": (function_context or {}).get("outgoing_edges", []) if isinstance(function_context, dict) else [],
+        },
+        "incoming_edges": incoming_edges or [],
+        "prior_available_stdout": prior_stdout,
+        "available_sources": {
+            "platform_input_envelope": ["user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources"],
+            "incoming_edges": incoming_edges or [],
+            "references_assets_static": ["references/*", "assets/*"],
+            "legal_static_sources": ["literal_default", "runtime_constant", "script_default", "reference_file", "asset_file"],
+        },
+    }
+    route = route_model(
+        VALIDATOR_TASK,
+        requested_model=model,
+        reason=f"creator SKILL.md single command block review: {script_path}",
+    )
+    _log_creator_model_usage(
+        phase="skill_md.command_block_review.route",
+        file_path="SKILL.md",
+        route=route,
+        model=model,
+        skill_name=skill_name,
+    )
+    logger.info("[Creator][skill_md][block_review] skill=%s script=%s ordinal=%d", skill_name, script_path, ordinal)
+    prompt = (
+        "你是 Creator 第一轮 SKILL.md 单 command block 接口审查器，只输出严格 JSON object。\n"
+        "你一次只审查当前 script_path 的当前 command_block；不得审查完整 SKILL.md 或其他脚本。\n"
+        "分别判断：1) JSON key 是否符合目标脚本接口；2) JSON value 是否来自当前局部可用来源；3) value 类型和序列化是否兼容。\n"
+        "不得因为图谱字段名与脚本 argv key 名不同就要求修改 argv key；不得把 optional key 判断为不存在；不得要求所有 value 都必须使用 placeholder；不得自行创造平台输入字段、图谱字段或 runtime sentinel。\n"
+        "失败时 repair_scope 必须是只修改当前 command block；不得修改其他 block、说明区域、scripts、references、assets 或图谱。\n"
+        "返回格式固定为：{\"passed\": true, \"target_script_path\": \"scripts/x.py\", \"key_checks\": [], \"value_checks\": [], \"type_checks\": [], \"issues\": [], \"repair_suggestions\": \"\"}\n"
+        "每个 key_checks/value_checks/type_checks item 必须包含 object、passed、evidence；失败项可包含 message/expected/minimal_edit/blocking。\n"
+    )
+    base_messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+    ]
+    raw = ""
+    last_schema_error = ""
+    for review_attempt in range(3):
+        active_messages = base_messages if review_attempt == 0 else [
+            *base_messages,
+            {
+                "role": "user",
+                "content": (
+                    "上一轮输出只做 JSON 格式/schema 重写，不重新审查 command block，不改变上一轮语义结论。\n"
+                    "请保留上一轮对 key_checks/value_checks/type_checks/issues/repair_suggestions 的语义判断，仅修正为固定 JSON object schema："
+                    "passed, target_script_path, key_checks, value_checks, type_checks, issues, repair_suggestions。\n"
+                    "不要输出 Markdown 或解释。\n"
+                    f"上一轮 schema_error：{last_schema_error}\n"
+                    f"上一轮 raw output excerpt：{str(raw or '')[:1200]}"
+                ),
+            },
+        ]
+        raw = await complete_chat_once(active_messages, route.model)
+        try:
+            data = _json_loads_loose_object(raw)
+        except Exception as exc:
+            data = {}
+            last_schema_error = f"invalid JSON: {exc}"
+        else:
+            if isinstance(data, dict):
+                data.setdefault("target_script_path", script_path)
+            last_schema_error = _skill_md_block_review_schema_error(data)
+            if not last_schema_error:
+                data["target_script_path"] = script_path
+                data["command_block_ordinal"] = ordinal
+                return data
+        if review_attempt < 2:
+            logger.info(
+                "[Creator][skill_md][block_review][schema_retry] skill=%s script=%s ordinal=%d attempt=%d error=%s",
+                skill_name,
+                script_path,
+                ordinal,
+                review_attempt + 1,
+                last_schema_error[:300],
+            )
+            continue
+    raise CreatorValidatorReviewError(
+        f"SKILL.md block reviewer schema invalid for {script_path} after 3 attempts: {last_schema_error}",
+        raw_excerpt=str(raw)[:1000],
+    )
+
+
+def _skill_md_block_review_to_contract_results(
+    review: dict[str, Any],
+    *,
+    block_text: str = "",
+    block_locator: dict[str, Any] | None = None,
+) -> list[ContractCheckResult]:
+    script_path = str(review.get("target_script_path") or "unknown")
+    if review.get("passed") is True:
+        return []
+    if not block_text:
+        block_text = str(review.get("command_block") or "")
+    if block_locator is None:
+        block_locator = {
+            "start": review.get("block_start"),
+            "end": review.get("block_end"),
+            "content_sha256": hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
+        }
+    typed_failures = _skill_md_block_review_failed_checks(review)
+    issues = _dedupe_review_issues(review.get("issues") if isinstance(review.get("issues"), list) else [])
+    if not typed_failures and not issues:
+        issues = [{"message": "当前 command block 接口校验失败。", "field": "command_block"}]
+    merged_failures: list[tuple[str, dict[str, Any]]] = typed_failures + [
+        ("issue", issue if isinstance(issue, dict) else {"message": str(issue)})
+        for issue in issues
+        if _skill_md_reviewer_issue_contradicts_passed_true(issue) or not typed_failures
+    ]
+    results: list[ContractCheckResult] = []
+    for idx, (failure_type, issue) in enumerate(merged_failures, 1):
+        message = str(issue.get("message") or issue.get("problem") or f"当前 command block {failure_type} 校验失败。")
+        expected = str(issue.get("expected") or "当前 command block 的 JSON key/value/type 必须与当前脚本接口和局部可用来源兼容。")
+        minimal = str(issue.get("minimal_edit") or issue.get("repair_suggestions") or review.get("repair_suggestions") or "只修当前 command block。")
+        locator = dict(block_locator or {})
+        results.append(ContractCheckResult(
+            id=f"skill_md.command_block.interface.{failure_type}.{idx}",
+            passed=False,
+            target=f"SKILL.md:{script_path}:command_block",
+            message=message,
+            expected=expected,
+            minimal_edit=f"{minimal}\n{_skill_md_command_block_repair_scope(script_path)}",
+            details={
+                "review": review,
+                "issue": issue,
+                "check_type": failure_type,
+                "script_path": script_path,
+                "current_block": block_text,
+                "block_text": block_text,
+                "block_start": locator.get("start"),
+                "block_end": locator.get("end"),
+                "block_locator": locator,
+                "block_ordinal": review.get("command_block_ordinal"),
+                "structured_checks": {
+                    "key_checks": review.get("key_checks") or [],
+                    "value_checks": review.get("value_checks") or [],
+                    "type_checks": review.get("type_checks") or [],
+                },
+                "skill_md_block_repair_scope": {
+                    "script_path": script_path,
+                    "block_text": block_text,
+                    "block_locator": locator,
+                    "block_ordinal": review.get("command_block_ordinal"),
+                    "block_sha256": hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
+                },
+            },
+            layer="skill_md_command_block_interface",
+        ))
     return results
 
 
@@ -1844,11 +2110,10 @@ def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
         return False
 
     if _review_issue_is_command_template_source_proof_error(issue):
-        impact = issue.get("contract_impact") or issue.get("impact")
-        return bool(isinstance(impact, dict) and impact.get("platform_io") is True)
+        return False
 
     if _review_issue_is_explicit_command_mapping_error(issue):
-        return True
+        return False
 
     if _review_issue_is_detail_or_proof_request(issue):
         return False
@@ -2104,6 +2369,71 @@ async def _validate_skill_md_blueprint_alignment(
             message,
         )
         raise ContractValidationError(message, fenced_results)
+
+    command_blocks = [
+        block
+        for block in parse_skill_md_bash_command_blocks(content)
+        if block.script_path and str(block.script_path).startswith("scripts/")
+    ]
+    prior_stdout: list[str] = []
+    for ordinal, block in enumerate(command_blocks, start=1):
+        script_path = str(block.script_path or "")
+        logger.info(
+            "[Creator][skill_md][single_block_review][start] skill=%s script=%s ordinal=%d",
+            skill_name,
+            script_path,
+            ordinal,
+        )
+        block_review = await _review_skill_md_command_block_with_model(
+            skill_name=skill_name,
+            script_path=script_path,
+            command_block=block.content,
+            ordinal=ordinal,
+            prior_stdout=prior_stdout,
+            requirement_graph=requirement_graph,
+            model=model,
+        )
+        block_review.update({
+            "command_block": block.content,
+            "block_start": block.start,
+            "block_end": block.end,
+            "block_ordinal": ordinal,
+        })
+        block_results = _skill_md_block_review_to_contract_results(
+            block_review,
+            block_text=block.content,
+            block_locator=_skill_md_block_locator(block),
+        )
+        if block_results:
+            logger.info(
+                "[Creator][skill_md][single_block_review][failed] skill=%s script=%s ordinal=%d",
+                skill_name,
+                script_path,
+                ordinal,
+            )
+            raise ContractValidationError(
+                "SKILL.md 单 command block 接口校验未通过；只修当前失败 block。\n"
+                + _format_contract_failures_safe(block_results),
+                block_results,
+            )
+        try:
+            local_context = _skill_md_script_interface_context_for_review(
+                skill_name=skill_name,
+                script_paths=[script_path],
+                requirement_graph=requirement_graph,
+            )
+            schema_outputs = (
+                (local_context[0].get("function_execution_context") or {})
+                .get("function_item", {})
+                .get("outputs", [])
+                if local_context else []
+            )
+            for item in schema_outputs or []:
+                text = str(item or "").strip()
+                if text and text not in prior_stdout:
+                    prior_stdout.append(text)
+        except Exception:
+            pass
 
     review["passed"] = True
     review["fenced_check_passed"] = True
