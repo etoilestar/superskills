@@ -7952,6 +7952,7 @@ async def _extract_requirement_graph_with_validator(
     _ = (workflow_allocation_summary,)
     graph = build_default_requirement_graph(files_out, responsibility_edges=responsibility_edges, function_items=function_items)
     max_refine_rounds = 3
+    original_validation_error: RequirementGraphValidationError | None = None
     for attempt in range(max_refine_rounds + 1):
         try:
             validated = validate_requirement_graph_schema(graph, files_out)
@@ -7959,6 +7960,8 @@ async def _extract_requirement_graph_with_validator(
                 logger.info("[Creator][responsibility_graph][refine_recheck_passed] attempt=%d", attempt)
             return validated
         except RequirementGraphValidationError as exc:
+            if original_validation_error is None:
+                original_validation_error = exc
             if not _is_refinable_platform_io_graph_error(exc) or attempt >= max_refine_rounds:
                 if attempt:
                     logger.info(
@@ -7967,7 +7970,7 @@ async def _extract_requirement_graph_with_validator(
                         getattr(exc, "code", ""),
                         str(exc)[:500],
                     )
-                raise
+                raise original_validation_error or exc
             feedback = _platform_io_graph_refine_feedback(exc, graph)
             logger.info(
                 "[Creator][responsibility_graph][platform_io_closure_failed] attempt=%d code=%s nodes=%s",
@@ -7976,17 +7979,42 @@ async def _extract_requirement_graph_with_validator(
                 json.dumps(feedback.get("related_nodes") or [], ensure_ascii=False),
             )
             logger.info("[Creator][responsibility_graph][refine_request] attempt=%d", attempt + 1)
-            graph = await _refine_requirement_graph_platform_io_closure(
-                blueprint_text=blueprint_text,
-                files_out=files_out,
-                current_graph=graph,
-                feedback=feedback,
-                requested_model=requested_model,
-            )
+            try:
+                graph = await _refine_requirement_graph_platform_io_closure(
+                    blueprint_text=blueprint_text,
+                    files_out=files_out,
+                    current_graph=graph,
+                    feedback=feedback,
+                    requested_model=requested_model,
+                )
+            except Exception as refine_exc:
+                logger.info(
+                    "[Creator][responsibility_graph][refine_result_rejected] attempt=%d error=%s",
+                    attempt + 1,
+                    f"{type(refine_exc).__name__}: {refine_exc}"[:500],
+                )
+                if attempt + 1 >= max_refine_rounds:
+                    raise original_validation_error or exc from refine_exc
+                continue
 
 
 def _is_refinable_platform_io_graph_error(exc: RequirementGraphValidationError) -> bool:
-    return getattr(exc, "code", "") == "responsibility_graph_platform_io_conflict"
+    if getattr(exc, "code", "") != "responsibility_graph_platform_io_conflict":
+        return False
+    details = getattr(exc, "details", {}) or {}
+    if not isinstance(details, dict):
+        return False
+    if details.get("index") is not None:
+        return False
+    if any(str(details.get(key) or "").strip() for key in ("from_output", "to_input", "from_node", "to_node")):
+        return False
+    node = str(details.get("node") or "")
+    targets = details.get("targets")
+    if node in {"platform_input_node", "platform_output_node"}:
+        return True
+    if isinstance(targets, list) and any(str(item or "").startswith("scripts/") for item in targets):
+        return True
+    return False
 
 
 def _platform_io_graph_refine_feedback(exc: RequirementGraphValidationError, graph: RequirementGraph) -> dict[str, Any]:
@@ -8013,6 +8041,52 @@ def _platform_io_graph_refine_feedback(exc: RequirementGraphValidationError, gra
         ],
         "current_endpoint_pairs": _responsibility_edge_endpoint_pairs(getattr(graph, "dataflow_edges", []) or []),
     }
+
+
+def _graph_scope_signature(graph: RequirementGraph) -> tuple[dict[str, dict[str, Any]], set[tuple[str, str, str, str]]]:
+    items: dict[str, dict[str, Any]] = {}
+    for item in getattr(graph, "function_items", []) or []:
+        data = item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+        target = str(data.get("target_file") or "")
+        if target:
+            items[target] = data
+    edges = {
+        (
+            str(edge.get("from_node") or ""),
+            str(edge.get("from_output") or ""),
+            str(edge.get("to_node") or ""),
+            str(edge.get("to_input") or ""),
+        )
+        for edge in (getattr(graph, "dataflow_edges", []) or [])
+        if isinstance(edge, dict)
+    }
+    return items, edges
+
+
+def _validate_refined_graph_scope(
+    *,
+    before: RequirementGraph,
+    after: RequirementGraph,
+    feedback: dict[str, Any],
+) -> None:
+    before_items, before_edges = _graph_scope_signature(before)
+    after_items, after_edges = _graph_scope_signature(after)
+    if set(before_items) != set(after_items):
+        raise ValueError("graph refine changed script node identity set")
+    related = {str(node) for node in (feedback.get("related_nodes") or []) if str(node)}
+    related.update({"platform_input_node", "platform_output_node"})
+    for target, before_item in before_items.items():
+        if target in related:
+            continue
+        after_item = after_items.get(target) or {}
+        for field in ("role", "purpose", "inputs", "outputs", "required_capabilities", "constraints"):
+            if before_item.get(field) != after_item.get(field):
+                raise ValueError(f"graph refine changed unrelated FunctionItem field: {target}.{field}")
+    changed_edges = before_edges.symmetric_difference(after_edges)
+    for edge in changed_edges:
+        from_node, _from_output, to_node, _to_input = edge
+        if from_node not in related and to_node not in related:
+            raise ValueError("graph refine changed unrelated responsibility edge")
 
 
 async def _refine_requirement_graph_platform_io_closure(
@@ -8043,11 +8117,15 @@ async def _refine_requirement_graph_platform_io_closure(
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
     ], route.model)
     data = _parse_prepare_plan_json(raw)
-    return build_default_requirement_graph(
+    if not isinstance(data.get("function_items"), list) or not isinstance(data.get("responsibility_edges"), list):
+        raise ValueError("graph refine response must include function_items and responsibility_edges lists")
+    refined = build_default_requirement_graph(
         files_out,
         responsibility_edges=data.get("responsibility_edges") or [],
         function_items=data.get("function_items") or [],
     )
+    _validate_refined_graph_scope(before=current_graph, after=refined, feedback=feedback)
+    return refined
 
 def _persist_requirement_graph(
     skill_name: str,

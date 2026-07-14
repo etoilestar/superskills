@@ -1179,6 +1179,17 @@ def _skill_md_command_block_repair_scope(script_path: str) -> str:
     )
 
 
+def _skill_md_block_locator(block: Any) -> dict[str, Any]:
+    start = int(getattr(block, "start", -1))
+    end = int(getattr(block, "end", -1))
+    content = str(getattr(block, "content", "") or "")
+    return {
+        "start": start,
+        "end": end,
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "content_excerpt": content[:1000],
+    }
+
 
 def _skill_md_reviewer_issue_contradicts_passed_true(issue: Any) -> bool:
     if not isinstance(issue, dict):
@@ -1700,6 +1711,78 @@ def _skill_md_blueprint_review_to_contract_results(
     return results
 
 
+
+def _skill_md_block_check_failed(check: Any) -> bool:
+    if not isinstance(check, dict):
+        return True
+    if check.get("passed") is False:
+        return True
+    result = str(check.get("result") or check.get("status") or "").strip().lower()
+    return result in {"fail", "failed", "error", "blocking", "invalid", "missing"}
+
+
+def _skill_md_block_check_schema_error(check: Any, *, check_type: str, index: int) -> str:
+    if not isinstance(check, dict):
+        return f"{check_type}_checks[{index}] must be object."
+    if not any(str(check.get(key) or "").strip() for key in ("object", "check_object", "target", "field", "key", "value_path", "subject", "path")):
+        return f"{check_type}_checks[{index}] missing checked object."
+    if "passed" not in check and not str(check.get("result") or check.get("status") or "").strip():
+        return f"{check_type}_checks[{index}] missing result."
+    if "passed" in check and not isinstance(check.get("passed"), bool):
+        return f"{check_type}_checks[{index}] passed must be bool when present."
+    if not str(check.get("evidence") or "").strip():
+        return f"{check_type}_checks[{index}] missing evidence."
+    return ""
+
+
+def _skill_md_block_review_schema_error(data: Any) -> str:
+    if not isinstance(data, dict) or not data:
+        return "SKILL.md block reviewer did not return a JSON object."
+    if not isinstance(data.get("passed"), bool):
+        return "SKILL.md block reviewer field passed must be bool."
+    if not str(data.get("target_script_path") or "").strip():
+        return "SKILL.md block reviewer missing target_script_path."
+    for check_type in ("key", "value", "type"):
+        key = f"{check_type}_checks"
+        checks = data.get(key)
+        if not isinstance(checks, list):
+            return f"SKILL.md block reviewer field {key} must be list."
+        for index, check in enumerate(checks):
+            error = _skill_md_block_check_schema_error(check, check_type=check_type, index=index)
+            if error:
+                return error
+    issues = data.get("issues")
+    if issues is None:
+        data["issues"] = []
+        issues = data["issues"]
+    if not isinstance(issues, list):
+        return "SKILL.md block reviewer field issues must be list."
+    if "repair_suggestions" in data and not isinstance(data.get("repair_suggestions"), str):
+        return "SKILL.md block reviewer field repair_suggestions must be string when present."
+    if data.get("passed") is True:
+        failed_checks = [
+            check
+            for key in ("key_checks", "value_checks", "type_checks")
+            for check in (data.get(key) or [])
+            if _skill_md_block_check_failed(check)
+        ]
+        if failed_checks:
+            return "SKILL.md block reviewer protocol contradiction: passed=true with failed check."
+        for issue in issues:
+            if _skill_md_reviewer_issue_contradicts_passed_true(issue):
+                return "SKILL.md block reviewer protocol contradiction: passed=true with blocking/error issue."
+    return ""
+
+
+def _skill_md_block_review_failed_checks(review: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    failed: list[tuple[str, dict[str, Any]]] = []
+    for check_type in ("key", "value", "type"):
+        for check in review.get(f"{check_type}_checks") or []:
+            if _skill_md_block_check_failed(check):
+                failed.append((check_type, dict(check)))
+    return failed
+
+
 async def _review_skill_md_command_block_with_model(
     *,
     skill_name: str,
@@ -1768,7 +1851,8 @@ async def _review_skill_md_command_block_with_model(
         "分别判断：1) JSON key 是否符合目标脚本接口；2) JSON value 是否来自当前局部可用来源；3) value 类型和序列化是否兼容。\n"
         "不得因为图谱字段名与脚本 argv key 名不同就要求修改 argv key；不得把 optional key 判断为不存在；不得要求所有 value 都必须使用 placeholder；不得自行创造平台输入字段、图谱字段或 runtime sentinel。\n"
         "失败时 repair_scope 必须是只修改当前 command block；不得修改其他 block、说明区域、scripts、references、assets 或图谱。\n"
-        "返回格式：{\"passed\": true, \"issues\": [], \"repair_suggestions\": \"\", \"target_script_path\": \"scripts/x.py\"}\n"
+        "返回格式固定为：{\"passed\": true, \"target_script_path\": \"scripts/x.py\", \"key_checks\": [], \"value_checks\": [], \"type_checks\": [], \"issues\": [], \"repair_suggestions\": \"\"}\n"
+        "每个 key_checks/value_checks/type_checks item 必须包含 object、passed、evidence；失败项可包含 message/expected/minimal_edit/blocking。\n"
     )
     raw = await complete_chat_once([
         {"role": "system", "content": prompt},
@@ -1781,35 +1865,79 @@ async def _review_skill_md_command_block_with_model(
             f"SKILL.md block reviewer returned invalid JSON for {script_path}: {exc}",
             raw_excerpt=str(raw)[:1000],
         ) from exc
-    if not isinstance(data, dict) or not isinstance(data.get("passed"), bool):
-        raise CreatorValidatorReviewError(f"SKILL.md block reviewer schema invalid for {script_path}", raw_excerpt=str(raw)[:1000])
+    if isinstance(data, dict):
+        data.setdefault("target_script_path", script_path)
+    schema_error = _skill_md_block_review_schema_error(data)
+    if schema_error:
+        raise CreatorValidatorReviewError(f"SKILL.md block reviewer schema invalid for {script_path}: {schema_error}", raw_excerpt=str(raw)[:1000])
     data["target_script_path"] = script_path
     data["command_block_ordinal"] = ordinal
     return data
 
 
-def _skill_md_block_review_to_contract_results(review: dict[str, Any]) -> list[ContractCheckResult]:
+def _skill_md_block_review_to_contract_results(
+    review: dict[str, Any],
+    *,
+    block_text: str = "",
+    block_locator: dict[str, Any] | None = None,
+) -> list[ContractCheckResult]:
     script_path = str(review.get("target_script_path") or "unknown")
     if review.get("passed") is True:
         return []
+    if not block_text:
+        block_text = str(review.get("command_block") or "")
+    if block_locator is None:
+        block_locator = {
+            "start": review.get("block_start"),
+            "end": review.get("block_end"),
+            "content_sha256": hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
+        }
+    typed_failures = _skill_md_block_review_failed_checks(review)
     issues = _dedupe_review_issues(review.get("issues") if isinstance(review.get("issues"), list) else [])
-    if not issues:
+    if not typed_failures and not issues:
         issues = [{"message": "当前 command block 接口校验失败。", "field": "command_block"}]
+    merged_failures: list[tuple[str, dict[str, Any]]] = typed_failures + [
+        ("issue", issue if isinstance(issue, dict) else {"message": str(issue)})
+        for issue in issues
+        if _skill_md_reviewer_issue_contradicts_passed_true(issue) or not typed_failures
+    ]
     results: list[ContractCheckResult] = []
-    for idx, issue in enumerate(issues, 1):
-        if not isinstance(issue, dict):
-            issue = {"message": str(issue)}
-        message = str(issue.get("message") or issue.get("problem") or "当前 command block 接口校验失败。")
+    for idx, (failure_type, issue) in enumerate(merged_failures, 1):
+        message = str(issue.get("message") or issue.get("problem") or f"当前 command block {failure_type} 校验失败。")
         expected = str(issue.get("expected") or "当前 command block 的 JSON key/value/type 必须与当前脚本接口和局部可用来源兼容。")
         minimal = str(issue.get("minimal_edit") or issue.get("repair_suggestions") or review.get("repair_suggestions") or "只修当前 command block。")
+        locator = dict(block_locator or {})
         results.append(ContractCheckResult(
-            id=f"skill_md.command_block.interface.{idx}",
+            id=f"skill_md.command_block.interface.{failure_type}.{idx}",
             passed=False,
             target=f"SKILL.md:{script_path}:command_block",
             message=message,
             expected=expected,
             minimal_edit=f"{minimal}\n{_skill_md_command_block_repair_scope(script_path)}",
-            details={"review": review, "issue": issue, "script_path": script_path},
+            details={
+                "review": review,
+                "issue": issue,
+                "check_type": failure_type,
+                "script_path": script_path,
+                "current_block": block_text,
+                "block_text": block_text,
+                "block_start": locator.get("start"),
+                "block_end": locator.get("end"),
+                "block_locator": locator,
+                "block_ordinal": review.get("command_block_ordinal"),
+                "structured_checks": {
+                    "key_checks": review.get("key_checks") or [],
+                    "value_checks": review.get("value_checks") or [],
+                    "type_checks": review.get("type_checks") or [],
+                },
+                "skill_md_block_repair_scope": {
+                    "script_path": script_path,
+                    "block_text": block_text,
+                    "block_locator": locator,
+                    "block_ordinal": review.get("command_block_ordinal"),
+                    "block_sha256": hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
+                },
+            },
             layer="skill_md_command_block_interface",
         ))
     return results
@@ -2235,7 +2363,17 @@ async def _validate_skill_md_blueprint_alignment(
             requirement_graph=requirement_graph,
             model=model,
         )
-        block_results = _skill_md_block_review_to_contract_results(block_review)
+        block_review.update({
+            "command_block": block.content,
+            "block_start": block.start,
+            "block_end": block.end,
+            "block_ordinal": ordinal,
+        })
+        block_results = _skill_md_block_review_to_contract_results(
+            block_review,
+            block_text=block.content,
+            block_locator=_skill_md_block_locator(block),
+        )
         if block_results:
             logger.info(
                 "[Creator][skill_md][single_block_review][failed] skill=%s script=%s ordinal=%d",
