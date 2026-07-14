@@ -222,25 +222,55 @@ def _loads_templated_json_argv_object(text: str) -> Any:
     """Load a JSON argv template, allowing unquoted placeholders as values."""
     return json.loads(_replace_unquoted_json_template_placeholders(text))
 
-def _flatten_source_names(value: Any, *, prefix: str = "") -> set[str]:
-    """Collect explicit source-field names without semantic guessing."""
-    names: set[str] = set()
+def _explicit_field_names(value: Iterable[str] | Mapping[str, Any] | None) -> set[str]:
+    """Collect only field names that are explicit placeholder roots/paths."""
+    if value is None:
+        return set()
     if isinstance(value, Mapping):
-        for raw_key, raw_value in value.items():
-            key = str(raw_key or "").strip()
-            if not key:
-                continue
-            path = f"{prefix}.{key}" if prefix else key
-            names.add(path)
-            names.update(_flatten_source_names(raw_value, prefix=path))
-    elif isinstance(value, list):
-        for item in value:
-            names.update(_flatten_source_names(item, prefix=prefix))
-    elif isinstance(value, str):
-        text = value.strip()
-        if text:
-            names.add(text)
-    return names
+        return {str(key).strip() for key in value.keys() if str(key or "").strip()}
+    return {str(item).strip() for item in value or [] if str(item or "").strip()}
+
+
+def _explicit_alignment_sources(function_execution_context: Mapping[str, Any] | None) -> set[str]:
+    """Extract only explicit graph/binding sources that can be placeholders."""
+    ctx = function_execution_context or {}
+    sources: set[str] = set()
+    for edge in ctx.get("incoming_edges") or []:
+        if not isinstance(edge, Mapping):
+            continue
+        source = str(edge.get("from_output") or "").strip()
+        if source:
+            sources.add(source)
+    for binding in ctx.get("input_bindings") or ctx.get("explicit_input_bindings") or []:
+        if not isinstance(binding, Mapping):
+            continue
+        source = str(binding.get("source") or binding.get("source_field") or "").strip()
+        if source:
+            sources.add(source)
+    return sources
+
+
+def _explicit_graph_confirmed_bindings(
+    function_execution_context: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Return explicit target->source bindings from incoming edges/bindings."""
+    ctx = function_execution_context or {}
+    bindings: dict[str, str] = {}
+    for edge in ctx.get("incoming_edges") or []:
+        if not isinstance(edge, Mapping):
+            continue
+        target = str(edge.get("to_input") or "").strip()
+        source = str(edge.get("from_output") or "").strip()
+        if target and source:
+            bindings[target] = source
+    for binding in ctx.get("input_bindings") or ctx.get("explicit_input_bindings") or []:
+        if not isinstance(binding, Mapping):
+            continue
+        target = str(binding.get("target") or binding.get("target_key") or binding.get("to_input") or "").strip()
+        source = str(binding.get("source") or binding.get("source_field") or "").strip()
+        if target and source:
+            bindings[target] = source
+    return bindings
 
 
 def _command_placeholder_bindings(command: str, script_path: str) -> dict[str, str]:
@@ -264,6 +294,7 @@ def build_command_alignment_snapshot(
     function_execution_context: Mapping[str, Any] | None = None,
     script_defaults: Mapping[str, Any] | Iterable[str] | None = None,
     e2e_verified_bindings: Mapping[str, str] | None = None,
+    candidate_bindings: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the shared SKILL.md/script argv alignment snapshot.
 
@@ -298,22 +329,35 @@ def build_command_alignment_snapshot(
         | set(str(k) for k in (run_analysis.get("required_read_keys") or []))
     )
 
+    accepted_targets = set(target_keys)
     sources: set[str] = set()
-    sources.update(_flatten_source_names(platform_input_fields or {}))
-    sources.update(_flatten_source_names(prior_stdout_fields or {}))
-    ctx = function_execution_context or {}
-    for key in ("incoming_edges", "explicit_incoming_edges", "input_bindings", "available_sources"):
-        sources.update(_flatten_source_names(ctx.get(key) if isinstance(ctx, Mapping) else {}))
-    sources.update(str(k) for k in (script_defaults.keys() if isinstance(script_defaults, Mapping) else (script_defaults or [])) if str(k or "").strip())
+    sources.update(_explicit_field_names(platform_input_fields))
+    sources.update(_explicit_field_names(prior_stdout_fields))
+    sources.update(_explicit_alignment_sources(function_execution_context))
 
     confirmed: dict[str, str] = {}
-    for mapping in (_command_placeholder_bindings(command, script_path), e2e_verified_bindings or {}):
+    candidates: dict[str, str] = {}
+
+    for mapping in (_explicit_graph_confirmed_bindings(function_execution_context), e2e_verified_bindings or {}):
         for target, source in mapping.items():
             target_text = str(target or "").strip()
             source_text = str(source or "").strip()
-            if target_text and source_text:
-                sources.add(source_text)
+            if target_text in accepted_targets and source_text in sources:
                 confirmed[target_text] = source_text
+            elif target_text and source_text:
+                candidates[target_text] = source_text
+
+    for mapping in (_command_placeholder_bindings(command, script_path), candidate_bindings or {}):
+        for target, source in mapping.items():
+            target_text = str(target or "").strip()
+            source_text = str(source or "").strip()
+            if target_text and source_text and target_text not in confirmed:
+                # Current command/template/model suggestions remain candidates until
+                # E2E or an explicit contract verifies both sides.
+                if target_text in accepted_targets and source_text in sources:
+                    candidates[target_text] = source_text
+                else:
+                    candidates[target_text] = source_text
 
     unresolved = [
         key for key in required_target_keys
@@ -326,6 +370,7 @@ def build_command_alignment_snapshot(
         "required_target_keys": required_target_keys,
         "available_sources": sorted(sources),
         "confirmed_bindings": {key: confirmed[key] for key in sorted(confirmed)},
+        "candidate_bindings": {key: candidates[key] for key in sorted(candidates)},
         "unresolved_target_keys": sorted(unresolved),
     }
 

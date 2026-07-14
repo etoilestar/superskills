@@ -1314,6 +1314,8 @@ def _existing_script_argv_context_for_skill_md(
     *,
     skill_name: str,
     declared_paths: set[str] | list[str],
+    blueprint_text: str = "",
+    conversation_history: list[dict] | None = None,
     responsibility_graph: Any = None,
 ) -> str:
     """Collect already generated script input JSON and local graph facts.
@@ -1327,6 +1329,27 @@ def _existing_script_argv_context_for_skill_md(
     except Exception:
         return ""
 
+    entries_by_path: dict[str, Any] = {}
+    ordered_script_paths: list[str] = []
+    try:
+        parsed = parse_blueprint([{"role": "assistant", "content": blueprint_text}])
+        if getattr(parsed, "skill_plan", None):
+            for entry in parsed.skill_plan.files:
+                if getattr(entry, "file_type", "") == "script":
+                    entries_by_path[str(entry.path)] = entry
+                    ordered_script_paths.append(str(entry.path))
+    except Exception:
+        entries_by_path = {}
+        ordered_script_paths = []
+
+    platform_context = build_creator_external_input_context(messages=conversation_history or [])
+    declared_prior_stdout_by_path: dict[str, list[str]] = {}
+    prior_outputs: set[str] = set()
+    for path in ordered_script_paths:
+        declared_prior_stdout_by_path[path] = sorted(prior_outputs)
+        entry = entries_by_path.get(path)
+        prior_outputs.update(str(item) for item in (getattr(entry, "outputs", []) or []) if str(item or "").strip())
+
     items: list[dict[str, Any]] = []
     for raw_path in sorted(str(path) for path in declared_paths or []):
         script_path = raw_path.replace("\\", "/").strip()
@@ -1337,6 +1360,7 @@ def _existing_script_argv_context_for_skill_md(
         if not abs_path.is_file():
             continue
 
+        content = ""
         try:
             content = abs_path.read_text(encoding="utf-8")
             schema = extract_python_strict_argv_schema(content)
@@ -1359,17 +1383,17 @@ def _existing_script_argv_context_for_skill_md(
 
         command = ""
         try:
-            entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text="")
+            entry = entries_by_path.get(script_path) or _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
             command = render_script_command_from_skill_plan(entry)
         except Exception:
             command = ""
 
         snapshot = build_command_alignment_snapshot(
             script_path=script_path,
-            script_content=content if "content" in locals() else "",
+            script_content=content,
             command=command,
-            platform_input_fields=build_creator_external_input_context(messages=[]),
-            prior_stdout_fields=[],
+            platform_input_fields=platform_context,
+            prior_stdout_fields=declared_prior_stdout_by_path.get(script_path, []),
             function_execution_context=function_execution_context if isinstance(function_execution_context, dict) else {},
             script_defaults=(run_analysis or {}).get("defaulted_keys") or (schema or {}).get("defaulted_keys") or [],
         )
@@ -1380,9 +1404,10 @@ def _existing_script_argv_context_for_skill_md(
             "strict_json_argv_schema": schema,
             "run_args_analysis": run_analysis,
             "function_execution_context": function_execution_context,
+            "declared_prior_stdout_fields": declared_prior_stdout_by_path.get(script_path, []),
             "note": (
                 "Shared fact snapshot for both SKILL.md writer and judge. "
-                "confirmed_bindings must be preserved exactly; unresolved_target_keys may be bound only to available_sources; "
+                "confirmed_bindings must be preserved exactly; candidate_bindings may be checked/adjusted; unresolved_target_keys may be bound only to available_sources; "
                 "do not match by name similarity, hard-code by role/script name, or invent business fields."
             ),
         })
@@ -2187,6 +2212,8 @@ def _build_generate_file_prompt(
         _existing_script_argv_context_for_skill_md(
             skill_name=skill_name,
             declared_paths=declared_paths,
+            blueprint_text=blueprint_text,
+            conversation_history=conversation_history,
             responsibility_graph=responsibility_graph,
         )
         if file_path == "SKILL.md"
@@ -2218,7 +2245,7 @@ def _build_generate_file_prompt(
             "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
             "4. SKILL.md 第一轮只生成静态可解析的使用说明、资源说明和脚本命令块；command 映射必须在第一轮根据脚本探针与责任图谱形成可执行闭环，不能把明确 dataflow 错误留给第二轮 E2E。\n"
             "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个真实 scripts/ 路径提供一个标准、独立、无缩进的 ```bash fenced code block。\n"
-            "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径。脚本路径后必须紧跟一个完整的输入 JSON object，并使用一对 ASCII 单引号包裹整个 JSON object，使其在 shell 中作为单个位置参数传入；JSON object 内部的字段名和字符串值必须继续使用标准 JSON 双引号。该输入 JSON 对应 Python 脚本中的 `sys.argv[1]`。\n"
+            "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径。脚本路径后必须紧跟一个完整的输入 JSON object，并使用一对 ASCII 单引号包裹整个 JSON object，使其在 shell 中作为脚本路径后的第一个位置参数传入；JSON object 内部的字段名和字符串值必须继续使用标准 JSON 双引号。该输入 JSON 对应 Python 脚本中的 `sys.argv[1]`。\n"
             "6a. 每个 scripts/*.py command block 附近必须写普通 Markdown action schema 声明：role、inputs、outputs；这些是使用说明，不是运行时 hard schema。\n"
             "6b. 输入 JSON key 必须使用对应脚本真实 strict_json_argv_guard schema 中的字段；如果 guard 不完整，再以 run_args_analysis 和 function_execution_context/function_item_graph_context 为事实依据补足，不能自行编造业务字段或别名。\n"
             "6c. 输入字段是脚本入口接口字段，不是平台字段白名单；输入值必须绑定到平台输入、责任图谱 incoming edge、已排序前序 stdout、reference/assets、literal_default、runtime_constant 或脚本默认值中的真实来源。\n"
