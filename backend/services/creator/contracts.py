@@ -222,6 +222,113 @@ def _loads_templated_json_argv_object(text: str) -> Any:
     """Load a JSON argv template, allowing unquoted placeholders as values."""
     return json.loads(_replace_unquoted_json_template_placeholders(text))
 
+def _flatten_source_names(value: Any, *, prefix: str = "") -> set[str]:
+    """Collect explicit source-field names without semantic guessing."""
+    names: set[str] = set()
+    if isinstance(value, Mapping):
+        for raw_key, raw_value in value.items():
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            path = f"{prefix}.{key}" if prefix else key
+            names.add(path)
+            names.update(_flatten_source_names(raw_value, prefix=path))
+    elif isinstance(value, list):
+        for item in value:
+            names.update(_flatten_source_names(item, prefix=prefix))
+    elif isinstance(value, str):
+        text = value.strip()
+        if text:
+            names.add(text)
+    return names
+
+
+def _command_placeholder_bindings(command: str, script_path: str) -> dict[str, str]:
+    sig = _command_signature(command, script_path) or {}
+    placeholders = sig.get("placeholders") or {}
+    bindings: dict[str, str] = {}
+    for key, source in placeholders.items():
+        source_text = str(source or "").strip()
+        if source_text and not source_text.startswith("__"):
+            bindings[str(key)] = source_text
+    return bindings
+
+
+def build_command_alignment_snapshot(
+    *,
+    script_path: str,
+    script_content: str = "",
+    command: str = "",
+    platform_input_fields: Iterable[str] | Mapping[str, Any] | None = None,
+    prior_stdout_fields: Iterable[str] | Mapping[str, Any] | None = None,
+    function_execution_context: Mapping[str, Any] | None = None,
+    script_defaults: Mapping[str, Any] | Iterable[str] | None = None,
+    e2e_verified_bindings: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build the shared SKILL.md/script argv alignment snapshot.
+
+    The snapshot only transports existing facts: guard schema, run(args) reads,
+    explicit graph edges, platform inputs, prior stdout fields, the current
+    command template, defaults, and optional E2E-verified bindings.  It never
+    matches by name similarity or invents business fields.
+    """
+    schema: dict[str, Any] = {}
+    run_analysis: dict[str, Any] = {}
+    if script_content and script_path.endswith(".py"):
+        try:
+            schema = extract_python_strict_argv_schema(script_content)
+        except Exception:
+            schema = {}
+        try:
+            run_analysis = _python_run_args_analysis(script_content)
+        except Exception:
+            run_analysis = {}
+
+    allowed = schema.get("allowed_keys")
+    required = schema.get("required_keys")
+    read_keys = set(str(k) for k in (run_analysis.get("required_read_keys") or []))
+    read_keys.update(str(k) for k in (run_analysis.get("optional_read_keys") or []))
+    if allowed is None:
+        target_keys = sorted(read_keys)
+    else:
+        target_keys = sorted(str(k) for k in (allowed or []) if str(k or "").strip())
+        target_keys = sorted(set(target_keys) | read_keys)
+    required_target_keys = sorted(
+        set(str(k) for k in (required or []) if str(k or "").strip())
+        | set(str(k) for k in (run_analysis.get("required_read_keys") or []))
+    )
+
+    sources: set[str] = set()
+    sources.update(_flatten_source_names(platform_input_fields or {}))
+    sources.update(_flatten_source_names(prior_stdout_fields or {}))
+    ctx = function_execution_context or {}
+    for key in ("incoming_edges", "explicit_incoming_edges", "input_bindings", "available_sources"):
+        sources.update(_flatten_source_names(ctx.get(key) if isinstance(ctx, Mapping) else {}))
+    sources.update(str(k) for k in (script_defaults.keys() if isinstance(script_defaults, Mapping) else (script_defaults or [])) if str(k or "").strip())
+
+    confirmed: dict[str, str] = {}
+    for mapping in (_command_placeholder_bindings(command, script_path), e2e_verified_bindings or {}):
+        for target, source in mapping.items():
+            target_text = str(target or "").strip()
+            source_text = str(source or "").strip()
+            if target_text and source_text:
+                sources.add(source_text)
+                confirmed[target_text] = source_text
+
+    unresolved = [
+        key for key in required_target_keys
+        if key not in confirmed
+    ]
+
+    return {
+        "script_path": script_path,
+        "target_keys": target_keys,
+        "required_target_keys": required_target_keys,
+        "available_sources": sorted(sources),
+        "confirmed_bindings": {key: confirmed[key] for key in sorted(confirmed)},
+        "unresolved_target_keys": sorted(unresolved),
+    }
+
 
 def _command_template_equivalent(command: str, script_path: str, entry: SkillPlanEntry) -> bool:
     """Compare command blocks by normalized execution shape, not business payload.

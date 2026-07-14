@@ -1357,16 +1357,33 @@ def _existing_script_argv_context_for_skill_md(
         except Exception as exc:
             function_execution_context = {"error": f"{type(exc).__name__}: {exc}"}
 
+        command = ""
+        try:
+            entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text="")
+            command = render_script_command_from_skill_plan(entry)
+        except Exception:
+            command = ""
+
+        snapshot = build_command_alignment_snapshot(
+            script_path=script_path,
+            script_content=content if "content" in locals() else "",
+            command=command,
+            platform_input_fields=build_creator_external_input_context(messages=[]),
+            prior_stdout_fields=[],
+            function_execution_context=function_execution_context if isinstance(function_execution_context, dict) else {},
+            script_defaults=(run_analysis or {}).get("defaulted_keys") or (schema or {}).get("defaulted_keys") or [],
+        )
+
         items.append({
             "script_path": script_path,
+            "command_alignment_snapshot": snapshot,
             "strict_json_argv_schema": schema,
             "run_args_analysis": run_analysis,
             "function_execution_context": function_execution_context,
             "note": (
-                "Advisory for SKILL.md command input JSON generation. "
-                "Use the script's actual guard/run fields and bind input values from incoming_edges "
-                "and platform runtime context facts; outgoing_edges only describe this script's outputs. Do not rename or mechanically rewrite input fields here; "
-                "E2E will validate and repair uncertain mappings."
+                "Shared fact snapshot for both SKILL.md writer and judge. "
+                "confirmed_bindings must be preserved exactly; unresolved_target_keys may be bound only to available_sources; "
+                "do not match by name similarity, hard-code by role/script name, or invent business fields."
             ),
         })
 
@@ -1374,7 +1391,7 @@ def _existing_script_argv_context_for_skill_md(
         return ""
 
     return (
-        "已生成脚本输入 JSON 事实（来自 strict_json_argv_guard / run(args) AST 和 FunctionItem 图谱局部上下文，仅供 SKILL.md command block 优先参考）：\n"
+        "已生成脚本输入 JSON 事实（command_alignment_snapshot 是 Writer/Judge 共享字段对齐快照，来自 strict_json_argv_guard / run(args) AST 和 FunctionItem 图谱局部上下文）：\n"
         + json.dumps(items, ensure_ascii=False, indent=2, default=str)
     )
 
