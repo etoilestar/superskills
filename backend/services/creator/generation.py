@@ -1317,6 +1317,7 @@ def _existing_script_argv_context_for_skill_md(
     blueprint_text: str = "",
     conversation_history: list[dict] | None = None,
     responsibility_graph: Any = None,
+    e2e_verified_bindings_by_script: Mapping[str, Mapping[str, str]] | None = None,
 ) -> str:
     """Collect already generated script input JSON and local graph facts.
 
@@ -1396,6 +1397,7 @@ def _existing_script_argv_context_for_skill_md(
             prior_stdout_fields=declared_prior_stdout_by_path.get(script_path, []),
             function_execution_context=function_execution_context if isinstance(function_execution_context, dict) else {},
             script_defaults=(run_analysis or {}).get("defaulted_keys") or (schema or {}).get("defaulted_keys") or [],
+            e2e_verified_bindings=(e2e_verified_bindings_by_script or {}).get(script_path, {}),
         )
 
         items.append({
@@ -2157,6 +2159,7 @@ def _build_generate_file_prompt(
     requirements: Any = None,
     responsibility_graph: Any = None,
     function_execution_context: dict[str, Any] | None = None,
+    e2e_verified_bindings_by_script: Mapping[str, Mapping[str, str]] | None = None,
 ) -> list[dict]:
     """Build a minimal generation prompt for a single Skill file."""
 
@@ -2215,6 +2218,7 @@ def _build_generate_file_prompt(
             blueprint_text=blueprint_text,
             conversation_history=conversation_history,
             responsibility_graph=responsibility_graph,
+            e2e_verified_bindings_by_script=e2e_verified_bindings_by_script,
         )
         if file_path == "SKILL.md"
         else ""

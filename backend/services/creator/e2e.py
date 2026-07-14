@@ -416,6 +416,42 @@ def _runtime_binding_trace(
     return trace
 
 
+def _verified_bindings_from_runtime_trace(
+    *,
+    runtime_binding_trace: dict[str, Any],
+    script_content: str,
+    script_path: str,
+) -> dict[str, str]:
+    schema: dict[str, Any] = {}
+    run_analysis: dict[str, Any] = {}
+    if script_path.endswith(".py"):
+        try:
+            schema = extract_python_strict_argv_schema(script_content)
+        except Exception:
+            schema = {}
+        try:
+            run_analysis = _python_run_args_analysis(script_content)
+        except Exception:
+            run_analysis = {}
+    accepted = set(str(k) for k in (schema.get("allowed_keys") or []) if str(k or "").strip())
+    accepted.update(str(k) for k in (run_analysis.get("required_read_keys") or []) if str(k or "").strip())
+    accepted.update(str(k) for k in (run_analysis.get("optional_read_keys") or []) if str(k or "").strip())
+    verified: dict[str, str] = {}
+    for target, item in (runtime_binding_trace or {}).items():
+        if not isinstance(item, dict):
+            continue
+        source_root = str(item.get("source_root") or "").strip()
+        if (
+            source_root
+            and str(item.get("placeholder_expr") or "").strip()
+            and isinstance(item.get("source_provenance"), dict)
+            and item.get("source_provenance")
+            and str(target) in accepted
+        ):
+            verified[str(target)] = source_root
+    return verified
+
+
 def snapshot_runtime_files(root: Path) -> dict[str, dict[str, Any]]:
     """Take a lightweight file snapshot for the E2E runtime workspace."""
     base = root.resolve()
@@ -465,6 +501,42 @@ def _artifact_failure_code(filesystem_trace: dict[str, Any]) -> str:
     if not created and not resolved:
         return "artifact_not_created"
     return "artifact_validation_failed"
+
+
+_ARTIFACT_FAILURE_PROGRESS = {
+    "artifact_not_created": 0,
+    "artifact_return_path_missing": 1,
+    "artifact_return_path_mismatch": 2,
+    "artifact_type_mismatch": 3,
+    "artifact_validation_failed": 3,
+}
+
+
+def _artifact_runtime_state(filesystem_trace: dict[str, Any] | None) -> dict[str, Any]:
+    trace = filesystem_trace or {}
+    resolved = trace.get("resolved_reported_paths") or []
+    return {
+        "created_count": len(trace.get("created_files") or []),
+        "modified_count": len(trace.get("modified_files") or []),
+        "reported_count": len(trace.get("reported_paths") or []),
+        "existing_reported_count": sum(1 for item in resolved if item.get("exists")),
+        "missing_reported_count": sum(1 for item in resolved if not item.get("exists")),
+        "failure_code": str(trace.get("failure_code") or trace.get("artifact_failure_code") or ""),
+    }
+
+
+def _artifact_runtime_state_improved(old_state: dict[str, Any], new_state: dict[str, Any]) -> bool:
+    if not old_state and not new_state:
+        return False
+    if int(old_state.get("created_count") or 0) == 0 and int(new_state.get("created_count") or 0) > 0:
+        return True
+    if int(old_state.get("existing_reported_count") or 0) == 0 and int(new_state.get("existing_reported_count") or 0) > 0:
+        return True
+    if int(new_state.get("missing_reported_count") or 0) < int(old_state.get("missing_reported_count") or 0):
+        return True
+    old_rank = _ARTIFACT_FAILURE_PROGRESS.get(str(old_state.get("failure_code") or ""), -1)
+    new_rank = _ARTIFACT_FAILURE_PROGRESS.get(str(new_state.get("failure_code") or ""), -1)
+    return new_rank > old_rank >= 0
 
 
 def _format_json_shape(obj: dict[str, Any]) -> str:
@@ -1704,6 +1776,7 @@ class CreatorE2ESession:
     events: list[dict[str, Any]] = field(default_factory=list)
     resolved_failures: list[dict[str, Any]] = field(default_factory=list)
     repair_attempt_counts: dict[str, int] = field(default_factory=dict)
+    verified_bindings_by_script: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def to_event_base(self) -> dict[str, Any]:
         return {
@@ -1979,6 +2052,7 @@ def _write_step_checkpoint(
     proc: subprocess.CompletedProcess[str],
     value_provenance: dict[str, Any] | None = None,
     filesystem_diff: dict[str, Any] | None = None,
+    verified_bindings: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     checkpoint = {
         "e2e_session_id": session.e2e_session_id,
@@ -2006,6 +2080,7 @@ def _write_step_checkpoint(
         "rendered_argv": rendered_payload,
         "value_provenance": value_provenance or {},
         "filesystem_diff": filesystem_diff or {},
+        "verified_bindings": verified_bindings or {},
         "status": "passed",
         "passed": True,
     }
@@ -2135,13 +2210,17 @@ def _e2e_candidate_improved(original_errors: list[str], new_errors: list[str], *
     new_structured = _structured_failure_from_errors([(new_errors or [""])[0]])
     old_fs = ((old_structured.get("details") or {}).get("filesystem_trace") or {}) if old_structured else {}
     new_fs = ((new_structured.get("details") or {}).get("filesystem_trace") or {}) if new_structured else {}
+    old_pos = _e2e_failure_position((original_errors or [""])[0])
+    new_pos = _e2e_failure_position((new_errors or [""])[0])
+    if old_pos == new_pos and (old_fs or new_fs):
+        old_state = _artifact_runtime_state(old_fs)
+        new_state = _artifact_runtime_state(new_fs)
+        return _artifact_runtime_state_improved(old_state, new_state)
     if old_fs or new_fs:
         old_missing = any(not item.get("exists") for item in (old_fs.get("resolved_reported_paths") or []))
         new_missing = any(not item.get("exists") for item in (new_fs.get("resolved_reported_paths") or []))
         if old_missing and new_missing and _stable_json_hash(old_fs.get("created_files") or []) == _stable_json_hash(new_fs.get("created_files") or []):
             return False
-    old_pos = _e2e_failure_position((original_errors or [""])[0])
-    new_pos = _e2e_failure_position((new_errors or [""])[0])
     if new_pos > old_pos:
         return True
     old_target = _e2e_repair_target_from_errors(original_errors or [])
@@ -2902,6 +2981,7 @@ def _parse_e2e_stdout_json(
         "modified_files": (filesystem_diff or {}).get("modified_files") or [],
         "deleted_files": (filesystem_diff or {}).get("deleted_files") or [],
     }
+    filesystem_trace["failure_code"] = _artifact_failure_code(filesystem_trace)
     variable_trace = {
         "related_fields": sorted(str(k) for k in (rendered_payload or {}).keys()),
         "binding_chain": [
@@ -3504,6 +3584,11 @@ def _run_skill_workflow_e2e_once(
                     break
                 payload = dict(checkpoint.get("context_after") or payload)
                 value_provenance.update(dict(checkpoint.get("value_provenance") or {}))
+                if e2e_session is not None:
+                    script_key = str(checkpoint.get("script_path") or "")
+                    verified = dict(checkpoint.get("verified_bindings") or {})
+                    if script_key and verified:
+                        e2e_session.verified_bindings_by_script.setdefault(script_key, {}).update({str(k): str(v) for k, v in verified.items()})
                 reused_checkpoints.append(prior_step)
                 traces.append(E2EStepTrace(
                     ordinal=int(checkpoint.get("step_index") or prior_step),
@@ -3693,6 +3778,11 @@ def _run_skill_workflow_e2e_once(
                     modified_files=filesystem_diff.get("modified_files") or [],
                     value_provenance=dict(value_provenance),
                 )
+                verified_bindings = _verified_bindings_from_runtime_trace(
+                    runtime_binding_trace=runtime_binding_trace,
+                    script_content=content,
+                    script_path=command.script_path,
+                )
 
                 # Strict E2E is deterministic: once the command renders, the script
                 # exits successfully, stdout is a valid JSON object that satisfies
@@ -3732,7 +3822,10 @@ def _run_skill_workflow_e2e_once(
                         proc=proc,
                         value_provenance=value_provenance,
                         filesystem_diff=filesystem_diff,
+                        verified_bindings=verified_bindings,
                     )
+                    if verified_bindings:
+                        e2e_session.verified_bindings_by_script.setdefault(command.script_path, {}).update(verified_bindings)
                     e2e_session.events.append({**e2e_session.to_event_base(), "event": "checkpoint_saved", "phase": "e2e_run", "status": "passed", "step_index": command.ordinal, "current_step": command.ordinal, "total_steps": len(commands), "script_path": command.script_path, "target_file": command.script_path})
 
                 traces.append(trace)
@@ -4300,6 +4393,18 @@ async def _repair_existing_file_for_e2e_failure(
         )
 
     failure_details = structured_failure.get("details") if isinstance(structured_failure, dict) else {}
+    artifact_runtime_state = _artifact_runtime_state((failure_details or {}).get("filesystem_trace") or {})
+    filesystem_trace_for_context = (failure_details or {}).get("filesystem_trace") or {}
+    created_count = int(artifact_runtime_state.get("created_count") or 0)
+    missing_reported_count = int(artifact_runtime_state.get("missing_reported_count") or 0)
+    if filesystem_trace_for_context and created_count > 0 and missing_reported_count > 0:
+        allowed_edit_scope = ["stdout artifact path mapping", "relative path normalization"]
+    elif filesystem_trace_for_context and created_count == 0:
+        allowed_edit_scope = ["artifact creation", "artifact save path", "stdout artifact return"]
+    elif target_path == "SKILL.md":
+        allowed_edit_scope = ["SKILL.md current command line"]
+    else:
+        allowed_edit_scope = ["current script guard/run entry area", "current script stdout/artifact return area"]
     minimal_repair_context = {
         "target_file": target_path,
         "failure_layer": structured_failure.get("layer"),
@@ -4308,10 +4413,11 @@ async def _repair_existing_file_for_e2e_failure(
         "rendered_payload": structured_failure.get("rendered_payload") or {},
         "stdout": structured_failure.get("stdout") or "",
         "stderr": structured_failure.get("stderr") or "",
-        "filesystem_trace": (failure_details or {}).get("filesystem_trace") or {},
+        "filesystem_trace": filesystem_trace_for_context,
+        "artifact_runtime_state": artifact_runtime_state,
         "expected": structured_failure.get("expected") or "",
         "actual": structured_failure.get("actual") or "",
-        "allowed_edit_scope": [target_path],
+        "allowed_edit_scope": allowed_edit_scope,
         "failed_command": structured_failure.get("failed_command") or "",
     }
 
@@ -4349,6 +4455,7 @@ async def _repair_existing_file_for_e2e_failure(
     )[-12000:]
     baseline_errors = list(repair_state.get("remaining_failed_checks") or e2e_errors or [])
     baseline_no_progress_count = 0
+    baseline_no_progress_counts: dict[str, int] = {}
 
     last_failure = ""
     max_candidate_attempts = 10
@@ -4882,13 +4989,7 @@ async def _repair_existing_file_for_e2e_failure(
                     or []
                 )
                 improved = _e2e_candidate_improved(baseline_errors, gate_errors, target_file=target_path)
-                if not improved:
-                    session_target.write_text(previous_session_content, encoding="utf-8")
-                    e2e_session.current_revision += 1
-                    if earliest_step:
-                        _invalidate_checkpoints_from(e2e_session, earliest_step)
-                    baseline_no_progress_count += 1
-
+                baseline_fingerprint = _e2e_behavior_fingerprint((baseline_errors or [""])[0], target_file=target_path)
                 failure_signature = (
                     _e2e_behavior_fingerprint(
                         (
@@ -4898,6 +4999,14 @@ async def _repair_existing_file_for_e2e_failure(
                         target_file=target_path,
                     )
                 )
+                if not improved:
+                    session_target.write_text(previous_session_content, encoding="utf-8")
+                    e2e_session.current_revision += 1
+                    if earliest_step:
+                        _invalidate_checkpoints_from(e2e_session, earliest_step)
+                    no_progress_key = f"{target_path}:{baseline_fingerprint}:{failure_signature}"
+                    baseline_no_progress_counts[no_progress_key] = baseline_no_progress_counts.get(no_progress_key, 0) + 1
+                    baseline_no_progress_count = baseline_no_progress_counts[no_progress_key]
 
                 template_signature = (
                     _stable_json_hash([
@@ -5093,6 +5202,7 @@ async def _repair_existing_file_for_e2e_failure(
                     working_content = sanitized
                     baseline_errors = list(gate_errors)
                     baseline_no_progress_count = 0
+                    baseline_no_progress_counts = {}
 
                 last_failure = (
                     "SANDBOX_E2E_FAILED：候选 patch 已应用，"
@@ -5138,7 +5248,7 @@ async def _repair_existing_file_for_e2e_failure(
                 if (
                     not improved
                     and baseline_no_progress_count >= 2
-                    and _e2e_behavior_fingerprint((baseline_errors or [""])[0], target_file=target_path) == failure_signature
+                    and baseline_fingerprint == failure_signature
                 ):
                     if repair_events is not None:
                         repair_events.extend(e2e_session.events)

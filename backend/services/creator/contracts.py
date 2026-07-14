@@ -336,7 +336,14 @@ def build_command_alignment_snapshot(
     sources.update(_explicit_alignment_sources(function_execution_context))
 
     confirmed: dict[str, str] = {}
-    candidates: dict[str, str] = {}
+    candidates: dict[str, dict[str, Any]] = {}
+
+    def candidate_record(target_text: str, source_text: str) -> dict[str, Any]:
+        return {
+            "source": source_text,
+            "valid_target": target_text in accepted_targets,
+            "source_available": source_text in sources,
+        }
 
     for mapping in (_explicit_graph_confirmed_bindings(function_execution_context), e2e_verified_bindings or {}):
         for target, source in mapping.items():
@@ -345,7 +352,7 @@ def build_command_alignment_snapshot(
             if target_text in accepted_targets and source_text in sources:
                 confirmed[target_text] = source_text
             elif target_text and source_text:
-                candidates[target_text] = source_text
+                candidates[target_text] = candidate_record(target_text, source_text)
 
     for mapping in (_command_placeholder_bindings(command, script_path), candidate_bindings or {}):
         for target, source in mapping.items():
@@ -354,10 +361,7 @@ def build_command_alignment_snapshot(
             if target_text and source_text and target_text not in confirmed:
                 # Current command/template/model suggestions remain candidates until
                 # E2E or an explicit contract verifies both sides.
-                if target_text in accepted_targets and source_text in sources:
-                    candidates[target_text] = source_text
-                else:
-                    candidates[target_text] = source_text
+                candidates[target_text] = candidate_record(target_text, source_text)
 
     unresolved = [
         key for key in required_target_keys
