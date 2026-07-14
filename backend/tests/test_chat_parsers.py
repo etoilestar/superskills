@@ -2285,13 +2285,123 @@ def test_skill_md_blueprint_alignment_does_not_trust_blocking_for_detail_request
     assert _skill_md_blueprint_review_to_contract_results(review) == []
 
 
-def test_skill_md_command_template_source_proof_issue_is_semantic_patch_not_hard_format():
-    from backend.services.creator.api import is_markdown_hard_format_error
-    from backend.services.creator.common import FileGenerationStageError
-    from backend.services.creator.contracts import (
-        ContractValidationError,
-        _skill_md_blueprint_review_to_contract_results,
+def test_skill_md_overall_reviewer_no_longer_handles_command_mapping():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {
+        "passed": False,
+        "issues": [{
+            "severity": "error",
+            "blocking": True,
+            "category": "command_mapping_explicit_evidence",
+            "field": "workflow",
+            "message": "strict_json_argv_schema shows argv key mismatch with incoming_edges from_output placeholder.",
+            "contract_impact": {"execution_closure": True, "platform_io": True},
+        }],
+    }
+
+    assert _skill_md_blueprint_review_to_contract_results(review) == []
+
+
+def test_skill_md_block_review_failure_routes_only_current_block():
+    from backend.services.creator.contracts import _skill_md_block_review_to_contract_results
+
+    review = {
+        "passed": False,
+        "target_script_path": "scripts/current.py",
+        "command_block": "python scripts/current.py '{\"bad\": \"{{input}}\"}'",
+        "block_start": 10,
+        "block_end": 70,
+        "command_block_ordinal": 2,
+        "key_checks": [{"subject": "bad", "passed": False, "evidence": "not accepted by argv schema"}],
+        "value_checks": [{"subject": "bad", "passed": True, "evidence": "uses available input"}],
+        "type_checks": [{"subject": "bad", "passed": True, "evidence": "string to string"}],
+        "issues": [],
+    }
+
+    results = _skill_md_block_review_to_contract_results(review, block_text=review["command_block"], block_locator={"start": 10, "end": 70})
+    assert len(results) == 1
+    assert results[0].layer == "skill_md_command_block_interface"
+    assert results[0].id.startswith("skill_md.command_block.interface.key.")
+    assert "scripts/current.py" in results[0].target
+    assert "不得修改其他 command block" in results[0].minimal_edit
+    assert results[0].details["current_block"].startswith("python scripts/current.py")
+    assert results[0].details["block_locator"]["start"] == 10
+
+
+def test_skill_md_block_reviewer_schema_rejects_passed_with_failed_check():
+    from backend.services.creator.contracts import _skill_md_block_review_schema_error
+
+    review = {
+        "passed": True,
+        "target_script_path": "scripts/current.py",
+        "key_checks": [{"subject": "bad", "passed": False, "evidence": "not accepted"}],
+        "value_checks": [{"subject": "bad", "passed": True, "evidence": "available"}],
+        "type_checks": [{"subject": "bad", "passed": True, "evidence": "compatible"}],
+        "issues": [],
+        "repair_suggestions": "",
+    }
+
+    assert "passed=true with failed" in _skill_md_block_review_schema_error(review)
+
+
+def test_skill_md_block_checks_keep_key_value_type_separate():
+    from backend.services.creator.contracts import _skill_md_block_review_to_contract_results
+
+    review = {
+        "passed": False,
+        "target_script_path": "scripts/current.py",
+        "command_block": "python scripts/current.py '{\"x\": \"{{missing}}\"}'",
+        "block_start": 1,
+        "block_end": 60,
+        "command_block_ordinal": 1,
+        "key_checks": [{"subject": "x", "passed": False, "evidence": "key failure"}],
+        "value_checks": [{"subject": "x", "passed": False, "evidence": "value source failure"}],
+        "type_checks": [{"subject": "x", "passed": False, "evidence": "type failure"}],
+        "issues": [],
+    }
+
+    result_ids = {result.id for result in _skill_md_block_review_to_contract_results(review, block_text=review["command_block"], block_locator={"start": 1, "end": 60})}
+    assert any(item.startswith("skill_md.command_block.interface.key.") for item in result_ids)
+    assert any(item.startswith("skill_md.command_block.interface.value.") for item in result_ids)
+    assert any(item.startswith("skill_md.command_block.interface.type.") for item in result_ids)
+
+
+def test_skill_md_block_repair_rejects_out_of_block_and_noop_patch():
+    from backend.services.creator.repair import (
+        CreatorDiffProposal,
+        CreatorRepairNoopPatch,
+        _validate_skill_md_block_repair_proposal,
     )
+
+    constraints = {
+        "script_path": "scripts/current.py",
+        "block_text": "python scripts/current.py '{\"x\":\"{{input}}\"}'",
+    }
+    with pytest.raises(ValueError, match="OLD must exactly equal"):
+        _validate_skill_md_block_repair_proposal(
+            proposal=CreatorDiffProposal(
+                target_file="SKILL.md",
+                reason="bad",
+                edits=[{"old": "说明文字", "new": "新说明文字"}],
+                mode="exact_replace",
+            ),
+            constraints=constraints,
+        )
+    with pytest.raises(CreatorRepairNoopPatch):
+        _validate_skill_md_block_repair_proposal(
+            proposal=CreatorDiffProposal(
+                target_file="SKILL.md",
+                reason="noop",
+                edits=[{"old": constraints["block_text"], "new": constraints["block_text"]}],
+                mode="exact_replace",
+            ),
+            constraints=constraints,
+        )
+
+
+def test_skill_md_command_template_source_proof_issue_moves_to_block_reviewer():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
 
     review = {
         "passed": False,
@@ -2300,39 +2410,14 @@ def test_skill_md_command_template_source_proof_issue_is_semantic_patch_not_hard
             "blocking": True,
             "field": "workflow",
             "message": "SKILL.md bash command block 的 JSON argv 包含缺少来源证明的字面值；命令块应是运行模板。",
-            "expected": "将缺少来源证明的字面值替换为平台输入 placeholder 或上游 output placeholder；无可靠来源的可选字段应省略并由脚本内部默认化。",
-            "minimal_edit": "只修改对应 bash command block 的 JSON argv，不改 metadata，不重写整篇文档。",
-            "contract_impact": {
-                "execution_closure": True,
-                "resource_role": False,
-                "platform_io": True,
-                "final_artifact": False,
-                "user_requirement_transfer": True,
-            },
+            "contract_impact": {"execution_closure": True, "platform_io": True},
         }],
     }
 
-    results = _skill_md_blueprint_review_to_contract_results(review)
-    assert len(results) == 1
-    assert results[0].layer == "skill_md_blueprint_alignment"
-    assert "hard_format" not in results[0].layer
+    assert _skill_md_blueprint_review_to_contract_results(review) == []
 
-    stage_error = FileGenerationStageError(
-        source="content_review",
-        layer=results[0].layer,
-        detail=results[0].message,
-        original=ContractValidationError("semantic", results),
-    )
-    assert not is_markdown_hard_format_error(stage_error)
-
-
-def test_skill_md_downstream_literal_source_proof_issue_is_semantic_patch_not_region_rewrite():
-    from backend.services.creator.api import is_markdown_hard_format_error
-    from backend.services.creator.common import FileGenerationStageError
-    from backend.services.creator.contracts import (
-        ContractValidationError,
-        _skill_md_blueprint_review_to_contract_results,
-    )
+def test_skill_md_downstream_literal_source_proof_issue_moves_to_block_reviewer():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
 
     review = {
         "passed": False,
@@ -2342,22 +2427,11 @@ def test_skill_md_downstream_literal_source_proof_issue_is_semantic_patch_not_re
             "category": "command_template_source_proof",
             "field": "workflow",
             "message": "运行模板中的下游 JSON argv 值缺少来源证明。",
-            "expected": "引用上游 output placeholder；无可靠来源的可选字段省略。",
-            "minimal_edit": "只修改对应 bash command block 的 JSON argv。",
-            "contract_impact": {"execution_closure": True, "platform_io": True, "user_requirement_transfer": True},
+            "contract_impact": {"execution_closure": True, "platform_io": True},
         }],
     }
 
-    results = _skill_md_blueprint_review_to_contract_results(review)
-    stage_error = FileGenerationStageError(
-        source="content_review",
-        layer=results[0].layer,
-        detail=results[0].message,
-        original=ContractValidationError("semantic", results),
-    )
-    assert results
-    assert not is_markdown_hard_format_error(stage_error)
-
+    assert _skill_md_blueprint_review_to_contract_results(review) == []
 
 def test_skill_md_plain_text_example_does_not_create_source_proof_failure():
     from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
@@ -3773,3 +3847,161 @@ def test_creator_trial_stdout_accepts_arbitrary_real_file_field(tmp_path):
         skill_dir=skill_dir,
         skill_plan_entry={"role": "pdf_builder", "outputs": ["pdf_path"], "required_capabilities": ["pdf_generation"]},
     )
+
+
+def test_skill_md_block_repair_accepts_valid_exact_replace_constraint():
+    from backend.services.creator.repair import CreatorDiffProposal, CreatorRepairScope, _validate_repair_diff_scope
+
+    old_block = "python scripts/current.py '{\"x\":\"{{input}}\"}'"
+    new_block = "python scripts/current.py '{\"x\":\"{{text}}\"}'"
+    content = f"# Skill\n```bash\n{old_block}\n```\n"
+    scope = CreatorRepairScope(
+        phase="module_functional_smoke",
+        repair_type="localized_patch",
+        target_file="SKILL.md",
+        notes=("skill_md_block_repair_constraint:" + json.dumps({"script_path": "scripts/current.py", "block_text": old_block}, ensure_ascii=False),),
+    )
+
+    candidate, stats = _validate_repair_diff_scope(
+        proposal=CreatorDiffProposal(
+            target_file="SKILL.md",
+            reason="fix current block",
+            edits=[{"old": old_block, "new": new_block}],
+            mode="exact_replace",
+        ),
+        current_content=content,
+        scope=scope,
+    )
+
+    assert new_block in candidate
+    assert stats["mode"] == "exact_replace"
+    assert stats["edit_count"] == 1
+
+
+def test_skill_md_command_block_repair_missing_constraint_fails_closed():
+    import asyncio
+    from backend.services.creator.repair import _repair_generated_file_with_feedback
+
+    with pytest.raises(ValueError, match="missing structured block constraint"):
+        asyncio.run(_repair_generated_file_with_feedback(
+            prompt_messages=[],
+            model="unit-test",
+            file_path="SKILL.md",
+            previous_content="---\nname: demo\ndescription: demo\n---\n```bash\npython scripts/a.py '{}'\n```\n",
+            validation_error="block failed",
+            failed_checks_text="- skill_md.command_block.interface.key.1: missing details",
+        ))
+
+
+def test_skill_md_command_block_repair_incomplete_constraint_fails_closed():
+    import asyncio
+    from backend.services.creator.repair import _repair_generated_file_with_feedback
+
+    failed = 'skill_md.command_block.interface.key.1 details: {"script_path":"scripts/a.py","block_text":""}'
+    with pytest.raises(ValueError, match="missing script_path/block_text"):
+        asyncio.run(_repair_generated_file_with_feedback(
+            prompt_messages=[],
+            model="unit-test",
+            file_path="SKILL.md",
+            previous_content="---\nname: demo\ndescription: demo\n---\n```bash\npython scripts/a.py '{}'\n```\n",
+            validation_error="block failed",
+            failed_checks_text=failed,
+        ))
+
+
+def test_skill_md_block_reviewer_invalid_json_schema_retry_succeeds(monkeypatch):
+    import asyncio
+    from backend.services.creator import contracts
+    from backend.services.creator.common import build_default_requirement_graph
+
+    calls = []
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        if len(calls) == 1:
+            return "not json"
+        return json.dumps({
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [{"object": "x", "passed": True, "evidence": "argv key exists"}],
+            "value_checks": [{"object": "x", "passed": True, "evidence": "value source is available"}],
+            "type_checks": [{"object": "x", "passed": True, "evidence": "string serialization is compatible"}],
+            "issues": [],
+            "repair_suggestions": "",
+        })
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    review = asyncio.run(contracts._review_skill_md_command_block_with_model(
+        skill_name="demo",
+        script_path="scripts/current.py",
+        command_block="python scripts/current.py '{}'",
+        ordinal=1,
+        prior_stdout=[],
+        requirement_graph=build_default_requirement_graph([]),
+        model="unit-test",
+    ))
+
+    assert review["passed"] is True
+    assert len(calls) == 2
+    assert "不重新审查 command block" in calls[1][-1]["content"]
+
+
+def test_skill_md_block_reviewer_missing_checks_schema_retry_succeeds(monkeypatch):
+    import asyncio
+    from backend.services.creator import contracts
+    from backend.services.creator.common import build_default_requirement_graph
+
+    calls = []
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        if len(calls) == 1:
+            return json.dumps({"passed": True, "target_script_path": "scripts/current.py", "issues": []})
+        return json.dumps({
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [],
+            "issues": [],
+            "repair_suggestions": "",
+        })
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    review = asyncio.run(contracts._review_skill_md_command_block_with_model(
+        skill_name="demo",
+        script_path="scripts/current.py",
+        command_block="python scripts/current.py '{}'",
+        ordinal=1,
+        prior_stdout=[],
+        requirement_graph=build_default_requirement_graph([]),
+        model="unit-test",
+    ))
+
+    assert review["passed"] is True
+    assert len(calls) == 2
+
+
+def test_skill_md_block_reviewer_schema_retry_limit_raises_validator_failure(monkeypatch):
+    import asyncio
+    from backend.services.creator import contracts
+    from backend.services.creator.common import build_default_requirement_graph
+
+    calls = []
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        return "not json"
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    with pytest.raises(contracts.CreatorValidatorReviewError, match="schema invalid"):
+        asyncio.run(contracts._review_skill_md_command_block_with_model(
+            skill_name="demo",
+            script_path="scripts/current.py",
+            command_block="python scripts/current.py '{}'",
+            ordinal=1,
+            prior_stdout=[],
+            requirement_graph=build_default_requirement_graph([]),
+            model="unit-test",
+        ))
+    assert len(calls) == 3

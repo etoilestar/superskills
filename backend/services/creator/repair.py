@@ -1898,6 +1898,46 @@ def _platform_io_patch_violation(before: str, after: str) -> str | None:
             return label
     return None
 
+
+def _skill_md_block_repair_constraints_from_notes(scope: CreatorRepairScope) -> dict[str, Any] | None:
+    for note in scope.notes or ():
+        text = str(note or "")
+        prefix = "skill_md_block_repair_constraint:"
+        if not text.startswith(prefix):
+            continue
+        try:
+            data = json.loads(text[len(prefix):])
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _validate_skill_md_block_repair_proposal(
+    *,
+    proposal: CreatorDiffProposal,
+    constraints: dict[str, Any],
+) -> None:
+    block_text = str(constraints.get("block_text") or "")
+    script_path = str(constraints.get("script_path") or "")
+    if not block_text or not script_path:
+        raise ValueError("skill_md_block_repair_constraint 缺少 block_text/script_path。")
+    if proposal.mode != "exact_replace":
+        raise ValueError("SKILL.md single-block repair only accepts exact_replace OLD/NEW patches.")
+    if len(proposal.edits or []) != 1:
+        raise ValueError("SKILL.md single-block repair must contain exactly one edit.")
+    edit = proposal.edits[0]
+    old = edit.get("old", "")
+    new = edit.get("new", "")
+    if old != block_text:
+        raise ValueError("SKILL.md single-block repair OLD must exactly equal the failed command block text.")
+    if new == old:
+        raise CreatorRepairNoopPatch("SKILL.md single-block repair rejected no-op OLD/NEW patch.")
+    if script_path.replace('\\', '/') not in str(new).replace('\\', '/'):
+        raise ValueError("SKILL.md single-block repair NEW must still invoke the same script_path.")
+    if "```" in str(new) or "~~~" in str(new):
+        raise ValueError("SKILL.md single-block repair NEW must replace only the block body, not fence markers or prose.")
+
 def _validate_repair_diff_scope(
     *,
     proposal: CreatorDiffProposal,
@@ -1923,6 +1963,10 @@ def _validate_repair_diff_scope(
         raise ValueError(
             f"repair proposal target_file 越权：expected={scope.target_file!r}, actual={proposal.target_file!r}"
         )
+
+    block_constraints = _skill_md_block_repair_constraints_from_notes(scope)
+    if block_constraints is not None:
+        _validate_skill_md_block_repair_proposal(proposal=proposal, constraints=block_constraints)
 
     if proposal.mode == "exact_replace":
         candidate, stats = _apply_exact_replace_patch(
@@ -2822,17 +2866,45 @@ async def _repair_generated_file_with_feedback(
                 + json.dumps(hard_format_failures, ensure_ascii=False, default=str)
             )
 
+    block_repair_constraint_note = ""
+    if file_path == "SKILL.md" and "skill_md.command_block." in str(failed_checks_text or ""):
+        match = re.search(r"details: (\{[^\n]*\})", failed_checks_text or "")
+        if not match:
+            raise ValueError("SKILL.md command block repair missing structured block constraint details; refusing file-level fallback repair.")
+        try:
+            details = json.loads(match.group(1))
+        except Exception as exc:
+            raise ValueError("SKILL.md command block repair constraint details are not valid JSON; refusing file-level fallback repair.") from exc
+        if not isinstance(details, dict):
+            raise ValueError("SKILL.md command block repair constraint details must be an object; refusing file-level fallback repair.")
+        block_text = str(details.get("block_text") or details.get("current_block") or "")
+        script_path = str(details.get("script_path") or "")
+        if not block_text or not script_path:
+            raise ValueError("SKILL.md command block repair constraint missing script_path/block_text; refusing file-level fallback repair.")
+        block_repair_constraint_note = "skill_md_block_repair_constraint:" + json.dumps({
+            "script_path": script_path,
+            "block_text": block_text,
+            "block_start": details.get("block_start"),
+            "block_end": details.get("block_end"),
+            "block_ordinal": details.get("block_ordinal"),
+        }, ensure_ascii=False, sort_keys=True)
+
+
+    scope_notes = [
+        "第一轮只修当前文件。",
+        "模型功能校验判断责任是否完成；smoke/trial run 判断代码是否通过。",
+        "平台兼容性直接交给现有 sandbox/smoke 校验，不在 repair 层做字段词表判断。",
+        "优先输出 edits old_lines/new_lines exact_replace patch，不要输出完整文件。",
+    ]
+    if block_repair_constraint_note:
+        scope_notes.append(block_repair_constraint_note)
+
     scope = CreatorRepairScope(
         phase="module_functional_smoke",
         repair_type=repair_mode or "localized_patch",
         target_file=file_path,
         max_changed_lines=220 if repair_mode == "strict_contract_rewrite" else 160,
-        notes=(
-            "第一轮只修当前文件。",
-            "模型功能校验判断责任是否完成；smoke/trial run 判断代码是否通过。",
-            "平台兼容性直接交给现有 sandbox/smoke 校验，不在 repair 层做字段词表判断。",
-            "优先输出 edits old_lines/new_lines exact_replace patch，不要输出完整文件。",
-        ),
+        notes=tuple(scope_notes),
     )
 
     plan_entry = (
