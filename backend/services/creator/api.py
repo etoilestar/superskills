@@ -7949,10 +7949,104 @@ async def _extract_requirement_graph_with_validator(
     only transports existing FileSpec constraints into RequirementItem objects
     and validates required script coverage.
     """
-    _ = (blueprint_text, requested_model, warnings, workflow_allocation_summary)
-    return validate_requirement_graph_schema(
-        build_default_requirement_graph(files_out, responsibility_edges=responsibility_edges, function_items=function_items),
+    _ = (workflow_allocation_summary,)
+    graph = build_default_requirement_graph(files_out, responsibility_edges=responsibility_edges, function_items=function_items)
+    max_refine_rounds = 3
+    for attempt in range(max_refine_rounds + 1):
+        try:
+            validated = validate_requirement_graph_schema(graph, files_out)
+            if attempt:
+                logger.info("[Creator][responsibility_graph][refine_recheck_passed] attempt=%d", attempt)
+            return validated
+        except RequirementGraphValidationError as exc:
+            if not _is_refinable_platform_io_graph_error(exc) or attempt >= max_refine_rounds:
+                if attempt:
+                    logger.info(
+                        "[Creator][responsibility_graph][refine_recheck_failed_final] attempt=%d code=%s detail=%s",
+                        attempt,
+                        getattr(exc, "code", ""),
+                        str(exc)[:500],
+                    )
+                raise
+            feedback = _platform_io_graph_refine_feedback(exc, graph)
+            logger.info(
+                "[Creator][responsibility_graph][platform_io_closure_failed] attempt=%d code=%s nodes=%s",
+                attempt,
+                getattr(exc, "code", ""),
+                json.dumps(feedback.get("related_nodes") or [], ensure_ascii=False),
+            )
+            logger.info("[Creator][responsibility_graph][refine_request] attempt=%d", attempt + 1)
+            graph = await _refine_requirement_graph_platform_io_closure(
+                blueprint_text=blueprint_text,
+                files_out=files_out,
+                current_graph=graph,
+                feedback=feedback,
+                requested_model=requested_model,
+            )
+
+
+def _is_refinable_platform_io_graph_error(exc: RequirementGraphValidationError) -> bool:
+    return getattr(exc, "code", "") == "responsibility_graph_platform_io_conflict"
+
+
+def _platform_io_graph_refine_feedback(exc: RequirementGraphValidationError, graph: RequirementGraph) -> dict[str, Any]:
+    details = getattr(exc, "details", {}) or {}
+    node = str(details.get("node") or "")
+    targets = [str(item) for item in (details.get("targets") or []) if str(item)]
+    directions: list[str] = []
+    if node == "platform_input_node":
+        directions.append("connect platform_input_node outputs to the actual first executable responsibility when runtime input is required")
+    if node == "platform_output_node":
+        directions.append("connect the final executable result producer to platform_output_node inputs")
+    if targets:
+        directions.append("place each isolated required FunctionItem on a platform_input_node -> ... -> platform_output_node path")
+    return {
+        "error_code": getattr(exc, "code", ""),
+        "message": str(exc),
+        "missing_connection_directions": directions or ["close platform IO path without inventing business fields"],
+        "related_nodes": ([node] if node else []) + targets,
+        "closure_requirements": [
+            "use only current FunctionItem target_file nodes and immutable platform boundary nodes",
+            "do not hard-code or invent business field names",
+            "do not add fixed backend edges; model must refine the graph",
+            "preserve deterministic graph contract validation after refine",
+        ],
+        "current_endpoint_pairs": _responsibility_edge_endpoint_pairs(getattr(graph, "dataflow_edges", []) or []),
+    }
+
+
+async def _refine_requirement_graph_platform_io_closure(
+    *,
+    blueprint_text: str,
+    files_out: list[FileSpecOut],
+    current_graph: RequirementGraph,
+    feedback: dict[str, Any],
+    requested_model: str | None = None,
+) -> RequirementGraph:
+    route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator responsibility graph platform IO refine")
+    payload = {
+        "task": "refine_current_responsibility_graph_platform_io_closure",
+        "feedback": feedback,
+        "current_graph": current_graph.model_dump(mode="json") if hasattr(current_graph, "model_dump") else current_graph,
+        "allowed_script_targets": [f.path for f in files_out if str(f.path).startswith("scripts/")],
+        "platform_io_contract": platform_io_contract_prompt_text(),
+        "blueprint_excerpt": str(blueprint_text or "")[-12000:],
+    }
+    prompt = (
+        "You are refining only the current Creator ResponsibilityGraph.\n"
+        "Do not add files, do not invent business fields, do not hard-code platform input/output names beyond the provided platform_io_contract.\n"
+        "Only adjust function_items responsibility fields and responsibility_edges needed to close platform IO paths and isolated main-flow nodes.\n"
+        "Return strict JSON object with function_items and responsibility_edges only."
+    )
+    raw = await complete_chat_once([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+    ], route.model)
+    data = _parse_prepare_plan_json(raw)
+    return build_default_requirement_graph(
         files_out,
+        responsibility_edges=data.get("responsibility_edges") or [],
+        function_items=data.get("function_items") or [],
     )
 
 def _persist_requirement_graph(
