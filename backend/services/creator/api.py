@@ -11603,7 +11603,7 @@ def is_generation_format_error(stage_error: FileGenerationStageError) -> bool:
 
 
 def _result_requires_full_format_rewrite(result: Any) -> bool:
-    """Detect structured first-step format failures without matching prose/id text."""
+    """Detect structured hard-format failures without broad layer/prose matching."""
     if isinstance(result, ContractCheckResult):
         if result.passed:
             return False
@@ -11611,23 +11611,32 @@ def _result_requires_full_format_rewrite(result: Any) -> bool:
         severity = str(details.get("severity") or "").strip()
         repair_strategy = str(details.get("repair_strategy") or "").strip()
         model_patch_allowed = details.get("model_patch_allowed")
+        if repair_strategy == "localized_patch" or model_patch_allowed is True:
+            return False
         return (
-            _is_markdown_format_result(result)
-            or result.layer == "hard_format"
+            result.layer == "hard_format"
             or severity == "hard_format"
             or repair_strategy == "full_rewrite"
             or model_patch_allowed is False
+            or any(result.id.startswith(prefix) for prefix in _MARKDOWN_FORMAT_ERROR_ID_PREFIXES)
         )
 
     if isinstance(result, dict):
         if result.get("passed") is True:
             return False
+        details = result.get("details") if isinstance(result.get("details"), dict) else {}
+        severity = str(result.get("severity") or details.get("severity") or "").strip()
+        repair_strategy = str(result.get("repair_strategy") or details.get("repair_strategy") or "").strip()
+        model_patch_allowed = result.get("model_patch_allowed", details.get("model_patch_allowed"))
+        if repair_strategy == "localized_patch" or model_patch_allowed is True:
+            return False
+        result_id = _contract_result_id(result)
         return (
-            _is_markdown_format_result(result)
-            or str(result.get("layer") or "").strip() == "hard_format"
-            or str(result.get("severity") or "").strip() == "hard_format"
-            or str(result.get("repair_strategy") or "").strip() == "full_rewrite"
-            or result.get("model_patch_allowed") is False
+            str(result.get("layer") or "").strip() == "hard_format"
+            or severity == "hard_format"
+            or repair_strategy == "full_rewrite"
+            or model_patch_allowed is False
+            or any(result_id.startswith(prefix) for prefix in _MARKDOWN_FORMAT_ERROR_ID_PREFIXES)
         )
 
     return False
@@ -11652,9 +11661,11 @@ def _stage_error_has_full_format_rewrite_contract(stage_error: FileGenerationSta
 def is_markdown_hard_format_error(stage_error: FileGenerationStageError) -> bool:
     if getattr(stage_error, "source", "") == "hard_format" or getattr(stage_error, "layer", "") == "hard_format":
         return True
-    if str(getattr(stage_error, "layer", "") or "") == "markdown_format":
+    if _stage_error_has_full_format_rewrite_contract(stage_error):
         return True
-    return _stage_error_has_full_format_rewrite_contract(stage_error)
+    if getattr(stage_error, "original", None) is not None:
+        return False
+    return str(getattr(stage_error, "layer", "") or "") == "markdown_format"
 
 
 def _first_round_format_stage_error(
@@ -12963,7 +12974,6 @@ async def generate_file(request: GenerateFileRequest):
                         "保持已通过的 YAML frontmatter 和 Markdown 格式；"
                         "按 reference semantic judge 的 issues 修正当前参考资料职责。"
                     )
-
                 contract_text = _build_generated_file_contract_text(
                     request.file_path,
                     request.blueprint_text,
