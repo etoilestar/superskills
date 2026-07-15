@@ -4384,13 +4384,130 @@ def _sync_prepare_summary_files_from_skill_plan(
     return warnings
 
 
-def _required_file_plan_user_upload_asset_paths(plan_files: list[Any] | None) -> list[str]:
+
+def _is_concrete_assets_file_path(path: str) -> bool:
+    normalized = _normalize_skill_path(str(path or ""))
+
+    if not normalized.startswith("assets/"):
+        return False
+
+    if normalized in {"assets", "assets/"}:
+        return False
+
+    if normalized.endswith("/"):
+        return False
+
+    # Only reject dynamic path syntax; do not infer meaning from placeholder text.
+    if any(
+        marker in normalized
+        for marker in (
+            "${",
+            "{{",
+            "}}",
+            "<",
+            ">",
+            "[",
+            "]",
+            "*",
+        )
+    ):
+        return False
+
+    return True
+
+
+def _filter_unconfirmed_asset_plan(
+    *,
+    files: list[Any] | None,
+    asset_requirements: list[Any] | None,
+    uploaded_files: list[dict[str, Any]] | None,
+    review_summary: PreparePlanReviewSummary | None,
+) -> list[dict[str, Any]]:
+    """Remove assets/** plan entries that lack structured user confirmation.
+
+    This is intentionally deterministic: allowed paths come only from explicit
+    include_as_asset upload decisions or source=user_explicit structured
+    asset requirements produced before the final file plan.
+    """
+    allowed_paths: set[str] = set()
+
+    for raw in uploaded_files or []:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("asset_decision") or "").strip() != "include_as_asset":
+            continue
+        path = _normalize_skill_path(str(raw.get("asset_target_path") or ""))
+        if _is_concrete_assets_file_path(path):
+            allowed_paths.add(path)
+
+    for item in asset_requirements or []:
+        source = str(getattr(item, "source", "") or "").strip()
+        if source != "user_explicit":
+            continue
+        path = _normalize_skill_path(str(getattr(item, "path", "") or ""))
+        if _is_concrete_assets_file_path(path):
+            allowed_paths.add(path)
+
+    removed: list[str] = []
+    kept_files: list[Any] = []
+    for file_spec in files or []:
+        path = _normalize_skill_path(str(getattr(file_spec, "path", "") or ""))
+        if path.startswith("assets/") and path not in allowed_paths:
+            if path and path not in removed:
+                removed.append(path)
+            continue
+        kept_files.append(file_spec)
+    if files is not None:
+        files[:] = kept_files
+
+    kept_assets: list[Any] = []
+    for asset in asset_requirements or []:
+        path = _normalize_skill_path(str(getattr(asset, "path", "") or ""))
+        if path.startswith("assets/") and path not in allowed_paths:
+            if path and path not in removed:
+                removed.append(path)
+            continue
+        kept_assets.append(asset)
+    if asset_requirements is not None:
+        asset_requirements[:] = kept_assets
+
+    if review_summary is not None:
+        review_summary.assets_to_upload = [
+            path
+            for path in (_normalize_skill_path(str(p or "")) for p in (review_summary.assets_to_upload or []))
+            if path in allowed_paths
+        ]
+        review_summary.files_to_create_or_update = [
+            path
+            for path in (_normalize_skill_path(str(p or "")) for p in (review_summary.files_to_create_or_update or []))
+            if not (path.startswith("assets/") and path not in allowed_paths)
+        ]
+
+    if not removed:
+        return []
+    return [{
+        "severity": "planning_warning",
+        "code": "ungrounded_asset_plan_removed",
+        "source": "prepare_plan",
+        "path": "",
+        "field": "files",
+        "files": removed,
+        "message": "已移除缺少用户明确要求或已确认上传依据的 assets 文件。",
+    }]
+
+def _required_file_plan_user_upload_asset_paths(plan_files: list[Any] | None, asset_requirements: list[Any] | None = None) -> list[str]:
     paths: list[str] = []
     for file_spec in plan_files or []:
         path = _normalize_skill_path(str(getattr(file_spec, "path", "") or ""))
         asset_source = str(getattr(file_spec, "asset_source", "") or "").strip()
         required = bool(getattr(file_spec, "required", False)) and not bool(getattr(file_spec, "can_skip", False))
         if path.startswith("assets/") and asset_source == "user_upload" and required and path not in paths:
+            paths.append(path)
+    for asset in asset_requirements or []:
+        path = _normalize_skill_path(str(getattr(asset, "path", "") or ""))
+        source = str(getattr(asset, "source", "") or "").strip()
+        required = bool(getattr(asset, "required", True))
+        if path.startswith("assets/") and source == "user_explicit" and required and path not in paths:
             paths.append(path)
     return paths
 
@@ -9628,9 +9745,17 @@ async def _prepare_plan_impl(
         in confirmed_uploaded_assets
     }
 
+    asset_filter_warnings = _filter_unconfirmed_asset_plan(
+        files=plan.files,
+        asset_requirements=plan.asset_requirements,
+        uploaded_files=request.uploaded_files,
+        review_summary=None,
+    )
+
     required_upload_assets = (
         _required_file_plan_user_upload_asset_paths(
-            plan.files
+            plan.files,
+            plan.asset_requirements,
         )
     )
     missing_required_upload_assets = [
@@ -9676,6 +9801,7 @@ async def _prepare_plan_impl(
                     or []
                 ),
                 *summary_sync_warnings,
+                *asset_filter_warnings,
             ],
             asset_requirements=plan.asset_requirements,
             creation_blockers=[
@@ -10196,6 +10322,7 @@ async def _prepare_plan_impl(
                 or []
             ),
             *summary_sync_warnings,
+            *asset_filter_warnings,
         ],
 
         asset_requirements=(

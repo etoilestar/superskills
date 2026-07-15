@@ -4,7 +4,7 @@ import pytest
 from fastapi import HTTPException
 
 from backend.services.creator import api
-from backend.services.creator.common import AnalyzeBlueprintResponse, FileSpecOut
+from backend.services.creator.common import AnalyzeBlueprintResponse, AssetRequirementOut, FileSpecOut
 
 
 def _request(**kwargs):
@@ -472,7 +472,7 @@ async def test_prepare_plan_blocks_ready_when_required_user_upload_asset_missing
                 _file("assets/template.png", asset_source="user_upload"),
             ],
             warnings=[],
-            asset_requirements=[],
+            asset_requirements=[AssetRequirementOut(path="assets/template.png", source="user_explicit", required=True)],
             blueprint_text=blueprint,
         )
 
@@ -1725,3 +1725,101 @@ def test_validate_structured_responsibility_edge_transport_accepts_function_item
         function_items=function_items,
         source="planner",
     ) == [edge]
+
+
+@pytest.mark.parametrize(
+    ("asset_path", "expected"),
+    [
+        ("assets/template.pdf", True),
+        ("assets/layout.v1", True),
+        ("assets/subdir/static-resource", True),
+        ("assets/", False),
+        ("assets/${x}", False),
+        ("assets/{{x}}", False),
+        ("assets/<x>", False),
+        ("assets/[x]", False),
+        ("assets/*", False),
+    ],
+)
+def test_concrete_assets_file_path_rejects_only_dynamic_path_structure(asset_path, expected):
+    assert api._is_concrete_assets_file_path(asset_path) is expected
+
+
+@pytest.mark.parametrize("asset_source", ["", "user_upload", "bundled"])
+def test_filter_unconfirmed_asset_plan_file_plan_asset_source_is_not_evidence(asset_source):
+    files = [_file("SKILL.md"), _file("assets/template.pdf", asset_source=asset_source)]
+    assets = []
+
+    warnings = api._filter_unconfirmed_asset_plan(
+        files=files,
+        asset_requirements=assets,
+        uploaded_files=[],
+        review_summary=api.PreparePlanReviewSummary(),
+    )
+
+    assert "assets/template.pdf" not in [f.path for f in files]
+    assert any(
+        w.get("code") == "ungrounded_asset_plan_removed"
+        and "assets/template.pdf" in w.get("files", [])
+        for w in warnings
+    )
+
+def test_filter_unconfirmed_asset_plan_removes_model_asset_without_structured_evidence():
+    summary = api.PreparePlanReviewSummary(
+        files_to_create_or_update=["SKILL.md", "assets/template.pdf"],
+        assets_to_upload=["assets/template.pdf"],
+    )
+    files = [_file("SKILL.md"), _file("assets/template.pdf", asset_source="user_upload")]
+    assets = [AssetRequirementOut(path="assets/template.pdf", source="user_upload", required=True)]
+
+    warnings = api._filter_unconfirmed_asset_plan(files=files, asset_requirements=assets, uploaded_files=[], review_summary=summary)
+
+    assert "assets/template.pdf" not in [f.path for f in files]
+    assert "assets/template.pdf" not in [a.path for a in assets]
+    assert "assets/template.pdf" not in summary.assets_to_upload
+    assert api._required_file_plan_user_upload_asset_paths(files, assets) == []
+    assert any(w.get("code") == "ungrounded_asset_plan_removed" and "assets/template.pdf" in w.get("files", []) for w in warnings)
+
+
+def test_filter_unconfirmed_asset_plan_keeps_confirmed_uploaded_asset():
+    summary = api.PreparePlanReviewSummary(files_to_create_or_update=["SKILL.md", "assets/template.pdf"])
+    files = [_file("SKILL.md"), _file("assets/template.pdf", asset_source="user_upload")]
+    assets = [AssetRequirementOut(path="assets/template.pdf", source="user_upload", required=True)]
+
+    warnings = api._filter_unconfirmed_asset_plan(
+        files=files,
+        asset_requirements=assets,
+        uploaded_files=[{"asset_decision": "include_as_asset", "asset_target_path": "assets/template.pdf"}],
+        review_summary=summary,
+    )
+
+    asset = next(f for f in files if f.path == "assets/template.pdf")
+    assert asset.asset_source == "user_upload"
+    assert "assets/template.pdf" in [a.path for a in assets]
+    assert not any(w.get("code") == "ungrounded_asset_plan_removed" for w in warnings)
+
+
+def test_filter_unconfirmed_asset_plan_keeps_user_explicit_asset_and_marks_missing_upload():
+    files = [_file("SKILL.md"), _file("assets/template.pdf", asset_source="user_upload")]
+    assets = [AssetRequirementOut(path="assets/template.pdf", source="user_explicit", required=True)]
+
+    warnings = api._filter_unconfirmed_asset_plan(files=files, asset_requirements=assets, uploaded_files=[], review_summary=api.PreparePlanReviewSummary())
+
+    assert "assets/template.pdf" in [f.path for f in files]
+    assert api._required_file_plan_user_upload_asset_paths(files, assets) == ["assets/template.pdf"]
+    assert not warnings
+
+
+def test_filter_unconfirmed_asset_plan_reference_only_upload_does_not_allow_asset():
+    files = [_file("SKILL.md"), _file("assets/template.pdf", asset_source="user_upload")]
+    assets = [AssetRequirementOut(path="assets/template.pdf", source="user_upload", required=True)]
+
+    api._filter_unconfirmed_asset_plan(
+        files=files,
+        asset_requirements=assets,
+        uploaded_files=[{"asset_decision": "reference_only", "asset_target_path": "assets/template.pdf"}],
+        review_summary=api.PreparePlanReviewSummary(),
+    )
+
+    assert "assets/template.pdf" not in [f.path for f in files]
+    assert "assets/template.pdf" not in [a.path for a in assets]
