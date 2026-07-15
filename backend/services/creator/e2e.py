@@ -523,9 +523,18 @@ def _is_artifact_validation_failure(
             "路径不存在",
         )
     )
-    artifact_contract = getattr(entry, "artifact_contract", None)
-    has_artifact_contract = bool(artifact_contract) if isinstance(artifact_contract, (dict, list, tuple, str)) else False
-    return bool(reported_paths) or validator_says_artifact or has_artifact_contract
+    artifact_contract = (
+        getattr(entry, "artifact_contract", {})
+        if isinstance(getattr(entry, "artifact_contract", {}), dict)
+        else {}
+    )
+    declared_artifact_fields = (
+        artifact_contract.get("artifact_fields")
+        or artifact_contract.get("file_outputs")
+        or artifact_contract.get("path_fields")
+        or []
+    )
+    return bool(reported_paths or validator_says_artifact or declared_artifact_fields)
 
 
 _ARTIFACT_FAILURE_PROGRESS = {
@@ -567,6 +576,30 @@ def _artifact_runtime_state_improved(old_state: dict[str, Any], new_state: dict[
 def _failure_code_from_structured(structured: dict[str, Any] | None) -> str:
     details = structured.get("details") if isinstance(structured, dict) else {}
     return str((details or {}).get("failure_code") or "")
+
+
+def _allowed_edit_scope_for_failure(
+    *,
+    target_path: str,
+    failure_code: str,
+    failure_layer: str,
+    is_artifact_failure: bool,
+    created_count: int,
+    missing_reported_count: int,
+) -> list[str]:
+    if is_artifact_failure and created_count > 0 and missing_reported_count > 0:
+        return ["stdout artifact path mapping", "relative path normalization"]
+    if is_artifact_failure and created_count == 0:
+        return ["artifact creation", "artifact save path", "stdout artifact return"]
+    if target_path == "SKILL.md":
+        return ["SKILL.md current failed command line"]
+    if failure_code in {"argv_schema_error", "argv_guard"}:
+        return ["current script strict_json_argv_guard/run entry alignment"]
+    if failure_code in {"script_exit", "timeout"} or failure_layer in {"script_exit", "timeout"}:
+        return ["traceback directly involved source region"]
+    if failure_code in {"stdout_contract", "stdout_json_parse", "stdout_json_type"}:
+        return ["current script stdout serialization and return logic"]
+    return ["current failure directly involved source region"]
 
 
 def _format_json_shape(obj: dict[str, Any]) -> str:
@@ -4453,20 +4486,14 @@ async def _repair_existing_file_for_e2e_failure(
     failure_code = str((failure_details or {}).get("failure_code") or "")
     failure_layer = str(structured_failure.get("layer") or "")
     is_artifact_failure = failure_code.startswith("artifact_")
-    if is_artifact_failure and created_count > 0 and missing_reported_count > 0:
-        allowed_edit_scope = ["stdout artifact path mapping", "relative path normalization"]
-    elif is_artifact_failure and created_count == 0:
-        allowed_edit_scope = ["artifact creation", "artifact save path", "stdout artifact return"]
-    elif target_path == "SKILL.md":
-        allowed_edit_scope = ["SKILL.md current failed command line"]
-    elif failure_code in {"argv_schema_error", "argv_guard"}:
-        allowed_edit_scope = ["current script strict_json_argv_guard/run entry alignment"]
-    elif failure_code in {"script_exit", "timeout"} or failure_layer in {"script_exit", "timeout"}:
-        allowed_edit_scope = ["traceback directly involved source region"]
-    elif failure_code in {"stdout_contract", "stdout_json_parse", "stdout_json_type"}:
-        allowed_edit_scope = ["current script stdout serialization and return logic"]
-    else:
-        allowed_edit_scope = ["current failure directly involved source region"]
+    allowed_edit_scope = _allowed_edit_scope_for_failure(
+        target_path=target_path,
+        failure_code=failure_code,
+        failure_layer=failure_layer,
+        is_artifact_failure=is_artifact_failure,
+        created_count=created_count,
+        missing_reported_count=missing_reported_count,
+    )
     minimal_repair_context = {
         "target_file": target_path,
         "failure_layer": failure_layer,

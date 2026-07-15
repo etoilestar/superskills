@@ -185,3 +185,24 @@ def test_synthetic_fixture_cannot_be_verified_but_external_context_can():
         script_content='def run(args):\n    return args["topic"]\n',
         script_path="scripts/x.py",
     ) == {"topic": "user_request"}
+
+
+def test_stdout_fields_final_contract_does_not_force_artifact_scope():
+    from backend.services.creator.e2e import _allowed_edit_scope_for_failure, _is_artifact_validation_failure
+
+    class Entry:
+        artifact_contract = {"stdout_fields": ["text"], "final": True}
+
+    assert _is_artifact_validation_failure(
+        error="stdout JSON contains error field",
+        reported_paths=[],
+        entry=Entry(),
+    ) is False
+    assert _allowed_edit_scope_for_failure(
+        target_path="scripts/text.py",
+        failure_code="stdout_contract",
+        failure_layer="stdout_contract",
+        is_artifact_failure=False,
+        created_count=1,
+        missing_reported_count=0,
+    ) == ["current script stdout serialization and return logic"]
