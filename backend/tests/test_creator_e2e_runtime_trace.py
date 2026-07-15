@@ -8,17 +8,18 @@ from backend.services.creator.e2e import (
 from backend.services.creator.common import E2EWorkflowCommand
 
 
-def _failure(filesystem_trace, *, code="artifact_not_created"):
+def _failure(filesystem_trace, *, code="artifact_not_created", layer=None, actual=""):
     filesystem_trace = dict(filesystem_trace)
     filesystem_trace.setdefault("failure_code", code)
     return (
         "E2E_REPAIR_TARGET=scripts/x.py\n"
-        "E2E_LAYER=stdout_contract\n"
+        f"E2E_LAYER={layer or code}\n"
         "E2E_STRUCTURED_FAILURE="
         + __import__("json").dumps({
             "failed_step_index": 1,
             "target_file": "scripts/x.py",
-            "layer": "stdout_contract",
+            "layer": layer or code,
+            "actual": actual,
             "details": {
                 "failure_code": code,
                 "filesystem_trace": filesystem_trace,
@@ -40,7 +41,7 @@ def test_runtime_binding_trace_uses_source_root_provenance_and_verified_binding(
         command=command,
         payload={"story_text": "hello"},
         rendered_payload={"content": "hello"},
-        value_provenance={"story_text": {"producer_step": 1, "producer_script": "scripts/a.py"}},
+        value_provenance={"story_text": {"producer_step": 1, "producer_script": "scripts/a.py", "source_kind": "stdout"}},
     )
 
     assert trace["content"]["source_root"] == "story_text"
@@ -106,13 +107,13 @@ def test_non_artifact_temp_file_does_not_count_as_progress():
         "modified_files": [],
         "reported_paths": [],
         "resolved_reported_paths": [],
-    }, code="script_exit")
+    }, code="script_exit", layer="script_exit", actual="same traceback")
     new = _failure({
         "created_files": [{"relative_path": "tmp/cache.tmp"}],
         "modified_files": [],
         "reported_paths": [],
         "resolved_reported_paths": [],
-    }, code="script_exit")
+    }, code="script_exit", layer="script_exit", actual="same traceback")
 
     assert _e2e_candidate_improved([old], [new], target_file="scripts/x.py") is False
 
@@ -132,3 +133,55 @@ def test_artifact_created_file_counts_as_progress_for_artifact_failure():
     }, code="artifact_return_path_mismatch")
 
     assert _e2e_candidate_improved([old], [new], target_file="scripts/x.py") is True
+
+
+def test_stdout_contract_temp_file_is_not_artifact_progress():
+    old = _failure({
+        "created_files": [],
+        "modified_files": [],
+        "reported_paths": [],
+        "resolved_reported_paths": [],
+    }, code="stdout_contract", layer="stdout_contract", actual="stdout serialization failed")
+    new = _failure({
+        "created_files": [{"relative_path": "tmp/cache.tmp"}],
+        "modified_files": [],
+        "reported_paths": [],
+        "resolved_reported_paths": [],
+    }, code="stdout_contract", layer="stdout_contract", actual="stdout serialization failed")
+
+    assert "artifact_" not in "stdout_contract"
+    assert _e2e_candidate_improved([old], [new], target_file="scripts/x.py") is False
+
+
+def test_synthetic_fixture_cannot_be_verified_but_external_context_can():
+    command = E2EWorkflowCommand(
+        ordinal=1,
+        runner="python",
+        script_path="scripts/x.py",
+        argv_template={"topic": "{{user_request}}"},
+        raw_command="python scripts/x.py '{}'",
+        source_path="SKILL.md",
+    )
+    synthetic_trace = _runtime_binding_trace(
+        command=command,
+        payload={"user_request": "sample"},
+        rendered_payload={"topic": "sample"},
+        value_provenance={"user_request": {"producer_step": 0, "source_kind": "synthetic_fixture"}},
+    )
+    assert _verified_bindings_from_runtime_trace(
+        runtime_binding_trace=synthetic_trace,
+        script_content='def run(args):\n    return args["topic"]\n',
+        script_path="scripts/x.py",
+    ) == {}
+
+    external_trace = _runtime_binding_trace(
+        command=command,
+        payload={"user_request": "real"},
+        rendered_payload={"topic": "real"},
+        value_provenance={"user_request": {"producer_step": 0, "source_kind": "external_context"}},
+    )
+    assert _verified_bindings_from_runtime_trace(
+        runtime_binding_trace=external_trace,
+        script_content='def run(args):\n    return args["topic"]\n',
+        script_path="scripts/x.py",
+    ) == {"topic": "user_request"}

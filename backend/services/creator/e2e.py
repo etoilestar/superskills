@@ -441,11 +441,13 @@ def _verified_bindings_from_runtime_trace(
         if not isinstance(item, dict):
             continue
         source_root = str(item.get("source_root") or "").strip()
+        source_provenance = item.get("source_provenance") if isinstance(item.get("source_provenance"), dict) else {}
+        source_kind = str(source_provenance.get("source_kind") or "")
+        source_is_verifiable = source_kind in {"external_context", "stdout"}
         if (
             source_root
             and str(item.get("placeholder_expr") or "").strip()
-            and isinstance(item.get("source_provenance"), dict)
-            and item.get("source_provenance")
+            and source_is_verifiable
             and str(target) in accepted
         ):
             verified[str(target)] = source_root
@@ -457,7 +459,7 @@ def snapshot_runtime_files(root: Path) -> dict[str, dict[str, Any]]:
     base = root.resolve()
     out: dict[str, dict[str, Any]] = {}
     for path in base.rglob("*"):
-        if not path.is_file() or any(part in {".venv", "__pycache__", ".pytest_cache"} for part in path.parts):
+        if not path.is_file() or any(part in {".venv", "__pycache__", ".pytest_cache", ".git", "node_modules"} for part in path.parts):
             continue
         try:
             stat = path.stat()
@@ -501,6 +503,29 @@ def _artifact_failure_code(filesystem_trace: dict[str, Any]) -> str:
     if not created and not resolved:
         return "artifact_not_created"
     return "artifact_validation_failed"
+
+
+def _is_artifact_validation_failure(
+    *,
+    error: Exception | str,
+    reported_paths: list[str],
+    entry: SkillPlanEntry,
+) -> bool:
+    error_text = str(error or "").lower()
+    validator_says_artifact = any(
+        token in error_text
+        for token in (
+            "artifact",
+            "file output",
+            "file_outputs",
+            "文件产物",
+            "产物路径",
+            "路径不存在",
+        )
+    )
+    artifact_contract = getattr(entry, "artifact_contract", None)
+    has_artifact_contract = bool(artifact_contract) if isinstance(artifact_contract, (dict, list, tuple, str)) else False
+    return bool(reported_paths) or validator_says_artifact or has_artifact_contract
 
 
 _ARTIFACT_FAILURE_PROGRESS = {
@@ -3120,7 +3145,12 @@ def _parse_e2e_stdout_json(
         )
     except ValueError as exc:
         artifact_code = _artifact_failure_code(filesystem_trace)
-        failure_code = artifact_code if "artifact" in str(exc).lower() or filesystem_trace.get("reported_paths") or filesystem_trace.get("created_files") else "stdout_contract"
+        is_artifact_validation = _is_artifact_validation_failure(
+            error=exc,
+            reported_paths=list(filesystem_trace.get("reported_paths") or []),
+            entry=entry,
+        )
+        failure_code = artifact_code if is_artifact_validation else "stdout_contract"
         if failure_code.startswith("artifact_"):
             filesystem_trace["failure_code"] = failure_code
         raise ValueError(
@@ -3512,6 +3542,10 @@ def _run_skill_workflow_e2e_once(
             except Exception:
                 pass
 
+        provided_external_keys = {
+            str(key)
+            for key in (external_context or {}).keys()
+        } if isinstance(external_context, dict) else set()
         payload: dict[str, Any] = _seed_initial_e2e_payload(
             commands,
             external_context=external_context,
@@ -3520,7 +3554,12 @@ def _run_skill_workflow_e2e_once(
             skill_plan_entries=skill_plan_entries,
         )
         value_provenance: dict[str, Any] = {
-            str(key): _provenance_record(step=0, script="external_context", source_kind="fixture", value=value)
+            str(key): _provenance_record(
+                step=0,
+                script="external_context",
+                source_kind="external_context" if str(key) in provided_external_keys else "synthetic_fixture",
+                value=value,
+            )
             for key, value in payload.items()
         }
         typed_input_specs = _collect_e2e_typed_inputs_from_graph(
@@ -4411,18 +4450,28 @@ async def _repair_existing_file_for_e2e_failure(
     filesystem_trace_for_context = (failure_details or {}).get("filesystem_trace") or {}
     created_count = int(artifact_runtime_state.get("created_count") or 0)
     missing_reported_count = int(artifact_runtime_state.get("missing_reported_count") or 0)
-    if filesystem_trace_for_context and created_count > 0 and missing_reported_count > 0:
+    failure_code = str((failure_details or {}).get("failure_code") or "")
+    failure_layer = str(structured_failure.get("layer") or "")
+    is_artifact_failure = failure_code.startswith("artifact_")
+    if is_artifact_failure and created_count > 0 and missing_reported_count > 0:
         allowed_edit_scope = ["stdout artifact path mapping", "relative path normalization"]
-    elif filesystem_trace_for_context and created_count == 0:
+    elif is_artifact_failure and created_count == 0:
         allowed_edit_scope = ["artifact creation", "artifact save path", "stdout artifact return"]
     elif target_path == "SKILL.md":
-        allowed_edit_scope = ["SKILL.md current command line"]
+        allowed_edit_scope = ["SKILL.md current failed command line"]
+    elif failure_code in {"argv_schema_error", "argv_guard"}:
+        allowed_edit_scope = ["current script strict_json_argv_guard/run entry alignment"]
+    elif failure_code in {"script_exit", "timeout"} or failure_layer in {"script_exit", "timeout"}:
+        allowed_edit_scope = ["traceback directly involved source region"]
+    elif failure_code in {"stdout_contract", "stdout_json_parse", "stdout_json_type"}:
+        allowed_edit_scope = ["current script stdout serialization and return logic"]
     else:
-        allowed_edit_scope = ["current script guard/run entry area", "current script stdout/artifact return area"]
+        allowed_edit_scope = ["current failure directly involved source region"]
     minimal_repair_context = {
         "target_file": target_path,
-        "failure_layer": structured_failure.get("layer"),
-        "failure_code": (failure_details or {}).get("failure_code"),
+        "failure_layer": failure_layer,
+        "failure_code": failure_code,
+        "is_artifact_failure": is_artifact_failure,
         "runtime_binding_trace": (failure_details or {}).get("runtime_binding_trace") or (failure_details or {}).get("variable_trace", {}).get("runtime_binding_trace") or {},
         "rendered_payload": structured_failure.get("rendered_payload") or {},
         "stdout": structured_failure.get("stdout") or "",

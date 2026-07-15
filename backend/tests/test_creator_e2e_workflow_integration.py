@@ -109,6 +109,7 @@ def test_two_step_e2e_trace_files_verified_bindings_and_checkpoint_reuse(tmp_pat
         assert step2_checkpoint["verified_bindings"] == {"content": "story_text"}
         assert step2_checkpoint["runtime_binding_trace"]["content"]["source_root"] == "story_text"
         assert step2_checkpoint["runtime_binding_trace"]["content"]["source_provenance"]["producer_script"] == "scripts/step1.py"
+        assert step2_checkpoint["runtime_binding_trace"]["content"]["source_provenance"]["source_kind"] == "stdout"
         assert "story_text" in step2_checkpoint["value_provenance"]
         assert any(item["relative_path"] == "outputs/result.dat" for item in step2_checkpoint["filesystem_diff"]["created_files"])
 
@@ -132,6 +133,7 @@ def test_two_step_e2e_trace_files_verified_bindings_and_checkpoint_reuse(tmp_pat
         assert session.verified_bindings_by_script["scripts/step2.py"] == {"content": "story_text"}
         step1_checkpoint = json.loads(e2e._checkpoint_path(session, 1).read_text(encoding="utf-8"))
         assert step1_checkpoint["status"] == "passed"
+        assert step1_checkpoint["runtime_binding_trace"]["topic"]["source_provenance"]["source_kind"] == "external_context"
         assert "story_text" in step1_checkpoint["context_after"]
         assert "story_text" in step1_checkpoint["value_provenance"]
     finally:
