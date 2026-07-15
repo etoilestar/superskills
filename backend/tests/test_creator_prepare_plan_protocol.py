@@ -1727,6 +1727,43 @@ def test_validate_structured_responsibility_edge_transport_accepts_function_item
     ) == [edge]
 
 
+@pytest.mark.parametrize(
+    ("asset_path", "expected"),
+    [
+        ("assets/template.pdf", True),
+        ("assets/layout.v1", True),
+        ("assets/subdir/static-resource", True),
+        ("assets/", False),
+        ("assets/${x}", False),
+        ("assets/{{x}}", False),
+        ("assets/<x>", False),
+        ("assets/[x]", False),
+        ("assets/*", False),
+    ],
+)
+def test_concrete_assets_file_path_rejects_only_dynamic_path_structure(asset_path, expected):
+    assert api._is_concrete_assets_file_path(asset_path) is expected
+
+
+@pytest.mark.parametrize("asset_source", ["", "user_upload", "bundled"])
+def test_filter_unconfirmed_asset_plan_file_plan_asset_source_is_not_evidence(asset_source):
+    files = [_file("SKILL.md"), _file("assets/template.pdf", asset_source=asset_source)]
+    assets = []
+
+    warnings = api._filter_unconfirmed_asset_plan(
+        files=files,
+        asset_requirements=assets,
+        uploaded_files=[],
+        review_summary=api.PreparePlanReviewSummary(),
+    )
+
+    assert "assets/template.pdf" not in [f.path for f in files]
+    assert any(
+        w.get("code") == "ungrounded_asset_plan_removed"
+        and "assets/template.pdf" in w.get("files", [])
+        for w in warnings
+    )
+
 def test_filter_unconfirmed_asset_plan_removes_model_asset_without_structured_evidence():
     summary = api.PreparePlanReviewSummary(
         files_to_create_or_update=["SKILL.md", "assets/template.pdf"],

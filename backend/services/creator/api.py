@@ -4387,14 +4387,32 @@ def _sync_prepare_summary_files_from_skill_plan(
 
 def _is_concrete_assets_file_path(path: str) -> bool:
     normalized = _normalize_skill_path(str(path or ""))
+
     if not normalized.startswith("assets/"):
         return False
-    if normalized in {"assets", "assets/"} or normalized.endswith("/"):
+
+    if normalized in {"assets", "assets/"}:
         return False
-    if _is_directory_like_skill_path(normalized):
+
+    if normalized.endswith("/"):
         return False
-    if re.search(r"[<>{}*]|\$\{|\[[^\]]*(?:name|path|file|ext|文件|名称)[^\]]*\]", normalized, re.I):
+
+    # Only reject dynamic path syntax; do not infer meaning from placeholder text.
+    if any(
+        marker in normalized
+        for marker in (
+            "${",
+            "{{",
+            "}}",
+            "<",
+            ">",
+            "[",
+            "]",
+            "*",
+        )
+    ):
         return False
+
     return True
 
 
@@ -4408,8 +4426,8 @@ def _filter_unconfirmed_asset_plan(
     """Remove assets/** plan entries that lack structured user confirmation.
 
     This is intentionally deterministic: allowed paths come only from explicit
-    include_as_asset upload decisions or source=user_explicit structured asset
-    requirements/file metadata already present in the final plan.
+    include_as_asset upload decisions or source=user_explicit structured
+    asset requirements produced before the final file plan.
     """
     allowed_paths: set[str] = set()
 
@@ -4422,7 +4440,7 @@ def _filter_unconfirmed_asset_plan(
         if _is_concrete_assets_file_path(path):
             allowed_paths.add(path)
 
-    for item in list(files or []) + list(asset_requirements or []):
+    for item in asset_requirements or []:
         source = str(getattr(item, "source", "") or "").strip()
         if source != "user_explicit":
             continue
