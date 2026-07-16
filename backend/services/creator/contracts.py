@@ -381,6 +381,162 @@ def _loads_templated_json_argv_object(text: str) -> Any:
     """Load a JSON argv template, allowing unquoted placeholders as null values."""
     return json.loads(_replace_unquoted_json_template_placeholders(text))
 
+def _explicit_field_names(value: Iterable[str] | Mapping[str, Any] | None) -> set[str]:
+    """Collect only field names that are explicit placeholder roots/paths."""
+    if value is None:
+        return set()
+    if isinstance(value, Mapping):
+        return {str(key).strip() for key in value.keys() if str(key or "").strip()}
+    return {str(item).strip() for item in value or [] if str(item or "").strip()}
+
+
+def _explicit_alignment_sources(function_execution_context: Mapping[str, Any] | None) -> set[str]:
+    """Extract only explicit graph/binding sources that can be placeholders."""
+    ctx = function_execution_context or {}
+    sources: set[str] = set()
+    for edge in ctx.get("incoming_edges") or []:
+        if not isinstance(edge, Mapping):
+            continue
+        source = str(edge.get("from_output") or "").strip()
+        if source:
+            sources.add(source)
+    for binding in ctx.get("input_bindings") or ctx.get("explicit_input_bindings") or []:
+        if not isinstance(binding, Mapping):
+            continue
+        source = str(binding.get("source") or binding.get("source_field") or "").strip()
+        if source:
+            sources.add(source)
+    return sources
+
+
+def _explicit_graph_confirmed_bindings(
+    function_execution_context: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Return explicit target->source bindings from incoming edges/bindings."""
+    ctx = function_execution_context or {}
+    bindings: dict[str, str] = {}
+    for edge in ctx.get("incoming_edges") or []:
+        if not isinstance(edge, Mapping):
+            continue
+        target = str(edge.get("to_input") or "").strip()
+        source = str(edge.get("from_output") or "").strip()
+        if target and source:
+            bindings[target] = source
+    for binding in ctx.get("input_bindings") or ctx.get("explicit_input_bindings") or []:
+        if not isinstance(binding, Mapping):
+            continue
+        target = str(binding.get("target") or binding.get("target_key") or binding.get("to_input") or "").strip()
+        source = str(binding.get("source") or binding.get("source_field") or "").strip()
+        if target and source:
+            bindings[target] = source
+    return bindings
+
+
+def _command_placeholder_bindings(command: str, script_path: str) -> dict[str, str]:
+    sig = _command_signature(command, script_path) or {}
+    placeholders = sig.get("placeholders") or {}
+    bindings: dict[str, str] = {}
+    for key, source in placeholders.items():
+        source_text = str(source or "").strip()
+        if source_text and not source_text.startswith("__"):
+            bindings[str(key)] = source_text
+    return bindings
+
+
+def build_command_alignment_snapshot(
+    *,
+    script_path: str,
+    script_content: str = "",
+    command: str = "",
+    platform_input_fields: Iterable[str] | Mapping[str, Any] | None = None,
+    prior_stdout_fields: Iterable[str] | Mapping[str, Any] | None = None,
+    function_execution_context: Mapping[str, Any] | None = None,
+    script_defaults: Mapping[str, Any] | Iterable[str] | None = None,
+    e2e_verified_bindings: Mapping[str, str] | None = None,
+    candidate_bindings: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build the shared SKILL.md/script argv alignment snapshot.
+
+    The snapshot only transports existing facts: guard schema, run(args) reads,
+    explicit graph edges, platform inputs, prior stdout fields, the current
+    command template, defaults, and optional E2E-verified bindings.  It never
+    matches by name similarity or invents business fields.
+    """
+    schema: dict[str, Any] = {}
+    run_analysis: dict[str, Any] = {}
+    if script_content and script_path.endswith(".py"):
+        try:
+            schema = extract_python_strict_argv_schema(script_content)
+        except Exception:
+            schema = {}
+        try:
+            run_analysis = _python_run_args_analysis(script_content)
+        except Exception:
+            run_analysis = {}
+
+    allowed = schema.get("allowed_keys")
+    required = schema.get("required_keys")
+    read_keys = set(str(k) for k in (run_analysis.get("required_read_keys") or []))
+    read_keys.update(str(k) for k in (run_analysis.get("optional_read_keys") or []))
+    if allowed is None:
+        target_keys = sorted(read_keys)
+    else:
+        target_keys = sorted(str(k) for k in (allowed or []) if str(k or "").strip())
+        target_keys = sorted(set(target_keys) | read_keys)
+    required_target_keys = sorted(
+        set(str(k) for k in (required or []) if str(k or "").strip())
+        | set(str(k) for k in (run_analysis.get("required_read_keys") or []))
+    )
+
+    accepted_targets = set(target_keys)
+    sources: set[str] = set()
+    sources.update(_explicit_field_names(platform_input_fields))
+    sources.update(_explicit_field_names(prior_stdout_fields))
+    sources.update(_explicit_alignment_sources(function_execution_context))
+
+    confirmed: dict[str, str] = {}
+    candidates: dict[str, dict[str, Any]] = {}
+
+    def candidate_record(target_text: str, source_text: str) -> dict[str, Any]:
+        return {
+            "source": source_text,
+            "valid_target": target_text in accepted_targets,
+            "source_available": source_text in sources,
+        }
+
+    for mapping in (_explicit_graph_confirmed_bindings(function_execution_context), e2e_verified_bindings or {}):
+        for target, source in mapping.items():
+            target_text = str(target or "").strip()
+            source_text = str(source or "").strip()
+            if target_text in accepted_targets and source_text in sources:
+                confirmed[target_text] = source_text
+            elif target_text and source_text:
+                candidates[target_text] = candidate_record(target_text, source_text)
+
+    for mapping in (_command_placeholder_bindings(command, script_path), candidate_bindings or {}):
+        for target, source in mapping.items():
+            target_text = str(target or "").strip()
+            source_text = str(source or "").strip()
+            if target_text and source_text and target_text not in confirmed:
+                # Current command/template/model suggestions remain candidates until
+                # E2E or an explicit contract verifies both sides.
+                candidates[target_text] = candidate_record(target_text, source_text)
+
+    unresolved = [
+        key for key in required_target_keys
+        if key not in confirmed
+    ]
+
+    return {
+        "script_path": script_path,
+        "target_keys": target_keys,
+        "required_target_keys": required_target_keys,
+        "available_sources": sorted(sources),
+        "confirmed_bindings": {key: confirmed[key] for key in sorted(confirmed)},
+        "candidate_bindings": {key: candidates[key] for key in sorted(candidates)},
+        "unresolved_target_keys": sorted(unresolved),
+    }
+
 
 def _explicit_field_names(value: Iterable[str] | Mapping[str, Any] | None) -> set[str]:
     """Collect only field names that are explicit placeholder roots/paths."""
