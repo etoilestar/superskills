@@ -795,6 +795,61 @@ def _filter_snippets_to_available_callables(
             out.append(snippet)
     return out
 
+def _registry_tool_from_available_index(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve one available_tools index row to a Registry function fact."""
+
+    if not isinstance(item, dict):
+        return None
+
+    function_name = str(item.get("function_name") or "").strip()
+    tool_id = str(item.get("tool_id") or "").strip()
+    capability_name = str(item.get("capability_name") or "").strip()
+    if not capability_name and "." in tool_id:
+        capability_name = tool_id.split(".", 1)[0].strip()
+    if not capability_name:
+        capability_name = tool_id.strip()
+    if not function_name and "." in tool_id:
+        function_name = tool_id.rsplit(".", 1)[-1].strip()
+    if not capability_name or not function_name:
+        return None
+
+    capability = get_tool_capability(capability_name)
+    if capability is None:
+        return None
+
+    for function in getattr(capability, "functions", []) or []:
+        registry_function_name = str(getattr(function, "function_name", "") or "").strip()
+        if registry_function_name != function_name:
+            continue
+        import_path = str(getattr(function, "import_path", "") or "").strip()
+        if not import_path:
+            return None
+        example_call = str(getattr(function, "example_call", "") or "").strip()
+        return {
+            "tool_id": tool_id or f"{capability_name}.{function_name}",
+            "capability_name": capability_name,
+            "description": str(getattr(function, "when_to_use", "") or getattr(function, "short_description", "") or getattr(capability, "display_name", "") or capability_name),
+            "short_description": str(getattr(function, "short_description", "") or ""),
+            "when_to_use": str(getattr(function, "when_to_use", "") or ""),
+            "function_name": function_name,
+            "import_path": import_path,
+            "call_template": example_call or f"from {import_path} import {function_name}\nresult = {function_name}(...)",
+            "signature": str(getattr(function, "signature", "") or ""),
+            "input_schema": getattr(function, "input_schema", None) or {},
+            "output_schema": getattr(function, "output_schema", None) or {},
+            "return_contract": str(getattr(function, "return_contract", "") or ""),
+            "example_return": str(getattr(function, "example_return", "") or ""),
+            "example_stdout": str(getattr(function, "example_stdout", "") or ""),
+            "common_mistakes": list(getattr(function, "common_mistakes", []) or []),
+            "usage_policy": str(getattr(function, "usage_policy", "") or getattr(capability, "usage_policy", "") or ""),
+            "required_env": list(getattr(function, "required_env", []) or getattr(capability, "required_env", []) or []),
+            "required_secrets": list(getattr(function, "required_secrets", []) or getattr(capability, "required_secrets", []) or []),
+            "artifact_outputs": list(getattr(function, "artifact_outputs", []) or getattr(capability, "artifact_outputs", []) or []),
+            "side_effects": list(getattr(function, "side_effects", []) or getattr(capability, "side_effects", []) or []),
+        }
+    return None
+
+
 def _available_tool_cards_from_binding(
     binding: dict[str, Any],
 ) -> tuple[
@@ -802,255 +857,104 @@ def _available_tool_cards_from_binding(
     list[str],
     list[str],
 ]:
-    """Build code-model tool context from authorized Registry contracts.
+    """Resolve authorized available_tools indexes into Registry facts/cards."""
 
-    Tool selection and authorization already happened before this function.
-
-    Current File Tool Binding provides exact allowed tool IDs.
-    Registry provides descriptions, callable IO, return contracts, examples,
-    mistakes, artifacts, and side effects.
-    """
-
-    available_tools: list[
-        dict[str, Any]
-    ] = []
-
+    resolved_tools: list[dict[str, Any]] = []
     tool_function_cards: list[str] = []
-
     selected_tool_names: list[str] = []
 
-    bound_available_tools = (
+    bound_available_tools = binding.get("available_tools") if isinstance(binding, dict) else []
+    for item in bound_available_tools if isinstance(bound_available_tools, list) else []:
+        resolved_tool = _registry_tool_from_available_index(item)
+        if not resolved_tool:
+            continue
+        capability_name = str(resolved_tool.get("capability_name") or "").strip()
+        if capability_name and capability_name not in selected_tool_names:
+            selected_tool_names.append(capability_name)
+        resolved_tools.append(resolved_tool)
+        tool_function_cards.append(_tool_function_card_from_available_tool(resolved_tool))
+
+    return (resolved_tools, tool_function_cards, selected_tool_names)
+
+def build_available_tool_context(
+    current_file_tool_binding: dict[str, Any],
+    *,
+    role: str = "",
+    file_path: str = "",
+    max_snippets: int = 8,
+    failure_layer: str | None = None,
+    error_text: str | None = None,
+) -> dict[str, Any]:
+    """Resolve all model-visible tool context from one binding index.
+
+    ``current_file_tool_binding["available_tools"]`` is the sole tool index.
+    Cards, snippets, compatibility allowed_* fields, and selected names are
+    derived only from that index via Registry projection helpers.
+    """
+
+    binding = dict(current_file_tool_binding or {})
+    raw_available_tools = (
         binding.get("available_tools")
-        if isinstance(binding, dict)
+        if isinstance(binding.get("available_tools"), list)
         else []
     )
-    if isinstance(bound_available_tools, list) and bound_available_tools:
-        for item in bound_available_tools:
-            if not isinstance(item, dict):
-                continue
-            function_name = str(item.get("function_name") or "").strip()
-            import_path = str(item.get("import_path") or "").strip()
-            tool_id = str(item.get("tool_id") or "").strip()
-            if not tool_id or not function_name or not import_path:
-                continue
-            capability_name = str(item.get("capability_name") or tool_id.split(".", 1)[0]).strip()
-            selected_tool_names.append(capability_name)
-            normalized_tool = {
-                **item,
-                "tool_id": tool_id,
-                "capability_name": capability_name,
-                "function_name": function_name,
-                "import_path": import_path,
-                "input_schema": item.get("input_schema") or {},
-                "output_schema": item.get("output_schema") or {},
-                "call_template": item.get("call_template") or f"from {import_path} import {function_name}\nresult = {function_name}(...)",
-            }
-            available_tools.append(normalized_tool)
-            tool_function_cards.append(
-                _tool_function_card_from_available_tool(
-                    normalized_tool
-                )
-            )
-        return (available_tools, tool_function_cards, selected_tool_names)
+    binding["available_tools"] = [
+        dict(tool)
+        for tool in raw_available_tools
+        if isinstance(tool, dict)
+    ]
 
-    contracts = tool_contracts_from_binding(
-        binding
-    )
-
-    for contract in contracts:
-        tool_name = str(
-            contract.get("tool_id")
-            or ""
-        ).strip()
-
-        if not tool_name:
-            continue
-
-        selected_tool_names.append(
-            tool_name
-        )
-
-        capability = get_tool_capability(
-            tool_name
-        )
-
-        if capability is not None:
-            tool_function_cards.extend(
-                function_cards_for_tool(
-                    capability
-                )
-            )
-
-        for function in (
-            contract.get("functions")
-            or []
-        ):
-            if not isinstance(
-                function,
-                dict,
-            ):
-                continue
-
-            function_name = str(
-                function.get(
-                    "function_name"
-                )
-                or ""
-            ).strip()
-
-            import_path = str(
-                function.get("import_path")
-                or ""
-            ).strip()
-
-            if (
-                not function_name
-                or not import_path
-            ):
-                continue
-
-            example_call = str(
-                function.get("example_call")
-                or ""
-            ).strip()
-
-            call_template = (
-                example_call
-                or (
-                    f"from {import_path} "
-                    f"import {function_name}\n"
-                    f"result = "
-                    f"{function_name}(...)"
-                )
-            )
-
-            available_tools.append({
-                "tool_id": (
-                    f"{tool_name}."
-                    f"{function_name}"
-                ),
-                "capability_name": (
-                    tool_name
-                ),
-                "description": str(
-                    function.get(
-                        "when_to_use"
-                    )
-                    or function.get(
-                        "short_description"
-                    )
-                    or contract.get(
-                        "display_name"
-                    )
-                    or tool_name
-                ),
-                "short_description": str(
-                    function.get(
-                        "short_description"
-                    )
-                    or ""
-                ),
-                "when_to_use": str(
-                    function.get(
-                        "when_to_use"
-                    )
-                    or ""
-                ),
-                "call_template": (
-                    call_template
-                ),
-                "signature": str(
-                    function.get("signature")
-                    or ""
-                ),
-                "input_schema": (
-                    function.get(
-                        "input_schema"
-                    )
-                    or contract.get(
-                        "input_schema"
-                    )
-                    or {}
-                ),
-                "output_schema": (
-                    function.get(
-                        "output_schema"
-                    )
-                    or contract.get(
-                        "output_schema"
-                    )
-                    or {}
-                ),
-                "return_contract": str(
-                    function.get(
-                        "return_contract"
-                    )
-                    or ""
-                ),
-                "example_return": str(
-                    function.get(
-                        "example_return"
-                    )
-                    or ""
-                ),
-                "example_stdout": str(
-                    function.get(
-                        "example_stdout"
-                    )
-                    or ""
-                ),
-                "common_mistakes": list(
-                    function.get(
-                        "common_mistakes"
-                    )
-                    or []
-                ),
-                "usage_policy": str(
-                    function.get(
-                        "usage_policy"
-                    )
-                    or contract.get(
-                        "usage_policy"
-                    )
-                    or ""
-                ),
-                "required_env": list(
-                    function.get(
-                        "required_env"
-                    )
-                    or []
-                ),
-                "required_secrets": list(
-                    function.get(
-                        "required_secrets"
-                    )
-                    or []
-                ),
-                "artifact_outputs": list(
-                    function.get(
-                        "artifact_outputs"
-                    )
-                    or contract.get(
-                        "artifact_outputs"
-                    )
-                    or []
-                ),
-                "side_effects": list(
-                    function.get(
-                        "side_effects"
-                    )
-                    or contract.get(
-                        "side_effects"
-                    )
-                    or []
-                ),
-            })
-
-    return (
+    (
         available_tools,
         tool_function_cards,
         selected_tool_names,
+    ) = _available_tool_cards_from_binding(binding)
+
+    capability_ids = [
+        tool_name
+        for tool_name in selected_tool_names
+        if get_tool_capability(tool_name) is not None
+    ]
+    snippets = _filter_snippets_to_available_callables(
+        resolve_tool_snippets_for_context(
+            role=role or "",
+            capabilities=list(dict.fromkeys(capability_ids)),
+            tool_names=list(dict.fromkeys(capability_ids)),
+            file_path=file_path,
+            failure_layer=failure_layer,
+            error_text=error_text,
+            max_snippets=max_snippets,
+        ),
+        available_tools,
     )
+
+    allowed_import_paths = _stable_unique([
+        tool.get("import_path")
+        for tool in available_tools
+        if isinstance(tool, dict)
+    ])
+    allowed_function_imports = _stable_unique([
+        tool.get("function_name")
+        for tool in available_tools
+        if isinstance(tool, dict)
+    ])
+    allowed_helper_imports = _stable_unique([
+        tool.get("function_name")
+        for tool in available_tools
+        if isinstance(tool, dict)
+    ])
+
+    return {
+        "available_tools": binding["available_tools"],
+        "resolved_tools": available_tools,
+        "tool_function_cards": tool_function_cards,
+        "tool_snippets": snippets,
+        "tool_snippet_prompt": tool_snippet_prompt(snippets),
+        "selected_tool_names": selected_tool_names,
+        "allowed_import_paths": allowed_import_paths,
+        "allowed_function_imports": allowed_function_imports,
+        "allowed_helper_imports": allowed_helper_imports,
+    }
 
 def _script_local_contract_payload(
     *,
@@ -1127,35 +1031,6 @@ def _script_local_contract_payload(
         )
     )
 
-    if isinstance(tool_binding_summary, dict):
-        available_tools_for_binding = (
-            tool_binding_summary.get("available_tools")
-            if isinstance(tool_binding_summary.get("available_tools"), list)
-            else []
-        )
-        tool_binding_summary["available_tools"] = available_tools_for_binding
-        tool_binding_summary["allowed_function_imports"] = _stable_unique([
-            item
-            for tool in available_tools_for_binding
-            if isinstance(tool, dict)
-            for item in (
-                tool.get("function_name"),
-                f"{tool.get('import_path')}.{tool.get('function_name')}"
-                if tool.get("import_path") and tool.get("function_name")
-                else "",
-            )
-        ])
-        tool_binding_summary["allowed_import_paths"] = _stable_unique([
-            tool.get("import_path")
-            for tool in available_tools_for_binding
-            if isinstance(tool, dict)
-        ])
-        tool_binding_summary["allowed_helper_imports"] = _stable_unique([
-            tool.get("function_name")
-            for tool in available_tools_for_binding
-            if isinstance(tool, dict)
-        ])
-
     if function_execution_context is None:
         function_execution_context = build_function_execution_context(
             graph=responsibility_graph,
@@ -1186,44 +1061,19 @@ def _script_local_contract_payload(
             )
         )
 
-    (
-        available_tools,
-        tool_function_cards,
-        selected_tool_names,
-    ) = _available_tool_cards_from_binding(
-        tool_binding_summary
+    tool_context = build_available_tool_context(
+        tool_binding_summary,
+        role=plan_entry.role or "",
+        file_path=file_path,
+        max_snippets=8,
     )
-
-    bound_capability_ids = [
-        tool_name
-        for tool_name
-        in selected_tool_names
-        if get_tool_capability(
-            tool_name
-        )
-        is not None
-    ]
-
-    tool_snippets = _filter_snippets_to_available_callables(
-        resolve_tool_snippets_for_context(
-            role=plan_entry.role or "",
-            capabilities=list(
-                dict.fromkeys(
-                    bound_capability_ids
-                )
-            ),
-            tool_names=list(
-                dict.fromkeys(
-                    bound_capability_ids
-                )
-            ),
-            file_path=file_path,
-            max_snippets=8,
-        ),
-        available_tools,
-    )
-
-    tool_binding_summary["available_tools"] = available_tools
+    available_tools = tool_context["available_tools"]
+    resolved_tools = tool_context["resolved_tools"]
+    tool_function_cards = tool_context["tool_function_cards"]
+    tool_snippets = tool_context["tool_snippets"]
+    tool_binding_summary["allowed_import_paths"] = tool_context["allowed_import_paths"]
+    tool_binding_summary["allowed_function_imports"] = tool_context["allowed_function_imports"]
+    tool_binding_summary["allowed_helper_imports"] = tool_context["allowed_helper_imports"]
 
     return {
         "file_path": file_path,
@@ -1238,6 +1088,7 @@ def _script_local_contract_payload(
         "function_item_graph_context": function_execution_context,
         "function_execution_context": function_execution_context,
         "available_tools": available_tools,
+        "resolved_tools": resolved_tools,
         "tool_function_cards": (
             tool_function_cards
         ),
@@ -1709,49 +1560,6 @@ def _build_script_generate_file_prompt_variant(
             function_execution_context=function_execution_context,
         )
     )
-
-    if (
-        isinstance(skill_plan_entry, dict)
-        and isinstance(
-            skill_plan_entry.get(
-                "tool_binding_summary"
-            ),
-            dict,
-        )
-    ):
-        raw_binding = (
-            _ensure_python_script_core_binding(
-                dict(
-                    skill_plan_entry.get(
-                        "tool_binding_summary"
-                    )
-                    or {}
-                ),
-                plan_entry,
-            )
-        )
-
-        local_contract[
-            "current_file_tool_binding"
-        ] = raw_binding
-
-        local_contract[
-            "allowed_helper_imports"
-        ] = list(
-            raw_binding.get(
-                "allowed_helper_imports"
-            )
-            or []
-        )
-
-        if function_execution_context is None:
-            local_contract["function_execution_context"] = build_function_execution_context(
-                graph=responsibility_graph,
-                target_file=file_path,
-                current_file_tool_binding=raw_binding,
-                fallback_function_item=(local_contract.get("responsibility_requirements") or [{}])[0],
-            )
-            local_contract["function_item_graph_context"] = local_contract["function_execution_context"]
 
     implementation_payload = (
         local_contract.get(
