@@ -12740,7 +12740,6 @@ async def generate_file(request: GenerateFileRequest):
                                     "repair_instructions": reference_review.get("repair_instructions") or "Patch only this reference's semantic content.",
                                     "review": reference_review,
                                 }, ensure_ascii=False, default=str),
-                                original=ScriptFunctionalValidationError(issues, layer="reference_semantic"),
                             )
 
                     elif request.file_path.startswith("scripts/"):

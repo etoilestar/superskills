@@ -5159,6 +5159,58 @@ async def _run_script_responsibility_review(
         "advisory_notes": data.get("advisory_notes") if isinstance(data.get("advisory_notes"), list) else [],
     }
 
+
+def _normalize_reference_semantic_issues(
+    raw_issues: Any,
+    *,
+    file_path: str,
+    repair_instructions: str = "",
+) -> list[dict[str, Any]]:
+    """Normalize reference semantic judge issues without semantic judgment."""
+    if raw_issues is None:
+        candidates: list[Any] = []
+    elif isinstance(raw_issues, list):
+        candidates = raw_issues
+    else:
+        candidates = [raw_issues]
+
+    normalized: list[dict[str, Any]] = []
+    fallback_reason = "Reference semantic judge failed this file."
+    fallback_edit = (
+        str(repair_instructions or "").strip()
+        or "Patch only this reference's semantic content."
+    )
+
+    for candidate in candidates:
+        issue_number = len(normalized) + 1
+        if isinstance(candidate, str):
+            reason = candidate.strip() or fallback_reason
+            normalized.append({
+                "id": f"reference_semantic.issue_{issue_number}",
+                "failed_file": file_path,
+                "reason": reason,
+                "minimal_edit": fallback_edit,
+            })
+            continue
+
+        if isinstance(candidate, Mapping):
+            issue = dict(candidate)
+            issue.setdefault("id", f"reference_semantic.issue_{issue_number}")
+            issue.setdefault("failed_file", file_path)
+            reason = (
+                issue.get("reason")
+                or issue.get("message")
+                or issue.get("problem")
+                or issue.get("detail")
+                or fallback_reason
+            )
+            issue["reason"] = str(reason)
+            minimal_edit = issue.get("minimal_edit") or fallback_edit
+            issue["minimal_edit"] = str(minimal_edit)
+            normalized.append(issue)
+
+    return normalized
+
 async def _run_reference_semantic_review(
     *,
     file_path: str,
@@ -5217,8 +5269,12 @@ async def _run_reference_semantic_review(
         data = _parse_validator_json_object(last_text)
         if isinstance(data, dict) and data:
             passed = bool(data.get("passed"))
-            issues = data.get("issues") if isinstance(data.get("issues"), list) else data.get("blocking_issues")
-            issues = issues if isinstance(issues, list) else []
+            raw_issues = data.get("issues") if "issues" in data else data.get("blocking_issues")
+            issues = _normalize_reference_semantic_issues(
+                raw_issues,
+                file_path=file_path,
+                repair_instructions=str(data.get("repair_instructions") or ""),
+            )
             if not passed and not issues:
                 issues = [{
                     "id": "reference_semantic.failed",

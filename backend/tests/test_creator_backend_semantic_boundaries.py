@@ -608,3 +608,110 @@ def test_skill_md_and_markdown_rewrite_prompts_use_input_json_position_arg_wordi
         assert "输入 JSON" in prompt
         assert "第一个位置参数" in prompt
         assert "sys.argv[1]" in prompt
+
+
+@pytest.mark.asyncio
+async def test_reference_semantic_review_normalizes_string_issues(monkeypatch):
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(repair, "route_model", lambda *a, **k: Route())
+
+    async def fake_complete(messages, model):
+        return json.dumps({
+            "passed": False,
+            "issues": [
+                "reference 内容与自身职责不一致",
+                "reference 错误承担了 executable script 职责",
+            ],
+            "repair_instructions": "只修改正文语义内容",
+        })
+
+    monkeypatch.setattr(repair, "complete_chat_once", fake_complete)
+
+    result = await repair._run_reference_semantic_review(
+        file_path="references/example.md",
+        content="# Example\n\nBody",
+        purpose="example reference",
+    )
+
+    assert result["passed"] is False
+    assert len(result["issues"]) == 2
+    assert all(isinstance(issue, dict) for issue in result["issues"])
+    assert result["issues"][0]["failed_file"] == "references/example.md"
+    assert result["issues"][0]["reason"] == "reference 内容与自身职责不一致"
+
+
+@pytest.mark.asyncio
+async def test_reference_semantic_review_preserves_dict_issues(monkeypatch):
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(repair, "route_model", lambda *a, **k: Route())
+
+    async def fake_complete(messages, model):
+        return json.dumps({
+            "passed": False,
+            "issues": [{
+                "id": "custom.reference.issue",
+                "reason": "内容跑题",
+                "minimal_edit": "修正正文",
+                "extra_field": "preserve me",
+            }],
+        })
+
+    monkeypatch.setattr(repair, "complete_chat_once", fake_complete)
+
+    result = await repair._run_reference_semantic_review(
+        file_path="references/example.md",
+        content="# Example\n\nBody",
+        purpose="example reference",
+    )
+
+    issue = result["issues"][0]
+    assert issue["id"] == "custom.reference.issue"
+    assert issue["reason"] == "内容跑题"
+    assert issue["minimal_edit"] == "修正正文"
+    assert issue["failed_file"] == "references/example.md"
+    assert issue["extra_field"] == "preserve me"
+
+
+@pytest.mark.asyncio
+async def test_reference_semantic_review_generates_fallback_issue_when_empty(monkeypatch):
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(repair, "route_model", lambda *a, **k: Route())
+
+    async def fake_complete(messages, model):
+        return json.dumps({
+            "passed": False,
+            "issues": [],
+            "reason": "reference semantic failure",
+            "repair_instructions": "patch body",
+        })
+
+    monkeypatch.setattr(repair, "complete_chat_once", fake_complete)
+
+    result = await repair._run_reference_semantic_review(
+        file_path="references/example.md",
+        content="# Example\n\nBody",
+        purpose="example reference",
+    )
+
+    assert result["passed"] is False
+    assert result["issues"][0]["id"] == "reference_semantic.failed"
+    assert result["issues"][0]["failed_file"] == "references/example.md"
+
+
+def test_reference_generate_file_branch_does_not_wrap_script_exception():
+    import inspect
+
+    source = inspect.getsource(generate_file)
+    start = source.index('elif request.file_path.startswith("references/"):')
+    end = source.index('elif request.file_path.startswith("scripts/"):', start)
+    reference_block = source[start:end]
+
+    assert "ScriptFunctionalValidationError" not in reference_block
+    assert 'source="reference_semantic_failed"' in reference_block
+    assert 'layer="semantic"' in reference_block
