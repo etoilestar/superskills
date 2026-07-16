@@ -1052,6 +1052,87 @@ def _available_tool_cards_from_binding(
         selected_tool_names,
     )
 
+
+def build_available_tool_context(
+    current_file_tool_binding: dict[str, Any],
+    *,
+    role: str = "",
+    file_path: str = "",
+    max_snippets: int = 8,
+    failure_layer: str | None = None,
+    error_text: str | None = None,
+) -> dict[str, Any]:
+    """Resolve all model-visible tool context from one binding index.
+
+    ``current_file_tool_binding["available_tools"]`` is the sole tool index.
+    Cards, snippets, compatibility allowed_* fields, and selected names are
+    derived only from that index via Registry projection helpers.
+    """
+
+    binding = dict(current_file_tool_binding or {})
+    raw_available_tools = (
+        binding.get("available_tools")
+        if isinstance(binding.get("available_tools"), list)
+        else []
+    )
+    binding["available_tools"] = [
+        dict(tool)
+        for tool in raw_available_tools
+        if isinstance(tool, dict)
+    ]
+
+    (
+        available_tools,
+        tool_function_cards,
+        selected_tool_names,
+    ) = _available_tool_cards_from_binding(binding)
+
+    capability_ids = [
+        tool_name
+        for tool_name in selected_tool_names
+        if get_tool_capability(tool_name) is not None
+    ]
+    snippets = _filter_snippets_to_available_callables(
+        resolve_tool_snippets_for_context(
+            role=role or "",
+            capabilities=list(dict.fromkeys(capability_ids)),
+            tool_names=list(dict.fromkeys(capability_ids)),
+            file_path=file_path,
+            failure_layer=failure_layer,
+            error_text=error_text,
+            max_snippets=max_snippets,
+        ),
+        available_tools,
+    )
+
+    allowed_import_paths = _stable_unique([
+        tool.get("import_path")
+        for tool in available_tools
+        if isinstance(tool, dict)
+    ])
+    allowed_function_imports = _stable_unique([
+        tool.get("function_name")
+        for tool in available_tools
+        if isinstance(tool, dict)
+    ])
+    allowed_helper_imports = _stable_unique([
+        tool.get("function_name")
+        for tool in available_tools
+        if isinstance(tool, dict)
+    ])
+
+    return {
+        "available_tools": available_tools,
+        "resolved_tools": available_tools,
+        "tool_function_cards": tool_function_cards,
+        "tool_snippets": snippets,
+        "tool_snippet_prompt": tool_snippet_prompt(snippets),
+        "selected_tool_names": selected_tool_names,
+        "allowed_import_paths": allowed_import_paths,
+        "allowed_function_imports": allowed_function_imports,
+        "allowed_helper_imports": allowed_helper_imports,
+    }
+
 def _script_local_contract_payload(
     *,
     file_path: str,
@@ -1127,35 +1208,6 @@ def _script_local_contract_payload(
         )
     )
 
-    if isinstance(tool_binding_summary, dict):
-        available_tools_for_binding = (
-            tool_binding_summary.get("available_tools")
-            if isinstance(tool_binding_summary.get("available_tools"), list)
-            else []
-        )
-        tool_binding_summary["available_tools"] = available_tools_for_binding
-        tool_binding_summary["allowed_function_imports"] = _stable_unique([
-            item
-            for tool in available_tools_for_binding
-            if isinstance(tool, dict)
-            for item in (
-                tool.get("function_name"),
-                f"{tool.get('import_path')}.{tool.get('function_name')}"
-                if tool.get("import_path") and tool.get("function_name")
-                else "",
-            )
-        ])
-        tool_binding_summary["allowed_import_paths"] = _stable_unique([
-            tool.get("import_path")
-            for tool in available_tools_for_binding
-            if isinstance(tool, dict)
-        ])
-        tool_binding_summary["allowed_helper_imports"] = _stable_unique([
-            tool.get("function_name")
-            for tool in available_tools_for_binding
-            if isinstance(tool, dict)
-        ])
-
     if function_execution_context is None:
         function_execution_context = build_function_execution_context(
             graph=responsibility_graph,
@@ -1186,44 +1238,19 @@ def _script_local_contract_payload(
             )
         )
 
-    (
-        available_tools,
-        tool_function_cards,
-        selected_tool_names,
-    ) = _available_tool_cards_from_binding(
-        tool_binding_summary
+    tool_context = build_available_tool_context(
+        tool_binding_summary,
+        role=plan_entry.role or "",
+        file_path=file_path,
+        max_snippets=8,
     )
-
-    bound_capability_ids = [
-        tool_name
-        for tool_name
-        in selected_tool_names
-        if get_tool_capability(
-            tool_name
-        )
-        is not None
-    ]
-
-    tool_snippets = _filter_snippets_to_available_callables(
-        resolve_tool_snippets_for_context(
-            role=plan_entry.role or "",
-            capabilities=list(
-                dict.fromkeys(
-                    bound_capability_ids
-                )
-            ),
-            tool_names=list(
-                dict.fromkeys(
-                    bound_capability_ids
-                )
-            ),
-            file_path=file_path,
-            max_snippets=8,
-        ),
-        available_tools,
-    )
-
+    available_tools = tool_context["available_tools"]
+    tool_function_cards = tool_context["tool_function_cards"]
+    tool_snippets = tool_context["tool_snippets"]
     tool_binding_summary["available_tools"] = available_tools
+    tool_binding_summary["allowed_import_paths"] = tool_context["allowed_import_paths"]
+    tool_binding_summary["allowed_function_imports"] = tool_context["allowed_function_imports"]
+    tool_binding_summary["allowed_helper_imports"] = tool_context["allowed_helper_imports"]
 
     return {
         "file_path": file_path,
@@ -1709,49 +1736,6 @@ def _build_script_generate_file_prompt_variant(
             function_execution_context=function_execution_context,
         )
     )
-
-    if (
-        isinstance(skill_plan_entry, dict)
-        and isinstance(
-            skill_plan_entry.get(
-                "tool_binding_summary"
-            ),
-            dict,
-        )
-    ):
-        raw_binding = (
-            _ensure_python_script_core_binding(
-                dict(
-                    skill_plan_entry.get(
-                        "tool_binding_summary"
-                    )
-                    or {}
-                ),
-                plan_entry,
-            )
-        )
-
-        local_contract[
-            "current_file_tool_binding"
-        ] = raw_binding
-
-        local_contract[
-            "allowed_helper_imports"
-        ] = list(
-            raw_binding.get(
-                "allowed_helper_imports"
-            )
-            or []
-        )
-
-        if function_execution_context is None:
-            local_contract["function_execution_context"] = build_function_execution_context(
-                graph=responsibility_graph,
-                target_file=file_path,
-                current_file_tool_binding=raw_binding,
-                fallback_function_item=(local_contract.get("responsibility_requirements") or [{}])[0],
-            )
-            local_contract["function_item_graph_context"] = local_contract["function_execution_context"]
 
     implementation_payload = (
         local_contract.get(

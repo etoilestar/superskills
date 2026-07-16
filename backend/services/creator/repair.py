@@ -2972,20 +2972,15 @@ async def _repair_generated_file_with_feedback(
         if plan_entry is not None:
             bound_tool_ids: list[str] = []
 
-            for key in (
-                    "primary_tool_ids",
-                    "secondary_tool_ids",
-                    "allowed_tool_ids",
-            ):
-                for tool_id in (
-                                       current_file_binding or {}
-                               ).get(key, []) or []:
-                    tool_id = str(tool_id or "").strip()
-
-                    if (
-                            tool_id
-                            and tool_id not in bound_tool_ids
-                    ):
+            for tool in (current_file_binding or {}).get("available_tools", []) or []:
+                if not isinstance(tool, dict):
+                    continue
+                for candidate in (
+                    tool.get("capability_name"),
+                    str(tool.get("tool_id") or "").split(".", 1)[0],
+                ):
+                    tool_id = str(candidate or "").strip()
+                    if tool_id and tool_id not in bound_tool_ids:
                         bound_tool_ids.append(tool_id)
 
             snippets = resolve_tool_snippets_for_context(
@@ -4871,53 +4866,6 @@ async def _run_script_responsibility_review(
     ):
         current_file_tool_binding = {}
 
-    if (
-        str(
-            getattr(
-                skill_plan_entry,
-                "runtime",
-                "",
-            )
-            or ""
-        ).strip().lower()
-        == "python"
-    ):
-        current_file_tool_binding = dict(
-            current_file_tool_binding
-        )
-
-        for key, value in (
-            (
-                "allowed_tool_ids",
-                "script_argv_guard",
-            ),
-            (
-                "primary_tool_ids",
-                "script_argv_guard",
-            ),
-            (
-                "allowed_helper_imports",
-                "strict_json_argv_guard",
-            ),
-        ):
-            values = [
-                str(item).strip()
-                for item in (
-                    current_file_tool_binding.get(
-                        key
-                    )
-                    or []
-                )
-                if str(item or "").strip()
-            ]
-
-            if value not in values:
-                values.append(value)
-
-            current_file_tool_binding[
-                key
-            ] = values
-
     provided_function_execution_context = review_context.get("function_execution_context")
     if isinstance(provided_function_execution_context, dict):
         function_execution_context = dict(provided_function_execution_context)
@@ -5117,9 +5065,10 @@ async def _run_script_responsibility_review(
                 "当前文件 requirements / must_do：\n"
 
                 f"{json.dumps(req_payload, ensure_ascii=False, default=str)[:8000]}\n\n"
+                "当前文件 available_tools（唯一工具索引，来自 Current File Tool Binding）：\n"
+                f"{json.dumps((current_file_tool_binding or {}).get('available_tools') or [], ensure_ascii=False, default=str)[:8000]}\n\n"
                 "当前文件已授权工具合同"
-                "（来自 Current File Tool Binding "
-                "中的 tool_id 回查 Tool Registry）：\n"
+                "（仅根据上述 available_tools 回查 Tool Registry）：\n"
                 f"{json.dumps(authorized_tool_contracts,ensure_ascii=False,default=str,)[:16000]}\n\n"
                 "脚本试运行输出（如本阶段尚未运行则为空或说明未提供）：\n"
                 f"{json.dumps(trial_stdout, ensure_ascii=False, default=str)[:4000]}\n\n"

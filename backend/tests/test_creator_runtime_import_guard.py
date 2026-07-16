@@ -143,3 +143,24 @@ def test_arbitrary_platform_import_outside_available_tools_is_rejected():
     result = guard_runtime_imports(src, 'scripts/a.py', {'available_tools': []})
     assert not result.success
     assert result.error_type == 'generated_tool_import_not_in_available_tools'
+
+
+def test_import_guard_rejects_bound_tool_call_missing_required_schema_key():
+    src = """from backend.services.runtime_tools.custom_tools.lookup import lookup_value
+
+lookup_value()
+"""
+    result = guard_runtime_imports(
+        src,
+        'scripts/a.py',
+        {'available_tools': [{
+            'tool_id': 'lookup.lookup_value',
+            'function_name': 'lookup_value',
+            'import_path': 'backend.services.runtime_tools.custom_tools.lookup',
+            'input_schema': {'type': 'object', 'required': ['query'], 'properties': {'query': {'type': 'string'}}},
+            'output_schema': {'type': 'object'},
+        }]},
+    )
+    assert not result.success
+    assert result.error_type == 'generated_tool_call_schema_mismatch'
+    assert 'query' in result.forbidden_imports[0]
