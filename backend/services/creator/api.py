@@ -29,7 +29,7 @@ from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_s
 from .tool_pool_store import (
     save_tool_pool,
     load_tool_pool,
-    get_file_binding,
+    get_file_binding as _store_get_file_binding,
     get_skill_tool_binding,
     tool_pool_snapshot,
 )
@@ -41,10 +41,57 @@ from .tool_pool_models import (
     ToolPoolDeniedRequest,
     ToolPoolMissingRequest,
     ToolPoolTool,
+    ToolPoolFileBinding,
+    ToolPoolModel,
 )
 from ..creator_tool_registry import get_tool_capability
 from .runtime_import_guard import guard_runtime_imports
 from .basic_format import check_patch_candidate_basic_format
+
+
+def _creator_file_binding_from_optional_tool_ids(
+    *,
+    pool: ToolPoolModel,
+    target_file: str,
+    allowed_tool_ids: list[str],
+    include_script_core: bool = False,
+) -> ToolPoolFileBinding:
+    allowed_set = {
+        str(tool_id or "").strip()
+        for tool_id in (allowed_tool_ids or [])
+        if str(tool_id or "").strip()
+    }
+    filtered_pool = pool.model_copy(deep=True)
+    filtered_pool.tools = [
+        tool
+        for tool in filtered_pool.tools
+        if tool.status == "allowed" and str(tool.tool_id or "").strip() in allowed_set
+    ]
+    return get_skill_tool_binding(
+        filtered_pool,
+        target_file=target_file,
+        include_script_core=include_script_core,
+    )
+
+
+def get_file_binding(
+    pool: ToolPoolModel,
+    target_file: str,
+    *,
+    raw: bool = False,
+) -> ToolPoolFileBinding | None:
+    normalized_target = str(target_file or "").replace("\\", "/").strip()
+    for binding in (pool.file_bindings or []):
+        if str(binding.target_file or "").replace("\\", "/").strip() == normalized_target:
+            if raw:
+                return binding
+            return _creator_file_binding_from_optional_tool_ids(
+                pool=pool,
+                target_file=normalized_target,
+                allowed_tool_ids=list(binding.allowed_tool_ids or []),
+                include_script_core=True,
+            )
+    return _store_get_file_binding(pool, normalized_target, raw=raw)
 
 
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
@@ -10167,6 +10214,11 @@ async def _prepare_plan_impl(
         tool_planning["tool_pool"]
     )
 
+    planned_file_bindings = [
+        binding.model_copy(deep=True)
+        for binding in (current_tool_pool.file_bindings or [])
+    ]
+
     tool_pool = build_tool_pool(
         skill_name=plan.skill_name,
 
@@ -10195,6 +10247,22 @@ async def _prepare_plan_impl(
             current_tool_pool
         ),
     )
+
+    restored_file_bindings = []
+    for binding in planned_file_bindings:
+        target_file = _normalize_skill_path(
+            str(binding.target_file or "")
+        )
+        if not target_file.startswith("scripts/"):
+            continue
+        rebuilt_binding = _creator_file_binding_from_optional_tool_ids(
+            pool=tool_pool,
+            target_file=target_file,
+            allowed_tool_ids=list(binding.allowed_tool_ids or []),
+        )
+        if rebuilt_binding.allowed_tool_ids:
+            restored_file_bindings.append(rebuilt_binding)
+    tool_pool.file_bindings = restored_file_bindings
 
     save_tool_pool(
         skill_dir_for_tool_pool,
