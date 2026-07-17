@@ -240,33 +240,46 @@ def get_file_binding(
     *,
     raw: bool = False,
 ) -> ToolPoolFileBinding | None:
-    """Backward-compatible script projection accessor.
+    """Return the persisted per-file optional tool view when present."""
 
-    Creator no longer persists independent per-file tool authorization.
+    normalized_target = str(target_file or "").replace("\\", "/").strip()
 
-    raw=True therefore has no mutable per-file binding to return.
-
-    raw=False returns a transient projection of the current Skill-wide ToolPool
-    for scripts/** consumers.
-
-    The function name is retained temporarily to avoid rewriting generation,
-    responsibility review, import guard, and existing API call sites in the same
-    migration.
-    """
-
-    normalized_target = str(
-        target_file or ""
-    ).replace(
-        "\\",
-        "/",
-    ).strip()
-
-    if raw:
+    if not normalized_target.startswith("scripts/"):
         return None
 
-    if not normalized_target.startswith(
-        "scripts/"
-    ):
+    for binding in pool.file_bindings or []:
+        if str(binding.target_file or "").replace("\\", "/").strip() != normalized_target:
+            continue
+        if raw:
+            return binding
+        projected = binding.model_copy(deep=True)
+        guard_contract = {
+            "tool_id": "script_argv_guard",
+            "function_name": "strict_json_argv_guard",
+            "import_path": "backend.services.runtime_tools",
+            "input_schema": {},
+            "output_schema": {},
+        }
+        available_tools = [
+            item
+            for item in (projected.available_tools or [])
+            if not (
+                isinstance(item, dict)
+                and item.get("tool_id") == "script_argv_guard"
+                and item.get("function_name") == "strict_json_argv_guard"
+                and item.get("import_path") == "backend.services.runtime_tools"
+            )
+        ]
+        projected.available_tools = [guard_contract, *available_tools]
+        helper_imports, import_paths, function_imports = _derive_legacy_fields_from_available_tools(projected.available_tools)
+        projected.allowed_tool_ids = _stable_unique(["script_argv_guard", *list(projected.allowed_tool_ids or [])])
+        projected.primary_tool_ids = _stable_unique(["script_argv_guard", *list(projected.primary_tool_ids or [])])
+        projected.allowed_helper_imports = _stable_unique([*list(projected.allowed_helper_imports or []), *helper_imports])
+        projected.allowed_import_paths = _stable_unique([*list(projected.allowed_import_paths or []), *import_paths])
+        projected.allowed_function_imports = _stable_unique([*list(projected.allowed_function_imports or []), *function_imports])
+        return projected
+
+    if raw:
         return None
 
     return get_skill_tool_binding(
@@ -359,9 +372,10 @@ def tool_pool_snapshot(
             if tool.status == "allowed"
         ],
 
-        # Legacy compatibility only.
-        # Per-file authorization is no longer used.
-        "file_bindings": [],
+        "file_bindings": [
+            binding.model_dump(mode="json")
+            for binding in (pool.file_bindings or [])
+        ],
 
         "denied_requests": [
             item.model_dump(

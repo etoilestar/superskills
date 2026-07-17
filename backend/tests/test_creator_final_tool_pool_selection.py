@@ -9,7 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.services.creator import api
-from backend.services.creator.tool_pool_models import ToolPoolModel, ToolPoolTool
+from backend.services.creator.tool_pool_models import ToolPoolFileBinding, ToolPoolModel, ToolPoolTool
 from backend.services.creator.tool_pool_store import load_tool_pool, save_tool_pool
 
 
@@ -68,7 +68,7 @@ def test_embedding_recall_keeps_exact_match_plus_top_k_union_contract():
 
 
 @pytest.mark.asyncio
-async def test_recalled_exact_and_embedding_candidates_all_enter_desired_tool_ids(monkeypatch, tmp_path):
+async def test_recalled_candidates_are_separated_from_available_optional_tools(monkeypatch, tmp_path):
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
     monkeypatch.setattr(
         api,
@@ -93,12 +93,16 @@ async def test_recalled_exact_and_embedding_candidates_all_enter_desired_tool_id
         file_specs=[{"path": "scripts/a.py", "required": True, "required_capabilities": ["exact"]}],
     )
 
-    assert result["desired_tool_ids"] == ["embedding_beta", "exact_alpha"]
-    assert result["planner_output"]["desired_tool_ids"] == ["embedding_beta", "exact_alpha"]
-    assert result["planner_output"]["candidate_tool_ids"] == ["exact_alpha", "embedding_beta"]
-    assert result["planner_output"]["decisions"] == {"exact_alpha": True, "embedding_beta": True}
+    assert result["recalled_candidate_tool_ids"] == ["exact_alpha", "embedding_beta"]
+    assert result["available_optional_tool_ids"] == []
+    assert result["unavailable_tool_ids"] == ["embedding_beta", "exact_alpha"]
+    assert result["tool_bindings_by_file"] == {}
+    assert result["planner_output"]["recalled_candidate_tool_ids"] == ["exact_alpha", "embedding_beta"]
+    assert result["planner_output"]["desired_tool_ids"] == ["exact_alpha", "embedding_beta"]
+    assert result["planner_output"]["authorized_tool_ids"] == []
+    assert "decisions" not in result["planner_output"]
     assert result["planner_output"]["recall_source"] == "exact capability recall + embedding top-k recall union"
-    assert result["planner_output"]["selection_mode"] == "recall_union_no_llm"
+    assert result["planner_output"]["selection_mode"] == "function_item_owned_optional_recall_no_llm"
 
 
 @pytest.mark.asyncio
@@ -119,11 +123,13 @@ async def test_final_tool_pool_planning_never_calls_llm_selector_phases(monkeypa
     assert calls == []
     assert "final_tool_selection" not in calls
     assert "final_tool_selection_convergence" not in calls
+    assert result["recalled_candidate_tool_ids"] == ["callable_alpha"]
     assert result["desired_tool_ids"] == ["callable_alpha"]
+    assert result["authorized_tool_ids"] == []
 
 
 @pytest.mark.asyncio
-async def test_auto_final_tool_planning_is_add_only_and_disables_removal(monkeypatch, tmp_path):
+async def test_auto_final_tool_planning_refreshes_optional_view_without_removal(monkeypatch, tmp_path):
     apply_kwargs = {}
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
     skill_dir = tmp_path / "demo"
@@ -151,7 +157,8 @@ async def test_auto_final_tool_planning_is_add_only_and_disables_removal(monkeyp
     patch = result["computed_patch"]["tool_pool_patch"]
     assert patch["remove_tool_requests"] == []
     assert apply_kwargs["allow_remove"] is False
-    assert result["desired_tool_ids"] == ["new_recalled_tool"]
+    assert result["recalled_candidate_tool_ids"] == ["new_recalled_tool"]
+    assert result["tool_bindings_by_file"] == {}
 
 
 @pytest.mark.asyncio
@@ -206,7 +213,7 @@ def test_backend_gate_still_rejects_unusable_tools(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_gate_denied_recalled_candidate_remains_desired_but_unavailable(monkeypatch, tmp_path):
+async def test_gate_denied_recalled_candidate_remains_candidate_but_unavailable(monkeypatch, tmp_path):
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
     monkeypatch.setattr(
         api,
@@ -225,11 +232,11 @@ async def test_gate_denied_recalled_candidate_remains_desired_but_unavailable(mo
         file_specs=[{"path": "scripts/a.py", "required": True}],
     )
 
-    assert result["desired_tool_ids"] == ["definitely_not_registered_tool", "system_text_generation"]
-    assert result["authorized_tool_ids"] == ["system_text_generation"]
+    assert result["recalled_candidate_tool_ids"] == ["system_text_generation", "definitely_not_registered_tool"]
+    assert result["available_optional_tool_ids"] == ["system_text_generation"]
     assert result["unavailable_tool_ids"] == ["definitely_not_registered_tool"]
-    assert result["planner_output"]["desired_tool_ids"] == ["definitely_not_registered_tool", "system_text_generation"]
-    assert result["planner_output"]["authorized_tool_ids"] == ["system_text_generation"]
+    assert result["planner_output"]["recalled_candidate_tool_ids"] == ["system_text_generation", "definitely_not_registered_tool"]
+    assert result["planner_output"]["available_optional_tool_ids"] == ["system_text_generation"]
     assert result["planner_output"]["unavailable_tool_ids"] == ["definitely_not_registered_tool"]
 
     pool = load_tool_pool(tmp_path / "demo")
@@ -244,9 +251,9 @@ def test_final_tool_pool_computed_patch_uses_recall_union_wording():
 
     assert "passed Backend factual authorization checks" not in source
     assert "Final Tool Selector marked this Registry candidate" not in source
-    assert "submitted to Backend factual" in source
-    assert "no post-recall semantic" in source
-    assert "recall_union_no_llm" in source
+    assert "Backend factual authorization" in source
+    assert "Passing Gate means optional availability" in source
+    assert "function_item_owned_optional_recall_no_llm" in source
 
 
 def test_first_round_semantic_judge_tool_augmentation_flow_is_unchanged():
@@ -321,7 +328,7 @@ def test_tool_readiness_blockers_are_judge_observations_not_producer_failures():
 
 def test_initial_skill_binding_syncs_before_generate_prompt_build():
     source = inspect.getsource(api.generate_file)
-    binding_created = source.index('current_skill_binding_payload = current_skill_binding.model_dump(mode="json")')
+    binding_created = source.index('current_skill_binding_payload = current_file_binding.model_dump(mode="json")')
     entry_sync = source.index('effective_skill_plan_entry = _with_current_skill_tool_binding', binding_created)
     prompt_build = source.index('_build_generate_file_prompt(', entry_sync)
     assert binding_created < entry_sync < prompt_build
@@ -341,3 +348,313 @@ def test_refreshed_binding_syncs_entry_before_context_guard_and_repair():
     assert refresh_block.index(entry_sync) < refresh_block.index(context_refresh)
     assert refresh_block.index(context_refresh) < refresh_block.index(guard_refresh)
     assert refresh_end < repair_start
+
+
+@pytest.mark.asyncio
+async def test_available_optional_tools_are_bound_only_to_owning_function_item(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(
+        api,
+        "_recall_creator_tool_candidates",
+        lambda file_specs, top_k: (
+            [
+                {"tool_id": "system_text_generation", "recalled_for_capabilities": ["write"]},
+                {"tool_id": "system_image_generation", "recalled_for_capabilities": ["draw"]},
+            ],
+            "test",
+        ),
+    )
+
+    result = await api._plan_final_tool_pool(
+        skill_name="demo",
+        file_specs=[
+            {"path": "scripts/write.py", "required": True, "required_capabilities": ["write"]},
+            {"path": "scripts/draw.py", "required": True, "required_capabilities": ["draw"]},
+        ],
+    )
+
+    assert result["available_optional_tool_ids"] == ["system_image_generation", "system_text_generation"]
+    assert result["tool_bindings_by_file"] == {
+        "scripts/write.py": ["system_text_generation"],
+        "scripts/draw.py": ["system_image_generation"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_final_tool_pool_persists_file_bindings_and_compat_aliases(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(
+        api,
+        "_recall_creator_tool_candidates",
+        lambda file_specs, top_k: (
+            [{"tool_id": "system_text_generation", "recalled_for_capabilities": ["write"]}],
+            "test",
+        ),
+    )
+
+    result = await api._plan_final_tool_pool(
+        skill_name="demo",
+        file_specs=[{"path": "scripts/write.py", "required": True, "required_capabilities": ["write"]}],
+    )
+
+    assert result["desired_tool_ids"] == ["system_text_generation"]
+    assert result["authorized_tool_ids"] == ["system_text_generation"]
+    assert result["planner_output"]["desired_tool_ids"] == ["system_text_generation"]
+    assert result["planner_output"]["authorized_tool_ids"] == ["system_text_generation"]
+
+    pool = load_tool_pool(tmp_path / "demo")
+    raw_binding = api.get_file_binding(pool, "scripts/write.py", raw=True)
+    projected_binding = api.get_file_binding(pool, "scripts/write.py")
+    assert raw_binding is not None
+    assert raw_binding.allowed_tool_ids == ["system_text_generation"]
+    assert projected_binding is not None
+    assert "script_argv_guard" in projected_binding.allowed_tool_ids
+    assert "system_text_generation" in projected_binding.allowed_tool_ids
+    assert api.tool_pool_snapshot(pool)["file_bindings"][0]["target_file"] == "scripts/write.py"
+
+
+@pytest.mark.asyncio
+async def test_persisted_file_binding_keeps_selected_tool_env_dependencies_and_import_fields(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(
+        api,
+        "_recall_creator_tool_candidates",
+        lambda file_specs, top_k: (
+            [{"tool_id": "system_image_generation", "recalled_for_capabilities": ["draw"]}],
+            "test",
+        ),
+    )
+
+    result = await api._plan_final_tool_pool(
+        skill_name="demo",
+        file_specs=[{"path": "scripts/draw.py", "required": True, "required_capabilities": ["draw"]}],
+    )
+
+    binding = api.get_file_binding(result["tool_pool"], "scripts/draw.py", raw=True)
+    assert binding is not None
+    assert binding.allowed_tool_ids == ["system_image_generation"]
+    assert binding.allowed_import_paths
+    assert binding.allowed_function_imports
+    assert isinstance(binding.required_env, list)
+    assert isinstance(binding.dependencies, list)
+
+
+def test_file_binding_helper_preserves_selected_tool_env_dependencies_and_import_metadata():
+    pool = ToolPoolModel(
+        tools=[
+            ToolPoolTool(
+                tool_id="custom_tool",
+                status="allowed",
+                allowed_import_paths=["pkg.helpers"],
+                allowed_function_imports=["pkg.helpers.run"],
+                required_env=["CUSTOM_TOKEN"],
+                dependencies=["custom-lib"],
+            )
+        ]
+    )
+
+    binding = api._creator_file_binding_from_optional_tool_ids(
+        pool=pool,
+        target_file="scripts/custom.py",
+        allowed_tool_ids=["custom_tool"],
+    )
+
+    assert binding.allowed_tool_ids == ["custom_tool"]
+    assert binding.allowed_import_paths == ["pkg.helpers"]
+    assert binding.allowed_function_imports == ["pkg.helpers.run"]
+    assert binding.required_env == ["CUSTOM_TOKEN"]
+    assert binding.dependencies == ["custom-lib"]
+
+
+def _binding(target_file, tool_ids, available_tools=None):
+    return ToolPoolFileBinding(
+        target_file=target_file,
+        allowed_tool_ids=list(tool_ids),
+        primary_tool_ids=list(tool_ids),
+        available_tools=list(available_tools or []),
+    )
+
+
+def test_responsibility_feedback_merges_only_target_file_binding(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir(parents=True)
+    save_tool_pool(
+        skill_dir,
+        ToolPoolModel(
+            tools=[ToolPoolTool(tool_id="system_text_generation", status="allowed")],
+            file_bindings=[
+                _binding("scripts/a.py", ["system_text_generation"]),
+                _binding("scripts/b.py", ["system_text_generation"]),
+            ],
+        ),
+    )
+
+    api._apply_planner_tool_pool_patch(
+        skill_name="demo",
+        planner_output={
+            "tool_pool_patch": {
+                "add_tool_requests": [{"candidate_tool_id": "system_image_generation"}],
+                "remove_tool_requests": [],
+                "affected_files": ["scripts/a.py"],
+            }
+        },
+        source_phase="responsibility_feedback",
+        allow_remove=False,
+    )
+
+    pool = load_tool_pool(skill_dir)
+    by_file = {binding.target_file: binding for binding in pool.file_bindings}
+    assert by_file["scripts/a.py"].allowed_tool_ids == ["system_text_generation", "system_image_generation"]
+    assert by_file["scripts/b.py"].allowed_tool_ids == ["system_text_generation"]
+    assert {tool.tool_id for tool in pool.tools if tool.status == "allowed"} == {
+        "system_text_generation",
+        "system_image_generation",
+    }
+
+
+def test_patch_without_target_file_does_not_clear_existing_bindings(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir(parents=True)
+    original_bindings = [
+        _binding("scripts/a.py", ["system_text_generation"]),
+        _binding("scripts/b.py", ["system_image_generation"]),
+    ]
+    save_tool_pool(
+        skill_dir,
+        ToolPoolModel(
+            tools=[ToolPoolTool(tool_id="system_text_generation", status="allowed")],
+            file_bindings=original_bindings,
+        ),
+    )
+
+    api._apply_planner_tool_pool_patch(
+        skill_name="demo",
+        planner_output={
+            "tool_pool_patch": {
+                "add_tool_requests": [{"candidate_tool_id": "system_text_generation"}],
+                "remove_tool_requests": [],
+                "affected_files": [],
+            }
+        },
+        source_phase="responsibility_feedback",
+        allow_remove=False,
+    )
+
+    pool = load_tool_pool(skill_dir)
+    assert [binding.model_dump(mode="json") for binding in pool.file_bindings] == [
+        binding.model_dump(mode="json") for binding in original_bindings
+    ]
+
+
+def test_script_guard_projection_fields_match_for_persisted_and_fallback_bindings():
+    persisted_pool = ToolPoolModel(file_bindings=[_binding("scripts/a.py", [])])
+    fallback_pool = ToolPoolModel()
+
+    persisted = api.get_file_binding(persisted_pool, "scripts/a.py")
+    fallback = api.get_file_binding(fallback_pool, "scripts/a.py")
+
+    for binding in (persisted, fallback):
+        assert binding is not None
+        assert "script_argv_guard" in binding.allowed_tool_ids
+        assert "strict_json_argv_guard" in binding.allowed_helper_imports
+        assert "backend.services.runtime_tools" in binding.allowed_import_paths
+        assert "strict_json_argv_guard" in binding.allowed_function_imports
+        assert "backend.services.runtime_tools.strict_json_argv_guard" in binding.allowed_function_imports
+        guard_tools = [
+            tool for tool in binding.available_tools
+            if tool.get("tool_id") == "script_argv_guard"
+            and tool.get("function_name") == "strict_json_argv_guard"
+        ]
+        assert len(guard_tools) == 1
+
+
+def test_e2e_callable_repair_context_uses_current_file_binding_and_falls_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir(parents=True)
+    pool = ToolPoolModel(
+        tools=[
+            ToolPoolTool(tool_id="system_text_generation", status="allowed"),
+            ToolPoolTool(tool_id="system_image_generation", status="allowed"),
+        ]
+    )
+    pool.file_bindings = [
+        api._creator_file_binding_from_optional_tool_ids(
+            pool=pool,
+            target_file="scripts/a.py",
+            allowed_tool_ids=["system_text_generation"],
+        ),
+        api._creator_file_binding_from_optional_tool_ids(
+            pool=pool,
+            target_file="scripts/b.py",
+            allowed_tool_ids=["system_image_generation"],
+        ),
+    ]
+    save_tool_pool(skill_dir, pool)
+
+    context = api._build_e2e_callable_repair_context(skill_name="demo", target_file="scripts/a.py")
+    tool_ids = {tool.get("tool_id") for tool in context.get("available_tools", [])}
+    assert "system_text_generation" in tool_ids
+    assert "system_image_generation" not in tool_ids
+    assert "script_argv_guard" in tool_ids
+
+    save_tool_pool(skill_dir, ToolPoolModel(tools=[ToolPoolTool(tool_id="system_text_generation", status="allowed")]))
+    fallback_context = api._build_e2e_callable_repair_context(skill_name="demo", target_file="scripts/a.py")
+    fallback_tool_ids = {tool.get("tool_id") for tool in fallback_context.get("available_tools", [])}
+    assert "system_text_generation" in fallback_tool_ids
+    assert "script_argv_guard" in fallback_tool_ids
+
+
+def test_responsibility_feedback_without_existing_binding_does_not_create_partial_binding(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir(parents=True)
+    save_tool_pool(skill_dir, ToolPoolModel())
+
+    api._apply_planner_tool_pool_patch(
+        skill_name="demo",
+        planner_output={
+            "tool_pool_patch": {
+                "add_tool_requests": [{"candidate_tool_id": "system_text_generation"}],
+                "remove_tool_requests": [],
+                "affected_files": ["scripts/a.py"],
+            }
+        },
+        source_phase="responsibility_feedback",
+        allow_remove=False,
+    )
+
+    pool = load_tool_pool(skill_dir)
+    assert {tool.tool_id for tool in pool.tools if tool.status == "allowed"} == {"system_text_generation"}
+    assert pool.file_bindings == []
+
+
+@pytest.mark.asyncio
+async def test_final_planning_preserves_existing_file_tools_and_skips_empty_bindings(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir(parents=True)
+    save_tool_pool(
+        skill_dir,
+        ToolPoolModel(
+            tools=[ToolPoolTool(tool_id="system_text_generation", status="allowed")],
+            file_bindings=[_binding("scripts/a.py", ["system_text_generation"])],
+        ),
+    )
+    monkeypatch.setattr(api, "_recall_creator_tool_candidates", lambda file_specs, top_k: ([], "none"))
+
+    result = await api._plan_final_tool_pool(
+        skill_name="demo",
+        file_specs=[
+            {"path": "scripts/a.py", "required": True, "required_capabilities": []},
+            {"path": "scripts/b.py", "required": True, "required_capabilities": []},
+        ],
+    )
+
+    assert result["tool_bindings_by_file"] == {"scripts/a.py": ["system_text_generation"]}
+    pool = load_tool_pool(skill_dir)
+    assert [(binding.target_file, binding.allowed_tool_ids) for binding in pool.file_bindings] == [
+        ("scripts/a.py", ["system_text_generation"])
+    ]
