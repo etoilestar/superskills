@@ -253,22 +253,30 @@ def get_file_binding(
         if raw:
             return binding
         projected = binding.model_copy(deep=True)
-        if "script_argv_guard" not in projected.allowed_tool_ids:
-            projected.allowed_tool_ids = ["script_argv_guard", *list(projected.allowed_tool_ids or [])]
-        if "script_argv_guard" not in projected.primary_tool_ids:
-            projected.primary_tool_ids = ["script_argv_guard", *list(projected.primary_tool_ids or [])]
-        if "strict_json_argv_guard" not in projected.allowed_helper_imports:
-            projected.allowed_helper_imports = ["strict_json_argv_guard", *list(projected.allowed_helper_imports or [])]
-        projected.available_tools = [
-            {
-                "tool_id": "script_argv_guard",
-                "function_name": "strict_json_argv_guard",
-                "import_path": "backend.services.runtime_tools",
-                "input_schema": {},
-                "output_schema": {},
-            },
-            *list(projected.available_tools or []),
+        guard_contract = {
+            "tool_id": "script_argv_guard",
+            "function_name": "strict_json_argv_guard",
+            "import_path": "backend.services.runtime_tools",
+            "input_schema": {},
+            "output_schema": {},
+        }
+        available_tools = [
+            item
+            for item in (projected.available_tools or [])
+            if not (
+                isinstance(item, dict)
+                and item.get("tool_id") == "script_argv_guard"
+                and item.get("function_name") == "strict_json_argv_guard"
+                and item.get("import_path") == "backend.services.runtime_tools"
+            )
         ]
+        projected.available_tools = [guard_contract, *available_tools]
+        helper_imports, import_paths, function_imports = _derive_legacy_fields_from_available_tools(projected.available_tools)
+        projected.allowed_tool_ids = _stable_unique(["script_argv_guard", *list(projected.allowed_tool_ids or [])])
+        projected.primary_tool_ids = _stable_unique(["script_argv_guard", *list(projected.primary_tool_ids or [])])
+        projected.allowed_helper_imports = _stable_unique([*list(projected.allowed_helper_imports or []), *helper_imports])
+        projected.allowed_import_paths = _stable_unique([*list(projected.allowed_import_paths or []), *import_paths])
+        projected.allowed_function_imports = _stable_unique([*list(projected.allowed_function_imports or []), *function_imports])
         return projected
 
     if raw:

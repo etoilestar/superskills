@@ -9,7 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.services.creator import api
-from backend.services.creator.tool_pool_models import ToolPoolModel, ToolPoolTool
+from backend.services.creator.tool_pool_models import ToolPoolFileBinding, ToolPoolModel, ToolPoolTool
 from backend.services.creator.tool_pool_store import load_tool_pool, save_tool_pool
 
 
@@ -464,3 +464,144 @@ def test_file_binding_helper_preserves_selected_tool_env_dependencies_and_import
     assert binding.allowed_function_imports == ["pkg.helpers.run"]
     assert binding.required_env == ["CUSTOM_TOKEN"]
     assert binding.dependencies == ["custom-lib"]
+
+
+def _binding(target_file, tool_ids, available_tools=None):
+    return ToolPoolFileBinding(
+        target_file=target_file,
+        allowed_tool_ids=list(tool_ids),
+        primary_tool_ids=list(tool_ids),
+        available_tools=list(available_tools or []),
+    )
+
+
+def test_responsibility_feedback_merges_only_target_file_binding(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir(parents=True)
+    save_tool_pool(
+        skill_dir,
+        ToolPoolModel(
+            tools=[ToolPoolTool(tool_id="system_text_generation", status="allowed")],
+            file_bindings=[
+                _binding("scripts/a.py", ["system_text_generation"]),
+                _binding("scripts/b.py", ["system_text_generation"]),
+            ],
+        ),
+    )
+
+    api._apply_planner_tool_pool_patch(
+        skill_name="demo",
+        planner_output={
+            "tool_pool_patch": {
+                "add_tool_requests": [{"candidate_tool_id": "system_image_generation"}],
+                "remove_tool_requests": [],
+                "affected_files": ["scripts/a.py"],
+            }
+        },
+        source_phase="responsibility_feedback",
+        allow_remove=False,
+    )
+
+    pool = load_tool_pool(skill_dir)
+    by_file = {binding.target_file: binding for binding in pool.file_bindings}
+    assert by_file["scripts/a.py"].allowed_tool_ids == ["system_text_generation", "system_image_generation"]
+    assert by_file["scripts/b.py"].allowed_tool_ids == ["system_text_generation"]
+    assert {tool.tool_id for tool in pool.tools if tool.status == "allowed"} == {
+        "system_text_generation",
+        "system_image_generation",
+    }
+
+
+def test_patch_without_target_file_does_not_clear_existing_bindings(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir(parents=True)
+    original_bindings = [
+        _binding("scripts/a.py", ["system_text_generation"]),
+        _binding("scripts/b.py", ["system_image_generation"]),
+    ]
+    save_tool_pool(
+        skill_dir,
+        ToolPoolModel(
+            tools=[ToolPoolTool(tool_id="system_text_generation", status="allowed")],
+            file_bindings=original_bindings,
+        ),
+    )
+
+    api._apply_planner_tool_pool_patch(
+        skill_name="demo",
+        planner_output={
+            "tool_pool_patch": {
+                "add_tool_requests": [{"candidate_tool_id": "system_text_generation"}],
+                "remove_tool_requests": [],
+                "affected_files": [],
+            }
+        },
+        source_phase="responsibility_feedback",
+        allow_remove=False,
+    )
+
+    pool = load_tool_pool(skill_dir)
+    assert [binding.model_dump(mode="json") for binding in pool.file_bindings] == [
+        binding.model_dump(mode="json") for binding in original_bindings
+    ]
+
+
+def test_script_guard_projection_fields_match_for_persisted_and_fallback_bindings():
+    persisted_pool = ToolPoolModel(file_bindings=[_binding("scripts/a.py", [])])
+    fallback_pool = ToolPoolModel()
+
+    persisted = api.get_file_binding(persisted_pool, "scripts/a.py")
+    fallback = api.get_file_binding(fallback_pool, "scripts/a.py")
+
+    for binding in (persisted, fallback):
+        assert binding is not None
+        assert "script_argv_guard" in binding.allowed_tool_ids
+        assert "strict_json_argv_guard" in binding.allowed_helper_imports
+        assert "backend.services.runtime_tools" in binding.allowed_import_paths
+        assert "strict_json_argv_guard" in binding.allowed_function_imports
+        assert "backend.services.runtime_tools.strict_json_argv_guard" in binding.allowed_function_imports
+        guard_tools = [
+            tool for tool in binding.available_tools
+            if tool.get("tool_id") == "script_argv_guard"
+            and tool.get("function_name") == "strict_json_argv_guard"
+        ]
+        assert len(guard_tools) == 1
+
+
+def test_e2e_callable_repair_context_uses_current_file_binding_and_falls_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir(parents=True)
+    pool = ToolPoolModel(
+        tools=[
+            ToolPoolTool(tool_id="system_text_generation", status="allowed"),
+            ToolPoolTool(tool_id="system_image_generation", status="allowed"),
+        ]
+    )
+    pool.file_bindings = [
+        api._creator_file_binding_from_optional_tool_ids(
+            pool=pool,
+            target_file="scripts/a.py",
+            allowed_tool_ids=["system_text_generation"],
+        ),
+        api._creator_file_binding_from_optional_tool_ids(
+            pool=pool,
+            target_file="scripts/b.py",
+            allowed_tool_ids=["system_image_generation"],
+        ),
+    ]
+    save_tool_pool(skill_dir, pool)
+
+    context = api._build_e2e_callable_repair_context(skill_name="demo", target_file="scripts/a.py")
+    tool_ids = {tool.get("tool_id") for tool in context.get("available_tools", [])}
+    assert "system_text_generation" in tool_ids
+    assert "system_image_generation" not in tool_ids
+    assert "script_argv_guard" in tool_ids
+
+    save_tool_pool(skill_dir, ToolPoolModel(tools=[ToolPoolTool(tool_id="system_text_generation", status="allowed")]))
+    fallback_context = api._build_e2e_callable_repair_context(skill_name="demo", target_file="scripts/a.py")
+    fallback_tool_ids = {tool.get("tool_id") for tool in fallback_context.get("available_tools", [])}
+    assert "system_text_generation" in fallback_tool_ids
+    assert "script_argv_guard" in fallback_tool_ids

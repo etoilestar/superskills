@@ -47,6 +47,7 @@ from .tool_pool_models import (
 from ..creator_tool_registry import get_tool_capability
 from .runtime_import_guard import guard_runtime_imports
 from .basic_format import check_patch_candidate_basic_format
+from .command_normalizer import _effective_command_lines
 
 
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
@@ -93,11 +94,17 @@ def _build_e2e_callable_repair_context(
     target_file: str,
 ) -> dict[str, Any]:
     pool = load_tool_pool(settings.skills_path / skill_name)
-    binding = get_skill_tool_binding(
+    binding_obj = get_file_binding(
         pool,
-        target_file=target_file,
-        include_script_core=True,
-    ).model_dump(mode="json")
+        target_file,
+    )
+    if binding_obj is None:
+        binding_obj = get_skill_tool_binding(
+            pool,
+            target_file=target_file,
+            include_script_core=True,
+        )
+    binding = binding_obj.model_dump(mode="json")
     context = build_available_tool_context(
         binding,
         file_path=target_file,
@@ -3479,7 +3486,10 @@ def _apply_planner_tool_pool_patch(
 
     Backend Gate authorizes the proposed tool for the current Skill.
 
-    There is no per-file tool authorization.
+    ToolPool.tools remains Skill-wide factual availability.
+
+    file_bindings stores per-file optional prompt/runtime views and does not
+    require tool usage.
 
     Code model, responsibility judge, repair model, and E2E must never call this
     function to expand ToolPool.
@@ -3573,9 +3583,6 @@ def _apply_planner_tool_pool_patch(
     )
 
     pool.skill_name = safe_skill_name
-
-    # Retire historical per-file authorization state.
-    pool.file_bindings = []
 
     for tool in pool.tools:
         tool.target_files = []
@@ -3679,7 +3686,11 @@ def _apply_planner_tool_pool_patch(
         add_requests.append(
             request.model_copy(
                 update={
-                    "target_file": "",
+                    "target_file": (
+                        _normalize_skill_path(str(request.target_file or ""))
+                        if source_phase == "responsibility_feedback"
+                        else ""
+                    ),
                     "source": proposal_source,
                 }
             )
@@ -3762,6 +3773,8 @@ def _apply_planner_tool_pool_patch(
         "patch_present": True,
     }
 
+    current_patch_allowed_tool_ids: list[str] = []
+
     for request in add_requests:
         tool_id = str(
             request.candidate_tool_id
@@ -3832,6 +3845,9 @@ def _apply_planner_tool_pool_patch(
                 existing_tool.reason = (
                     request.reason
                 )
+
+            if tool_id not in current_patch_allowed_tool_ids:
+                current_patch_allowed_tool_ids.append(tool_id)
 
             total[
                 "attached_existing"
@@ -3956,6 +3972,9 @@ def _apply_planner_tool_pool_patch(
                 tool
             )
 
+            if gate_event.tool_id not in current_patch_allowed_tool_ids:
+                current_patch_allowed_tool_ids.append(gate_event.tool_id)
+
             total[
                 "allowed_new"
             ] += 1
@@ -4024,7 +4043,51 @@ def _apply_planner_tool_pool_patch(
             "denied_new"
         ] += 1
 
-    pool.file_bindings = []
+    feedback_target_file = ""
+    if source_phase == "responsibility_feedback":
+        affected_files = [
+            _normalize_skill_path(str(item or ""))
+            for item in (patch.affected_files or [])
+            if str(item or "").strip()
+        ]
+        request_targets = [
+            _normalize_skill_path(str(request.target_file or ""))
+            for request in add_requests
+            if str(request.target_file or "").strip()
+        ]
+        candidate_targets = [*affected_files, *request_targets]
+        legal_targets = [
+            target
+            for target in candidate_targets
+            if target.startswith("scripts/")
+        ]
+        if legal_targets:
+            feedback_target_file = legal_targets[0]
+
+    if feedback_target_file and current_patch_allowed_tool_ids:
+        existing_binding = next(
+            (
+                binding
+                for binding in (pool.file_bindings or [])
+                if _normalize_skill_path(str(binding.target_file or "")) == feedback_target_file
+            ),
+            None,
+        )
+        merged_tool_ids = merge_unique(
+            list(existing_binding.allowed_tool_ids or []) if existing_binding is not None else [],
+            current_patch_allowed_tool_ids,
+        )
+        rebuilt_binding = _creator_file_binding_from_optional_tool_ids(
+            pool=pool,
+            target_file=feedback_target_file,
+            allowed_tool_ids=merged_tool_ids,
+        )
+        pool.file_bindings = [
+            binding
+            for binding in (pool.file_bindings or [])
+            if _normalize_skill_path(str(binding.target_file or "")) != feedback_target_file
+        ]
+        pool.file_bindings.append(rebuilt_binding)
 
     save_tool_pool(
         skill_dir,
@@ -5930,6 +5993,13 @@ candidate_tool_catalog 已由统一 Tool recall 层产生：
                 invalid_candidate_tool_ids
             )
         )
+
+    if (
+        isinstance(data, dict)
+        and isinstance(data.get("tool_pool_patch"), dict)
+        and target_file
+    ):
+        data["tool_pool_patch"]["affected_files"] = [target_file]
 
     result = (
         _apply_planner_tool_pool_patch(
@@ -11828,11 +11898,14 @@ def _single_skill_md_command_block_failure(original: Exception | None) -> dict[s
 
 def _validate_repaired_skill_md_command_block(repaired_block: str, *, script_path: str) -> None:
     text = str(repaired_block or "")
-    if text.lstrip().startswith("---") or re.search(r"(?m)^\s{0,3}#{1,6}\s", text):
+    if text.lstrip().startswith("---"):
         raise ValueError("repaired command block must not contain frontmatter or Markdown headings")
     fence_matches = list(re.finditer(r"(?m)^\s*(`{3,}|~{3,})([^`\n]*)\s*$", text))
     if len(fence_matches) != 2:
         raise ValueError("repaired command block must contain exactly one fenced block")
+    outside_text = text[:fence_matches[0].start()] + text[fence_matches[1].end():]
+    if re.search(r"(?m)^\s{0,3}#{1,6}\s", outside_text):
+        raise ValueError("repaired command block must not contain frontmatter or Markdown headings")
     if text[:fence_matches[0].start()].strip() or text[fence_matches[1].end():].strip():
         raise ValueError("repaired command block must not contain prose outside the fence")
     if fence_matches[0].group(1)[0] != "`" or len(fence_matches[0].group(1)) != 3:
@@ -11840,7 +11913,7 @@ def _validate_repaired_skill_md_command_block(repaired_block: str, *, script_pat
     if (fence_matches[0].group(2) or "").strip().lower() != "bash":
         raise ValueError("repaired command block fence type must be bash")
     body = text[fence_matches[0].end():fence_matches[1].start()]
-    command_lines = [line for line in body.splitlines() if line.strip()]
+    command_lines = _effective_command_lines(body)
     if len(command_lines) != 1:
         raise ValueError("repaired command block must contain exactly one command line")
     if script_path not in command_lines[0]:
@@ -13207,8 +13280,8 @@ async def generate_file(request: GenerateFileRequest):
                                 model=route.model,
                                 skill_name=skill_name,
                                 block_text=(
-                                    single_block_locator.get("command_text")
-                                    or single_block_locator["block_text"]
+                                    single_block_locator.get("full_block_text")
+                                    or single_block_locator.get("block_text")
                                 ),
                                 script_path=single_block_locator["script_path"],
                                 structured_checks=single_block_locator.get("structured_checks") or {},

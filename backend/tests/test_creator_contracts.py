@@ -1402,3 +1402,100 @@ async def test_generate_file_repairs_first_of_multiple_blocks_after_real_format_
     assert "scripts/one.py" in body and "required" in body
     assert "scripts/two.py" in body and "literal" in body
     assert alignment_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_command_block_repair_receives_full_fenced_block(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api, contracts
+    from backend.services.creator.command_normalizer import parse_skill_md_bash_command_blocks
+    from backend.services.creator.common import GenerateFileRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    (tmp_path / "demo-skill").mkdir()
+    bad = "```bash\npython scripts/main.py '{\"bad\":\"literal\"}'\n```\n"
+    fixed = "```bash\npython scripts/main.py '{\"input\":\"{{user_request}}\"}'\n```\n"
+    candidate = "---\nname: demo\ndescription: demo\n---\n# Demo\n" + bad + "Done\n"
+    block = parse_skill_md_bash_command_blocks(candidate)[0]
+    full_block = candidate[block.start:block.end]
+    result = contracts.ContractCheckResult(
+        id="skill_md.command_block.interface.issue",
+        passed=False,
+        target="SKILL.md:scripts/main.py:command_block",
+        message="failed",
+        expected="repair only this block",
+        minimal_edit="repair only this block",
+        details={
+            "script_path": "scripts/main.py",
+            "block_text": full_block,
+            "full_block_text": full_block,
+            "command_text": block.content,
+            "command_body_text": block.content,
+            "block_start": block.start,
+            "block_end": block.end,
+            "body_start": block.body_start,
+            "body_end": block.body_end,
+            "block_sha256": hashlib.sha256(full_block.encode("utf-8")).hexdigest(),
+        },
+        layer="skill_md_command_block_interface",
+    )
+    stage_error = api.FileGenerationStageError(
+        source="content_review",
+        layer="skill_md_command_block_interface",
+        detail="block failed",
+        original=contracts.ContractValidationError("block", [result]),
+    )
+    seen = {}
+
+    async def fake_complete_creator_file_generation(**kwargs):
+        return candidate
+
+    alignment_calls = 0
+
+    async def fake_alignment(**_kwargs):
+        nonlocal alignment_calls
+        alignment_calls += 1
+        if alignment_calls == 1:
+            raise stage_error
+        return None
+
+    async def fake_repair_skill_md_command_block(**kwargs):
+        seen["block_text"] = kwargs["block_text"]
+        return fixed
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(api, "_validate_skill_md_against_existing_files", lambda *a, **k: None)
+    monkeypatch.setattr(api, "_validate_skill_md_blueprint_alignment", fake_alignment)
+    monkeypatch.setattr(api, "_repair_skill_md_command_block", fake_repair_skill_md_command_block)
+
+    response = await api.generate_file(GenerateFileRequest(
+        skill_name="demo-skill",
+        file_path="SKILL.md",
+        purpose="demo",
+        blueprint_text="use scripts/main.py",
+        conversation_history=[],
+        role="skill_md",
+        skill_plan_entry={},
+    ))
+    async for _chunk in response.body_iterator:
+        pass
+
+    assert seen["block_text"].startswith("```bash")
+    assert seen["block_text"].rstrip().endswith("```")
+    assert "python scripts/main.py" in seen["block_text"]
+    assert not seen["block_text"].startswith("python scripts/main.py")
+
+
+def test_repaired_block_effective_command_lines_ignore_comments_but_reject_two_commands():
+    from backend.services.creator import api
+
+    api._validate_repaired_skill_md_command_block(
+        "```bash\n# execution entry\npython scripts/main.py '{\"input\":\"{{input}}\"}'\n```",
+        script_path="scripts/main.py",
+    )
+
+    with pytest.raises(ValueError, match="exactly one command line"):
+        api._validate_repaired_skill_md_command_block(
+            "```bash\npython scripts/a.py '{}'\npython scripts/b.py '{}'\n```",
+            script_path="scripts/a.py",
+        )
