@@ -98,7 +98,8 @@ async def test_recalled_candidates_are_separated_from_available_optional_tools(m
     assert result["unavailable_tool_ids"] == ["embedding_beta", "exact_alpha"]
     assert result["tool_bindings_by_file"] == {"scripts/a.py": []}
     assert result["planner_output"]["recalled_candidate_tool_ids"] == ["exact_alpha", "embedding_beta"]
-    assert "desired_tool_ids" not in result["planner_output"]
+    assert result["planner_output"]["desired_tool_ids"] == []
+    assert result["planner_output"]["authorized_tool_ids"] == []
     assert "decisions" not in result["planner_output"]
     assert result["planner_output"]["recall_source"] == "exact capability recall + embedding top-k recall union"
     assert result["planner_output"]["selection_mode"] == "function_item_owned_optional_recall_no_llm"
@@ -123,7 +124,8 @@ async def test_final_tool_pool_planning_never_calls_llm_selector_phases(monkeypa
     assert "final_tool_selection" not in calls
     assert "final_tool_selection_convergence" not in calls
     assert result["recalled_candidate_tool_ids"] == ["callable_alpha"]
-    assert "desired_tool_ids" not in result
+    assert result["desired_tool_ids"] == []
+    assert result["authorized_tool_ids"] == []
 
 
 @pytest.mark.asyncio
@@ -376,3 +378,36 @@ async def test_available_optional_tools_are_bound_only_to_owning_function_item(m
         "scripts/write.py": ["system_text_generation"],
         "scripts/draw.py": ["system_image_generation"],
     }
+
+
+@pytest.mark.asyncio
+async def test_final_tool_pool_persists_file_bindings_and_compat_aliases(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(
+        api,
+        "_recall_creator_tool_candidates",
+        lambda file_specs, top_k: (
+            [{"tool_id": "system_text_generation", "recalled_for_capabilities": ["write"]}],
+            "test",
+        ),
+    )
+
+    result = await api._plan_final_tool_pool(
+        skill_name="demo",
+        file_specs=[{"path": "scripts/write.py", "required": True, "required_capabilities": ["write"]}],
+    )
+
+    assert result["desired_tool_ids"] == ["system_text_generation"]
+    assert result["authorized_tool_ids"] == ["system_text_generation"]
+    assert result["planner_output"]["desired_tool_ids"] == ["system_text_generation"]
+    assert result["planner_output"]["authorized_tool_ids"] == ["system_text_generation"]
+
+    pool = load_tool_pool(tmp_path / "demo")
+    raw_binding = api.get_file_binding(pool, "scripts/write.py", raw=True)
+    projected_binding = api.get_file_binding(pool, "scripts/write.py")
+    assert raw_binding is not None
+    assert raw_binding.allowed_tool_ids == ["system_text_generation"]
+    assert projected_binding is not None
+    assert "script_argv_guard" in projected_binding.allowed_tool_ids
+    assert "system_text_generation" in projected_binding.allowed_tool_ids
+    assert api.tool_pool_snapshot(pool)["file_bindings"][0]["target_file"] == "scripts/write.py"

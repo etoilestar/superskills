@@ -40,6 +40,8 @@ from .tool_pool_models import (
     ToolPoolAddToolRequest,
     ToolPoolDeniedRequest,
     ToolPoolMissingRequest,
+    ToolPoolFileBinding,
+    ToolPoolModel,
     ToolPoolTool,
 )
 from ..creator_tool_registry import get_tool_capability
@@ -3308,11 +3310,24 @@ async def _plan_final_tool_pool(
             if owner in tool_bindings_by_file and tool_id not in tool_bindings_by_file[owner]:
                 tool_bindings_by_file[owner].append(tool_id)
 
+    updated_pool.file_bindings = [
+        _creator_file_binding_from_optional_tool_ids(
+            pool=updated_pool,
+            target_file=path,
+            allowed_tool_ids=tool_ids,
+        )
+        for path, tool_ids in tool_bindings_by_file.items()
+    ]
+    save_tool_pool(skill_dir, updated_pool)
+    updated_pool = load_tool_pool(skill_dir)
+
     normalized_selector_output = {
         "recalled_candidate_tool_ids": recalled_candidate_tool_ids,
         "available_optional_tool_ids": available_optional_tool_ids,
         "unavailable_tool_ids": unavailable_tool_ids,
         "tool_bindings_by_file": tool_bindings_by_file,
+        "desired_tool_ids": available_optional_tool_ids,
+        "authorized_tool_ids": available_optional_tool_ids,
         "candidate_tool_ids": recalled_candidate_tool_ids,
         "recall_source": recall_source,
         "selection_mode": "function_item_owned_optional_recall_no_llm",
@@ -3347,8 +3362,68 @@ async def _plan_final_tool_pool(
         "available_optional_tool_ids": available_optional_tool_ids,
         "unavailable_tool_ids": unavailable_tool_ids,
         "tool_bindings_by_file": tool_bindings_by_file,
+        "desired_tool_ids": available_optional_tool_ids,
+        "authorized_tool_ids": available_optional_tool_ids,
         "tool_pool": updated_pool,
     }
+
+
+
+def _creator_file_binding_from_optional_tool_ids(
+    *,
+    pool: ToolPoolModel,
+    target_file: str,
+    allowed_tool_ids: list[str],
+) -> ToolPoolFileBinding:
+    """Persist a per-file optional tool view without making tools mandatory."""
+    skill_binding = get_skill_tool_binding(
+        pool,
+        target_file=target_file,
+        include_script_core=False,
+    )
+    allowed_set = {str(tool_id or "").strip() for tool_id in allowed_tool_ids if str(tool_id or "").strip()}
+    available_tools = [
+        tool
+        for tool in (skill_binding.available_tools or [])
+        if str(tool.get("tool_id") or "").strip() in allowed_set
+    ]
+    scored_tools = [
+        tool
+        for tool in (skill_binding.scored_tools or [])
+        if str(tool.get("tool_id") or "").strip() in allowed_set
+    ]
+    matched_features_by_tool = {
+        tool_id: features
+        for tool_id, features in (skill_binding.matched_features_by_tool or {}).items()
+        if str(tool_id or "").strip() in allowed_set
+    }
+    return ToolPoolFileBinding(
+        target_file=target_file,
+        allowed_tool_ids=list(allowed_tool_ids),
+        primary_tool_ids=list(allowed_tool_ids),
+        secondary_tool_ids=[],
+        available_tools=available_tools,
+        scored_tools=scored_tools,
+        matched_features_by_tool=matched_features_by_tool,
+        allowed_helper_imports=sorted({
+            str(item.get("function_name") or "")
+            for item in available_tools
+            if str(item.get("function_name") or "")
+        }),
+        allowed_import_paths=sorted({
+            str(item.get("import_path") or "")
+            for item in available_tools
+            if str(item.get("import_path") or "")
+        }),
+        allowed_function_imports=sorted({
+            f'{item.get("import_path")}.{item.get("function_name")}'
+            for item in available_tools
+            if item.get("import_path") and item.get("function_name")
+        }),
+        required_env=[],
+        dependencies=[],
+        snippets=[],
+    )
 
 def _apply_planner_tool_pool_patch(
     *,
@@ -11614,7 +11689,12 @@ def _stage_error_has_full_format_rewrite_contract(stage_error: FileGenerationSta
 
 
 def _single_skill_md_command_block_failure(original: Exception | None) -> dict[str, Any] | None:
-    """Return the shared command-block locator when a validation error targets one block."""
+    """Return the first structured command-block locator for local repair.
+
+    Multiple failing blocks are repaired as a queue across validation rounds:
+    repair one locator, re-run full format/semantic/block validation, then handle
+    the next still-failing block from the fresh failure set.
+    """
     if not isinstance(original, ContractValidationError):
         return None
     failures = [result for result in original.results if not result.passed]
@@ -11628,9 +11708,11 @@ def _single_skill_md_command_block_failure(original: Exception | None) -> dict[s
         scope = details.get("skill_md_block_repair_scope")
         if not isinstance(scope, dict):
             scope = {}
-        block_text = str(scope.get("block_text") or details.get("block_text") or "")
+        block_text = str(scope.get("full_block_text") or scope.get("block_text") or details.get("full_block_text") or details.get("block_text") or "")
         command_text = str(
-            scope.get("command_text")
+            scope.get("command_body_text")
+            or scope.get("command_text")
+            or details.get("command_body_text")
             or details.get("command_text")
             or details.get("current_block")
             or ""
@@ -11638,53 +11720,70 @@ def _single_skill_md_command_block_failure(original: Exception | None) -> dict[s
         script_path = str(scope.get("script_path") or details.get("script_path") or "").strip()
         block_start = scope.get("block_start")
         block_end = scope.get("block_end")
+        body_start = scope.get("body_start")
+        body_end = scope.get("body_end")
         block_locator = scope.get("block_locator") if isinstance(scope.get("block_locator"), dict) else details.get("block_locator")
         if block_start is None:
             block_start = details.get("block_start")
         if block_end is None:
             block_end = details.get("block_end")
+        if body_start is None:
+            body_start = details.get("body_start")
+        if body_end is None:
+            body_end = details.get("body_end")
         if block_start is None and isinstance(block_locator, dict):
-            block_start = block_locator.get("start")
+            block_start = block_locator.get("block_start", block_locator.get("start"))
         if block_end is None and isinstance(block_locator, dict):
-            block_end = block_locator.get("end")
+            block_end = block_locator.get("block_end", block_locator.get("end"))
+        if body_start is None and isinstance(block_locator, dict):
+            body_start = block_locator.get("body_start")
+        if body_end is None and isinstance(block_locator, dict):
+            body_end = block_locator.get("body_end")
         block_sha256 = str(scope.get("block_sha256") or details.get("block_sha256") or "").strip()
         try:
             block_start = int(block_start)
             block_end = int(block_end)
+            body_start = int(body_start) if body_start is not None else -1
+            body_end = int(body_end) if body_end is not None else -1
         except Exception:
             return None
         if not block_text or not script_path or block_start < 0 or block_end <= block_start or not block_sha256:
             return None
         locators.append({
             "block_text": block_text,
+            "full_block_text": block_text,
             "command_text": command_text,
+            "command_body_text": command_text,
             "script_path": script_path,
             "block_start": block_start,
             "block_end": block_end,
+            "body_start": body_start,
+            "body_end": body_end,
             "block_sha256": block_sha256,
             "block_ordinal": details.get("block_ordinal") or scope.get("block_ordinal"),
             "structured_checks": details.get("structured_checks") or {},
+            "result": result,
         })
+    locators.sort(key=lambda item: (item["block_start"], item["block_end"]))
     first = locators[0]
-    if any(
-        item["block_start"] != first["block_start"]
-        or item["block_end"] != first["block_end"]
-        or item["block_sha256"] != first["block_sha256"]
-        for item in locators
-    ):
-        return None
+    first_start = first["block_start"]
+    first_end = first["block_end"]
+    first_sha = first["block_sha256"]
     first["failure_reasons"] = [
         {
-            "id": result.id,
-            "message": result.message,
-            "expected": result.expected,
-            "minimal_edit": result.minimal_edit,
-            "details": result.details,
+            "id": item["result"].id,
+            "message": item["result"].message,
+            "expected": item["result"].expected,
+            "minimal_edit": item["result"].minimal_edit,
+            "details": item["result"].details,
         }
-        for result in failures
+        for item in locators
+        if item["block_start"] == first_start
+        and item["block_end"] == first_end
+        and item["block_sha256"] == first_sha
     ]
+    first.pop("result", None)
     return first
-
 
 def _validate_repaired_skill_md_command_block(repaired_block: str, *, script_path: str) -> None:
     text = str(repaired_block or "")
