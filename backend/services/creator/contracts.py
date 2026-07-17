@@ -1496,15 +1496,28 @@ def _skill_md_command_block_repair_scope(script_path: str) -> str:
 
 
 def _skill_md_block_locator(block: Any, skill_md_content: str = "") -> dict[str, Any]:
-    start = int(getattr(block, "start", -1))
-    end = int(getattr(block, "end", -1))
+    start = int(getattr(block, "start", getattr(block, "block_start", -1)))
+    end = int(getattr(block, "end", getattr(block, "block_end", -1)))
+    body_start = int(getattr(block, "body_start", -1) or -1)
+    body_end = int(getattr(block, "body_end", -1) or -1)
     full_block_text = str(skill_md_content or "")[start:end] if start >= 0 and end >= start else ""
     if not full_block_text:
-        full_block_text = str(getattr(block, "content", "") or "")
+        full_block_text = str(getattr(block, "full_block_text", "") or getattr(block, "content", "") or "")
+    command_body_text = str(skill_md_content or "")[body_start:body_end] if body_start >= 0 and body_end >= body_start else ""
+    if not command_body_text:
+        command_body_text = str(getattr(block, "command_body_text", "") or getattr(block, "content", "") or "")
+    block_sha256 = hashlib.sha256(full_block_text.encode("utf-8")).hexdigest()
     return {
         "start": start,
         "end": end,
-        "content_sha256": hashlib.sha256(full_block_text.encode("utf-8")).hexdigest(),
+        "block_start": start,
+        "block_end": end,
+        "body_start": body_start,
+        "body_end": body_end,
+        "full_block_text": full_block_text,
+        "command_body_text": command_body_text,
+        "block_sha256": block_sha256,
+        "content_sha256": block_sha256,
         "content_excerpt": full_block_text[:1000],
     }
 
@@ -2649,9 +2662,14 @@ def _skill_md_block_review_to_contract_results(
                 "current_block": command_text,
                 "command_text": command_text,
                 "block_text": block_text,
-                "block_start": locator.get("start"),
-                "block_end": locator.get("end"),
-                "block_sha256": hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
+                "block_start": locator.get("block_start", locator.get("start")),
+                "block_end": locator.get("block_end", locator.get("end")),
+                "body_start": locator.get("body_start"),
+                "body_end": locator.get("body_end"),
+                "full_block_text": block_text,
+                "command_body_text": command_text,
+                "block_sha256": locator.get("block_sha256") or hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
+                "failed_checks": [failure_type],
                 "block_locator": locator,
                 "block_ordinal": review.get("command_block_ordinal"),
                 "structured_checks": {
@@ -2660,11 +2678,15 @@ def _skill_md_block_review_to_contract_results(
                     "type_checks": review.get("type_checks") or [],
                 },
                 "skill_md_block_repair_scope": {
-                    "block_start": locator.get("start"),
-                    "block_end": locator.get("end"),
+                    "block_start": locator.get("block_start", locator.get("start")),
+                    "block_end": locator.get("block_end", locator.get("end")),
+                    "body_start": locator.get("body_start"),
+                    "body_end": locator.get("body_end"),
                     "block_text": block_text,
-                    "block_sha256": hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
+                    "full_block_text": block_text,
+                    "block_sha256": locator.get("block_sha256") or hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
                     "command_text": command_text,
+                    "command_body_text": command_text,
                     "block_ordinal": review.get("command_block_ordinal"),
                     "script_path": script_path,
                     "block_locator": locator,

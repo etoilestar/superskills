@@ -68,7 +68,7 @@ def test_embedding_recall_keeps_exact_match_plus_top_k_union_contract():
 
 
 @pytest.mark.asyncio
-async def test_recalled_exact_and_embedding_candidates_all_enter_desired_tool_ids(monkeypatch, tmp_path):
+async def test_recalled_candidates_are_separated_from_available_optional_tools(monkeypatch, tmp_path):
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
     monkeypatch.setattr(
         api,
@@ -93,12 +93,15 @@ async def test_recalled_exact_and_embedding_candidates_all_enter_desired_tool_id
         file_specs=[{"path": "scripts/a.py", "required": True, "required_capabilities": ["exact"]}],
     )
 
-    assert result["desired_tool_ids"] == ["embedding_beta", "exact_alpha"]
-    assert result["planner_output"]["desired_tool_ids"] == ["embedding_beta", "exact_alpha"]
-    assert result["planner_output"]["candidate_tool_ids"] == ["exact_alpha", "embedding_beta"]
-    assert result["planner_output"]["decisions"] == {"exact_alpha": True, "embedding_beta": True}
+    assert result["recalled_candidate_tool_ids"] == ["exact_alpha", "embedding_beta"]
+    assert result["available_optional_tool_ids"] == []
+    assert result["unavailable_tool_ids"] == ["embedding_beta", "exact_alpha"]
+    assert result["tool_bindings_by_file"] == {"scripts/a.py": []}
+    assert result["planner_output"]["recalled_candidate_tool_ids"] == ["exact_alpha", "embedding_beta"]
+    assert "desired_tool_ids" not in result["planner_output"]
+    assert "decisions" not in result["planner_output"]
     assert result["planner_output"]["recall_source"] == "exact capability recall + embedding top-k recall union"
-    assert result["planner_output"]["selection_mode"] == "recall_union_no_llm"
+    assert result["planner_output"]["selection_mode"] == "function_item_owned_optional_recall_no_llm"
 
 
 @pytest.mark.asyncio
@@ -119,11 +122,12 @@ async def test_final_tool_pool_planning_never_calls_llm_selector_phases(monkeypa
     assert calls == []
     assert "final_tool_selection" not in calls
     assert "final_tool_selection_convergence" not in calls
-    assert result["desired_tool_ids"] == ["callable_alpha"]
+    assert result["recalled_candidate_tool_ids"] == ["callable_alpha"]
+    assert "desired_tool_ids" not in result
 
 
 @pytest.mark.asyncio
-async def test_auto_final_tool_planning_is_add_only_and_disables_removal(monkeypatch, tmp_path):
+async def test_auto_final_tool_planning_refreshes_optional_view_without_removal(monkeypatch, tmp_path):
     apply_kwargs = {}
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
     skill_dir = tmp_path / "demo"
@@ -151,7 +155,8 @@ async def test_auto_final_tool_planning_is_add_only_and_disables_removal(monkeyp
     patch = result["computed_patch"]["tool_pool_patch"]
     assert patch["remove_tool_requests"] == []
     assert apply_kwargs["allow_remove"] is False
-    assert result["desired_tool_ids"] == ["new_recalled_tool"]
+    assert result["recalled_candidate_tool_ids"] == ["new_recalled_tool"]
+    assert result["tool_bindings_by_file"] == {"scripts/a.py": []}
 
 
 @pytest.mark.asyncio
@@ -206,7 +211,7 @@ def test_backend_gate_still_rejects_unusable_tools(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_gate_denied_recalled_candidate_remains_desired_but_unavailable(monkeypatch, tmp_path):
+async def test_gate_denied_recalled_candidate_remains_candidate_but_unavailable(monkeypatch, tmp_path):
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
     monkeypatch.setattr(
         api,
@@ -225,11 +230,11 @@ async def test_gate_denied_recalled_candidate_remains_desired_but_unavailable(mo
         file_specs=[{"path": "scripts/a.py", "required": True}],
     )
 
-    assert result["desired_tool_ids"] == ["definitely_not_registered_tool", "system_text_generation"]
-    assert result["authorized_tool_ids"] == ["system_text_generation"]
+    assert result["recalled_candidate_tool_ids"] == ["system_text_generation", "definitely_not_registered_tool"]
+    assert result["available_optional_tool_ids"] == ["system_text_generation"]
     assert result["unavailable_tool_ids"] == ["definitely_not_registered_tool"]
-    assert result["planner_output"]["desired_tool_ids"] == ["definitely_not_registered_tool", "system_text_generation"]
-    assert result["planner_output"]["authorized_tool_ids"] == ["system_text_generation"]
+    assert result["planner_output"]["recalled_candidate_tool_ids"] == ["system_text_generation", "definitely_not_registered_tool"]
+    assert result["planner_output"]["available_optional_tool_ids"] == ["system_text_generation"]
     assert result["planner_output"]["unavailable_tool_ids"] == ["definitely_not_registered_tool"]
 
     pool = load_tool_pool(tmp_path / "demo")
@@ -244,9 +249,9 @@ def test_final_tool_pool_computed_patch_uses_recall_union_wording():
 
     assert "passed Backend factual authorization checks" not in source
     assert "Final Tool Selector marked this Registry candidate" not in source
-    assert "submitted to Backend factual" in source
-    assert "no post-recall semantic" in source
-    assert "recall_union_no_llm" in source
+    assert "Backend factual authorization" in source
+    assert "Passing Gate means optional availability" in source
+    assert "function_item_owned_optional_recall_no_llm" in source
 
 
 def test_first_round_semantic_judge_tool_augmentation_flow_is_unchanged():
@@ -341,3 +346,33 @@ def test_refreshed_binding_syncs_entry_before_context_guard_and_repair():
     assert refresh_block.index(entry_sync) < refresh_block.index(context_refresh)
     assert refresh_block.index(context_refresh) < refresh_block.index(guard_refresh)
     assert refresh_end < repair_start
+
+
+@pytest.mark.asyncio
+async def test_available_optional_tools_are_bound_only_to_owning_function_item(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(
+        api,
+        "_recall_creator_tool_candidates",
+        lambda file_specs, top_k: (
+            [
+                {"tool_id": "system_text_generation", "recalled_for_capabilities": ["write"]},
+                {"tool_id": "system_image_generation", "recalled_for_capabilities": ["draw"]},
+            ],
+            "test",
+        ),
+    )
+
+    result = await api._plan_final_tool_pool(
+        skill_name="demo",
+        file_specs=[
+            {"path": "scripts/write.py", "required": True, "required_capabilities": ["write"]},
+            {"path": "scripts/draw.py", "required": True, "required_capabilities": ["draw"]},
+        ],
+    )
+
+    assert result["available_optional_tool_ids"] == ["system_image_generation", "system_text_generation"]
+    assert result["tool_bindings_by_file"] == {
+        "scripts/write.py": ["system_text_generation"],
+        "scripts/draw.py": ["system_image_generation"],
+    }

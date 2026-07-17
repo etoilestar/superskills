@@ -3178,164 +3178,62 @@ async def _plan_final_tool_pool(
     responsibility_graph: dict[str, Any] | None = None,
     requested_model: str | None = None,
 ) -> dict[str, Any]:
-    """Select the final Skill-wide ToolPool from Plan capability recall.
+    """Build the final ToolPool fact view from FunctionItem-owned recall.
 
-    Plan already owns semantic capability decomposition.
-
-    Pipeline:
-
-        final file_specs.required_capabilities
-        -> per-capability embedding recall
-        -> candidate union
-        -> deterministic Backend diff
-        -> Backend Gate
-        -> shared Skill ToolPool
-
-    review_summary is never an input to this function.
+    Recall produces candidate tools only. Backend Gate only checks factual
+    availability (Registry presence, callable contract, configuration, and
+    dependencies). A gated tool is an optional enhancement for the owning
+    FunctionItem; it is not a required implementation dependency and absence of
+    use is not a failure condition.
     """
 
-    skill_dir = (
-        settings.skills_path
-        / _validate_skill_name(
-            skill_name
-        )
-    )
+    skill_dir = settings.skills_path / _validate_skill_name(skill_name)
+    skill_dir.mkdir(parents=True, exist_ok=True)
 
-    skill_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    current_pool = load_tool_pool(
-        skill_dir
-    )
-
+    current_pool = load_tool_pool(skill_dir)
     current_allowed_ids = {
-        str(
-            tool.tool_id
-            or ""
-        ).strip()
-        for tool in (
-            current_pool.tools or []
-        )
-        if (
-            tool.status == "allowed"
-            and str(
-                tool.tool_id
-                or ""
-            ).strip()
-        )
+        str(tool.tool_id or "").strip()
+        for tool in (current_pool.tools or [])
+        if tool.status == "allowed" and str(tool.tool_id or "").strip()
     }
 
     try:
-        (
-            candidate_catalog,
-            recall_source,
-        ) = _recall_creator_tool_candidates(
+        candidate_catalog, recall_source = _recall_creator_tool_candidates(
             file_specs=file_specs,
             top_k=3,
         )
-
     except Exception as exc:
         logger.exception(
-            "[Creator]"
-            "[final_tool_selection]"
-            "[tool_recall_failed] "
-            "skill=%s "
-            "error=%s",
+            "[Creator][final_tool_selection][tool_recall_failed] skill=%s error=%s",
             skill_name,
-            (
-                f"{type(exc).__name__}: "
-                f"{exc}"
-            ),
+            f"{type(exc).__name__}: {exc}",
         )
-
         raise HTTPException(
             status_code=502,
             detail={
-                "code": (
-                    "creator_tool_recall_failed"
-                ),
-
-                "message": (
-                    "Tool Registry capability recall "
-                    "failed."
-                ),
-
-                "error": (
-                    f"{type(exc).__name__}: "
-                    f"{exc}"
-                ),
+                "code": "creator_tool_recall_failed",
+                "message": "Tool Registry capability recall failed.",
+                "error": f"{type(exc).__name__}: {exc}",
             },
         ) from exc
 
-    ordered_candidate_tool_ids: list[
-        str
-    ] = []
-
-    for item in (
-        candidate_catalog or []
-    ):
-        if not isinstance(
-            item,
-            dict,
-        ):
+    ordered_candidate_tool_ids: list[str] = []
+    for item in candidate_catalog or []:
+        if not isinstance(item, dict):
             continue
-
-        tool_id = str(
-            item.get("tool_id")
-            or ""
-        ).strip()
-
-        if (
-            tool_id
-            and tool_id
-            not in ordered_candidate_tool_ids
-        ):
-            ordered_candidate_tool_ids.append(
-                tool_id
-            )
+        tool_id = str(item.get("tool_id") or "").strip()
+        if tool_id and tool_id not in ordered_candidate_tool_ids:
+            ordered_candidate_tool_ids.append(tool_id)
 
     candidate_by_tool_id = {
-        str(
-            item.get("tool_id")
-            or ""
-        ).strip(): item
-        for item in (
-            candidate_catalog or []
-        )
-        if (
-            isinstance(
-                item,
-                dict,
-            )
-            and str(
-                item.get("tool_id")
-                or ""
-            ).strip()
-        )
+        str(item.get("tool_id") or "").strip(): item
+        for item in (candidate_catalog or [])
+        if isinstance(item, dict) and str(item.get("tool_id") or "").strip()
     }
 
-    desired_tool_ids: set[str] = set(
-        ordered_candidate_tool_ids
-    )
-
-    selector_output: dict[
-        str,
-        Any,
-    ] = {
-        "decisions": {
-            tool_id: True
-            for tool_id
-            in ordered_candidate_tool_ids
-        },
-    }
-
-    add_tool_ids = sorted(
-        desired_tool_ids
-        - current_allowed_ids
-    )
-
+    recalled_candidate_tool_ids = list(ordered_candidate_tool_ids)
+    recalled_candidate_set = set(recalled_candidate_tool_ids)
+    add_tool_ids = sorted(recalled_candidate_set - current_allowed_ids)
     remove_tool_ids: list[str] = []
 
     computed_patch = {
@@ -3343,193 +3241,97 @@ async def _plan_final_tool_pool(
             "add_tool_requests": [
                 {
                     "requested_capability": (
-                        ", ".join(
-                            candidate_by_tool_id
-                            .get(
-                                tool_id,
-                                {},
-                            )
-                            .get(
-                                "recalled_for_capabilities",
-                                [],
-                            )
-                        )
-                        or (
-                            "Skill Plan required "
-                            "capability"
-                        )
+                        ", ".join(candidate_by_tool_id.get(tool_id, {}).get("recalled_for_capabilities", []) or [])
+                        or "Skill Plan required capability"
                     ),
-
-                    "candidate_tool_id": (
-                        tool_id
-                    ),
-
+                    "candidate_tool_id": tool_id,
                     "reason": (
-                        "Registry candidate was recalled "
-                        "from the normalized FunctionItem "
-                        "capability contracts and "
-                        "submitted to Backend factual "
-                        "authorization."
+                        "Registry candidate was recalled from the normalized FunctionItem "
+                        "capability contracts and submitted only to Backend factual authorization."
                     ),
                 }
-                for tool_id
-                in add_tool_ids
+                for tool_id in add_tool_ids
             ],
-
             "remove_tool_requests": [
                 {
                     "tool_id": tool_id,
-
-                    "reason": (
-                        "Tool is not required by the "
-                        "current normalized Skill Plan "
-                        "capability selection."
-                    ),
+                    "reason": "Tool binding refresh does not remove protected or runtime-required tools.",
                 }
-                for tool_id
-                in remove_tool_ids
+                for tool_id in remove_tool_ids
             ],
-
             "update_file_bindings": [],
-
             "reason": (
-                "Backend diff from exact capability "
-                "recall and embedding top-k recall "
-                "union; no post-recall semantic "
-                "tool pruning."
+                "Backend diff from FunctionItem-owned exact capability recall and embedding top-k recall. "
+                "Passing Gate means optional availability, not required use."
             ),
-
             "affected_files": [],
         }
     }
 
-    apply_result = (
-        _apply_planner_tool_pool_patch(
-            skill_name=skill_name,
-
-            planner_output=(
-                computed_patch
-            ),
-
-            source_phase=(
-                "final_contract_tool_planning"
-            ),
-
-            allow_remove=False,
-        )
+    apply_result = _apply_planner_tool_pool_patch(
+        skill_name=skill_name,
+        planner_output=computed_patch,
+        source_phase="final_contract_tool_planning",
+        allow_remove=False,
     )
 
-    updated_pool = load_tool_pool(
-        skill_dir
-    )
-
-    authorized_tool_ids = sorted(
+    updated_pool = load_tool_pool(skill_dir)
+    available_optional_tool_ids = sorted(
         tool_id
-        for tool_id
-        in desired_tool_ids
-        if any(
-            tool.tool_id == tool_id
-            and tool.status == "allowed"
-            for tool
-            in updated_pool.tools
-        )
+        for tool_id in recalled_candidate_set
+        if any(tool.tool_id == tool_id and tool.status == "allowed" for tool in updated_pool.tools)
     )
+    unavailable_tool_ids = sorted(recalled_candidate_set - set(available_optional_tool_ids))
 
-    unavailable_tool_ids = sorted(
-        desired_tool_ids
-        - set(
-            authorized_tool_ids
-        )
-    )
+    file_capabilities: dict[str, set[str]] = {}
+    for spec in file_specs or []:
+        if not isinstance(spec, dict):
+            continue
+        path = _normalize_skill_path(str(spec.get("path") or spec.get("target_file") or ""))
+        if not path.startswith("scripts/") or spec.get("required") is False:
+            continue
+        caps = {str(cap or "").strip() for cap in (spec.get("required_capabilities") or []) if str(cap or "").strip()}
+        file_capabilities[path] = caps
+
+    tool_bindings_by_file: dict[str, list[str]] = {path: [] for path in file_capabilities}
+    for tool_id in available_optional_tool_ids:
+        card = candidate_by_tool_id.get(tool_id, {})
+        owners = [
+            _normalize_skill_path(str(owner or ""))
+            for owner in (card.get("owner_files") or card.get("target_files") or [])
+            if str(owner or "").strip()
+        ]
+        if not owners:
+            recalled_caps = {str(cap or "").strip() for cap in (card.get("recalled_for_capabilities") or []) if str(cap or "").strip()}
+            owners = [path for path, caps in file_capabilities.items() if recalled_caps and caps.intersection(recalled_caps)]
+        for owner in owners:
+            if owner in tool_bindings_by_file and tool_id not in tool_bindings_by_file[owner]:
+                tool_bindings_by_file[owner].append(tool_id)
 
     normalized_selector_output = {
-        "decisions": (
-            selector_output.get(
-                "decisions"
-            )
-            if isinstance(
-                selector_output.get(
-                    "decisions"
-                ),
-                dict,
-            )
-            else {}
-        ),
-
-        "desired_tool_ids": (
-            sorted(
-                desired_tool_ids
-            )
-        ),
-
-        "candidate_tool_ids": (
-            ordered_candidate_tool_ids
-        ),
-
-        "recall_source": (
-            recall_source
-        ),
-
-        "selection_mode": (
-            "recall_union_no_llm"
-        ),
-
-        "authorized_tool_ids": (
-            authorized_tool_ids
-        ),
-
-        "unavailable_tool_ids": (
-            unavailable_tool_ids
-        ),
+        "recalled_candidate_tool_ids": recalled_candidate_tool_ids,
+        "available_optional_tool_ids": available_optional_tool_ids,
+        "unavailable_tool_ids": unavailable_tool_ids,
+        "tool_bindings_by_file": tool_bindings_by_file,
+        "candidate_tool_ids": recalled_candidate_tool_ids,
+        "recall_source": recall_source,
+        "selection_mode": "function_item_owned_optional_recall_no_llm",
     }
 
     logger.info(
-        "[Creator]"
-        "[final_tool_selection]"
-        "[result] %s",
+        "[Creator][final_tool_selection][result] %s",
         json.dumps(
             {
-                "event": (
-                    "final_skill_tool_"
-                    "selection_result"
-                ),
-
+                "event": "final_skill_tool_optional_availability_result",
                 "skill_name": skill_name,
-
-                "recall_source": (
-                    recall_source
-                ),
-
-                "selection_mode": (
-                    "recall_union_no_llm"
-                ),
-
-                "candidate_tool_ids": (
-                    ordered_candidate_tool_ids
-                ),
-
-                "desired_tool_ids": (
-                    sorted(
-                        desired_tool_ids
-                    )
-                ),
-
-                "authorized_tool_ids": (
-                    authorized_tool_ids
-                ),
-
-                "unavailable_tool_ids": (
-                    unavailable_tool_ids
-                ),
-
-                "add_tool_ids": (
-                    add_tool_ids
-                ),
-
-                "remove_tool_ids": (
-                    remove_tool_ids
-                ),
-
+                "recall_source": recall_source,
+                "selection_mode": "function_item_owned_optional_recall_no_llm",
+                "recalled_candidate_tool_ids": recalled_candidate_tool_ids,
+                "available_optional_tool_ids": available_optional_tool_ids,
+                "unavailable_tool_ids": unavailable_tool_ids,
+                "tool_bindings_by_file": tool_bindings_by_file,
+                "add_tool_ids": add_tool_ids,
+                "remove_tool_ids": remove_tool_ids,
                 "llm_selector_used": False,
             },
             ensure_ascii=False,
@@ -3537,39 +3339,16 @@ async def _plan_final_tool_pool(
         ),
     )
 
-
     return {
-        "planner_output": (
-            normalized_selector_output
-        ),
-
-        "computed_patch": (
-            computed_patch
-        ),
-
-        "apply_result": (
-            apply_result
-        ),
-
-        "desired_tool_ids": (
-            sorted(
-                desired_tool_ids
-            )
-        ),
-
-        "authorized_tool_ids": (
-            authorized_tool_ids
-        ),
-
-        "unavailable_tool_ids": (
-            unavailable_tool_ids
-        ),
-
-        "tool_pool": (
-            updated_pool
-        ),
+        "planner_output": normalized_selector_output,
+        "computed_patch": computed_patch,
+        "apply_result": apply_result,
+        "recalled_candidate_tool_ids": recalled_candidate_tool_ids,
+        "available_optional_tool_ids": available_optional_tool_ids,
+        "unavailable_tool_ids": unavailable_tool_ids,
+        "tool_bindings_by_file": tool_bindings_by_file,
+        "tool_pool": updated_pool,
     }
-
 
 def _apply_planner_tool_pool_patch(
     *,
