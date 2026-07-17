@@ -96,9 +96,9 @@ async def test_recalled_candidates_are_separated_from_available_optional_tools(m
     assert result["recalled_candidate_tool_ids"] == ["exact_alpha", "embedding_beta"]
     assert result["available_optional_tool_ids"] == []
     assert result["unavailable_tool_ids"] == ["embedding_beta", "exact_alpha"]
-    assert result["tool_bindings_by_file"] == {"scripts/a.py": []}
+    assert result["tool_bindings_by_file"] == {}
     assert result["planner_output"]["recalled_candidate_tool_ids"] == ["exact_alpha", "embedding_beta"]
-    assert result["planner_output"]["desired_tool_ids"] == []
+    assert result["planner_output"]["desired_tool_ids"] == ["exact_alpha", "embedding_beta"]
     assert result["planner_output"]["authorized_tool_ids"] == []
     assert "decisions" not in result["planner_output"]
     assert result["planner_output"]["recall_source"] == "exact capability recall + embedding top-k recall union"
@@ -124,7 +124,7 @@ async def test_final_tool_pool_planning_never_calls_llm_selector_phases(monkeypa
     assert "final_tool_selection" not in calls
     assert "final_tool_selection_convergence" not in calls
     assert result["recalled_candidate_tool_ids"] == ["callable_alpha"]
-    assert result["desired_tool_ids"] == []
+    assert result["desired_tool_ids"] == ["callable_alpha"]
     assert result["authorized_tool_ids"] == []
 
 
@@ -158,7 +158,7 @@ async def test_auto_final_tool_planning_refreshes_optional_view_without_removal(
     assert patch["remove_tool_requests"] == []
     assert apply_kwargs["allow_remove"] is False
     assert result["recalled_candidate_tool_ids"] == ["new_recalled_tool"]
-    assert result["tool_bindings_by_file"] == {"scripts/a.py": []}
+    assert result["tool_bindings_by_file"] == {}
 
 
 @pytest.mark.asyncio
@@ -605,3 +605,56 @@ def test_e2e_callable_repair_context_uses_current_file_binding_and_falls_back(tm
     fallback_tool_ids = {tool.get("tool_id") for tool in fallback_context.get("available_tools", [])}
     assert "system_text_generation" in fallback_tool_ids
     assert "script_argv_guard" in fallback_tool_ids
+
+
+def test_responsibility_feedback_without_existing_binding_does_not_create_partial_binding(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir(parents=True)
+    save_tool_pool(skill_dir, ToolPoolModel())
+
+    api._apply_planner_tool_pool_patch(
+        skill_name="demo",
+        planner_output={
+            "tool_pool_patch": {
+                "add_tool_requests": [{"candidate_tool_id": "system_text_generation"}],
+                "remove_tool_requests": [],
+                "affected_files": ["scripts/a.py"],
+            }
+        },
+        source_phase="responsibility_feedback",
+        allow_remove=False,
+    )
+
+    pool = load_tool_pool(skill_dir)
+    assert {tool.tool_id for tool in pool.tools if tool.status == "allowed"} == {"system_text_generation"}
+    assert pool.file_bindings == []
+
+
+@pytest.mark.asyncio
+async def test_final_planning_preserves_existing_file_tools_and_skips_empty_bindings(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir(parents=True)
+    save_tool_pool(
+        skill_dir,
+        ToolPoolModel(
+            tools=[ToolPoolTool(tool_id="system_text_generation", status="allowed")],
+            file_bindings=[_binding("scripts/a.py", ["system_text_generation"])],
+        ),
+    )
+    monkeypatch.setattr(api, "_recall_creator_tool_candidates", lambda file_specs, top_k: ([], "none"))
+
+    result = await api._plan_final_tool_pool(
+        skill_name="demo",
+        file_specs=[
+            {"path": "scripts/a.py", "required": True, "required_capabilities": []},
+            {"path": "scripts/b.py", "required": True, "required_capabilities": []},
+        ],
+    )
+
+    assert result["tool_bindings_by_file"] == {"scripts/a.py": ["system_text_generation"]}
+    pool = load_tool_pool(skill_dir)
+    assert [(binding.target_file, binding.allowed_tool_ids) for binding in pool.file_bindings] == [
+        ("scripts/a.py", ["system_text_generation"])
+    ]

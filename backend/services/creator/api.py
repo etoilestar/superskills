@@ -3302,7 +3302,7 @@ async def _plan_final_tool_pool(
         caps = {str(cap or "").strip() for cap in (spec.get("required_capabilities") or []) if str(cap or "").strip()}
         file_capabilities[path] = caps
 
-    tool_bindings_by_file: dict[str, list[str]] = {path: [] for path in file_capabilities}
+    planned_tool_bindings_by_file: dict[str, list[str]] = {path: [] for path in file_capabilities}
     for tool_id in available_optional_tool_ids:
         card = candidate_by_tool_id.get(tool_id, {})
         owners = [
@@ -3314,8 +3314,25 @@ async def _plan_final_tool_pool(
             recalled_caps = {str(cap or "").strip() for cap in (card.get("recalled_for_capabilities") or []) if str(cap or "").strip()}
             owners = [path for path, caps in file_capabilities.items() if recalled_caps and caps.intersection(recalled_caps)]
         for owner in owners:
-            if owner in tool_bindings_by_file and tool_id not in tool_bindings_by_file[owner]:
-                tool_bindings_by_file[owner].append(tool_id)
+            if owner in planned_tool_bindings_by_file and tool_id not in planned_tool_bindings_by_file[owner]:
+                planned_tool_bindings_by_file[owner].append(tool_id)
+
+    existing_bindings_by_file = {
+        _normalize_skill_path(str(binding.target_file or "")): binding
+        for binding in (updated_pool.file_bindings or [])
+        if _normalize_skill_path(str(binding.target_file or "")).startswith("scripts/")
+    }
+    tool_bindings_by_file: dict[str, list[str]] = {}
+    for path in file_capabilities:
+        existing_binding = existing_bindings_by_file.get(path)
+        merged_tool_ids = []
+        if existing_binding is not None:
+            merged_tool_ids.extend(list(existing_binding.allowed_tool_ids or []))
+        for tool_id in planned_tool_bindings_by_file.get(path, []):
+            if tool_id not in merged_tool_ids:
+                merged_tool_ids.append(tool_id)
+        if merged_tool_ids:
+            tool_bindings_by_file[path] = merged_tool_ids
 
     updated_pool.file_bindings = [
         _creator_file_binding_from_optional_tool_ids(
@@ -3333,7 +3350,7 @@ async def _plan_final_tool_pool(
         "available_optional_tool_ids": available_optional_tool_ids,
         "unavailable_tool_ids": unavailable_tool_ids,
         "tool_bindings_by_file": tool_bindings_by_file,
-        "desired_tool_ids": available_optional_tool_ids,
+        "desired_tool_ids": recalled_candidate_tool_ids,
         "authorized_tool_ids": available_optional_tool_ids,
         "candidate_tool_ids": recalled_candidate_tool_ids,
         "recall_source": recall_source,
@@ -3369,7 +3386,7 @@ async def _plan_final_tool_pool(
         "available_optional_tool_ids": available_optional_tool_ids,
         "unavailable_tool_ids": unavailable_tool_ids,
         "tool_bindings_by_file": tool_bindings_by_file,
-        "desired_tool_ids": available_optional_tool_ids,
+        "desired_tool_ids": recalled_candidate_tool_ids,
         "authorized_tool_ids": available_optional_tool_ids,
         "tool_pool": updated_pool,
     }
@@ -4073,8 +4090,12 @@ def _apply_planner_tool_pool_patch(
             ),
             None,
         )
+        if existing_binding is None:
+            current_patch_allowed_tool_ids = []
+
+    if feedback_target_file and current_patch_allowed_tool_ids:
         merged_tool_ids = merge_unique(
-            list(existing_binding.allowed_tool_ids or []) if existing_binding is not None else [],
+            list(existing_binding.allowed_tool_ids or []),
             current_patch_allowed_tool_ids,
         )
         rebuilt_binding = _creator_file_binding_from_optional_tool_ids(
