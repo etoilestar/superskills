@@ -26,6 +26,18 @@ class SkillMdCommandBlock:
     lang: str
     content: str
     script_path: str | None = None
+    body_start: int = 0
+    body_end: int = 0
+    full_block_text: str = ""
+    command_body_text: str = ""
+
+    @property
+    def block_start(self) -> int:
+        return self.start
+
+    @property
+    def block_end(self) -> int:
+        return self.end
 
 
 @dataclass
@@ -104,12 +116,18 @@ def parse_skill_md_bash_command_blocks(skill_md: str) -> list[SkillMdCommandBloc
         if close_re.match(line.rstrip("\n\r")):
             content = "".join(body_lines).strip()
             if lang in _SHELL_LANGS and "scripts/" in content.replace("\\", "/"):
+                block_end = offset + len(line)
+                raw_body = "".join(body_lines)
                 blocks.append(SkillMdCommandBlock(
                     start=block_start,
-                    end=offset + len(line),
+                    end=block_end,
                     lang=lang,
                     content=content,
                     script_path=_script_path_from_command(_effective_command_lines(content)[0] if _effective_command_lines(content) else content),
+                    body_start=body_start,
+                    body_end=offset,
+                    full_block_text=text[block_start:block_end],
+                    command_body_text=raw_body,
                 ))
             in_block = False
             offset += len(line)

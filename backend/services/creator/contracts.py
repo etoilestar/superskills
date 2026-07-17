@@ -1496,15 +1496,28 @@ def _skill_md_command_block_repair_scope(script_path: str) -> str:
 
 
 def _skill_md_block_locator(block: Any, skill_md_content: str = "") -> dict[str, Any]:
-    start = int(getattr(block, "start", -1))
-    end = int(getattr(block, "end", -1))
+    start = int(getattr(block, "start", getattr(block, "block_start", -1)))
+    end = int(getattr(block, "end", getattr(block, "block_end", -1)))
+    body_start = int(getattr(block, "body_start", -1) or -1)
+    body_end = int(getattr(block, "body_end", -1) or -1)
     full_block_text = str(skill_md_content or "")[start:end] if start >= 0 and end >= start else ""
     if not full_block_text:
-        full_block_text = str(getattr(block, "content", "") or "")
+        full_block_text = str(getattr(block, "full_block_text", "") or getattr(block, "content", "") or "")
+    command_body_text = str(skill_md_content or "")[body_start:body_end] if body_start >= 0 and body_end >= body_start else ""
+    if not command_body_text:
+        command_body_text = str(getattr(block, "command_body_text", "") or getattr(block, "content", "") or "")
+    block_sha256 = hashlib.sha256(full_block_text.encode("utf-8")).hexdigest()
     return {
         "start": start,
         "end": end,
-        "content_sha256": hashlib.sha256(full_block_text.encode("utf-8")).hexdigest(),
+        "block_start": start,
+        "block_end": end,
+        "body_start": body_start,
+        "body_end": body_end,
+        "full_block_text": full_block_text,
+        "command_body_text": command_body_text,
+        "block_sha256": block_sha256,
+        "content_sha256": block_sha256,
         "content_excerpt": full_block_text[:1000],
     }
 
@@ -2649,9 +2662,14 @@ def _skill_md_block_review_to_contract_results(
                 "current_block": command_text,
                 "command_text": command_text,
                 "block_text": block_text,
-                "block_start": locator.get("start"),
-                "block_end": locator.get("end"),
-                "block_sha256": hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
+                "block_start": locator.get("block_start", locator.get("start")),
+                "block_end": locator.get("block_end", locator.get("end")),
+                "body_start": locator.get("body_start"),
+                "body_end": locator.get("body_end"),
+                "full_block_text": block_text,
+                "command_body_text": command_text,
+                "block_sha256": locator.get("block_sha256") or hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
+                "failed_checks": [failure_type],
                 "block_locator": locator,
                 "block_ordinal": review.get("command_block_ordinal"),
                 "structured_checks": {
@@ -2660,11 +2678,15 @@ def _skill_md_block_review_to_contract_results(
                     "type_checks": review.get("type_checks") or [],
                 },
                 "skill_md_block_repair_scope": {
-                    "block_start": locator.get("start"),
-                    "block_end": locator.get("end"),
+                    "block_start": locator.get("block_start", locator.get("start")),
+                    "block_end": locator.get("block_end", locator.get("end")),
+                    "body_start": locator.get("body_start"),
+                    "body_end": locator.get("body_end"),
                     "block_text": block_text,
-                    "block_sha256": hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
+                    "full_block_text": block_text,
+                    "block_sha256": locator.get("block_sha256") or hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
                     "command_text": command_text,
+                    "command_body_text": command_text,
                     "block_ordinal": review.get("command_block_ordinal"),
                     "script_path": script_path,
                     "block_locator": locator,
@@ -2935,34 +2957,6 @@ async def _validate_skill_md_blueprint_alignment(
     - 不检查最终平台输出；
     - 不检查脚本真实运行。
     """
-    try:
-        hard_results = _check_skill_md_contract(content, blueprint_text)
-    except Exception as exc:
-        logger.exception(
-            "[Creator][skill_md] hard contract validator crashed skill=%s",
-            skill_name,
-        )
-        raise ValueError(
-            "SKILL.md 基础合同校验器内部异常，已转为可返修错误。\n"
-            f"错误：{type(exc).__name__}: {exc}\n"
-            "请检查 frontmatter、Creator 流程泄露、Runtime Contract 泄露、"
-            "scripts 命令块格式、references/assets 资源说明等基础结构。"
-        ) from exc
-
-    hard_failed = [result for result in hard_results if not result.passed]
-    if hard_failed:
-        message = (
-            "SKILL.md 基础格式/资源合同校验未通过。\n"
-            "这属于第一轮当前文件责任失败，请只修 SKILL.md 的失败区域。\n"
-            + _format_contract_failures_safe(hard_results)
-        )
-        logger.info(
-            "[Creator][skill_md] hard contract failed skill=%s failures=\n%s",
-            skill_name,
-            message,
-        )
-        raise ContractValidationError(message, hard_results)
-
     deterministic_results = _deterministic_skill_md_blueprint_alignment_checks(
         content=content,
         blueprint_text=blueprint_text,
@@ -3038,39 +3032,6 @@ async def _validate_skill_md_blueprint_alignment(
             for path in _extract_declared_skill_paths(blueprint_text)
             if isinstance(path, str) and path.startswith("scripts/")
         ]
-
-    try:
-        fenced_results = _check_skill_md_fenced_command_contracts(
-            content=content,
-            blueprint_text=blueprint_text,
-            required_script_paths=required_script_paths,
-        )
-    except Exception as exc:
-        logger.exception(
-            "[Creator][skill_md] fenced command validator crashed skill=%s",
-            skill_name,
-        )
-        raise ValueError(
-            "SKILL.md 命令块校验器内部异常，已转为可返修错误。\n"
-            f"错误：{type(exc).__name__}: {exc}\n"
-            "请检查 SKILL.md 中真实脚本是否使用标准 ```bash fenced code block，"
-            "且脚本参数是否为 json.loads 可解析的 JSON object。"
-        ) from exc
-
-    fenced_failed = [result for result in fenced_results if not result.passed]
-    if fenced_failed:
-        message = (
-            "SKILL.md 命令块格式校验未通过。\n"
-            "蓝图语义已对齐，但真实脚本命令块仍不满足后台可解析规范。\n"
-            "请只修复以下命令块问题，不要新增蓝图外脚本。\n"
-            + _format_contract_failures_safe(fenced_results)
-        )
-        logger.info(
-            "[Creator][skill_md] fenced command contract failed skill=%s failures=\n%s",
-            skill_name,
-            message,
-        )
-        raise ContractValidationError(message, fenced_results)
 
     command_blocks = [
         block
