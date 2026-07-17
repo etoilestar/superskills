@@ -718,3 +718,12 @@ def test_reference_generate_file_branch_does_not_wrap_script_exception():
     assert "ScriptFunctionalValidationError" not in reference_block
     assert 'source="reference_semantic_failed"' in reference_block
     assert 'layer="semantic"' in reference_block
+
+
+def test_generate_file_prefers_persisted_file_binding_before_skill_projection():
+    import inspect
+    source = inspect.getsource(generate_file)
+    start = source.index('if request.file_path.startswith("scripts/"):')
+    block = source[start:source.index('if request.file_path.startswith("scripts/"):', start + 1)]
+    assert "current_file_binding = get_file_binding" in block
+    assert block.index("current_file_binding = get_file_binding") < block.index("get_skill_tool_binding")
