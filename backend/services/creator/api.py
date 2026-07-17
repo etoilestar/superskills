@@ -3397,6 +3397,23 @@ def _creator_file_binding_from_optional_tool_ids(
         for tool_id, features in (skill_binding.matched_features_by_tool or {}).items()
         if str(tool_id or "").strip() in allowed_set
     }
+    selected_pool_tools = [
+        tool
+        for tool in (pool.tools or [])
+        if str(tool.tool_id or "").strip() in allowed_set
+        and tool.status == "allowed"
+    ]
+    required_env = sorted({
+        str(env_name or "")
+        for tool in selected_pool_tools
+        for env_name in (tool.required_env or [])
+        if str(env_name or "")
+    })
+    dependencies = []
+    for tool in selected_pool_tools:
+        for dependency in (tool.dependencies or []):
+            if dependency not in dependencies:
+                dependencies.append(dependency)
     return ToolPoolFileBinding(
         target_file=target_file,
         allowed_tool_ids=list(allowed_tool_ids),
@@ -3406,22 +3423,46 @@ def _creator_file_binding_from_optional_tool_ids(
         scored_tools=scored_tools,
         matched_features_by_tool=matched_features_by_tool,
         allowed_helper_imports=sorted({
-            str(item.get("function_name") or "")
-            for item in available_tools
-            if str(item.get("function_name") or "")
+            *[
+                str(helper or "")
+                for tool in selected_pool_tools
+                for helper in (tool.allowed_helper_imports or [])
+                if str(helper or "")
+            ],
+            *[
+                str(item.get("function_name") or "")
+                for item in available_tools
+                if str(item.get("function_name") or "")
+            ],
         }),
         allowed_import_paths=sorted({
-            str(item.get("import_path") or "")
-            for item in available_tools
-            if str(item.get("import_path") or "")
+            *[
+                str(import_path or "")
+                for tool in selected_pool_tools
+                for import_path in (tool.allowed_import_paths or [])
+                if str(import_path or "")
+            ],
+            *[
+                str(item.get("import_path") or "")
+                for item in available_tools
+                if str(item.get("import_path") or "")
+            ],
         }),
         allowed_function_imports=sorted({
-            f'{item.get("import_path")}.{item.get("function_name")}'
-            for item in available_tools
-            if item.get("import_path") and item.get("function_name")
+            *[
+                str(function_import or "")
+                for tool in selected_pool_tools
+                for function_import in (tool.allowed_function_imports or [])
+                if str(function_import or "")
+            ],
+            *[
+                f'{item.get("import_path")}.{item.get("function_name")}'
+                for item in available_tools
+                if item.get("import_path") and item.get("function_name")
+            ],
         }),
-        required_env=[],
-        dependencies=[],
+        required_env=required_env,
+        dependencies=dependencies,
         snippets=[],
     )
 
@@ -12496,12 +12537,17 @@ async def generate_file(request: GenerateFileRequest):
             if request.file_path.startswith("scripts/"):
                 skill_dir = settings.skills_path / skill_name
                 current_tool_pool = load_tool_pool(skill_dir)
-                current_skill_binding = get_skill_tool_binding(
+                current_file_binding = get_file_binding(
                     current_tool_pool,
-                    target_file=request.file_path,
-                    include_script_core=True,
+                    request.file_path,
                 )
-                current_skill_binding_payload = current_skill_binding.model_dump(mode="json")
+                if current_file_binding is None:
+                    current_file_binding = get_skill_tool_binding(
+                        current_tool_pool,
+                        target_file=request.file_path,
+                        include_script_core=True,
+                    )
+                current_skill_binding_payload = current_file_binding.model_dump(mode="json")
                 current_tool_pool_summary = current_tool_pool.model_dump(mode="json")
                 logger.info(
                     "[Creator][generate_file][producer_tool_pool] skill=%s file=%s summary=%s",
@@ -13472,11 +13518,16 @@ async def generate_file(request: GenerateFileRequest):
                                     or int(expansion_result.get("attached_existing") or 0) > 0
                                 ):
                                     refreshed_tool_pool = load_tool_pool(settings.skills_path / skill_name)
-                                    refreshed_binding = get_skill_tool_binding(
+                                    refreshed_binding = get_file_binding(
                                         refreshed_tool_pool,
-                                        target_file=request.file_path,
-                                        include_script_core=True,
+                                        request.file_path,
                                     )
+                                    if refreshed_binding is None:
+                                        refreshed_binding = get_skill_tool_binding(
+                                            refreshed_tool_pool,
+                                            target_file=request.file_path,
+                                            include_script_core=True,
+                                        )
                                     current_tool_pool_summary = refreshed_tool_pool.model_dump(mode="json")
                                     current_skill_binding_payload = refreshed_binding.model_dump(mode="json")
                                     effective_skill_plan_entry = _with_current_skill_tool_binding(

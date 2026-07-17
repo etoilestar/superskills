@@ -328,7 +328,7 @@ def test_tool_readiness_blockers_are_judge_observations_not_producer_failures():
 
 def test_initial_skill_binding_syncs_before_generate_prompt_build():
     source = inspect.getsource(api.generate_file)
-    binding_created = source.index('current_skill_binding_payload = current_skill_binding.model_dump(mode="json")')
+    binding_created = source.index('current_skill_binding_payload = current_file_binding.model_dump(mode="json")')
     entry_sync = source.index('effective_skill_plan_entry = _with_current_skill_tool_binding', binding_created)
     prompt_build = source.index('_build_generate_file_prompt(', entry_sync)
     assert binding_created < entry_sync < prompt_build
@@ -411,3 +411,56 @@ async def test_final_tool_pool_persists_file_bindings_and_compat_aliases(monkeyp
     assert "script_argv_guard" in projected_binding.allowed_tool_ids
     assert "system_text_generation" in projected_binding.allowed_tool_ids
     assert api.tool_pool_snapshot(pool)["file_bindings"][0]["target_file"] == "scripts/write.py"
+
+
+@pytest.mark.asyncio
+async def test_persisted_file_binding_keeps_selected_tool_env_dependencies_and_import_fields(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(
+        api,
+        "_recall_creator_tool_candidates",
+        lambda file_specs, top_k: (
+            [{"tool_id": "system_image_generation", "recalled_for_capabilities": ["draw"]}],
+            "test",
+        ),
+    )
+
+    result = await api._plan_final_tool_pool(
+        skill_name="demo",
+        file_specs=[{"path": "scripts/draw.py", "required": True, "required_capabilities": ["draw"]}],
+    )
+
+    binding = api.get_file_binding(result["tool_pool"], "scripts/draw.py", raw=True)
+    assert binding is not None
+    assert binding.allowed_tool_ids == ["system_image_generation"]
+    assert binding.allowed_import_paths
+    assert binding.allowed_function_imports
+    assert isinstance(binding.required_env, list)
+    assert isinstance(binding.dependencies, list)
+
+
+def test_file_binding_helper_preserves_selected_tool_env_dependencies_and_import_metadata():
+    pool = ToolPoolModel(
+        tools=[
+            ToolPoolTool(
+                tool_id="custom_tool",
+                status="allowed",
+                allowed_import_paths=["pkg.helpers"],
+                allowed_function_imports=["pkg.helpers.run"],
+                required_env=["CUSTOM_TOKEN"],
+                dependencies=["custom-lib"],
+            )
+        ]
+    )
+
+    binding = api._creator_file_binding_from_optional_tool_ids(
+        pool=pool,
+        target_file="scripts/custom.py",
+        allowed_tool_ids=["custom_tool"],
+    )
+
+    assert binding.allowed_tool_ids == ["custom_tool"]
+    assert binding.allowed_import_paths == ["pkg.helpers"]
+    assert binding.allowed_function_imports == ["pkg.helpers.run"]
+    assert binding.required_env == ["CUSTOM_TOKEN"]
+    assert binding.dependencies == ["custom-lib"]

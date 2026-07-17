@@ -1316,3 +1316,89 @@ def test_skill_md_each_block_review_uses_only_current_script_context():
     assert "script_paths=[script_path]" in before_stdout_update
     assert "script_paths=required_script_paths" not in before_stdout_update
     assert "script_paths=[path" not in before_stdout_update
+
+
+@pytest.mark.asyncio
+async def test_generate_file_repairs_first_of_multiple_blocks_after_real_format_validation(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api, contracts
+    from backend.services.creator.command_normalizer import parse_skill_md_bash_command_blocks
+    from backend.services.creator.common import GenerateFileRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    (tmp_path / "demo-skill").mkdir()
+
+    bad_one = "```bash\npython scripts/one.py '{\"bad\":\"literal\"}'\n```\n"
+    bad_two = "```bash\npython scripts/two.py '{\"bad\":\"literal\"}'\n```\n"
+    fixed_one = "```bash\npython scripts/one.py '{\"required\":\"{{user_request}}\"}'\n```\n"
+    candidate = "---\nname: demo\ndescription: demo\n---\n# Demo\n" + bad_one + "Between\n" + bad_two + "Done\n"
+    blocks = parse_skill_md_bash_command_blocks(candidate)
+    results = []
+    for block in blocks:
+        full_block = candidate[block.start:block.end]
+        script_path = str(block.script_path)
+        results.append(contracts.ContractCheckResult(
+            id=f"skill_md.command_block.interface.issue.{script_path}",
+            passed=False,
+            target=f"SKILL.md:{script_path}:command_block",
+            message=f"{script_path} failed",
+            expected="repair only this block",
+            minimal_edit="repair only this block",
+            details={
+                "script_path": script_path,
+                "block_text": full_block,
+                "full_block_text": full_block,
+                "command_text": block.content,
+                "command_body_text": block.content,
+                "block_start": block.start,
+                "block_end": block.end,
+                "body_start": block.body_start,
+                "body_end": block.body_end,
+                "block_sha256": hashlib.sha256(full_block.encode("utf-8")).hexdigest(),
+            },
+            layer="skill_md_command_block_interface",
+        ))
+    stage_error = api.FileGenerationStageError(
+        source="content_review",
+        layer="skill_md_command_block_interface",
+        detail="two command blocks failed",
+        original=contracts.ContractValidationError("multi block", list(reversed(results))),
+    )
+    variants = []
+    alignment_calls = 0
+
+    async def fake_complete_creator_file_generation(**kwargs):
+        variants.append(kwargs.get("prompt_variant"))
+        if kwargs.get("prompt_variant") == "repair_skill_md_command_block":
+            return fixed_one
+        return candidate
+
+    async def fake_alignment(**_kwargs):
+        nonlocal alignment_calls
+        alignment_calls += 1
+        if alignment_calls == 1:
+            raise stage_error
+        return None
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(api, "_validate_skill_md_against_existing_files", lambda *a, **k: None)
+    monkeypatch.setattr(api, "_validate_skill_md_blueprint_alignment", fake_alignment)
+
+    response = await api.generate_file(GenerateFileRequest(
+        skill_name="demo-skill",
+        file_path="SKILL.md",
+        purpose="demo",
+        blueprint_text="use scripts/one.py scripts/two.py",
+        conversation_history=[],
+        role="skill_md",
+        skill_plan_entry={},
+    ))
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else str(chunk))
+    body = "".join(chunks)
+
+    assert "repair_skill_md_command_block" in variants
+    assert "scripts/one.py" in body and "required" in body
+    assert "scripts/two.py" in body and "literal" in body
+    assert alignment_calls == 2
