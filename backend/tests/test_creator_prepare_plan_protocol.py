@@ -1823,3 +1823,138 @@ def test_filter_unconfirmed_asset_plan_reference_only_upload_does_not_allow_asse
 
     assert "assets/template.pdf" not in [f.path for f in files]
     assert "assets/template.pdf" not in [a.path for a in assets]
+
+
+def _script_blueprint(paths):
+    blueprint_paths = "\n".join(
+        f"- path: `{path}`\n  role: script\n  inputs: [user_request]\n  outputs: [result]\n  dependencies: []\n  required_capabilities: []\n  forbidden_capabilities: [hidden_runtime_protocol]\n  references: []"
+        for path in paths
+    )
+    return _ready_blueprint(blueprint_paths)
+
+
+def _script_plan(paths):
+    return AnalyzeBlueprintResponse(
+        skill_name="demo-skill",
+        files=[FileSpecOut(path=path, purpose="script", required=True, can_skip=False) for path in paths],
+        warnings=[],
+        asset_requirements=[],
+        blueprint_text=_script_blueprint(paths),
+    )
+
+
+def _request_for_script_paths(paths):
+    return _request(
+        human_feedback="A. 没有，按上面的选择继续",
+        prepare_action="confirm",
+        previous_blueprint_text=_script_blueprint(paths),
+        function_items=[_abstract_function_item(path) for path in paths],
+        responsibility_edges=[
+            {
+                "from_node": path,
+                "from_output": "semantic_result",
+                "to_node": "platform_output_node",
+                "to_input": "text",
+                "purpose": "deliver",
+                "constraints": [],
+            }
+            for path in paths
+        ],
+    )
+
+
+def _tool(tool_id, *, status="allowed"):
+    return api.ToolPoolTool(tool_id=tool_id, status=status, source="blueprint_preselect")
+
+
+@pytest.mark.asyncio
+async def test_prepare_plan_preserves_planned_file_bindings_after_tool_pool_normalization(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+
+    async def fake_generate(_request):
+        return {"status": "ready", "internal_blueprint_text": _ready_blueprint(), "skill_name": "demo-skill"}
+
+    async def fake_analyze(_request):
+        return _script_plan(["scripts/write.py", "scripts/draw.py"])
+
+    async def fake_plan_final_tool_pool(**_kwargs):
+        return {
+            "tool_pool": api.ToolPoolModel(
+                skill_name="demo-skill",
+                tools=[_tool("text_tool"), _tool("image_tool")],
+                file_bindings=[
+                    api.ToolPoolFileBinding(target_file="scripts/write.py", allowed_tool_ids=["text_tool"]),
+                    api.ToolPoolFileBinding(target_file="scripts/draw.py", allowed_tool_ids=["image_tool"]),
+                ],
+            ),
+            "required_capabilities": [],
+        }
+
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
+    monkeypatch.setattr(api, "_plan_final_tool_pool", fake_plan_final_tool_pool)
+
+    response = await api.prepare_plan(_request_for_script_paths(["scripts/write.py", "scripts/draw.py"]))
+    saved_pool = api.load_tool_pool(tmp_path / "demo-skill")
+    assert {
+        binding.target_file: binding.allowed_tool_ids
+        for binding in saved_pool.file_bindings
+    } == {
+        "scripts/write.py": ["text_tool"],
+        "scripts/draw.py": ["image_tool"],
+    }
+
+    write_binding = api.get_file_binding(saved_pool, "scripts/write.py", raw=True)
+    draw_binding = api.get_file_binding(saved_pool, "scripts/draw.py", raw=True)
+    assert write_binding.allowed_tool_ids == ["text_tool"]
+    assert draw_binding.allowed_tool_ids == ["image_tool"]
+
+    write_projected = api.get_file_binding(saved_pool, "scripts/write.py")
+    assert "script_argv_guard" in write_projected.allowed_tool_ids
+    assert "text_tool" in write_projected.allowed_tool_ids
+    assert "image_tool" not in write_projected.allowed_tool_ids
+
+    assert api.tool_pool_snapshot(saved_pool)["file_bindings"] == []
+
+    summaries = {file.path: file.tool_binding_summary for file in response.files}
+    assert summaries["scripts/write.py"]["allowed_tool_ids"] == ["script_argv_guard", "text_tool"]
+    assert summaries["scripts/draw.py"]["allowed_tool_ids"] == ["script_argv_guard", "image_tool"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_plan_drops_binding_whose_tools_are_no_longer_allowed_after_normalization(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+
+    async def fake_generate(_request):
+        return {"status": "ready", "internal_blueprint_text": _ready_blueprint(), "skill_name": "demo-skill"}
+
+    async def fake_analyze(_request):
+        return _script_plan(["scripts/a.py"])
+
+    async def fake_plan_final_tool_pool(**_kwargs):
+        return {
+            "tool_pool": api.ToolPoolModel(
+                skill_name="demo-skill",
+                tools=[_tool("active_tool")],
+                file_bindings=[
+                    api.ToolPoolFileBinding(
+                        target_file="scripts/a.py",
+                        allowed_tool_ids=["active_tool", "removed_tool"],
+                    ),
+                ],
+            ),
+            "required_capabilities": [],
+        }
+
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
+    monkeypatch.setattr(api, "_plan_final_tool_pool", fake_plan_final_tool_pool)
+
+    await api.prepare_plan(_request_for_script_paths(["scripts/a.py"]))
+    saved_pool = api.load_tool_pool(tmp_path / "demo-skill")
+
+    assert {
+        binding.target_file: binding.allowed_tool_ids
+        for binding in saved_pool.file_bindings
+    } == {"scripts/a.py": ["active_tool"]}
+    assert api.get_file_binding(saved_pool, "scripts/a.py", raw=True).allowed_tool_ids == ["active_tool"]
