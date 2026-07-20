@@ -13,6 +13,10 @@ def _request(**kwargs):
     return api.PreparePlanRequest(**data)
 
 
+async def _async_result(value):
+    return value
+
+
 def _ready_blueprint(paths="- path: `SKILL.md`\n  role: skill_overview\n  inputs: [user_request]\n  outputs: [workflow]\n  dependencies: []\n  required_capabilities: []\n  forbidden_capabilities: [hidden_runtime_protocol]\n  references: []"):
     return f"""## 📋 Skill 架构蓝图
 ### 基本信息
@@ -690,6 +694,7 @@ async def test_incomplete_binding_target_set_does_not_emit_draft_and_convergence
         events.append(event)
 
     monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    monkeypatch.setattr(api, "_review_responsibility_graph_alignment", lambda **kwargs: _async_result({"passed": True, "issues": []}))
     result = await api._generate_internal_blueprint_or_questions(_request(), event_emitter=emit)
 
     assert "planner_draft" not in [event["event"] for event in events]
@@ -802,6 +807,7 @@ async def test_binding_uses_post_repair_file_plan_targets(monkeypatch):
         return json.dumps(responses.pop(0))
 
     monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    monkeypatch.setattr(api, "_review_responsibility_graph_alignment", lambda **kwargs: _async_result({"passed": True, "issues": []}))
     result = await api._generate_internal_blueprint_or_questions(_request())
 
     binding_payload = next(
@@ -1945,3 +1951,141 @@ def test_executable_ownership_prompts_add_no_backend_semantic_classifier():
         "CARDINALITY_RULES",
     ]:
         assert classifier_name not in source
+
+
+@pytest.mark.asyncio
+async def test_responsibility_graph_alignment_review_is_read_only(monkeypatch):
+    async def fake_complete(messages, model):
+        return '{"passed":false,"issues":[],"function_items":[]}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    with pytest.raises(ValueError, match="passed and issues"):
+        await api._review_responsibility_graph_alignment(
+            request=_request(), frozen_blueprint_text="frozen", allowed_function_item_targets=[],
+            function_items=[], responsibility_edges=[], planner_model="planner",
+        )
+
+
+async def _run_ready_graph_alignment_flow(monkeypatch, review, repair=None):
+    import json
+
+    blueprint = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py")))
+    item = _function_item("scripts/a.py")
+    edge = _output_edge("scripts/a.py")
+
+    async def fake_complete(messages, model):
+        return json.dumps(_ready_payload(blueprint))
+
+    async def bind(**kwargs):
+        return {"function_items": [item], "responsibility_edges": [edge]}
+
+    async def converge(**kwargs):
+        return {**_ready_payload("converged"), "function_items": [item], "responsibility_edges": [edge]}
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    monkeypatch.setattr(api, "_bind_executable_responsibility_plan", bind)
+    monkeypatch.setattr(api, "_converge_ready_executable_plan", converge)
+    monkeypatch.setattr(api, "_review_responsibility_graph_alignment", review)
+    if repair is not None:
+        monkeypatch.setattr(api, "_repair_responsibility_graph_alignment", repair)
+    return await api._generate_internal_blueprint_or_questions(_request()), item, edge
+
+
+@pytest.mark.asyncio
+async def test_alignment_review_pass_does_not_trigger_localized_repair(monkeypatch):
+    review_calls = 0
+    repair_calls = 0
+
+    async def review(**kwargs):
+        nonlocal review_calls
+        review_calls += 1
+        return {"passed": True, "issues": []}
+
+    async def repair(**kwargs):
+        nonlocal repair_calls
+        repair_calls += 1
+        raise AssertionError("repair must not run after a passing review")
+
+    result, item, edge = await _run_ready_graph_alignment_flow(monkeypatch, review, repair)
+    assert result["function_items"] == [item]
+    assert result["responsibility_edges"] == [edge]
+    assert review_calls == 1
+    assert repair_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_alignment_failure_runs_one_localized_repair_then_final_review(monkeypatch):
+    review_calls = 0
+    repair_calls = 0
+
+    async def review(**kwargs):
+        nonlocal review_calls
+        review_calls += 1
+        return (
+            {"passed": False, "issues": [{"id": "alignment", "target_files": ["scripts/a.py"], "affected_edge_indexes": [], "reason": "missing alignment", "evidence": "current graph", "repair_guidance": "restore ownership"}]}
+            if review_calls == 1 else {"passed": True, "issues": []}
+        )
+
+    async def repair(**kwargs):
+        nonlocal repair_calls
+        repair_calls += 1
+        item = _function_item("scripts/a.py")
+        item["purpose"] = "repaired responsibility"
+        return {"function_items": [item], "responsibility_edges": [_output_edge("scripts/a.py")]}
+
+    result, _, edge = await _run_ready_graph_alignment_flow(monkeypatch, review, repair)
+    assert result["function_items"][0]["purpose"] == "repaired responsibility"
+    assert result["responsibility_edges"] == [edge]
+    assert review_calls == 2
+    assert repair_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_alignment_repair_reuses_frozen_target_and_edge_validators(monkeypatch):
+    async def review(**kwargs):
+        return {"passed": False, "issues": [{"id": "alignment", "target_files": ["scripts/a.py"], "affected_edge_indexes": [], "reason": "x", "evidence": "x", "repair_guidance": "x"}]}
+
+    async def wrong_target_repair(**kwargs):
+        return {"function_items": [_function_item("scripts/outside.py")], "responsibility_edges": [_output_edge("scripts/outside.py")]}
+
+    with pytest.raises(api.PreparePlanProtocolError, match="target_file set"):
+        await _run_ready_graph_alignment_flow(monkeypatch, review, wrong_target_repair)
+
+    async def invalid_edge_repair(**kwargs):
+        return {"function_items": [_function_item("scripts/a.py")], "responsibility_edges": [{"from": "scripts/a.py"}]}
+
+    with pytest.raises(api.PreparePlanProtocolError, match="unknown_fields|missing_fields"):
+        await _run_ready_graph_alignment_flow(monkeypatch, review, invalid_edge_repair)
+
+
+@pytest.mark.asyncio
+async def test_alignment_final_review_failure_blocks_after_bounded_calls(monkeypatch):
+    review_calls = 0
+    repair_calls = 0
+
+    async def review(**kwargs):
+        nonlocal review_calls
+        review_calls += 1
+        return {"passed": False, "issues": [{"id": "alignment", "target_files": ["scripts/a.py"], "affected_edge_indexes": [], "reason": "x", "evidence": "x", "repair_guidance": "x"}]}
+
+    async def repair(**kwargs):
+        nonlocal repair_calls
+        repair_calls += 1
+        return {"function_items": [_function_item("scripts/a.py")], "responsibility_edges": [_output_edge("scripts/a.py")]}
+
+    with pytest.raises(api.PreparePlanProtocolError, match="remained unresolved"):
+        await _run_ready_graph_alignment_flow(monkeypatch, review, repair)
+    assert review_calls == 2
+    assert repair_calls == 1
+
+
+def test_alignment_review_and_repair_prompts_are_abstract_and_bounded():
+    import inspect
+
+    review_source = inspect.getsource(api._review_responsibility_graph_alignment)
+    repair_source = inspect.getsource(api._repair_responsibility_graph_alignment)
+    for text in ["requirement", "traceability", "dependency", "executability", "frozen FilePlan"]:
+        assert text in review_source or text in repair_source
+    assert "localized" in repair_source
+    assert "while " not in review_source
+    assert "while " not in repair_source
