@@ -2089,3 +2089,67 @@ def test_alignment_review_and_repair_prompts_are_abstract_and_bounded():
     assert "localized" in repair_source
     assert "while " not in review_source
     assert "while " not in repair_source
+
+
+@pytest.mark.asyncio
+async def test_alignment_review_requires_localizable_failure_issues(monkeypatch):
+    responses = iter([
+        '{"passed":false,"issues":[]}',
+        '{"passed":false,"issues":[{"id":"issue","target_files":[],"affected_edge_indexes":[],"reason":"r","evidence":"e"}]}',
+        '{"passed":false,"issues":[{"id":1,"target_files":[],"affected_edge_indexes":[],"reason":"r","evidence":"e","repair_guidance":"g"}]}',
+    ])
+
+    async def fake_complete(messages, model):
+        return next(responses)
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    kwargs = {
+        "request": _request(), "frozen_blueprint_text": "frozen",
+        "allowed_function_item_targets": [], "function_items": [],
+        "responsibility_edges": [], "planner_model": "planner",
+    }
+    with pytest.raises(ValueError, match="must include issues"):
+        await api._review_responsibility_graph_alignment(**kwargs)
+    with pytest.raises(ValueError, match="invalid structure"):
+        await api._review_responsibility_graph_alignment(**kwargs)
+    with pytest.raises(ValueError, match="invalid structure"):
+        await api._review_responsibility_graph_alignment(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_alignment_review_and_repair_accept_normal_protocol_outputs(monkeypatch):
+    import json
+
+    issue = {"id": "issue", "target_files": [], "affected_edge_indexes": [], "reason": "r", "evidence": "e", "repair_guidance": "g"}
+    responses = iter([
+        json.dumps({"passed": False, "issues": [issue]}),
+        json.dumps({"function_items": [], "responsibility_edges": []}),
+    ])
+
+    async def fake_complete(messages, model):
+        return next(responses)
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    review = await api._review_responsibility_graph_alignment(
+        request=_request(), frozen_blueprint_text="frozen", allowed_function_item_targets=[],
+        function_items=[], responsibility_edges=[], planner_model="planner",
+    )
+    repair = await api._repair_responsibility_graph_alignment(
+        request=_request(), frozen_blueprint_text="frozen", allowed_function_item_targets=[],
+        function_items=[], responsibility_edges=[], review_issues=review["issues"], planner_model="planner",
+    )
+    assert review == {"passed": False, "issues": [issue]}
+    assert repair == {"function_items": [], "responsibility_edges": []}
+
+
+@pytest.mark.asyncio
+async def test_alignment_repair_rejects_extra_top_level_fields(monkeypatch):
+    async def fake_complete(messages, model):
+        return '{"function_items":[],"responsibility_edges":[],"extra":true}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    with pytest.raises(ValueError, match="function_items and responsibility_edges"):
+        await api._repair_responsibility_graph_alignment(
+            request=_request(), frozen_blueprint_text="frozen", allowed_function_item_targets=[],
+            function_items=[], responsibility_edges=[], review_issues=[], planner_model="planner",
+        )

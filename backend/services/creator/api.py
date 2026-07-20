@@ -6425,6 +6425,22 @@ Do not return function_items or responsibility_edges.
         raise ValueError("Responsibility graph alignment review must return only passed and issues")
     if data["passed"] and data["issues"]:
         raise ValueError("Passing responsibility graph alignment review must not include issues")
+    if not data["passed"] and not data["issues"]:
+        raise ValueError("Failing responsibility graph alignment review must include issues")
+    issue_fields = {
+        "id": str,
+        "target_files": list,
+        "affected_edge_indexes": list,
+        "reason": str,
+        "evidence": str,
+        "repair_guidance": str,
+    }
+    for issue in data["issues"]:
+        if not isinstance(issue, dict) or any(
+            key not in issue or not isinstance(issue[key], value_type)
+            for key, value_type in issue_fields.items()
+        ):
+            raise ValueError("Responsibility graph alignment review issue has invalid structure")
     return {"passed": data["passed"], "issues": data["issues"]}
 
 
@@ -6479,7 +6495,7 @@ Return only strict JSON:
         planner_model,
     )
     data = _parse_prepare_plan_json(text)
-    if not isinstance(data.get("function_items"), list) or not isinstance(data.get("responsibility_edges"), list):
+    if set(data) != {"function_items", "responsibility_edges"} or not isinstance(data.get("function_items"), list) or not isinstance(data.get("responsibility_edges"), list):
         raise ValueError("Responsibility graph alignment repair must return function_items and responsibility_edges")
     return {"function_items": data["function_items"], "responsibility_edges": data["responsibility_edges"]}
 
