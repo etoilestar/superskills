@@ -1823,3 +1823,125 @@ def test_filter_unconfirmed_asset_plan_reference_only_upload_does_not_allow_asse
 
     assert "assets/template.pdf" not in [f.path for f in files]
     assert "assets/template.pdf" not in [a.path for a in assets]
+
+
+@pytest.mark.asyncio
+async def test_executable_binding_prompt_explains_real_execution_ownership(monkeypatch):
+    captured = []
+
+    async def fake_complete(messages, model):
+        captured.extend(messages)
+        return '{"function_items":[],"responsibility_edges":[]}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    await api._bind_executable_responsibility_plan(
+        request=_request(),
+        current_planner_result={},
+        planner_model="planner",
+        allowed_function_item_targets=[],
+    )
+
+    prompt = " ".join(captured[0]["content"].lower().split())
+    for intent in [
+        "functionitems are the executable responsibility owners",
+        "cross-responsibility data dependencies and transport",
+        "actual host execution model",
+        "every required computation must have a real executable owner",
+        "script-local intermediate values",
+    ]:
+        assert intent in prompt
+
+
+@pytest.mark.asyncio
+async def test_convergence_prompt_requires_executable_ownership_closure(monkeypatch):
+    captured = []
+
+    async def fake_complete(messages, model):
+        captured.extend(messages)
+        return (
+            '{"status":"ready","clarifying_questions":[],"review_summary":{},'
+            '"internal_blueprint_text":"revised","skill_name":"demo","blockers":[],'
+            '"function_items":[],"responsibility_edges":[]}'
+        )
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    await api._converge_ready_executable_plan(
+        request=_request(),
+        current_planner_result={},
+        planner_model="planner",
+        allowed_function_item_targets=[],
+    )
+
+    prompt = " ".join(captured[0]["content"].lower().split())
+    for intent in [
+        "executable ownership closure",
+        "replay the complete executable plan against the actual host execution model",
+        "every required computation has an executable owner",
+        "revise the owning functionitem and affected responsibilityedges together",
+        "implicit execution behavior that the host runtime does not provide",
+    ]:
+        assert intent in prompt
+
+
+@pytest.mark.asyncio
+async def test_same_planner_convergence_adopts_complete_ownership_revision(monkeypatch):
+    import json
+
+    draft_items = [
+        {**_function_item("scripts/producer.py"), "outputs": ["units"]},
+        {**_function_item("scripts/processor.py"), "inputs": ["unit"], "outputs": ["result"]},
+        {**_function_item("scripts/consumer.py"), "inputs": ["results"]},
+    ]
+    draft_edges = [
+        {"from_node": "scripts/producer.py", "from_output": "units", "to_node": "scripts/processor.py", "to_input": "unit", "purpose": "provide a unit", "constraints": []},
+        {"from_node": "scripts/processor.py", "from_output": "result", "to_node": "scripts/consumer.py", "to_input": "results", "purpose": "provide results", "constraints": []},
+    ]
+    revised_items = [
+        draft_items[0],
+        {**_function_item("scripts/processor.py"), "inputs": ["units"], "outputs": ["results"], "purpose": "process the supplied units"},
+        draft_items[2],
+    ]
+    revised_edges = [
+        {"from_node": "scripts/producer.py", "from_output": "units", "to_node": "scripts/processor.py", "to_input": "units", "purpose": "provide units", "constraints": []},
+        {"from_node": "scripts/processor.py", "from_output": "results", "to_node": "scripts/consumer.py", "to_input": "results", "purpose": "provide results", "constraints": []},
+    ]
+    responses = iter([
+        {"function_items": draft_items, "responsibility_edges": draft_edges},
+        {"status": "ready", "clarifying_questions": [], "review_summary": {}, "internal_blueprint_text": "revised", "skill_name": "demo", "blockers": [], "function_items": revised_items, "responsibility_edges": revised_edges},
+    ])
+
+    async def fake_complete(messages, model):
+        return json.dumps(next(responses))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    binding = await api._bind_executable_responsibility_plan(
+        request=_request(),
+        current_planner_result={},
+        planner_model="planner",
+        allowed_function_item_targets=[item["target_file"] for item in draft_items],
+    )
+    result = await api._converge_ready_executable_plan(
+        request=_request(),
+        current_planner_result=binding,
+        planner_model="planner",
+        allowed_function_item_targets=[item["target_file"] for item in draft_items],
+    )
+
+    assert result["function_items"] == revised_items
+    assert result["responsibility_edges"] == revised_edges
+
+
+def test_executable_ownership_prompts_add_no_backend_semantic_classifier():
+    import inspect
+
+    source = "\n".join([
+        inspect.getsource(api._bind_executable_responsibility_plan),
+        inspect.getsource(api._converge_ready_executable_plan),
+    ])
+    for classifier_name in [
+        "MAP_EACH_STRATEGIES",
+        "LOOP_STRATEGIES",
+        "CONTROL_FLOW_KEYWORDS",
+        "CARDINALITY_RULES",
+    ]:
+        assert classifier_name not in source

@@ -6097,6 +6097,23 @@ If a responsibility is missing, revise function_items and responsibility_edges t
 If a FunctionItem is added, removed, or changed, revise affected ResponsibilityEdges in the same response.
 Return one complete revised executable plan.
 
+Executable ownership closure:
+
+Replay the complete executable plan against the actual host execution model.
+
+For every required business action or transformation:
+1. Identify the executable FunctionItem that owns it.
+2. Verify that this FunctionItem's purpose, inputs, outputs, capabilities, and constraints are sufficient to perform that owned responsibility.
+3. Verify that no required computation exists only in workflow prose or ResponsibilityEdge metadata without an executable owner.
+4. Verify that every ResponsibilityEdge represents data the source FunctionItem can actually produce and the target FunctionItem can directly consume as part of its responsibility boundary.
+5. If an edge depends on implicit execution behavior that the host runtime does not provide, revise the owning FunctionItem and affected ResponsibilityEdges together.
+6. Do not merely rename an edge or remove a constraint and preserve an unexecutable responsibility split.
+7. When responsibility boundaries change, update FunctionItem.inputs, FunctionItem.outputs, purpose, constraints, and all affected ResponsibilityEdges consistently.
+8. Preserve the frozen FilePlan target set. Do not add, remove, split, or merge script files.
+
+The final plan is ready only when every required computation has an executable
+owner under the real host execution model.
+
 Every function_items item must be a JSON object with exactly:
 target_file, role, purpose, inputs, outputs, required_capabilities, constraints.
 target_file must exactly equal one item from allowed_function_item_targets.
@@ -6416,6 +6433,31 @@ Preserve user-stated requirements by priority: latest explicit human_feedback, o
 Your only task is to bind executable responsibilities and cross-responsibility transport onto the frozen FilePlan.
 
 FunctionItems are executable responsibility nodes.
+
+Executable responsibility ownership:
+
+FunctionItems are the executable responsibility owners.
+ResponsibilityEdges describe cross-responsibility data dependencies and transport between executable owners.
+
+Reason from the actual host execution model. The current host invokes each
+generated script through its declared command invocation. There is no separate
+generic workflow engine that automatically executes arbitrary control-flow
+semantics described only in ResponsibilityEdge metadata.
+
+Therefore:
+- Any computation required to fulfill a FunctionItem's owned business responsibility must be executable inside that FunctionItem script unless the platform contract explicitly provides that execution capability.
+- Ordinary program logic needed to complete one script responsibility remains inside that script.
+- Do not externalize implementation logic from a FunctionItem into ResponsibilityEdges when the host runtime has no corresponding executable node.
+- A ResponsibilityEdge must represent a real value produced by one executable responsibility and consumed by another executable responsibility.
+- If fulfilling a downstream responsibility requires processing an upstream result before the downstream responsibility is complete, decide which FunctionItem owns that processing and express the FunctionItem input/output boundary accordingly.
+- FunctionItem inputs and outputs must represent stable cross-script responsibility boundaries, not temporary values that exist only because of internal implementation steps.
+- Do not promote script-local intermediate values into cross-script inputs or outputs unless another FunctionItem genuinely consumes them as part of its own independent responsibility.
+
+Before returning, mentally replay the plan using the actual host execution model:
+each FunctionItem script is invoked according to the generated workflow;
+every required computation must have a real executable owner; and every
+ResponsibilityEdge must be satisfiable as data transport without assuming an
+undeclared workflow execution engine.
 
 Every target_file must be copied exactly from allowed_function_item_targets.
 Do not invent a target path.
