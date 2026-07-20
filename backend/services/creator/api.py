@@ -6097,6 +6097,23 @@ If a responsibility is missing, revise function_items and responsibility_edges t
 If a FunctionItem is added, removed, or changed, revise affected ResponsibilityEdges in the same response.
 Return one complete revised executable plan.
 
+Executable ownership closure:
+
+Replay the complete executable plan against the actual host execution model.
+
+For every required business action or transformation:
+1. Identify the executable FunctionItem that owns it.
+2. Verify that this FunctionItem's purpose, inputs, outputs, capabilities, and constraints are sufficient to perform that owned responsibility.
+3. Verify that no required computation exists only in workflow prose or ResponsibilityEdge metadata without an executable owner.
+4. Verify that every ResponsibilityEdge represents data the source FunctionItem can actually produce and the target FunctionItem can directly consume as part of its responsibility boundary.
+5. If an edge depends on implicit execution behavior that the host runtime does not provide, revise the owning FunctionItem and affected ResponsibilityEdges together.
+6. Do not merely rename an edge or remove a constraint and preserve an unexecutable responsibility split.
+7. When responsibility boundaries change, update FunctionItem.inputs, FunctionItem.outputs, purpose, constraints, and all affected ResponsibilityEdges consistently.
+8. Preserve the frozen FilePlan target set. Do not add, remove, split, or merge script files.
+
+The final plan is ready only when every required computation has an executable
+owner under the real host execution model.
+
 Every function_items item must be a JSON object with exactly:
 target_file, role, purpose, inputs, outputs, required_capabilities, constraints.
 target_file must exactly equal one item from allowed_function_item_targets.
@@ -6341,6 +6358,148 @@ Only output strict JSON object. Do not output Markdown or explanation.
     return data
 
 
+async def _review_responsibility_graph_alignment(
+    *,
+    request: PreparePlanRequest,
+    frozen_blueprint_text: str,
+    allowed_function_item_targets: list[str],
+    function_items: list[dict[str, Any]],
+    responsibility_edges: list[dict[str, Any]],
+    planner_model: str,
+) -> dict[str, Any]:
+    """Use the same Planner as a read-only graph alignment reviewer."""
+
+    prompt = """
+You are the same Blueprint Planner acting only as a read-only Responsibility
+Graph Alignment Reviewer. You are not planning, repairing, or replacing the
+responsibility graph.
+
+Review current confirmed requirements for traceability to the current
+FunctionItems and ResponsibilityEdges under the frozen FilePlan and actual
+host execution model. Do not infer predefined requirement categories.
+
+Check only these three principles:
+1. Requirement fidelity: every confirmed requirement has an appropriate
+   responsibility owner and is not weakened, lost, or incorrectly assigned.
+2. Responsibility and dependency closure: FunctionItem role, purpose, inputs,
+   outputs, capabilities, and constraints express a consistent boundary; real
+   cross-responsibility dependencies are represented by ResponsibilityEdges
+   whose source can produce and target can consume the transported result.
+3. Executability: every required computation has a real execution owner and
+   the graph does not depend on implicit host execution behavior.
+
+For each issue, localize the affected target_files and affected_edge_indexes,
+state the current alignment fact as evidence, and give only localized repair
+guidance. Do not propose FilePlan changes.
+
+Return only strict JSON:
+{"passed": true, "issues": []}
+or
+{"passed": false, "issues": [{"id": "...", "target_files": [],
+"affected_edge_indexes": [], "reason": "...", "evidence": "...",
+"repair_guidance": "..."}]}
+Do not return function_items or responsibility_edges.
+""".strip()
+    payload = {
+        "task": "review_responsibility_graph_alignment",
+        "frozen_file_plan": frozen_blueprint_text,
+        "allowed_function_item_targets": allowed_function_item_targets,
+        "function_items": function_items,
+        "responsibility_edges": responsibility_edges,
+        "platform_io_contract": platform_io_contract_prompt_text(),
+        "confirmed_decision_context": {
+            "conversation_history": request.conversation_history,
+            "user_request": request.user_request,
+            "human_feedback": request.human_feedback,
+            "previous_blueprint_text": request.previous_blueprint_text,
+            "skill_name": request.skill_name,
+        },
+    }
+    text = await complete_chat_once(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+        planner_model,
+    )
+    data = _parse_prepare_plan_json(text)
+    if set(data) != {"passed", "issues"} or not isinstance(data.get("passed"), bool) or not isinstance(data.get("issues"), list):
+        raise ValueError("Responsibility graph alignment review must return only passed and issues")
+    if data["passed"] and data["issues"]:
+        raise ValueError("Passing responsibility graph alignment review must not include issues")
+    if not data["passed"] and not data["issues"]:
+        raise ValueError("Failing responsibility graph alignment review must include issues")
+    issue_fields = {
+        "id": str,
+        "target_files": list,
+        "affected_edge_indexes": list,
+        "reason": str,
+        "evidence": str,
+        "repair_guidance": str,
+    }
+    for issue in data["issues"]:
+        if not isinstance(issue, dict) or any(
+            key not in issue or not isinstance(issue[key], value_type)
+            for key, value_type in issue_fields.items()
+        ):
+            raise ValueError("Responsibility graph alignment review issue has invalid structure")
+    return {"passed": data["passed"], "issues": data["issues"]}
+
+
+async def _repair_responsibility_graph_alignment(
+    *,
+    request: PreparePlanRequest,
+    frozen_blueprint_text: str,
+    allowed_function_item_targets: list[str],
+    function_items: list[dict[str, Any]],
+    responsibility_edges: list[dict[str, Any]],
+    review_issues: list[dict[str, Any]],
+    planner_model: str,
+) -> dict[str, Any]:
+    """Ask the same Planner for one localized responsibility-graph repair."""
+
+    prompt = """
+You are the same Blueprint Planner repairing your responsibility graph after a
+read-only alignment review. Perform one minimal coherent localized repair using
+the review issues. Restore requirement traceability, responsibility ownership,
+responsibility boundary consistency, input/output alignment, dependency closure,
+and constraint ownership with actual host executability preserved.
+
+The FilePlan is frozen. Preserve the exact allowed_function_item_targets and
+current wire schema. Do not add, remove, rename, split, or merge files. Do not
+modify FilePlan resources, platform protocol, or ToolPool. Modify only
+FunctionItem responsibility fields and affected ResponsibilityEdges. Prefer the
+issue target_files and affected_edge_indexes; adjust directly connected edges
+only when needed for a coherent repair. Do not rewrite unrelated FunctionItems.
+
+Return only strict JSON:
+{"function_items": [...], "responsibility_edges": [...]}
+""".strip()
+    payload = {
+        "task": "repair_responsibility_graph_alignment",
+        "frozen_file_plan": frozen_blueprint_text,
+        "allowed_function_item_targets": allowed_function_item_targets,
+        "function_items": function_items,
+        "responsibility_edges": responsibility_edges,
+        "review_issues": review_issues,
+        "platform_io_contract": platform_io_contract_prompt_text(),
+        "confirmed_decision_context": {
+            "conversation_history": request.conversation_history,
+            "user_request": request.user_request,
+            "human_feedback": request.human_feedback,
+            "previous_blueprint_text": request.previous_blueprint_text,
+            "skill_name": request.skill_name,
+        },
+    }
+    text = await complete_chat_once(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+        planner_model,
+    )
+    data = _parse_prepare_plan_json(text)
+    if set(data) != {"function_items", "responsibility_edges"} or not isinstance(data.get("function_items"), list) or not isinstance(data.get("responsibility_edges"), list):
+        raise ValueError("Responsibility graph alignment repair must return function_items and responsibility_edges")
+    return {"function_items": data["function_items"], "responsibility_edges": data["responsibility_edges"]}
+
+
 def _resolve_allowed_function_item_targets_from_blueprint(
     internal_blueprint_text: str,
 ) -> list[str]:
@@ -6416,6 +6575,31 @@ Preserve user-stated requirements by priority: latest explicit human_feedback, o
 Your only task is to bind executable responsibilities and cross-responsibility transport onto the frozen FilePlan.
 
 FunctionItems are executable responsibility nodes.
+
+Executable responsibility ownership:
+
+FunctionItems are the executable responsibility owners.
+ResponsibilityEdges describe cross-responsibility data dependencies and transport between executable owners.
+
+Reason from the actual host execution model. The current host invokes each
+generated script through its declared command invocation. There is no separate
+generic workflow engine that automatically executes arbitrary control-flow
+semantics described only in ResponsibilityEdge metadata.
+
+Therefore:
+- Any computation required to fulfill a FunctionItem's owned business responsibility must be executable inside that FunctionItem script unless the platform contract explicitly provides that execution capability.
+- Ordinary program logic needed to complete one script responsibility remains inside that script.
+- Do not externalize implementation logic from a FunctionItem into ResponsibilityEdges when the host runtime has no corresponding executable node.
+- A ResponsibilityEdge must represent a real value produced by one executable responsibility and consumed by another executable responsibility.
+- If fulfilling a downstream responsibility requires processing an upstream result before the downstream responsibility is complete, decide which FunctionItem owns that processing and express the FunctionItem input/output boundary accordingly.
+- FunctionItem inputs and outputs must represent stable cross-script responsibility boundaries, not temporary values that exist only because of internal implementation steps.
+- Do not promote script-local intermediate values into cross-script inputs or outputs unless another FunctionItem genuinely consumes them as part of its own independent responsibility.
+
+Before returning, mentally replay the plan using the actual host execution model:
+each FunctionItem script is invoked according to the generated workflow;
+every required computation must have a real executable owner; and every
+ResponsibilityEdge must be satisfiable as data transport without assuming an
+undeclared workflow execution engine.
 
 Every target_file must be copied exactly from allowed_function_item_targets.
 Do not invent a target path.
@@ -7444,6 +7628,63 @@ Blueprint Planner 只规划业务责任。
                     f"draft_error={draft_edge_error}; "
                     f"convergence_error={exc}"
                 ) from exc
+
+        try:
+            alignment_review = await _review_responsibility_graph_alignment(
+                request=request,
+                frozen_blueprint_text=frozen_blueprint_text,
+                allowed_function_item_targets=allowed_function_item_targets,
+                function_items=list(data.get("function_items") or []),
+                responsibility_edges=list(data.get("responsibility_edges") or []),
+                planner_model=route.model,
+            )
+            if not alignment_review["passed"]:
+                repaired_graph = await _repair_responsibility_graph_alignment(
+                    request=request,
+                    frozen_blueprint_text=frozen_blueprint_text,
+                    allowed_function_item_targets=allowed_function_item_targets,
+                    function_items=list(data.get("function_items") or []),
+                    responsibility_edges=list(data.get("responsibility_edges") or []),
+                    review_issues=alignment_review["issues"],
+                    planner_model=route.model,
+                )
+                repaired_function_items = normalize_structured_function_items(
+                    repaired_graph["function_items"], source="planner"
+                )
+                _validate_function_item_targets_in_allowed_domain(
+                    repaired_function_items, allowed_function_item_targets
+                )
+                repaired_edges = validate_structured_responsibility_edge_transport(
+                    repaired_graph["responsibility_edges"],
+                    function_items=repaired_function_items,
+                    source="planner",
+                )
+                final_alignment_review = await _review_responsibility_graph_alignment(
+                    request=request,
+                    frozen_blueprint_text=frozen_blueprint_text,
+                    allowed_function_item_targets=allowed_function_item_targets,
+                    function_items=repaired_function_items,
+                    responsibility_edges=repaired_edges,
+                    planner_model=route.model,
+                )
+                if not final_alignment_review["passed"]:
+                    raise PreparePlanProtocolError(
+                        "Responsibility graph alignment remained unresolved after "
+                        "one localized same-Planner repair; "
+                        f"issues={final_alignment_review['issues']}"
+                    )
+                data["function_items"] = repaired_function_items
+                data["responsibility_edges"] = repaired_edges
+                data["internal_blueprint_text"] = _render_structured_responsibility_view(
+                    frozen_blueprint_text, repaired_function_items, repaired_edges
+                )
+        except PreparePlanProtocolError:
+            raise
+        except Exception as exc:
+            raise PreparePlanProtocolError(
+                "Responsibility graph alignment review or localized repair failed; "
+                f"error={type(exc).__name__}: {exc}"
+            ) from exc
 
     return data
 
