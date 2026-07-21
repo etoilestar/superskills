@@ -870,6 +870,22 @@ def _skill_local_paths_in_markdown(content: str) -> set[str]:
     return {match.group(1).strip() for match in _SKILL_FILE_PATH_RE.finditer(content or "")}
 
 
+def concrete_skill_md_resource_paths(content: str) -> list[str]:
+    """Return only concrete local resources that require plan/disk checks."""
+    paths: set[str] = set()
+    for path in _skill_local_paths_in_markdown(content):
+        normalized = path.replace("\\", "/").strip("/")
+        if not normalized.startswith(("scripts/", "references/", "assets/")):
+            continue
+        if (
+            normalized.endswith("/")
+            or any(token in normalized for token in ("*", "?", "{{", "}}", "[", "]"))
+        ):
+            continue
+        paths.add(normalized)
+    return sorted(paths)
+
+
 def validate_skill_md_resource_plan_alignment(
     *,
     content: str,
@@ -885,12 +901,7 @@ def validate_skill_md_resource_plan_alignment(
     planned = {str(path).replace("\\", "/").strip("/") for path in file_plan_paths}
     uploaded = {str(path).replace("\\", "/").strip("/") for path in confirmed_uploaded_assets}
     results: list[ContractCheckResult] = []
-    for path in sorted(_skill_local_paths_in_markdown(content)):
-        normalized = path.replace("\\", "/").strip("/")
-        if not normalized.startswith(("scripts/", "references/", "assets/")):
-            continue
-        if normalized.endswith("/") or "{{" in normalized or "}}" in normalized or "*" in normalized:
-            continue
+    for normalized in concrete_skill_md_resource_paths(content):
         if normalized not in planned:
             results.append(ContractCheckResult(
                 id="skill_md.resource.not_in_file_plan", passed=False, target=normalized,

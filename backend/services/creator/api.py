@@ -4515,6 +4515,38 @@ async def _repair_prepare_summary_protocol(*, request: Any, summary: Any, error:
     ], route.model)
     return _parse_prepare_plan_json(text)
 
+
+async def _repair_prepare_planner_transport(
+    *,
+    request: PreparePlanRequest,
+    raw_output: str,
+    error: Exception,
+    planner_model: str,
+) -> str:
+    """Repair only the Planner's top-level JSON transport envelope."""
+    prompt = """只修复 Planner 顶层 JSON transport。
+- 只修复 JSON 格式和顶层传输字段；
+- 不修改用户需求；
+- 不修改业务目标、输入、输出和核心动作；
+- 不新增文件、素材或能力；
+- 保留原输出中能够恢复的 internal_blueprint_text；
+- 只返回完整 JSON object；
+- 不输出 Markdown fence 或解释。"""
+    return await complete_chat_once(
+        [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": json.dumps({
+                "raw_output": raw_output,
+                "transport_error": str(error),
+                "request_context": {
+                    "user_request": request.user_request,
+                    "human_feedback": request.human_feedback,
+                },
+            }, ensure_ascii=False, default=str)},
+        ],
+        planner_model,
+    )
+
 _PREPARE_SUPPLEMENT_QUESTION = "以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明"
 
 
@@ -5829,10 +5861,6 @@ candidate_tool_catalog 已由统一 Tool recall 层产生：
             },
         ],
         route.model,
-    )
-
-    data = _parse_prepare_plan_json(
-        text
     )
 
     raw_patch = (
@@ -7496,9 +7524,27 @@ Blueprint Planner 只规划业务责任。
         route.model,
     )
 
-    data = _parse_prepare_plan_json(
-        text
+    def validate_planner_transport(candidate: str) -> dict[str, Any]:
+        data = _parse_prepare_plan_json(candidate)
+        status = data.get("status")
+        if not isinstance(status, str) or status.strip() not in {"ready", "needs_clarification", "blocked"}:
+            raise ValueError("Planner transport has invalid status")
+        for field, expected in {"clarifying_questions": list, "review_summary": dict,
+                                "internal_blueprint_text": str, "skill_name": str, "blockers": list}.items():
+            if field in data and not isinstance(data[field], expected):
+                raise ValueError(f"Planner transport field {field} has invalid type")
+        return data
+
+    async def repair_planner_transport(candidate: str, exc: Exception) -> str:
+        return await _repair_prepare_planner_transport(
+            request=request, raw_output=candidate, error=exc, planner_model=route.model,
+        )
+
+    text = await _retry_prepare_stage_repair(
+        stage="planner_transport", candidate=text, validate=validate_planner_transport,
+        repair=repair_planner_transport, event_emitter=event_emitter,
     )
+    data = _parse_prepare_plan_json(text)
 
     data.pop(
         "tool_pool_patch",
@@ -14378,9 +14424,7 @@ def _validate_first_round_resource_closure(skill_name: str) -> dict[str, Any]:
     if not skill_md.is_file():
         missing["missing_scripts"] = ["SKILL.md"]
     else:
-        for path in sorted(creator_contracts._skill_local_paths_in_markdown(skill_md.read_text(encoding="utf-8"))):
-            if not path.startswith(("scripts/", "references/", "assets/")) or path.endswith("/") or "{{" in path or "}}" in path:
-                continue
+        for path in creator_contracts.concrete_skill_md_resource_paths(skill_md.read_text(encoding="utf-8")):
             if not (skill_dir / path).is_file():
                 missing[f"missing_{path.split('/', 1)[0]}"].append(path)
     return {"success": not any(missing.values()), "error_type": "first_round_resource_closure_failed", "e2e_started": False, **missing}

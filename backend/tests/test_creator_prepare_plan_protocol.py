@@ -2253,3 +2253,50 @@ async def test_retry_prepare_stage_repair_raises_only_after_two_failed_repairs()
             stage="test_stage", candidate="invalid", validate=validate, repair=repair
         )
     assert len(repairs) == 2
+
+
+@pytest.mark.asyncio
+async def test_planner_transport_invalid_json_is_repaired_before_processing(monkeypatch):
+    events, calls = [], []
+    async def fake_complete(*_args, **_kwargs):
+        calls.append(1)
+        return "not json" if len(calls) == 1 else '{"status":"needs_clarification","clarifying_questions":[]}'
+    async def emit(event): events.append(event)
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request(), event_emitter=emit)
+    assert result["status"] == "needs_clarification"
+    assert len(calls) == 2
+    assert [event["event"] for event in events] == ["prepare_repair_started", "prepare_repair_succeeded"]
+
+
+@pytest.mark.asyncio
+async def test_planner_transport_retries_twice_before_success(monkeypatch):
+    calls = []
+    async def fake_complete(*_args, **_kwargs):
+        calls.append(1)
+        return "invalid" if len(calls) < 3 else '{"status":"needs_clarification","clarifying_questions":[]}'
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result["status"] == "needs_clarification"
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_planner_transport_exhaustion_stops_before_file_plan_freeze(monkeypatch):
+    calls = []
+    async def fake_complete(*_args, **_kwargs):
+        calls.append(1)
+        return "invalid"
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    with pytest.raises(api.PreparePlanProtocolError, match="planner_transport"):
+        await api._generate_internal_blueprint_or_questions(_request())
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_planner_transport_does_not_repair_model_infrastructure_error(monkeypatch):
+    async def unavailable(*_args, **_kwargs):
+        raise ConnectionError("model unavailable")
+    monkeypatch.setattr(api, "complete_chat_once", unavailable)
+    with pytest.raises(ConnectionError):
+        await api._generate_internal_blueprint_or_questions(_request())

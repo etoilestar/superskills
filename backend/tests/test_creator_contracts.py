@@ -1793,3 +1793,19 @@ async def test_validate_skill_starts_e2e_after_first_round_resource_closure_pass
     result = await api.validate_skill(api.SkillActionRequest(skill_name="demo-skill"))
     assert result.success
     assert calls == ["session", "validate"]
+
+
+def test_dynamic_skill_md_resources_are_ignored_by_plan_and_closure(monkeypatch, tmp_path):
+    from backend.config import settings
+    content = "Use assets/*.png and assets/{{name}}.png"
+    assert contracts.concrete_skill_md_resource_paths(content) == []
+    assert contracts.validate_skill_md_resource_plan_alignment(
+        content=content, file_plan_paths=["SKILL.md"], confirmed_uploaded_assets=[]
+    ) == []
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+    closure = api._validate_first_round_resource_closure("demo-skill")
+    assert closure["success"]
+    assert closure["missing_assets"] == []
