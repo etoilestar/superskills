@@ -2265,48 +2265,94 @@ def _e2e_failure_position(error: str) -> tuple[int, int]:
     return (step, _E2E_LAYER_RANK.get(layer, 3))
 
 
-def _e2e_behavior_fingerprint(error: str, *, target_file: str) -> str:
+def _normalize_e2e_failure_text(value: str) -> str:
+    """Stabilize volatile runtime values without discarding breakpoint evidence."""
+    text = str(value or "")
+    text = re.sub(r"/tmp/creator-e2e-session-[^/\s]+", "<SESSION_WORKSPACE>", text)
+    text = re.sub(r"(?:[A-Za-z]:)?/[^\s\"']*(?:creator-e2e-session|tmp)[^\s\"']*", lambda m: "<SESSION_WORKSPACE>" + ("/" + m.group(0).rsplit("/", 1)[-1] if "/" in m.group(0) else ""), text)
+    text = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "<UUID>", text, flags=re.I)
+    text = re.sub(r"0x[0-9a-f]+", "<ADDRESS>", text, flags=re.I)
+    text = re.sub(r"\b(?:port|PORT)[ =:]\d{2,5}\b", "port=<PORT>", text)
+    text = re.sub(r"^\s*\d{4}-\d\d-\d\d[T ][0-2]\d:[0-5]\d:[0-5]\d(?:[.,]\d+)?(?:Z|[+-]\d\d:?\d\d)?\s*", "", text, flags=re.M)
+    return " ".join(text.split())
+
+
+def _e2e_failure_identity(error: str, *, target_file: str = "") -> dict[str, Any]:
+    """Extract a deterministic, structured identity for an E2E breakpoint."""
     structured = _structured_failure_from_errors([error])
-    details = structured.get("details") if isinstance(structured, dict) else {}
-    basis = {
-        "failed_step_index": structured.get("failed_step_index") if structured else None,
-        "target_file": target_file,
-        "failure_layer": structured.get("layer") if structured else _failure_layer_from_error_text(error),
-        "failure_code": (details or {}).get("failure_code") if isinstance(details, dict) else None,
-        "return_code": structured.get("return_code") if structured else None,
-        "normalized_actual": structured.get("actual") if structured else str(error or "")[:500],
-        "filesystem_state": (details or {}).get("filesystem_trace") if isinstance(details, dict) else {},
+    details = structured.get("details") if isinstance(structured.get("details"), dict) else {}
+    stderr = str(structured.get("stderr") or "")
+    actual = str(structured.get("actual") or "")
+    evidence = "\n".join(part for part in (stderr, actual, str(details.get("message") or "")) if part)
+    exception = re.findall(r"\b([A-Za-z_][\w.]*(?:Error|Exception))\s*:", evidence)
+    traceback_function = ""
+    traceback_source_line = ""
+    frames = re.findall(r'File "[^"]+", line \d+, in ([^\n]+)\n\s*([^\n]+)', stderr)
+    if frames:
+        traceback_function, traceback_source_line = frames[-1]
+    elif exception:
+        # Preserve a concise non-traceback runtime expression where available.
+        line = next((line for line in evidence.splitlines() if exception[-1] in line), "")
+        traceback_source_line = line
+    return {
+        "failed_step_index": structured.get("failed_step_index"),
+        "target_file": str(structured.get("target_file") or target_file or ""),
+        "layer": str(structured.get("layer") or _failure_layer_from_error_text(error) or ""),
+        "return_code": structured.get("return_code"),
+        "exception_type": exception[-1].split(".")[-1] if exception else "",
+        "error_code": str(details.get("failure_code") or structured.get("error_code") or ""),
+        "target_region": _normalize_e2e_failure_text(str(structured.get("target_region") or details.get("target_region") or "")),
+        "failed_command_digest": _stable_json_hash(_normalize_e2e_failure_text(str(structured.get("failed_command") or ""))),
+        "traceback_function": _normalize_e2e_failure_text(traceback_function),
+        "traceback_source_line": _normalize_e2e_failure_text(traceback_source_line),
+        "normalized_actual": _normalize_e2e_failure_text(actual or stderr),
     }
-    return _stable_json_hash(basis)
+
+
+def _e2e_breakpoint_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """Return whether evidence shows a material new breakpoint, not noise."""
+    for key in ("exception_type", "traceback_function", "traceback_source_line", "error_code", "target_region"):
+        if before.get(key) and after.get(key) and before[key] != after[key]:
+            return True
+    # For structured non-traceback failures, the stable actual is the blocker.
+    return bool(before.get("normalized_actual") and after.get("normalized_actual") and before["normalized_actual"] != after["normalized_actual"])
+
+
+def _e2e_behavior_fingerprint(error: str, *, target_file: str) -> str:
+    return _stable_json_hash(_e2e_failure_identity(error, target_file=target_file))
+
+
+def _e2e_diagnosis_family_key(*, repair_target: str, before_failure_identity: dict[str, Any]) -> str:
+    return _stable_json_hash({"repair_target": repair_target, "before_failure_identity": before_failure_identity, "target_region": before_failure_identity.get("target_region")})
+
+
+def _e2e_experiment_key(*, repair_target: str, before_failure_identity: dict[str, Any], patch_digest: str) -> str:
+    return _stable_json_hash({"repair_target": repair_target, "before_failure_identity": before_failure_identity, "patch_digest": patch_digest})
+
+
+def _count_matching_no_progress_attempts(e2e_session: CreatorE2ESession, *, repair_target: str, before_failure_identity: dict[str, Any]) -> int:
+    return sum(1 for attempt in e2e_session.debug_attempts if attempt.get("result") == "no_progress" and attempt.get("repair_target") == repair_target and attempt.get("before_failure_identity") == before_failure_identity)
 
 
 def _e2e_candidate_improved(original_errors: list[str], new_errors: list[str], *, target_file: str) -> bool:
     if not new_errors:
         return True
-    old_structured = _structured_failure_from_errors([(original_errors or [""])[0]])
-    new_structured = _structured_failure_from_errors([(new_errors or [""])[0]])
+    old_error, new_error = (original_errors or [""])[0], (new_errors or [""])[0]
+    old_structured, new_structured = _structured_failure_from_errors([old_error]), _structured_failure_from_errors([new_error])
     old_fs = ((old_structured.get("details") or {}).get("filesystem_trace") or {}) if old_structured else {}
     new_fs = ((new_structured.get("details") or {}).get("filesystem_trace") or {}) if new_structured else {}
-    old_code = _failure_code_from_structured(old_structured)
-    new_code = _failure_code_from_structured(new_structured)
+    old_code, new_code = _failure_code_from_structured(old_structured), _failure_code_from_structured(new_structured)
     is_artifact_failure = old_code.startswith("artifact_") or new_code.startswith("artifact_")
-    old_pos = _e2e_failure_position((original_errors or [""])[0])
-    new_pos = _e2e_failure_position((new_errors or [""])[0])
+    old_pos, new_pos = _e2e_failure_position(old_error), _e2e_failure_position(new_error)
     if old_pos == new_pos and is_artifact_failure:
-        old_state = _artifact_runtime_state(old_fs)
-        new_state = _artifact_runtime_state(new_fs)
-        return _artifact_runtime_state_improved(old_state, new_state)
-    if is_artifact_failure:
-        old_missing = any(not item.get("exists") for item in (old_fs.get("resolved_reported_paths") or []))
-        new_missing = any(not item.get("exists") for item in (new_fs.get("resolved_reported_paths") or []))
-        if old_missing and new_missing and _stable_json_hash(old_fs.get("created_files") or []) == _stable_json_hash(new_fs.get("created_files") or []):
-            return False
+        return _artifact_runtime_state_improved(_artifact_runtime_state(old_fs), _artifact_runtime_state(new_fs))
     if new_pos > old_pos:
         return True
-    old_target = _e2e_repair_target_from_errors(original_errors or [])
-    new_target = _e2e_repair_target_from_errors(new_errors or [])
+    before, after = _e2e_failure_identity(old_error, target_file=target_file), _e2e_failure_identity(new_error, target_file=target_file)
+    if (before["failed_step_index"], before["target_file"], before["layer"]) == (after["failed_step_index"], after["target_file"], after["layer"]):
+        return _e2e_breakpoint_changed(before, after)
+    old_target, new_target = _e2e_repair_target_from_errors(original_errors or []), _e2e_repair_target_from_errors(new_errors or [])
     return bool(old_target == target_file and new_target and new_target != target_file)
-
 
 def _e2e_repair_state_from_errors(errors: list[str], *, resolved_failures: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     failed_checks = [error for error in (errors or []) if str(error or "").strip()]
@@ -4041,7 +4087,7 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
     route = route_creator_file_model(file_path=symptom, purpose="E2E failure debug diagnosis only; select one repair target", requested_model=requested_model)
     rejected = [a for a in e2e_session.debug_attempts if a.get("result") == "no_progress"]
     prompt = {"structured_failure": failure, "symptom_file": symptom, "layer": failure.get("layer"), "filesystem_trace": details.get("filesystem_trace", {}), "runtime_binding_trace": details.get("runtime_binding_trace", {}), "previous_step_traces": traces, "skill_files": related, "platform_io_facts": _platform_io_repair_summary(), "previous_debug_attempts": rejected, "retry_reason": retry_reason}
-    messages = [{"role": "system", "content": "You diagnose a Creator E2E breakpoint. Output only JSON. Select exactly one primary repair_target. It must be SKILL.md or an existing scripts/*.py in this Skill. Do not propose edits or backend/runtime/tool changes."}, {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, default=str) + "\nReturn {repair_target, root_cause_hypothesis, evidence, repair_instruction, confidence}. The rejected combinations were tested by real sandbox E2E without improvement. Do not repeat them; select a different hypothesis and/or target."}]
+    messages = [{"role": "system", "content": "You diagnose a Creator E2E breakpoint. Output only JSON. Select exactly one primary repair_target. It must be SKILL.md or an existing scripts/*.py in this Skill. Do not propose edits or backend/runtime/tool changes."}, {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, default=str) + "\nReturn {repair_target, root_cause_hypothesis, evidence, repair_instruction, confidence}. These are real Sandbox experiments with stable failure identities and patch digests. Do not re-propose the same target, breakpoint, and repair region merely by changing hypothesis wording."}]
     for proposal_attempt in range(3):
         try:
             text = _complete_chat_once_sync_for_e2e(messages, route.model)
@@ -4052,10 +4098,17 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
         target, hypothesis = str(data.get("repair_target") or "").strip(), str(data.get("root_cause_hypothesis") or "").strip()
         key = f"{target}|{_normalized_debug_hypothesis(hypothesis)}"
         valid = _is_skill_repair_target(workspace, target) and bool(hypothesis)
-        repeated = any(a.get("hypothesis_key") == key and a.get("result") == "no_progress" for a in e2e_session.debug_attempts)
-        if valid and not repeated:
+        failure_identity = _e2e_failure_identity((e2e_errors or [""])[0], target_file=symptom)
+        family_no_progress = _count_matching_no_progress_attempts(
+            e2e_session, repair_target=target, before_failure_identity=failure_identity,
+        )
+        # Hypothesis wording is explanatory only. Actual experiment deduplication
+        # happens after a patch digest exists, before Sandbox is invoked. After
+        # two distinct no-progress experiments, force a new target (the model
+        # does not supply a separately enforceable repair-region field).
+        if valid and family_no_progress < 2:
             return {"repair_target": target, "symptom_file": symptom, "root_cause_hypothesis": hypothesis, "evidence": data.get("evidence") or [], "repair_instruction": str(data.get("repair_instruction") or ""), "confidence": data.get("confidence") or "", "hypothesis_key": key}
-        messages.append({"role": "user", "content": "Your proposal was invalid or was already rejected by a real sandbox experiment. Do not patch or run E2E; return a different valid target+hypothesis JSON proposal."})
+        messages.append({"role": "user", "content": "Your proposal was invalid, or this breakpoint already has two no-progress experiments for that target. Do not merely rewrite the hypothesis: return a different valid repair target JSON proposal."})
     return {"status": "diagnosis_exhausted", "symptom_file": symptom}
 
 
@@ -4624,9 +4677,6 @@ async def _repair_existing_file_for_e2e_failure(
         or e2e_errors
     )[-12000:]
     baseline_errors = list(repair_state.get("remaining_failed_checks") or e2e_errors or [])
-    baseline_no_progress_count = 0
-    baseline_no_progress_counts: dict[str, int] = {}
-
     last_failure = ""
     # The production API owns the overall (<=10) debug-experiment loop. Keep
     # legacy direct callers usable while they migrate to the session loop.
@@ -4946,6 +4996,22 @@ async def _repair_existing_file_for_e2e_failure(
 
             consecutive_format_regressions = 0
 
+            before_identity = _e2e_failure_identity((baseline_errors or [""])[0], target_file=target_path)
+            patch_digest = _stable_json_hash(_normalize_e2e_failure_text(sanitized))
+            diagnosis_family_key = _e2e_diagnosis_family_key(repair_target=target_path, before_failure_identity=before_identity)
+            experiment_key = _e2e_experiment_key(repair_target=target_path, before_failure_identity=before_identity, patch_digest=patch_digest)
+            if any(attempt.get("experiment_key") == experiment_key for attempt in e2e_session.debug_attempts):
+                event = {**e2e_session.to_event_base(), "attempt": candidate_attempt, "target_file": target_path,
+                         "status": "duplicate_experiment_rejected", "progress_reason": "duplicate_experiment",
+                         "candidate_retained": False, "candidate_rolled_back": False,
+                         "before_failure_identity": before_identity, "experiment_key": experiment_key,
+                         "diagnosis_family_key": diagnosis_family_key, "rerun_status": "skipped"}
+                e2e_session.events.append(event)
+                if repair_events is not None:
+                    repair_events.extend(e2e_session.events)
+                return {"status": "duplicate_experiment_rejected", "sandbox_executed": False, "repaired_target": target_path,
+                        "next_target": None, "next_failure": baseline_errors, "experiment_key": experiment_key, "attempt": candidate_attempt}
+
             old_command_signature = (
                 e2e_session.command_plan_signature
             )
@@ -5158,33 +5224,50 @@ async def _repair_existing_file_for_e2e_failure(
                         + 1
                     )
 
-                gate_errors = (
-                    sandbox_gate.get("errors")
-                    or []
-                )
+                gate_errors = sandbox_gate.get("errors") or []
+                after_identity = _e2e_failure_identity((gate_errors or [""])[0], target_file=target_path)
                 improved = _e2e_candidate_improved(baseline_errors, gate_errors, target_file=target_path)
                 baseline_fingerprint = _e2e_behavior_fingerprint((baseline_errors or [""])[0], target_file=target_path)
-                failure_signature = (
-                    _e2e_behavior_fingerprint(
-                        (
-                            gate_errors
-                            or [""]
-                        )[0],
-                        target_file=target_path,
-                    )
+                failure_signature = _e2e_behavior_fingerprint((gate_errors or [""])[0], target_file=target_path)
+                same_breakpoint_progress = (
+                    before_identity["failed_step_index"] == after_identity["failed_step_index"]
+                    and before_identity["target_file"] == after_identity["target_file"]
+                    and before_identity["layer"] == after_identity["layer"]
+                    and _e2e_breakpoint_changed(before_identity, after_identity)
                 )
+                progress_reason = "same_step_new_breakpoint" if same_breakpoint_progress else (
+                    "step_advanced" if _e2e_failure_position((gate_errors or [""])[0]) > _e2e_failure_position((baseline_errors or [""])[0]) else "same_breakpoint_repeated"
+                )
+                candidate_retained, candidate_rolled_back = bool(improved), not bool(improved)
+                decision = {"repair_target": target_path, "candidate_attempt": candidate_attempt,
+                            "before_failure_identity": before_identity, "after_failure_identity": after_identity,
+                            "improved": improved, "progress_reason": progress_reason,
+                            "candidate_retained": candidate_retained, "candidate_rolled_back": candidate_rolled_back,
+                            "experiment_key": experiment_key}
+                logger.info("[Creator][E2E][candidate_progress_decision] %s", json.dumps(decision, ensure_ascii=False, sort_keys=True, default=str))
+                if e2e_session.events:
+                    e2e_session.events[-1].update(decision)
+                attempt_record = {"symptom_file": diagnosis["symptom_file"], "repair_target": target_path,
+                    "root_cause_hypothesis": diagnosis["root_cause_hypothesis"], "hypothesis_key": diagnosis["hypothesis_key"],
+                    "patch_digest": patch_digest, "diagnosis_family_key": diagnosis_family_key, "experiment_key": experiment_key,
+                    "before_failure_identity": before_identity, "after_failure_identity": after_identity,
+                    "before_failure_signature": baseline_fingerprint, "after_failure_signature": failure_signature,
+                    "improved": improved, "result": "progressed" if improved else "no_progress"}
                 if not improved:
                     session_target.write_text(previous_session_content, encoding="utf-8")
                     e2e_session.current_revision += 1
                     if earliest_step:
                         _invalidate_checkpoints_from(e2e_session, earliest_step)
-                    e2e_session.debug_attempts.append({"symptom_file": diagnosis["symptom_file"], "repair_target": target_path, "root_cause_hypothesis": diagnosis["root_cause_hypothesis"], "hypothesis_key": diagnosis["hypothesis_key"], "patch_digest": _stable_json_hash(sanitized), "before_failure_signature": baseline_fingerprint, "after_failure_signature": failure_signature, "improved": False, "result": "no_progress"})
+                    e2e_session.debug_attempts.append(attempt_record)
+                    no_progress_count = _count_matching_no_progress_attempts(e2e_session, repair_target=target_path, before_failure_identity=before_identity)
+                    if e2e_session.events:
+                        e2e_session.events[-1].update({"status": "debug_hypothesis_rejected", "no_progress_count": no_progress_count, "writeback_status": "rolled_back"})
                     if repair_events is not None:
                         repair_events.extend(e2e_session.events)
-                    return {"status": "debug_hypothesis_rejected", "sandbox_executed": True, "repaired_target": target_path, "next_target": None, "next_failure": gate_errors, "hypothesis_key": diagnosis["hypothesis_key"], "attempt": candidate_attempt}
-                    no_progress_key = f"{target_path}:{baseline_fingerprint}:{failure_signature}"
-                    baseline_no_progress_counts[no_progress_key] = baseline_no_progress_counts.get(no_progress_key, 0) + 1
-                    baseline_no_progress_count = baseline_no_progress_counts[no_progress_key]
+                    return {"status": "debug_hypothesis_rejected", "sandbox_executed": True, "repaired_target": target_path,
+                            "next_target": None, "next_failure": gate_errors, "hypothesis_key": diagnosis["hypothesis_key"],
+                            "experiment_key": experiment_key, "no_progress_count": no_progress_count, "attempt": candidate_attempt}
+                e2e_session.debug_attempts.append(attempt_record)
 
                 template_signature = (
                     _stable_json_hash([
@@ -5379,71 +5462,10 @@ async def _repair_existing_file_for_e2e_failure(
 
                 if improved:
                     target_file.write_text(sanitized, encoding="utf-8")
-                    e2e_session.debug_attempts.append({"symptom_file": diagnosis["symptom_file"], "repair_target": target_path, "root_cause_hypothesis": diagnosis["root_cause_hypothesis"], "hypothesis_key": diagnosis["hypothesis_key"], "patch_digest": _stable_json_hash(sanitized), "before_failure_signature": baseline_fingerprint, "after_failure_signature": failure_signature, "improved": True, "result": "progressed"})
+                    if e2e_session.events:
+                        e2e_session.events[-1].update({"status": "debug_progress", "writeback_status": "written"})
                     if repair_events is not None: repair_events.extend(e2e_session.events)
-                    return {"status": "debug_progress", "sandbox_executed": True, "repaired_target": target_path, "next_target": None, "next_failure": gate_errors, "attempt": candidate_attempt}
-                    working_content = sanitized
-                    baseline_errors = list(gate_errors)
-                    baseline_no_progress_count = 0
-                    baseline_no_progress_counts = {}
-
-                last_failure = (
-                    "SANDBOX_E2E_FAILED：候选 patch 已应用，"
-                    "但简单沙盒 E2E 仍失败。\n"
-                    f"attempt={candidate_attempt}/"
-                    f"{max_candidate_attempts}\n"
-                    f"candidate_improved={improved}; "
-                    + (
-                        "未改善，已回滚到候选前版本。\n"
-                        if not improved
-                        else "运行位置已推进，保留为下一轮基础。\n"
-                    )
-                    +
-                    f"diff_stats="
-                    f"{json.dumps(diff_stats, ensure_ascii=False, default=str)[:3000]}\n"
-                    f"sandbox_gate="
-                    f"{json.dumps(sandbox_gate, ensure_ascii=False, default=str)[:12000]}\n"
-                    "请只依据 sandbox_gate.errors 中新的真实运行失败"
-                    "继续输出新的 exact_replace patch。"
-                )
-
-                repair_feedback = (
-                    "\n\n".join(
-                        sandbox_gate.get(
-                            "errors"
-                        )
-                        or e2e_errors
-                    )[-12000:]
-                    + "\n\n"
-                    + last_failure
-                )
-
-                logger.warning(
-                    "[Creator][E2E]"
-                    "[repair_candidate_e2e_failed] "
-                    "skill=%s file=%s attempt=%d/%d",
-                    skill_name,
-                    target_path,
-                    candidate_attempt,
-                    max_candidate_attempts,
-                )
-
-                if (
-                    not improved
-                    and baseline_no_progress_count >= 2
-                    and baseline_fingerprint == failure_signature
-                ):
-                    if repair_events is not None:
-                        repair_events.extend(e2e_session.events)
-                    return {
-                        "status": "blocked",
-                        "repaired_target": target_path,
-                        "next_target": None,
-                        "next_failure": ["behavioral_no_progress: candidate rolled back because failure position/fingerprint did not improve."],
-                        "attempt": candidate_attempt,
-                    }
-
-                continue
+                    return {"status": "debug_progress", "sandbox_executed": True, "repaired_target": target_path, "next_target": None, "next_failure": gate_errors, "experiment_key": experiment_key, "attempt": candidate_attempt}
 
             for error in e2e_errors:
                 (

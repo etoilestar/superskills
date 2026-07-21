@@ -554,7 +554,7 @@ async def test_e2e_repair_stays_localized_after_repeated_attempts(tmp_path, monk
     assert full_calls == []
     assert len(gate_calls) == 1
     assert result["hypothesis_key"]
-    assert events[-1]["writeback_status"] == "candidate_only"
+    assert events[-1]["writeback_status"] == "rolled_back"
 
 
 def _write_trial_script(tmp_path: Path, script: str, command_payload: dict | None = None):
@@ -916,7 +916,9 @@ async def test_e2e_debug_diagnosis_rejects_repeated_failed_hypothesis(monkeypatc
         skill_name="demo", skill_dir=skill_dir,
         e2e_errors=["E2E_SYMPTOM_FILE=scripts/two.py"], e2e_session=session,
     )
-    assert diagnosis["status"] == "diagnosis_exhausted"
+    # Hypothesis prose is no longer the deduplication key; a real candidate
+    # digest is required before an experiment can be rejected.
+    assert diagnosis["repair_target"] == "scripts/one.py"
 
 @pytest.mark.asyncio
 async def test_e2e_diagnosis_reads_session_workspace_and_retries_rejected_proposal(monkeypatch, tmp_path):
@@ -944,8 +946,8 @@ async def test_e2e_diagnosis_reads_session_workspace_and_retries_rejected_propos
         skill_name="demo", skill_dir=skill_dir,
         e2e_errors=["E2E_SYMPTOM_FILE=scripts/two.py"], e2e_session=session,
     )
-    assert diagnosis["repair_target"] == "scripts/two.py"
-    assert len(calls) == 2
+    assert diagnosis["repair_target"] == "scripts/one.py"
+    assert len(calls) == 1
     assert "session-accepted-patch" in prompts[0]
 
 @pytest.mark.asyncio
@@ -996,3 +998,68 @@ async def test_validate_skill_continues_after_sandbox_debug_outcome(monkeypatch,
     response = await api.validate_skill(SkillActionRequest(skill_name="demo", auto_repair=True, max_e2e_repair_attempts=2))
     assert response.success is True
     assert calls == ["scripts/b.py", "scripts/a.py"]
+
+
+def _structured_runtime_error(*, workspace: str, exception: str, source: str, step: int = 2):
+    failure = {
+        "failed_step_index": step,
+        "target_file": "scripts/generate_images.py",
+        "target_region": "run",
+        "failed_command": "python scripts/generate_images.py '{}'",
+        "return_code": 1,
+        "layer": "script_exit",
+        "actual": "runtime failed",
+        "stderr": (
+            f'Traceback (most recent call last):\n  File "{workspace}/scripts/generate_images.py", line 12, in run\n'
+            f"    {source}\n{exception}: failure\n"
+        ),
+        "details": {"failure_code": "script_exit"},
+    }
+    return "E2E_STRUCTURED_FAILURE=" + json.dumps(failure)
+
+
+def test_same_step_new_runtime_breakpoint_is_debug_progress():
+    before = _structured_runtime_error(
+        workspace="/tmp/creator-e2e-session-a", exception="TypeError", source='response["text"]',
+    )
+    after = _structured_runtime_error(
+        workspace="/tmp/creator-e2e-session-b", exception="NameError", source="file_outputs",
+    )
+    before_identity = e2e._e2e_failure_identity(before, target_file="scripts/generate_images.py")
+    after_identity = e2e._e2e_failure_identity(after, target_file="scripts/generate_images.py")
+
+    assert e2e._e2e_candidate_improved([before], [after], target_file="scripts/generate_images.py") is True
+    assert e2e._e2e_breakpoint_changed(before_identity, after_identity) is True
+    assert before_identity["failed_step_index"] == after_identity["failed_step_index"] == 2
+    assert before_identity["layer"] == after_identity["layer"] == "script_exit"
+
+
+def test_same_breakpoint_with_only_session_path_change_is_not_progress():
+    before = _structured_runtime_error(
+        workspace="/tmp/creator-e2e-session-a", exception="TypeError", source='response["text"]',
+    )
+    after = _structured_runtime_error(
+        workspace="/tmp/creator-e2e-session-b", exception="TypeError", source='response["text"]',
+    )
+    assert e2e._e2e_candidate_improved([before], [after], target_file="scripts/generate_images.py") is False
+    assert e2e._e2e_failure_identity(before)["traceback_source_line"] == e2e._e2e_failure_identity(after)["traceback_source_line"]
+
+
+def test_experiment_key_deduplicates_wording_but_allows_different_patch(tmp_path):
+    before = _structured_runtime_error(
+        workspace="/tmp/creator-e2e-session-a", exception="TypeError", source='response["text"]',
+    )
+    identity = e2e._e2e_failure_identity(before, target_file="scripts/generate_images.py")
+    one = e2e._e2e_experiment_key(repair_target="scripts/generate_images.py", before_failure_identity=identity, patch_digest=e2e._stable_json_hash("patch one"))
+    same = e2e._e2e_experiment_key(repair_target="scripts/generate_images.py", before_failure_identity=identity, patch_digest=e2e._stable_json_hash("patch one"))
+    two = e2e._e2e_experiment_key(repair_target="scripts/generate_images.py", before_failure_identity=identity, patch_digest=e2e._stable_json_hash("patch two"))
+    assert one == same
+    assert one != two
+
+    skill_dir = _make_skill(tmp_path)
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+    session.debug_attempts.extend([
+        {"result": "no_progress", "repair_target": "scripts/generate_images.py", "before_failure_identity": identity},
+        {"result": "no_progress", "repair_target": "scripts/generate_images.py", "before_failure_identity": identity},
+    ])
+    assert e2e._count_matching_no_progress_attempts(session, repair_target="scripts/generate_images.py", before_failure_identity=identity) == 2
