@@ -4448,7 +4448,57 @@ def _required_file_plan_user_upload_asset_paths(plan_files: list[Any] | None, as
 
 MAX_PREPARE_BUSINESS_CLARIFICATION_ROUNDS = 2
 MAX_PREPARE_SUPPLEMENT_ROUNDS = 1
-MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS = 3
+MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS = 1
+
+
+async def _retry_prepare_stage_repair(
+    *,
+    stage: str,
+    candidate: Any,
+    validate,
+    repair,
+    event_emitter=None,
+    max_attempts: int = 2,
+) -> Any:
+    """Validate a prepare artifact and perform at most two localized repairs."""
+    current = candidate
+    last_error: Exception | None = None
+    for attempt in range(max_attempts + 1):
+        try:
+            valid = validate(current)
+            if valid is False:
+                raise ValueError("prepare stage validation returned false")
+            if attempt and event_emitter is not None:
+                await event_emitter({"event": "prepare_repair_succeeded", "stage": stage, "attempt": attempt})
+            return current
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            if event_emitter is not None:
+                await event_emitter({"event": "prepare_repair_started", "stage": stage, "attempt": attempt + 1, "max_attempts": max_attempts})
+            try:
+                current = await repair(current, exc)
+            except Exception as repair_exc:
+                last_error = repair_exc
+                # A failed localized repair is still a recoverable attempt;
+                # retry once more and emit no terminal stream error here.
+                continue
+    raise PreparePlanProtocolError(
+        f"Prepare stage {stage} remained invalid after {max_attempts} repairs: {last_error}"
+    )
+
+
+async def _repair_prepare_summary_protocol(*, request: Any, summary: Any, error: Exception) -> Any:
+    """Repair only the transport shape of the user-facing review summary."""
+    route = route_model("creator_prepare_plan", requested_model=request.model, reason="creator prepare summary protocol repair")
+    text = await complete_chat_once([
+        {"role": "system", "content": """只修复 PreparePlanReviewSummary JSON 的结构和字段类型。
+不得增加新需求、文件、素材或能力。不得修改用户已确认的目标、输入和输出。
+只返回完整 JSON object。字段必须是 goal,input,output 字符串，以及 workflow,files_to_create_or_update,assets_to_upload,risks,changes 字符串数组。"""},
+        {"role": "user", "content": json.dumps({"summary": summary, "validation_error": str(error)}, ensure_ascii=False, default=str)},
+    ], route.model)
+    return _parse_prepare_plan_json(text)
 
 _PREPARE_SUPPLEMENT_QUESTION = "以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明"
 
@@ -7502,43 +7552,29 @@ Blueprint Planner 只规划业务责任。
             )
         )
         if protocol_errors:
-            try:
-                repaired_blueprint_text = await _repair_prepare_blueprint_protocol(
-                    request=request,
-                    blueprint_text=frozen_blueprint_text,
-                    protocol_errors=protocol_errors,
-                )
-            except Exception as exc:
-                raise PreparePlanProtocolError(
-                    "Planner ready Blueprint FilePlan protocol "
-                    "repair failed before executable target freeze; "
-                    f"error={type(exc).__name__}: {exc}"
-                ) from exc
+            def validate_blueprint(candidate: str) -> None:
+                repaired_errors = []
+                try:
+                    validate_blueprint_shape_for_creator(candidate)
+                except BlueprintShapeError as exc:
+                    repaired_errors.append(_prepare_protocol_issue("invalid_strict_blueprint_shape", str(exc), field="internal_blueprint_text"))
+                repaired_errors.extend(_preflight_prepare_blueprint_text(candidate))
+                if repaired_errors:
+                    raise ValueError(f"errors={repaired_errors}")
 
-            repaired_errors = []
-            try:
-                validate_blueprint_shape_for_creator(
-                    repaired_blueprint_text
+            async def repair_blueprint(candidate: str, exc: Exception) -> str:
+                return await _repair_prepare_blueprint_protocol(
+                    request=request, blueprint_text=candidate,
+                    protocol_errors=_preflight_prepare_blueprint_text(candidate) or [
+                        _prepare_protocol_issue("invalid_strict_blueprint_shape", str(exc), field="internal_blueprint_text")
+                    ],
                 )
-            except BlueprintShapeError as exc:
-                repaired_errors.append(
-                    _prepare_protocol_issue(
-                        "invalid_strict_blueprint_shape",
-                        str(exc),
-                        field="internal_blueprint_text",
-                    )
-                )
-            repaired_errors.extend(
-                _preflight_prepare_blueprint_text(
-                    repaired_blueprint_text
-                )
+
+            repaired_blueprint_text = await _retry_prepare_stage_repair(
+                stage="blueprint_protocol", candidate=frozen_blueprint_text,
+                validate=validate_blueprint, repair=repair_blueprint,
+                event_emitter=event_emitter,
             )
-            if repaired_errors:
-                raise PreparePlanProtocolError(
-                    "Planner ready Blueprint failed strict FilePlan "
-                    "preflight before executable target freeze; "
-                    f"errors={repaired_errors}"
-                )
             frozen_blueprint_text = repaired_blueprint_text
             first_planner_result = {
                 **first_planner_result,
@@ -7620,21 +7656,39 @@ Blueprint Planner 只规划业务责任。
             else data
         )
         try:
-            convergence_result = await _converge_ready_executable_plan(
-                request=request,
-                current_planner_result=convergence_input,
-                planner_model=route.model,
-                allowed_function_item_targets=allowed_function_item_targets,
-                draft_transport_error=(
-                    "; ".join(
-                        part for part in [
-                            f"function_items: {draft_function_item_error}" if draft_function_item_error is not None else "",
-                            f"responsibility_edges: {draft_edge_error}" if draft_edge_error is not None else "",
-                        ]
-                        if part
-                    )
-                ),
+            draft_transport_error = "; ".join(
+                part for part in [
+                    f"function_items: {draft_function_item_error}" if draft_function_item_error is not None else "",
+                    f"responsibility_edges: {draft_edge_error}" if draft_edge_error is not None else "",
+                ] if part
             )
+            async def repair_convergence(candidate: dict[str, Any], exc: Exception) -> dict[str, Any]:
+                return await _converge_ready_executable_plan(
+                    request=request, current_planner_result=candidate,
+                    planner_model=route.model,
+                    allowed_function_item_targets=allowed_function_item_targets,
+                    draft_transport_error=f"{draft_transport_error}; previous_convergence_error: {exc}",
+                )
+
+            def validate_convergence(candidate: dict[str, Any]) -> None:
+                items = list(candidate.get("function_items") or [])
+                _validate_function_item_targets_in_allowed_domain(items, allowed_function_item_targets)
+                validate_structured_responsibility_edge_transport(candidate.get("responsibility_edges"), function_items=items, source="planner")
+
+            convergence_attempted = False
+            def validate_convergence_retry(candidate: dict[str, Any]) -> None:
+                nonlocal convergence_attempted
+                if not convergence_attempted:
+                    convergence_attempted = True
+                    raise ValueError(draft_transport_error or "convergence required")
+                validate_convergence(candidate)
+
+            convergence_result = await _retry_prepare_stage_repair(
+                stage="responsibility_graph", candidate=convergence_input,
+                validate=validate_convergence_retry,
+                repair=repair_convergence, event_emitter=event_emitter,
+            )
+            validate_convergence(convergence_result)
             normalized_converged_function_items = list(
                 convergence_result.get("function_items") or []
             )
@@ -7982,13 +8036,32 @@ changes：
             )
         )
 
-        summary = (
-            _coerce_prepare_summary(
-                projected
-            )
+        required_summary_fields = {
+            "goal": str, "input": str, "output": str, "workflow": list,
+            "files_to_create_or_update": list, "assets_to_upload": list,
+            "risks": list, "changes": list,
+        }
+
+        def validate_summary(candidate: Any) -> None:
+            if not isinstance(candidate, dict) or set(candidate) != set(required_summary_fields):
+                raise ValueError("PreparePlanReviewSummary must contain exactly the required fields")
+            for key, expected in required_summary_fields.items():
+                value = candidate.get(key)
+                if not isinstance(value, expected) or (expected is list and not all(isinstance(item, str) for item in value)):
+                    raise ValueError(f"PreparePlanReviewSummary.{key} has invalid type")
+
+        async def repair_summary(candidate: Any, exc: Exception) -> Any:
+            return await _repair_prepare_summary_protocol(request=request, summary=candidate, error=exc)
+
+        projected = await _retry_prepare_stage_repair(
+            stage="summary_protocol", candidate=projected, validate=validate_summary,
+            repair=repair_summary,
         )
+        summary = _coerce_prepare_summary(projected)
 
     except Exception as exc:
+        if isinstance(exc, PreparePlanProtocolError):
+            raise
         logger.warning(
             "[Creator]"
             "[review_summary_projection]"
@@ -13100,6 +13173,18 @@ async def generate_file(request: GenerateFileRequest):
                             skill_plan_entry=effective_skill_plan_entry,
                         ))
 
+                        # First-round validation is plan-only: referenced
+                        # scripts/references can be generated later, so never
+                        # use disk existence as a gate here.
+                        planned_paths = _extract_prepare_skill_plan_paths(request.blueprint_text)
+                        _raise_file_contract_failures(
+                            validate_skill_md_resource_plan_alignment(
+                                content=content,
+                                file_plan_paths=planned_paths,
+                                confirmed_uploaded_assets=[],
+                            )
+                        )
+
                         _validate_skill_md_against_existing_files(
                             skill_name,
                             content,
@@ -14269,6 +14354,22 @@ def _external_context_from_skill_action_request(request: SkillActionRequest) -> 
     return context
 
 
+def _validate_first_round_resource_closure(skill_name: str) -> dict[str, Any]:
+    """Ensure planned local SKILL.md resources exist before an E2E session."""
+    skill_dir = settings.skills_path / _validate_skill_name(skill_name)
+    skill_md = skill_dir / "SKILL.md"
+    missing = {"missing_scripts": [], "missing_references": [], "missing_assets": []}
+    if not skill_md.is_file():
+        missing["missing_scripts"] = ["SKILL.md"]
+    else:
+        for path in sorted(creator_contracts._skill_local_paths_in_markdown(skill_md.read_text(encoding="utf-8"))):
+            if not path.startswith(("scripts/", "references/", "assets/")) or path.endswith("/") or "{{" in path or "}}" in path:
+                continue
+            if not (skill_dir / path).is_file():
+                missing[f"missing_{path.split('/', 1)[0]}"].append(path)
+    return {"success": not any(missing.values()), "error_type": "first_round_resource_closure_failed", "e2e_started": False, **missing}
+
+
 @router.post("/validate-skill", response_model=SkillActionResponse)
 async def validate_skill(request: SkillActionRequest):
     """Validate and strictly E2E-run a Skill package.
@@ -14294,6 +14395,14 @@ async def validate_skill(request: SkillActionRequest):
             success=False,
             path=result.get("path"),
             message=result["message"],
+        )
+
+    closure = _validate_first_round_resource_closure(skill_name)
+    if not closure["success"]:
+        return SkillActionResponse(
+            success=False, path=str(skill_dir), error_type=closure["error_type"],
+            message=json.dumps(closure, ensure_ascii=False),
+            deterministic_workflow_passed=False,
         )
 
     max_attempts = max(0, min(int(request.max_e2e_repair_attempts or 0), 10))

@@ -870,6 +870,44 @@ def _skill_local_paths_in_markdown(content: str) -> set[str]:
     return {match.group(1).strip() for match in _SKILL_FILE_PATH_RE.finditer(content or "")}
 
 
+def validate_skill_md_resource_plan_alignment(
+    *,
+    content: str,
+    file_plan_paths: list[str],
+    confirmed_uploaded_assets: list[str],
+) -> list[ContractCheckResult]:
+    """Statically check explicit local SKILL.md resources against FilePlan.
+
+    This deliberately does not inspect the skill directory: first-round files
+    may be generated after SKILL.md.  Directory mentions, URLs, templates and
+    runtime/dynamic paths are not concrete resources.
+    """
+    planned = {str(path).replace("\\", "/").strip("/") for path in file_plan_paths}
+    uploaded = {str(path).replace("\\", "/").strip("/") for path in confirmed_uploaded_assets}
+    results: list[ContractCheckResult] = []
+    for path in sorted(_skill_local_paths_in_markdown(content)):
+        normalized = path.replace("\\", "/").strip("/")
+        if not normalized.startswith(("scripts/", "references/", "assets/")):
+            continue
+        if normalized.endswith("/") or "{{" in normalized or "}}" in normalized or "*" in normalized:
+            continue
+        if normalized not in planned:
+            results.append(ContractCheckResult(
+                id="skill_md.resource.not_in_file_plan", passed=False, target=normalized,
+                message=f"SKILL.md 引用了 FilePlan 外的本地资源：{normalized}",
+                expected="SKILL.md 引用的 scripts/references/assets 具体文件必须在冻结 FilePlan 中。",
+                minimal_edit="将资源加入 FilePlan，或删除该引用。", matched_paths=[normalized],
+            ))
+        elif normalized.startswith("assets/") and normalized not in uploaded:
+            results.append(ContractCheckResult(
+                id="skill_md.asset.not_confirmed_uploaded", passed=False, target=normalized,
+                message=f"SKILL.md 引用了没有确认上传依据的 asset：{normalized}",
+                expected="user_upload asset 必须同时在 FilePlan 和 confirmed_uploaded_assets 中。",
+                minimal_edit="确认上传该 asset，或删除 SKILL.md 中的引用；不要生成占位 asset。", matched_paths=[normalized],
+            ))
+    return results
+
+
 def _kernel_resource_leak_paths(content: str) -> list[str]:
     """Return explicit kernel/references paths mentioned in final Skill text."""
     seen: set[str] = set()
