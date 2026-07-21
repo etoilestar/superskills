@@ -4170,6 +4170,18 @@ def _copy_confirmed_uploaded_assets_to_skill(skill_name: str, confirmed_uploaded
         copied.append({**item, "asset_target_path": target_rel, "provided": True, "bytes": target.stat().st_size})
     return copied
 
+
+def _existing_skill_asset_paths(skill_name: str) -> list[str]:
+    skill_dir = settings.skills_path / _validate_skill_name(skill_name)
+    assets_dir = skill_dir / "assets"
+    if not assets_dir.is_dir():
+        return []
+    return sorted(
+        path.relative_to(skill_dir).as_posix()
+        for path in assets_dir.rglob("*")
+        if path.is_file()
+    )
+
 def _read_prepare_existing_skill_context(skill_name: str | None) -> dict[str, Any]:
     if not skill_name:
         return {}
@@ -4448,7 +4460,7 @@ def _required_file_plan_user_upload_asset_paths(plan_files: list[Any] | None, as
 
 MAX_PREPARE_BUSINESS_CLARIFICATION_ROUNDS = 2
 MAX_PREPARE_SUPPLEMENT_ROUNDS = 1
-MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS = 1
+MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS = 3
 
 
 async def _retry_prepare_stage_repair(
@@ -4484,8 +4496,11 @@ async def _retry_prepare_stage_repair(
                 # A failed localized repair is still a recoverable attempt;
                 # retry once more and emit no terminal stream error here.
                 continue
+    suffix = ""
+    if stage == "blueprint_protocol":
+        suffix = "; repair failed before executable target freeze"
     raise PreparePlanProtocolError(
-        f"Prepare stage {stage} remained invalid after {max_attempts} repairs: {last_error}"
+        f"Prepare stage {stage} remained invalid after {max_attempts} repairs: {last_error}{suffix}"
     )
 
 
@@ -13177,11 +13192,12 @@ async def generate_file(request: GenerateFileRequest):
                         # scripts/references can be generated later, so never
                         # use disk existence as a gate here.
                         planned_paths = _extract_prepare_skill_plan_paths(request.blueprint_text)
+                        available_asset_paths = _existing_skill_asset_paths(skill_name)
                         _raise_file_contract_failures(
                             validate_skill_md_resource_plan_alignment(
                                 content=content,
                                 file_plan_paths=planned_paths,
-                                confirmed_uploaded_assets=[],
+                                confirmed_uploaded_assets=available_asset_paths,
                             )
                         )
 

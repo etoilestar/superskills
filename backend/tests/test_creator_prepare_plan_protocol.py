@@ -2217,3 +2217,39 @@ async def test_boundary_presence_failure_after_repair_blocks(monkeypatch):
 
     with pytest.raises(api.PreparePlanProtocolError, match="missing platform output boundary edge"):
         await _run_ready_graph_alignment_flow(monkeypatch, review, repair, initial_edges=[input_edge])
+
+
+@pytest.mark.asyncio
+async def test_retry_prepare_stage_repair_retries_after_first_invalid_repair():
+    repairs = []
+
+    def validate(candidate):
+        if candidate != "valid":
+            raise ValueError("invalid")
+
+    async def repair(candidate, error):
+        repairs.append((candidate, str(error)))
+        return "still-invalid" if len(repairs) == 1 else "valid"
+
+    assert await api._retry_prepare_stage_repair(
+        stage="test_stage", candidate="invalid", validate=validate, repair=repair
+    ) == "valid"
+    assert len(repairs) == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_prepare_stage_repair_raises_only_after_two_failed_repairs():
+    repairs = []
+
+    def validate(candidate):
+        raise ValueError("invalid")
+
+    async def repair(candidate, error):
+        repairs.append(candidate)
+        return candidate
+
+    with pytest.raises(api.PreparePlanProtocolError, match="test_stage"):
+        await api._retry_prepare_stage_repair(
+            stage="test_stage", candidate="invalid", validate=validate, repair=repair
+        )
+    assert len(repairs) == 2

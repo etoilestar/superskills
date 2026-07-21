@@ -901,9 +901,9 @@ def validate_skill_md_resource_plan_alignment(
         elif normalized.startswith("assets/") and normalized not in uploaded:
             results.append(ContractCheckResult(
                 id="skill_md.asset.not_confirmed_uploaded", passed=False, target=normalized,
-                message=f"SKILL.md 引用了没有确认上传依据的 asset：{normalized}",
-                expected="user_upload asset 必须同时在 FilePlan 和 confirmed_uploaded_assets 中。",
-                minimal_edit="确认上传该 asset，或删除 SKILL.md 中的引用；不要生成占位 asset。", matched_paths=[normalized],
+                message=f"SKILL.md 引用了尚未上传或尚未准备到 Skill 目录的 asset：{normalized}",
+                expected="asset 必须同时在 FilePlan 和 Skill 的 assets/** 可用路径中。",
+                minimal_edit="上传或准备该 asset，或删除 SKILL.md 中的引用；不要生成占位 asset。", matched_paths=[normalized],
             ))
     return results
 
