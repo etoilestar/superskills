@@ -10,6 +10,7 @@ from backend.services.creator_contracts import (
     validate_python_evidence,
 )
 from backend.services.skill_plan import SkillPlanEntry, ToolSlot
+from backend.services.creator import api, contracts
 
 
 def _entry(**kw):
@@ -1726,3 +1727,85 @@ def test_command_block_json_protocol_empty_schema_preserves_existing_keys_and_al
         script_path="scripts/generate_story.py",
         arg_protocol={"expected_arg_mode": "argparse_flags", "requires_json_argv": False},
     )
+
+
+def test_skill_md_resource_plan_rejects_script_outside_file_plan():
+    results = contracts.validate_skill_md_resource_plan_alignment(
+        content="Run `scripts/a.py`.", file_plan_paths=["SKILL.md"], confirmed_uploaded_assets=[]
+    )
+    assert [result.id for result in results] == ["skill_md.resource.not_in_file_plan"]
+
+
+def test_skill_md_resource_plan_allows_planned_script_without_disk_check():
+    results = contracts.validate_skill_md_resource_plan_alignment(
+        content="Run `scripts/a.py`.", file_plan_paths=["SKILL.md", "scripts/a.py"], confirmed_uploaded_assets=[]
+    )
+    assert results == []
+
+
+def test_skill_md_resource_plan_allows_existing_asset():
+    results = contracts.validate_skill_md_resource_plan_alignment(
+        content="Use `assets/logo.png`.", file_plan_paths=["SKILL.md", "assets/logo.png"],
+        confirmed_uploaded_assets=["assets/logo.png"],
+    )
+    assert results == []
+
+
+def test_skill_md_resource_plan_rejects_missing_asset():
+    results = contracts.validate_skill_md_resource_plan_alignment(
+        content="Use `assets/logo.png`.", file_plan_paths=["SKILL.md", "assets/logo.png"], confirmed_uploaded_assets=[]
+    )
+    assert [result.id for result in results] == ["skill_md.asset.not_confirmed_uploaded"]
+
+
+@pytest.mark.asyncio
+async def test_validate_skill_blocks_e2e_when_first_round_resource_closure_fails(monkeypatch, tmp_path):
+    from backend.config import settings
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("# Demo", encoding="utf-8")
+    monkeypatch.setattr(api, "_validate_first_round_resource_closure", lambda _name: {
+        "success": False, "error_type": "first_round_resource_closure_failed", "e2e_started": False,
+        "missing_scripts": ["scripts/a.py"], "missing_references": [], "missing_assets": [],
+    })
+    monkeypatch.setattr(api, "_create_e2e_session", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not start E2E")))
+    monkeypatch.setattr(api, "validate_workflow_e2e", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not validate E2E")))
+    result = await api.validate_skill(api.SkillActionRequest(skill_name="demo-skill"))
+    assert not result.success
+    assert result.error_type == "first_round_resource_closure_failed"
+
+
+@pytest.mark.asyncio
+async def test_validate_skill_starts_e2e_after_first_round_resource_closure_passes(monkeypatch, tmp_path):
+    from backend.config import settings
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("# Demo", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(api, "_validate_first_round_resource_closure", lambda _name: {
+        "success": True, "error_type": "first_round_resource_closure_failed", "e2e_started": False,
+        "missing_scripts": [], "missing_references": [], "missing_assets": [],
+    })
+    monkeypatch.setattr(api, "_create_e2e_session", lambda *_args, **_kwargs: calls.append("session") or type("Session", (), {"events": []})())
+    monkeypatch.setattr(api, "validate_workflow_e2e", lambda *_args, **_kwargs: calls.append("validate") or [])
+    result = await api.validate_skill(api.SkillActionRequest(skill_name="demo-skill"))
+    assert result.success
+    assert calls == ["session", "validate"]
+
+
+def test_dynamic_skill_md_resources_are_ignored_by_plan_and_closure(monkeypatch, tmp_path):
+    from backend.config import settings
+    content = "Use assets/*.png and assets/{{name}}.png"
+    assert contracts.concrete_skill_md_resource_paths(content) == []
+    assert contracts.validate_skill_md_resource_plan_alignment(
+        content=content, file_plan_paths=["SKILL.md"], confirmed_uploaded_assets=[]
+    ) == []
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+    closure = api._validate_first_round_resource_closure("demo-skill")
+    assert closure["success"]
+    assert closure["missing_assets"] == []
