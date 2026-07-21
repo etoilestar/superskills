@@ -5863,6 +5863,10 @@ candidate_tool_catalog 已由统一 Tool recall 层产生：
         route.model,
     )
 
+    data = _parse_prepare_plan_json(
+        text
+    )
+
     raw_patch = (
         data.get(
             "tool_pool_patch"

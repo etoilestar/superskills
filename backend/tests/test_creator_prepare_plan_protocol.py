@@ -2300,3 +2300,32 @@ async def test_planner_transport_does_not_repair_model_infrastructure_error(monk
     monkeypatch.setattr(api, "complete_chat_once", unavailable)
     with pytest.raises(ConnectionError):
         await api._generate_internal_blueprint_or_questions(_request())
+
+
+@pytest.mark.asyncio
+async def test_plan_tool_pool_patch_parses_model_response_before_reading_patch(monkeypatch):
+    async def complete(*_args, **_kwargs):
+        return '{"tool_pool_patch":{"add_tools":[],"remove_tools":[],"update_bindings":[]}}'
+    monkeypatch.setattr(api, "complete_chat_once", complete)
+    monkeypatch.setattr(api, "_planner_shared_tool_context", lambda _value: {})
+    monkeypatch.setattr(api, "_recall_creator_tool_candidates", lambda **_kwargs: ([], "test"))
+    monkeypatch.setattr(api, "_apply_planner_tool_pool_patch", lambda **kwargs: {"normalized": kwargs["planner_output"]})
+    result = await api._plan_tool_pool_patch_from_responsibility_feedback(
+        skill_name="demo-skill", target_file="scripts/a.py", file_spec={},
+        responsibility_issues=[], script_content="", requested_model=None,
+    )
+    assert result["planner_decision"]["tool_pool_patch"]["affected_files"] == ["scripts/a.py"]
+
+
+@pytest.mark.asyncio
+async def test_plan_tool_pool_patch_invalid_json_raises_parse_error_not_unbound_data(monkeypatch):
+    async def complete(*_args, **_kwargs):
+        return "not json"
+    monkeypatch.setattr(api, "complete_chat_once", complete)
+    monkeypatch.setattr(api, "_planner_shared_tool_context", lambda _value: {})
+    monkeypatch.setattr(api, "_recall_creator_tool_candidates", lambda **_kwargs: ([], "test"))
+    with pytest.raises(ValueError, match="did not return JSON"):
+        await api._plan_tool_pool_patch_from_responsibility_feedback(
+            skill_name="demo-skill", target_file="scripts/a.py", file_spec={},
+            responsibility_issues=[], script_content="", requested_model=None,
+        )
