@@ -950,6 +950,8 @@ def build_available_tool_context(
     *,
     role: str = "",
     file_path: str = "",
+    required_capabilities: list[str] | None = None,
+    relevant_tool_ids: list[str] | None = None,
     max_snippets: int = 8,
     failure_layer: str | None = None,
     error_text: str | None = None,
@@ -986,15 +988,43 @@ def build_available_tool_context(
         )
 
     (
-        available_tools,
-        tool_function_cards,
+        authorized_tools,
+        _authorized_tool_function_cards,
         selected_tool_names,
     ) = _available_tool_cards_from_binding(binding)
 
+    # ToolPool authorization remains Skill-wide.  The code model only needs
+    # rich signatures for helpers that serve this FunctionItem; the compact
+    # available_tools index still exposes every authorized callable.
+    required_capability_names = set(_string_list(required_capabilities))
+    binding_relevant_tool_ids = set(_string_list(relevant_tool_ids))
+    relevant_available_tools = [
+        tool for tool in authorized_tools
+        if str(tool.get("function_name") or "").strip() == "strict_json_argv_guard"
+        or str(tool.get("capability_name") or "").strip() in required_capability_names
+        or str(tool.get("tool_id") or "").strip() in required_capability_names
+        or any(
+            str(tool.get("tool_id") or "").strip() == tool_id
+            or str(tool.get("tool_id") or "").strip().startswith(f"{tool_id}.")
+            for tool_id in binding_relevant_tool_ids
+        )
+    ]
+    # Older plans can lack FunctionItem tool metadata. In that case preserve
+    # existing binding visibility rather than guessing a narrower subset.
+    available_tools = relevant_available_tools if len(relevant_available_tools) > 1 else authorized_tools
+    tool_function_cards = [
+        _tool_function_card_from_available_tool(tool)
+        for tool in available_tools
+    ]
+
+    expanded_capability_names = {
+        str(tool.get("capability_name") or "").strip()
+        for tool in available_tools
+    }
     capability_ids = [
         tool_name
         for tool_name in selected_tool_names
-        if get_tool_capability(tool_name) is not None
+        if tool_name in expanded_capability_names and get_tool_capability(tool_name) is not None
     ]
     snippets = _filter_snippets_to_available_callables(
         resolve_tool_snippets_for_context(
@@ -1142,10 +1172,26 @@ def _script_local_contract_payload(
             )
         )
 
+    function_item_capabilities = _stable_unique([
+        capability
+        for item in responsibility_requirements
+        for capability in _string_list(item.get("required_tools"))
+    ])
+    prompt_required_capabilities = _stable_unique([
+        *function_item_capabilities,
+        *_string_list(plan_entry.required_capabilities),
+        *_string_list(plan_entry.raw_capability_hints),
+    ])
+    binding_relevant_tool_ids = _stable_unique([
+        *_string_list(tool_binding_summary.get("primary_tool_ids")),
+        *_string_list(tool_binding_summary.get("secondary_tool_ids")),
+    ])
     tool_context = build_available_tool_context(
         tool_binding_summary,
         role=plan_entry.role or "",
         file_path=file_path,
+        required_capabilities=prompt_required_capabilities or None,
+        relevant_tool_ids=binding_relevant_tool_ids or None,
         max_snippets=8,
     )
     available_tools = tool_context["available_tools"]
@@ -1183,9 +1229,20 @@ def _script_local_contract_payload(
                 tool_snippets
             )
         ),
-        "current_file_tool_binding": (
-            prompt_tool_binding_summary
-        ),
+        "current_file_tool_binding": {
+            # Keep authorization visible without repeating Skill-wide registry
+            # metadata that is irrelevant to this script implementation.
+            "target_file": prompt_tool_binding_summary.get("target_file", file_path),
+            "allowed_tool_ids": prompt_tool_binding_summary.get("allowed_tool_ids", []),
+            "primary_tool_ids": prompt_tool_binding_summary.get("primary_tool_ids", []),
+            "secondary_tool_ids": prompt_tool_binding_summary.get("secondary_tool_ids", []),
+            "available_tools": available_tools,
+            "expanded_tool_ids": [tool.get("tool_id") for tool in resolved_tools],
+            "allowed_import_paths": tool_context["allowed_import_paths"],
+            "allowed_function_imports": tool_context["allowed_function_imports"],
+            "allowed_helper_imports": tool_context["allowed_helper_imports"],
+            "dependencies": prompt_tool_binding_summary.get("dependencies", []),
+        },
         "allowed_helper_imports": (
             prompt_tool_binding_summary.get(
                 "allowed_helper_imports",
@@ -1822,6 +1879,16 @@ def _build_script_generate_file_prompt_variant(
         None,
     )
 
+    logger.info(
+        "[Creator][script_generation_context] file_path=%s input_count=%d output_count=%d incoming_edge_count=%d outgoing_edge_count=%d expanded_tool_count=%d",
+        file_path,
+        len(local_contract.get("inputs") or []),
+        len(local_contract.get("outputs") or []),
+        len((local_contract.get("function_item_graph_context") or {}).get("incoming_edges") or []),
+        len((local_contract.get("function_item_graph_context") or {}).get("outgoing_edges") or []),
+        len(tool_function_cards),
+    )
+
     instruction = [
         (
             f'你正在为 Skill 包 "{skill_name}" '
@@ -1858,10 +1925,10 @@ def _build_script_generate_file_prompt_variant(
             "strict_json_argv_guard(payload, {})，保持统一入口协议。"
         ),
         (
-            "脚本第一轮可以选择清晰、稳定的 argv key；"
-            "SkillPlan/ResponsibilityGraph/workflow allocation/"
-            "local_contract 中的 inputs 只提供语义输入提示和 "
-            "SKILL.md block 参考，不是 argv key 白名单。"
+            "CURRENT SCRIPT CONTRACT：local_contract 中 inputs 和 outputs 是本 Skill 已确定的接口字段。"
+            "必须原样实现这些字段；不得改成同义词、别名或更自然的名称。"
+            "inputs 必须作为脚本 JSON argv/guard 和 run(args) 消费的字段，"
+            "outputs 必须作为 stdout JSON 字段交付。"
         ),
         (
             "command_argv_contract、SKILL.md command、E2E repair trace "
@@ -1919,8 +1986,8 @@ def _build_script_generate_file_prompt_variant(
             "所有 required=true constraints 都必须实现；"
             "根据完整 constraint object 理解其语义，不存在固定 constraint vocabulary，"
             "不要忽略不认识的 constraint；"
-            "inputs/outputs 表达语义责任，不要求局部变量名或 argv key "
-            "与这些文本逐字一致。"
+            "FunctionItem 的 inputs/outputs 是已确认接口合同：argv/guard、run(args)、"
+            "stdout JSON 和 edge 字段必须逐字使用，不得重新命名或解释为 raw value。"
         ),
         (
             "coverage_requirements 是职责覆盖约束，不是 argv/stdout 字段；"
