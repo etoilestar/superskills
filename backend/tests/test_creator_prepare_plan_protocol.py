@@ -2217,3 +2217,176 @@ async def test_boundary_presence_failure_after_repair_blocks(monkeypatch):
 
     with pytest.raises(api.PreparePlanProtocolError, match="missing platform output boundary edge"):
         await _run_ready_graph_alignment_flow(monkeypatch, review, repair, initial_edges=[input_edge])
+
+
+@pytest.mark.asyncio
+async def test_retry_prepare_stage_repair_retries_after_first_invalid_repair():
+    repairs = []
+
+    def validate(candidate):
+        if candidate != "valid":
+            raise ValueError("invalid")
+
+    async def repair(candidate, error):
+        repairs.append((candidate, str(error)))
+        return "still-invalid" if len(repairs) == 1 else "valid"
+
+    assert await api._retry_prepare_stage_repair(
+        stage="test_stage", candidate="invalid", validate=validate, repair=repair
+    ) == "valid"
+    assert len(repairs) == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_prepare_stage_repair_raises_only_after_two_failed_repairs():
+    repairs = []
+
+    def validate(candidate):
+        raise ValueError("invalid")
+
+    async def repair(candidate, error):
+        repairs.append(candidate)
+        return candidate
+
+    with pytest.raises(api.PreparePlanProtocolError, match="test_stage"):
+        await api._retry_prepare_stage_repair(
+            stage="test_stage", candidate="invalid", validate=validate, repair=repair
+        )
+    assert len(repairs) == 2
+
+
+@pytest.mark.asyncio
+async def test_planner_transport_invalid_json_is_repaired_before_processing(monkeypatch):
+    events, calls = [], []
+    async def fake_complete(*_args, **_kwargs):
+        calls.append(1)
+        return "not json" if len(calls) == 1 else '{"status":"needs_clarification","clarifying_questions":[]}'
+    async def emit(event): events.append(event)
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request(), event_emitter=emit)
+    assert result["status"] == "needs_clarification"
+    assert len(calls) == 2
+    assert [event["event"] for event in events] == ["prepare_repair_started", "prepare_repair_succeeded"]
+
+
+@pytest.mark.asyncio
+async def test_planner_transport_retries_twice_before_success(monkeypatch):
+    calls = []
+    async def fake_complete(*_args, **_kwargs):
+        calls.append(1)
+        return "invalid" if len(calls) < 3 else '{"status":"needs_clarification","clarifying_questions":[]}'
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result["status"] == "needs_clarification"
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_planner_transport_exhaustion_stops_before_file_plan_freeze(monkeypatch):
+    calls = []
+    async def fake_complete(*_args, **_kwargs):
+        calls.append(1)
+        return "invalid"
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    with pytest.raises(api.PreparePlanProtocolError, match="planner_transport"):
+        await api._generate_internal_blueprint_or_questions(_request())
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_planner_transport_does_not_repair_model_infrastructure_error(monkeypatch):
+    async def unavailable(*_args, **_kwargs):
+        raise ConnectionError("model unavailable")
+    monkeypatch.setattr(api, "complete_chat_once", unavailable)
+    with pytest.raises(ConnectionError):
+        await api._generate_internal_blueprint_or_questions(_request())
+
+
+@pytest.mark.asyncio
+async def test_plan_tool_pool_patch_parses_model_response_before_reading_patch(monkeypatch):
+    async def complete(*_args, **_kwargs):
+        return '{"tool_pool_patch":{"add_tools":[],"remove_tools":[],"update_bindings":[]}}'
+    monkeypatch.setattr(api, "complete_chat_once", complete)
+    monkeypatch.setattr(api, "_planner_shared_tool_context", lambda _value: {})
+    monkeypatch.setattr(api, "_recall_creator_tool_candidates", lambda **_kwargs: ([], "test"))
+    monkeypatch.setattr(api, "_apply_planner_tool_pool_patch", lambda **kwargs: {"normalized": kwargs["planner_output"]})
+    result = await api._plan_tool_pool_patch_from_responsibility_feedback(
+        skill_name="demo-skill", target_file="scripts/a.py", file_spec={},
+        responsibility_issues=[], script_content="", requested_model=None,
+    )
+    assert result["planner_decision"]["tool_pool_patch"]["affected_files"] == ["scripts/a.py"]
+
+
+@pytest.mark.asyncio
+async def test_plan_tool_pool_patch_invalid_json_raises_parse_error_not_unbound_data(monkeypatch):
+    async def complete(*_args, **_kwargs):
+        return "not json"
+    monkeypatch.setattr(api, "complete_chat_once", complete)
+    monkeypatch.setattr(api, "_planner_shared_tool_context", lambda _value: {})
+    monkeypatch.setattr(api, "_recall_creator_tool_candidates", lambda **_kwargs: ([], "test"))
+    with pytest.raises(ValueError, match="did not return JSON"):
+        await api._plan_tool_pool_patch_from_responsibility_feedback(
+            skill_name="demo-skill", target_file="scripts/a.py", file_spec={},
+            responsibility_issues=[], script_content="", requested_model=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_valid_responsibility_graph_does_not_force_convergence_repair(monkeypatch):
+    # The retry helper must accept a valid graph directly rather than creating
+    # a synthetic "convergence required" validation failure.
+    called = []
+    async def repair(*_args, **_kwargs):
+        called.append(True)
+        return {"function_items": [], "responsibility_edges": []}
+    result = await api._retry_prepare_stage_repair(
+        stage="responsibility_graph", candidate={"function_items": [], "responsibility_edges": []},
+        validate=lambda _candidate: None, repair=repair,
+    )
+    assert result["function_items"] == []
+    assert called == []
+
+
+def test_responsibility_graph_field_alignment_accepts_stdout_to_argv_and_platform_output():
+    items = [
+        {"target_file": "scripts/a.py", "inputs": [], "outputs": ["image_paths"]},
+        {"target_file": "scripts/b.py", "inputs": ["image_paths"], "outputs": ["pdf_path"]},
+    ]
+    api._validate_responsibility_graph_field_alignment(items, [
+        {"from_node": "scripts/a.py", "from_output": "image_paths", "to_node": "scripts/b.py", "to_input": "image_paths"},
+        {"from_node": "scripts/b.py", "from_output": "pdf_path", "to_node": "platform_output_node", "to_input": "pdf_path"},
+    ])
+
+
+def test_responsibility_graph_field_alignment_rejects_undeclared_output_and_cycle():
+    items = [
+        {"target_file": "scripts/a.py", "inputs": ["b"], "outputs": ["a"]},
+        {"target_file": "scripts/b.py", "inputs": ["a"], "outputs": ["b"]},
+    ]
+    with pytest.raises(ValueError, match="not declared"):
+        api._validate_responsibility_graph_field_alignment(items, [{"from_node": "scripts/a.py", "from_output": "missing", "to_node": "scripts/b.py", "to_input": "a"}])
+    with pytest.raises(ValueError, match="cycle"):
+        api._validate_responsibility_graph_field_alignment(items, [
+            {"from_node": "scripts/a.py", "from_output": "a", "to_node": "scripts/b.py", "to_input": "a"},
+            {"from_node": "scripts/b.py", "from_output": "b", "to_node": "scripts/a.py", "to_input": "b"},
+        ])
+
+
+def test_preflight_rejects_nested_json_bash_fence():
+    issues = api._preflight_prepare_blueprint_text("```bash\n```json\n{}\n```\n```")
+    assert "invalid_blueprint_bash_fence" in {issue["code"] for issue in issues}
+
+
+def test_confirmed_prepare_uploaded_asset_paths_requires_explicit_concrete_decision():
+    assert api._confirmed_prepare_uploaded_asset_paths([
+        {"asset_decision": "include_as_asset", "asset_target_path": "assets/confirmed.png"},
+        {"asset_decision": "include_as_asset", "asset_target_path": "assets/"},
+        {"asset_decision": "unknown", "asset_target_path": "assets/ignored.png"},
+    ]) == {"assets/confirmed.png"}
+
+
+def test_responsibility_graph_repair_uses_latest_review_blueprint_source():
+    import inspect
+    source = inspect.getsource(api._generate_internal_blueprint_or_questions)
+    repair_call = source[source.index("repaired_graph = await _repair_responsibility_graph_alignment("):]
+    assert "frozen_blueprint_text=latest_review_blueprint" in repair_call.split(")\n", 1)[0] or "frozen_blueprint_text=latest_review_blueprint" in repair_call[:500]
