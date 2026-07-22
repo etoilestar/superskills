@@ -951,6 +951,7 @@ def build_available_tool_context(
     role: str = "",
     file_path: str = "",
     required_capabilities: list[str] | None = None,
+    relevant_tool_ids: list[str] | None = None,
     max_snippets: int = 8,
     failure_layer: str | None = None,
     error_text: str | None = None,
@@ -996,11 +997,17 @@ def build_available_tool_context(
     # rich signatures for helpers that serve this FunctionItem; the compact
     # available_tools index still exposes every authorized callable.
     required_capability_names = set(_string_list(required_capabilities))
+    binding_relevant_tool_ids = set(_string_list(relevant_tool_ids))
     relevant_available_tools = [
         tool for tool in authorized_tools
         if str(tool.get("function_name") or "").strip() == "strict_json_argv_guard"
         or str(tool.get("capability_name") or "").strip() in required_capability_names
         or str(tool.get("tool_id") or "").strip() in required_capability_names
+        or any(
+            str(tool.get("tool_id") or "").strip() == tool_id
+            or str(tool.get("tool_id") or "").strip().startswith(f"{tool_id}.")
+            for tool_id in binding_relevant_tool_ids
+        )
     ]
     # Older plans can lack FunctionItem tool metadata. In that case preserve
     # existing binding visibility rather than guessing a narrower subset.
@@ -1175,11 +1182,16 @@ def _script_local_contract_payload(
         *_string_list(plan_entry.required_capabilities),
         *_string_list(plan_entry.raw_capability_hints),
     ])
+    binding_relevant_tool_ids = _stable_unique([
+        *_string_list(tool_binding_summary.get("primary_tool_ids")),
+        *_string_list(tool_binding_summary.get("secondary_tool_ids")),
+    ])
     tool_context = build_available_tool_context(
         tool_binding_summary,
         role=plan_entry.role or "",
         file_path=file_path,
         required_capabilities=prompt_required_capabilities or None,
+        relevant_tool_ids=binding_relevant_tool_ids or None,
         max_snippets=8,
     )
     available_tools = tool_context["available_tools"]

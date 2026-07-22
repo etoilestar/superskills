@@ -425,7 +425,11 @@ def test_script_prompt_projects_current_function_item_and_expands_only_relevant_
     from backend.services.creator.generation import _build_script_generate_file_prompt_variant
 
     clear_registered_tool_capabilities()
-    for capability, function_name in (("source_reader", "read_source"), ("unrelated_writer", "write_unrelated")):
+    for capability, function_name in (
+        ("source_reader", "read_source"),
+        ("binding_secondary", "use_secondary"),
+        ("unrelated_writer", "write_unrelated"),
+    ):
         register_tool_capability(ToolCapability(
             name=capability,
             display_name=capability,
@@ -463,8 +467,9 @@ def test_script_prompt_projects_current_function_item_and_expands_only_relevant_
             inputs=current.inputs, outputs=current.outputs, required_capabilities=["source_reader"],
             runtime_contract={"tool_binding_summary": {"available_tools": [
                 {"tool_id": "source_reader.read_source", "function_name": "read_source"},
+                {"tool_id": "binding_secondary.use_secondary", "function_name": "use_secondary"},
                 {"tool_id": "unrelated_writer.write_unrelated", "function_name": "write_unrelated"},
-            ]}},
+            ], "secondary_tool_ids": ["binding_secondary"]}},
         )
         entry_payload = dict(entry.__dict__)
         entry_payload["tool_binding_summary"] = entry.runtime_contract["tool_binding_summary"]
@@ -480,6 +485,7 @@ def test_script_prompt_projects_current_function_item_and_expands_only_relevant_
         assert "source_value" in text and "result_paths" in text
         assert "不得改成同义词、别名" in text
         assert "read_source(value: str)" in text
+        assert "use_secondary(value: str)" in text
         assert "write_unrelated(value: str)" not in text
         assert "other_output" not in text
     finally:
