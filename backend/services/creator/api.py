@@ -7501,9 +7501,12 @@ Blueprint Planner 只规划业务责任。
                 frozen_blueprint_text
             )
         )
-        if protocol_errors:
+        repair_index = -1
+        for repair_index in range(2):
+            if not protocol_errors:
+                break
             try:
-                repaired_blueprint_text = await _repair_prepare_blueprint_protocol(
+                frozen_blueprint_text = await _repair_prepare_blueprint_protocol(
                     request=request,
                     blueprint_text=frozen_blueprint_text,
                     protocol_errors=protocol_errors,
@@ -7512,34 +7515,26 @@ Blueprint Planner 只规划业务责任。
                 raise PreparePlanProtocolError(
                     "Planner ready Blueprint FilePlan protocol "
                     "repair failed before executable target freeze; "
-                    f"error={type(exc).__name__}: {exc}"
+                    f"repair_index={repair_index}; error={type(exc).__name__}: {exc}"
                 ) from exc
 
-            repaired_errors = []
+            protocol_errors = []
             try:
-                validate_blueprint_shape_for_creator(
-                    repaired_blueprint_text
-                )
+                validate_blueprint_shape_for_creator(frozen_blueprint_text)
             except BlueprintShapeError as exc:
-                repaired_errors.append(
-                    _prepare_protocol_issue(
-                        "invalid_strict_blueprint_shape",
-                        str(exc),
-                        field="internal_blueprint_text",
-                    )
-                )
-            repaired_errors.extend(
-                _preflight_prepare_blueprint_text(
-                    repaired_blueprint_text
-                )
+                protocol_errors.append(_prepare_protocol_issue(
+                    "invalid_strict_blueprint_shape", str(exc),
+                    field="internal_blueprint_text",
+                ))
+            protocol_errors.extend(_preflight_prepare_blueprint_text(frozen_blueprint_text))
+        if protocol_errors:
+            raise PreparePlanProtocolError(
+                "Planner ready Blueprint failed strict FilePlan preflight "
+                "before executable target freeze; "
+                f"repair_index={repair_index}; errors={protocol_errors}; "
+                f"blueprint={frozen_blueprint_text}"
             )
-            if repaired_errors:
-                raise PreparePlanProtocolError(
-                    "Planner ready Blueprint failed strict FilePlan "
-                    "preflight before executable target freeze; "
-                    f"errors={repaired_errors}"
-                )
-            frozen_blueprint_text = repaired_blueprint_text
+        if repair_index >= 0:
             first_planner_result = {
                 **first_planner_result,
                 "internal_blueprint_text": frozen_blueprint_text,
@@ -7674,76 +7669,100 @@ Blueprint Planner 只规划业务责任。
                 ) from exc
 
         try:
-            alignment_review = await _review_responsibility_graph_alignment(
-                request=request,
-                frozen_blueprint_text=frozen_blueprint_text,
-                allowed_function_item_targets=allowed_function_item_targets,
-                function_items=list(data.get("function_items") or []),
-                responsibility_edges=list(data.get("responsibility_edges") or []),
-                planner_model=route.model,
-            )
-            boundary_error = ""
-            try:
-                _validate_responsibility_graph_boundary_presence(
-                    list(data.get("responsibility_edges") or []),
-                    allowed_function_item_targets,
+            current_function_items = list(data.get("function_items") or [])
+            current_edges = list(data.get("responsibility_edges") or [])
+            current_issues: list[dict[str, Any]] = []
+            last_error = ""
+            for repair_index in range(3):
+                alignment_review = await _review_responsibility_graph_alignment(
+                    request=request, frozen_blueprint_text=frozen_blueprint_text,
+                    allowed_function_item_targets=allowed_function_item_targets,
+                    function_items=current_function_items, responsibility_edges=current_edges,
+                    planner_model=route.model,
                 )
-            except ValueError as exc:
-                boundary_error = str(exc)
-            if not alignment_review["passed"] or boundary_error:
-                repair_issues = list(alignment_review["issues"])
+                boundary_error = ""
+                try:
+                    _validate_responsibility_graph_boundary_presence(current_edges, allowed_function_item_targets)
+                except ValueError as exc:
+                    boundary_error = str(exc)
+                if alignment_review["passed"] and not boundary_error:
+                    data["function_items"] = current_function_items
+                    data["responsibility_edges"] = current_edges
+                    data["internal_blueprint_text"] = _render_structured_responsibility_view(
+                        frozen_blueprint_text, current_function_items, current_edges)
+                    break
+                current_issues = list(alignment_review["issues"])
                 if boundary_error:
-                    repair_issues.append({
-                        "id": "platform_boundary_presence",
-                        "target_files": [],
-                        "affected_edge_indexes": [],
-                        "reason": boundary_error,
+                    current_issues.append({"id": "platform_boundary_presence", "target_files": [],
+                        "affected_edge_indexes": [], "reason": boundary_error,
                         "evidence": "The current responsibility graph lacks a required platform boundary edge.",
-                        "repair_guidance": "Restore platform boundary closure without changing the frozen FilePlan.",
-                    })
-                repaired_graph = await _repair_responsibility_graph_alignment(
-                    request=request,
-                    frozen_blueprint_text=frozen_blueprint_text,
-                    allowed_function_item_targets=allowed_function_item_targets,
-                    function_items=list(data.get("function_items") or []),
-                    responsibility_edges=list(data.get("responsibility_edges") or []),
-                    review_issues=repair_issues,
-                    planner_model=route.model,
-                )
-                repaired_function_items = normalize_structured_function_items(
-                    repaired_graph["function_items"], source="planner"
-                )
-                _validate_function_item_targets_in_allowed_domain(
-                    repaired_function_items, allowed_function_item_targets
-                )
-                repaired_edges = validate_structured_responsibility_edge_transport(
-                    repaired_graph["responsibility_edges"],
-                    function_items=repaired_function_items,
-                    source="planner",
-                )
-                final_alignment_review = await _review_responsibility_graph_alignment(
-                    request=request,
-                    frozen_blueprint_text=frozen_blueprint_text,
-                    allowed_function_item_targets=allowed_function_item_targets,
-                    function_items=repaired_function_items,
-                    responsibility_edges=repaired_edges,
-                    planner_model=route.model,
-                )
-                if not final_alignment_review["passed"]:
+                        "repair_guidance": "Restore platform boundary closure without changing the frozen FilePlan."})
+                last_error = boundary_error
+                if repair_index >= 2:
                     raise PreparePlanProtocolError(
-                        "Responsibility graph alignment remained unresolved after "
-                        "one localized same-Planner repair; "
-                        f"issues={final_alignment_review['issues']}"
+                        "Responsibility graph alignment remained unresolved after two localized same-Planner repairs; "
+                        f"last_error={last_error}; issues={current_issues}; "
+                        f"function_items={current_function_items}; responsibility_edges={current_edges}"
                     )
-                _validate_responsibility_graph_boundary_presence(
-                    repaired_edges,
-                    allowed_function_item_targets,
+                repaired_graph = await _repair_responsibility_graph_alignment(
+                    request=request, frozen_blueprint_text=frozen_blueprint_text,
+                    allowed_function_item_targets=allowed_function_item_targets,
+                    function_items=current_function_items, responsibility_edges=current_edges,
+                    review_issues=current_issues, planner_model=route.model,
                 )
-                data["function_items"] = repaired_function_items
-                data["responsibility_edges"] = repaired_edges
-                data["internal_blueprint_text"] = _render_structured_responsibility_view(
-                    frozen_blueprint_text, repaired_function_items, repaired_edges
-                )
+                current_function_items = list(repaired_graph["function_items"])
+                current_edges = list(repaired_graph["responsibility_edges"])
+                try:
+                    current_function_items = normalize_structured_function_items(current_function_items, source="planner")
+                    _validate_function_item_targets_in_allowed_domain(current_function_items, allowed_function_item_targets)
+                    current_edges = validate_structured_responsibility_edge_transport(
+                        current_edges, function_items=current_function_items, source="planner")
+                except Exception as exc:
+                    last_error = str(exc)
+                    current_issues = [{
+                        "id": "responsibility_graph_candidate_validation", "target_files": [],
+                        "affected_edge_indexes": [], "reason": last_error,
+                        "evidence": "The latest repaired responsibility graph failed the existing deterministic validator.",
+                        "repair_guidance": "Repair only the invalid FunctionItem or ResponsibilityEdge fields identified by the validator. Preserve the frozen FilePlan.",
+                    }]
+                    if repair_index >= 1:
+                        raise PreparePlanProtocolError(
+                            "Responsibility graph repaired candidate remained invalid after two localized same-Planner repairs; "
+                            f"last_error={last_error}; issues={current_issues}; "
+                            f"function_items={current_function_items}; responsibility_edges={current_edges}"
+                        ) from exc
+                    # The invalid candidate itself is intentionally the next repair input.
+                    repaired_graph = await _repair_responsibility_graph_alignment(
+                        request=request, frozen_blueprint_text=frozen_blueprint_text,
+                        allowed_function_item_targets=allowed_function_item_targets,
+                        function_items=current_function_items, responsibility_edges=current_edges,
+                        review_issues=current_issues, planner_model=route.model,
+                    )
+                    current_function_items = normalize_structured_function_items(repaired_graph["function_items"], source="planner")
+                    _validate_function_item_targets_in_allowed_domain(current_function_items, allowed_function_item_targets)
+                    current_edges = validate_structured_responsibility_edge_transport(
+                        repaired_graph["responsibility_edges"], function_items=current_function_items, source="planner")
+                    alignment_review = await _review_responsibility_graph_alignment(
+                        request=request, frozen_blueprint_text=frozen_blueprint_text,
+                        allowed_function_item_targets=allowed_function_item_targets,
+                        function_items=current_function_items, responsibility_edges=current_edges,
+                        planner_model=route.model,
+                    )
+                    try:
+                        _validate_responsibility_graph_boundary_presence(current_edges, allowed_function_item_targets)
+                    except ValueError as boundary_exc:
+                        last_error = str(boundary_exc)
+                    if not alignment_review["passed"] or last_error:
+                        raise PreparePlanProtocolError(
+                            "Responsibility graph alignment remained unresolved after two localized same-Planner repairs; "
+                            f"last_error={last_error}; issues={alignment_review['issues']}; "
+                            f"function_items={current_function_items}; responsibility_edges={current_edges}"
+                        )
+                    data["function_items"] = current_function_items
+                    data["responsibility_edges"] = current_edges
+                    data["internal_blueprint_text"] = _render_structured_responsibility_view(
+                        frozen_blueprint_text, current_function_items, current_edges)
+                    break
         except PreparePlanProtocolError:
             raise
         except Exception as exc:
@@ -9310,22 +9329,10 @@ async def _prepare_plan_impl(
                 )
             )
 
-        except PreparePlanProtocolError as exc:
-            return PreparePlanResponse(
-                status="blocked",
-                prepare_stage="blueprint_protocol_failed",
-                clarifying_questions=[],
-                review_summary=PreparePlanReviewSummary(),
-                blueprint_text=previous_blueprint_text,
-                skill_name=skill_name,
-                creation_blockers=[
-                    _prepare_protocol_issue(
-                        "planner_structured_graph_protocol_failed",
-                        str(exc),
-                        field="responsibility_edges",
-                    )
-                ],
-            )
+        except PreparePlanProtocolError:
+            # Planner protocol failures are internal repair failures, not user
+            # clarification blockers.
+            raise
 
         except Exception as exc:
             raise HTTPException(
@@ -9712,73 +9719,28 @@ async def _prepare_plan_impl(
         )
     )
 
-    protocol_errors = (
-        _preflight_prepare_blueprint_text(
-            blueprint_text
-        )
-    )
-
-    if protocol_errors:
+    protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
+    repair_index = -1
+    for repair_index in range(2):
+        if not protocol_errors:
+            break
         try:
-            blueprint_text = (
-                await _repair_prepare_blueprint_protocol(
-                    request=request,
-
-                    blueprint_text=(
-                        blueprint_text
-                    ),
-
-                    protocol_errors=(
-                        protocol_errors
-                    ),
-                )
+            blueprint_text = await _repair_prepare_blueprint_protocol(
+                request=request, blueprint_text=blueprint_text,
+                protocol_errors=protocol_errors,
             )
-
-            blueprint_text = (
-                _normalize_prepare_blueprint_references(
-                    blueprint_text
-                )
-            )
-
-            protocol_errors = (
-                _preflight_prepare_blueprint_text(
-                    blueprint_text
-                )
-            )
-
-        except Exception:
-            pass
+        except Exception as exc:
+            raise PreparePlanProtocolError(
+                "Confirmed Blueprint protocol repair failed; "
+                f"repair_index={repair_index}; error={type(exc).__name__}: {exc}"
+            ) from exc
+        blueprint_text = _normalize_prepare_blueprint_references(blueprint_text)
+        protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
 
     if protocol_errors:
-        summary = await project_summary(
-            blueprint_text,
-            prepared,
-        )
-
-        return PreparePlanResponse(
-            status="blocked",
-
-            prepare_stage=(
-                "blueprint_protocol_failed"
-            ),
-
-            clarifying_questions=[],
-
-            review_summary=(
-                _strip_prepare_summary_risks(
-                    summary
-                )
-            ),
-
-            blueprint_text=(
-                blueprint_text
-            ),
-
-            skill_name=skill_name,
-
-            creation_blockers=(
-                protocol_errors
-            ),
+        raise PreparePlanProtocolError(
+            "Confirmed Blueprint failed strict preflight after localized repairs; "
+            f"repair_index={repair_index}; errors={protocol_errors}; blueprint={blueprint_text}"
         )
 
     try:
@@ -9923,54 +9885,15 @@ async def _prepare_plan_impl(
             )
 
             if protocol_errors:
-                analyze_errors = (
-                    protocol_errors
-                )
-
-                break
+                # Continue with the latest repaired Blueprint and the errors it
+                # actually produced; the next same-Planner repair receives both.
+                analyze_errors = protocol_errors
+                continue
 
     if plan is None:
-        summary = await project_summary(
-            blueprint_text,
-            prepared,
-        )
-
-        blockers = (
-            analyze_errors
-            or [
-                _prepare_protocol_issue(
-                    "strict_analyze_failed",
-                    (
-                        "已确认 full blueprint "
-                        "无法解析为创建计划。"
-                    ),
-                    field="analyze_blueprint",
-                )
-            ]
-        )
-
-        return PreparePlanResponse(
-            status="blocked",
-
-            prepare_stage=(
-                "blueprint_analyze_failed"
-            ),
-
-            clarifying_questions=[],
-
-            review_summary=(
-                _strip_prepare_summary_risks(
-                    summary
-                )
-            ),
-
-            blueprint_text=(
-                blueprint_text
-            ),
-
-            skill_name=skill_name,
-
-            creation_blockers=blockers,
+        raise PreparePlanProtocolError(
+            "Confirmed Blueprint strict analyze failed after available retries; "
+            f"errors={analyze_errors}; blueprint={blueprint_text}"
         )
 
     (
