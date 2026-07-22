@@ -870,6 +870,64 @@ def _skill_local_paths_in_markdown(content: str) -> set[str]:
     return {match.group(1).strip() for match in _SKILL_FILE_PATH_RE.finditer(content or "")}
 
 
+def concrete_skill_md_resource_paths(content: str) -> list[str]:
+    """Return only concrete local resources that require plan/disk checks."""
+    paths: set[str] = set()
+    for path in _skill_local_paths_in_markdown(content):
+        normalized = path.replace("\\", "/").strip("/")
+        if not normalized.startswith(("scripts/", "references/", "assets/")):
+            continue
+        if (
+            normalized.endswith("/")
+            or any(token in normalized for token in ("*", "?", "{{", "}}", "[", "]"))
+        ):
+            continue
+        paths.add(normalized)
+    return sorted(paths)
+
+
+_NON_TEXT_REFERENCE_SUFFIXES = {".docx", ".pdf", ".pptx", ".xlsx", ".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+def is_non_text_reference_path(path: str) -> bool:
+    """References are Creator-generated text resources, never binary assets."""
+    normalized = str(path or "").replace("\\", "/").lower()
+    return normalized.startswith("references/") and Path(normalized).suffix in _NON_TEXT_REFERENCE_SUFFIXES
+
+
+def validate_skill_md_resource_plan_alignment(
+    *,
+    content: str,
+    file_plan_paths: list[str],
+    confirmed_uploaded_assets: list[str],
+) -> list[ContractCheckResult]:
+    """Statically check explicit local SKILL.md resources against FilePlan.
+
+    This deliberately does not inspect the skill directory: first-round files
+    may be generated after SKILL.md.  Directory mentions, URLs, templates and
+    runtime/dynamic paths are not concrete resources.
+    """
+    planned = {str(path).replace("\\", "/").strip("/") for path in file_plan_paths}
+    uploaded = {str(path).replace("\\", "/").strip("/") for path in confirmed_uploaded_assets}
+    results: list[ContractCheckResult] = []
+    for normalized in concrete_skill_md_resource_paths(content):
+        if normalized not in planned:
+            results.append(ContractCheckResult(
+                id="skill_md.resource.not_in_file_plan", passed=False, target=normalized,
+                message=f"SKILL.md 引用了 FilePlan 外的本地资源：{normalized}",
+                expected="SKILL.md 引用的 scripts/references/assets 具体文件必须在冻结 FilePlan 中。",
+                minimal_edit="将资源加入 FilePlan，或删除该引用。", matched_paths=[normalized],
+            ))
+        elif normalized.startswith("assets/") and normalized not in uploaded:
+            results.append(ContractCheckResult(
+                id="skill_md.asset.not_confirmed_uploaded", passed=False, target=normalized,
+                message=f"SKILL.md 引用了尚未上传或尚未准备到 Skill 目录的 asset：{normalized}",
+                expected="asset 必须同时在 FilePlan 和 Skill 的 assets/** 可用路径中。",
+                minimal_edit="上传或准备该 asset，或删除 SKILL.md 中的引用；不要生成占位 asset。", matched_paths=[normalized],
+            ))
+    return results
+
+
 def _kernel_resource_leak_paths(content: str) -> list[str]:
     """Return explicit kernel/references paths mentioned in final Skill text."""
     seen: set[str] = set()
