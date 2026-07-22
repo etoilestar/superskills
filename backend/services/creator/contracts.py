@@ -886,6 +886,15 @@ def concrete_skill_md_resource_paths(content: str) -> list[str]:
     return sorted(paths)
 
 
+_NON_TEXT_REFERENCE_SUFFIXES = {".docx", ".pdf", ".pptx", ".xlsx", ".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+def is_non_text_reference_path(path: str) -> bool:
+    """References are Creator-generated text resources, never binary assets."""
+    normalized = str(path or "").replace("\\", "/").lower()
+    return normalized.startswith("references/") and Path(normalized).suffix in _NON_TEXT_REFERENCE_SUFFIXES
+
+
 def validate_skill_md_resource_plan_alignment(
     *,
     content: str,

@@ -2329,3 +2329,64 @@ async def test_plan_tool_pool_patch_invalid_json_raises_parse_error_not_unbound_
             skill_name="demo-skill", target_file="scripts/a.py", file_spec={},
             responsibility_issues=[], script_content="", requested_model=None,
         )
+
+
+@pytest.mark.asyncio
+async def test_valid_responsibility_graph_does_not_force_convergence_repair(monkeypatch):
+    # The retry helper must accept a valid graph directly rather than creating
+    # a synthetic "convergence required" validation failure.
+    called = []
+    async def repair(*_args, **_kwargs):
+        called.append(True)
+        return {"function_items": [], "responsibility_edges": []}
+    result = await api._retry_prepare_stage_repair(
+        stage="responsibility_graph", candidate={"function_items": [], "responsibility_edges": []},
+        validate=lambda _candidate: None, repair=repair,
+    )
+    assert result["function_items"] == []
+    assert called == []
+
+
+def test_responsibility_graph_field_alignment_accepts_stdout_to_argv_and_platform_output():
+    items = [
+        {"target_file": "scripts/a.py", "inputs": [], "outputs": ["image_paths"]},
+        {"target_file": "scripts/b.py", "inputs": ["image_paths"], "outputs": ["pdf_path"]},
+    ]
+    api._validate_responsibility_graph_field_alignment(items, [
+        {"from_node": "scripts/a.py", "from_output": "image_paths", "to_node": "scripts/b.py", "to_input": "image_paths"},
+        {"from_node": "scripts/b.py", "from_output": "pdf_path", "to_node": "platform_output_node", "to_input": "pdf_path"},
+    ])
+
+
+def test_responsibility_graph_field_alignment_rejects_undeclared_output_and_cycle():
+    items = [
+        {"target_file": "scripts/a.py", "inputs": ["b"], "outputs": ["a"]},
+        {"target_file": "scripts/b.py", "inputs": ["a"], "outputs": ["b"]},
+    ]
+    with pytest.raises(ValueError, match="not declared"):
+        api._validate_responsibility_graph_field_alignment(items, [{"from_node": "scripts/a.py", "from_output": "missing", "to_node": "scripts/b.py", "to_input": "a"}])
+    with pytest.raises(ValueError, match="cycle"):
+        api._validate_responsibility_graph_field_alignment(items, [
+            {"from_node": "scripts/a.py", "from_output": "a", "to_node": "scripts/b.py", "to_input": "a"},
+            {"from_node": "scripts/b.py", "from_output": "b", "to_node": "scripts/a.py", "to_input": "b"},
+        ])
+
+
+def test_preflight_rejects_nested_json_bash_fence():
+    issues = api._preflight_prepare_blueprint_text("```bash\n```json\n{}\n```\n```")
+    assert "invalid_blueprint_bash_fence" in {issue["code"] for issue in issues}
+
+
+def test_confirmed_prepare_uploaded_asset_paths_requires_explicit_concrete_decision():
+    assert api._confirmed_prepare_uploaded_asset_paths([
+        {"asset_decision": "include_as_asset", "asset_target_path": "assets/confirmed.png"},
+        {"asset_decision": "include_as_asset", "asset_target_path": "assets/"},
+        {"asset_decision": "unknown", "asset_target_path": "assets/ignored.png"},
+    ]) == {"assets/confirmed.png"}
+
+
+def test_responsibility_graph_repair_uses_latest_review_blueprint_source():
+    import inspect
+    source = inspect.getsource(api._generate_internal_blueprint_or_questions)
+    repair_call = source[source.index("repaired_graph = await _repair_responsibility_graph_alignment("):]
+    assert "frozen_blueprint_text=latest_review_blueprint" in repair_call.split(")\n", 1)[0] or "frozen_blueprint_text=latest_review_blueprint" in repair_call[:500]

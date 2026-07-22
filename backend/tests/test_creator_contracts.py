@@ -1809,3 +1809,10 @@ def test_dynamic_skill_md_resources_are_ignored_by_plan_and_closure(monkeypatch,
     closure = api._validate_first_round_resource_closure("demo-skill")
     assert closure["success"]
     assert closure["missing_assets"] == []
+
+
+def test_prepare_blueprint_rejects_binary_reference_resources():
+    issues = api._preflight_prepare_blueprint_text(
+        "### SkillPlan / 文件职责计划\n- path: `references/template.docx`\n  role: reference"
+    )
+    assert "blueprint.reference.non_text_resource" in {issue["code"] for issue in issues}
