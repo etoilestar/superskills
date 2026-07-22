@@ -4921,12 +4921,13 @@ async def _run_script_responsibility_review(
                 "你是 Creator 第一轮单脚本职责审查模型，只输出严格 JSON object。\n\n"
 
                 "你只判断当前 scripts/** 源码是否覆盖自身负责的语义任务；也就是只判断当前脚本是否完成自身职责、是否完成 purpose 短合同表达的职责。"
-                "不要判断其它文件、workflow、字段名、审美或充分性细节；不要求固定字段名。\n\n"
+                "不要判断其它文件、workflow、审美或充分性细节。FunctionItem 已确定的字段名必须按既定合同审查。\n\n"
 
                 "语义职责槽位参考：purpose、requirements、workflow_allocation_summary 只用于判断当前脚本自身职责是否完成。\n"
                 "Judge checks whether the current script implements its FunctionItem. Reference files may only serve as dependency/resource evidence for the current FunctionItem; SKILL.md, references/**, and assets/** do not own executable workflow responsibilities.\n\n"
                 "核心原则（图谱式可观察边界）：\n"
-                "- 当前脚本的语义职责以 current script FunctionItem（通过现有 requirements/responsibility_requirements payload 传输）的 purpose、must_do、must_not_do 和 constraints 为准；inputs/outputs 只是接口提示。\n"
+                "- 当前脚本的语义职责以 current script FunctionItem（通过现有 requirements/responsibility_requirements payload 传输）的 purpose、must_do、must_not_do 和 constraints 为准；inputs、outputs 和相连 ResponsibilityEdges 是已确认的接口合同。\n"
+                "- 不得重新命名 input/output 字段，不得把已声明的结构化 stdout 字段解释为 raw string，也不得以更自然的名称替换既定合同。若源码不一致，应判定当前脚本偏离既定合同，修复方向只能让脚本回到 FunctionItem/edge 合同。\n"
                 "- FunctionItem describes what the current script owns. Incoming ResponsibilityEdges describe what upstream responsibilities must provide to the current script. Outgoing ResponsibilityEdges describe what the current script must make available to downstream responsibilities. Required edge constraints must be checked against the current FunctionItem implementation.\n"
                 "- requirements.constraints 是当前文件拥有的开放责任约束。\n"
                 "- 所有 required=true constraints 都必须检查实现证据。\n"
@@ -5022,8 +5023,8 @@ async def _run_script_responsibility_review(
 
                 "审查要求：\n"
                 "1. 只判断当前脚本是否完成 purpose 短合同和 current script FunctionItem。\n"
-                "2. 不要判断其它非职责问题，不要按字段名/变量名/固定函数名/脚本类型词表判错。\n"
-                "3. 检查脚本是否保持自己可观察的输入关系，并交付 current script FunctionItem 要求的输出/产物。\n"
+                "2. 不要判断其它非职责问题，不要按局部变量名、固定函数名或脚本类型词表判错；但必须按 FunctionItem inputs/outputs 和连接 edges 的既定字段名检查脚本接口。\n"
+                "3. 检查脚本是否保持自己可观察的输入关系，并以既定结构化 stdout 字段交付 current script FunctionItem 要求的输出/产物；不得建议改成 raw value。\n"
                 "4. 不要要求当前脚本验证无法从输入、依赖、工具或声明能力中观察的信息。\n"
                 "5. requirements.constraints 是开放责任约束；所有 required=true constraints 都必须检查实现证据。\n"
                 "6. 不得忽略不认识的 constraint，也不得重新创造 current script FunctionItem 中不存在的 constraint。\n"
