@@ -4808,12 +4808,23 @@ async def _run_script_responsibility_review(
     ):
         current_file_tool_binding = {}
 
-    from .generation import build_available_tool_context
+    from .generation import build_available_tool_context, _stable_unique, _string_list
 
+    review_required_capabilities = _stable_unique([
+        capability
+        for item in req_items
+        for capability in _string_list(getattr(item, "required_tools", []))
+    ] + _string_list(getattr(skill_plan_entry, "required_capabilities", [])))
+    review_binding_relevant_tool_ids = _stable_unique([
+        *_string_list(current_file_tool_binding.get("primary_tool_ids")),
+        *_string_list(current_file_tool_binding.get("secondary_tool_ids")),
+    ])
     review_tool_context = build_available_tool_context(
         current_file_tool_binding or {},
         role=str(getattr(skill_plan_entry, "role", "") or ""),
         file_path=file_path,
+        required_capabilities=review_required_capabilities or None,
+        relevant_tool_ids=review_binding_relevant_tool_ids or None,
         max_snippets=8,
     )
     authorized_tool_contracts = [
@@ -4911,6 +4922,11 @@ async def _run_script_responsibility_review(
     workflow_allocation_summary = str(review_context.get("workflow_allocation_summary") or "").strip()
     trial_stdout = review_context.get("trial_stdout_json", review_context.get("trial_stdout", ""))
     artifact_info = review_context.get("artifact_info", review_context.get("artifact_paths", []))
+    output_contract = review_context.get("output_contract") if isinstance(review_context.get("output_contract"), dict) else {}
+    stdout_schema = review_context.get("stdout_schema") if isinstance(review_context.get("stdout_schema"), dict) else output_contract.get("stdout_schema")
+    if not isinstance(stdout_schema, dict):
+        from .generation import _script_stdout_schema_for_entry
+        stdout_schema = _script_stdout_schema_for_entry(skill_plan_entry)
     graph_context = function_execution_context
     req_payload = [graph_context.get("function_item") or function_item_prompt_payload(item) for item in req_items]
 
@@ -4921,12 +4937,13 @@ async def _run_script_responsibility_review(
                 "你是 Creator 第一轮单脚本职责审查模型，只输出严格 JSON object。\n\n"
 
                 "你只判断当前 scripts/** 源码是否覆盖自身负责的语义任务；也就是只判断当前脚本是否完成自身职责、是否完成 purpose 短合同表达的职责。"
-                "不要判断其它文件、workflow、字段名、审美或充分性细节；不要求固定字段名。\n\n"
+                "不要判断其它文件、workflow、审美或充分性细节。FunctionItem 已确定的字段名必须按既定合同审查。\n\n"
 
                 "语义职责槽位参考：purpose、requirements、workflow_allocation_summary 只用于判断当前脚本自身职责是否完成。\n"
                 "Judge checks whether the current script implements its FunctionItem. Reference files may only serve as dependency/resource evidence for the current FunctionItem; SKILL.md, references/**, and assets/** do not own executable workflow responsibilities.\n\n"
                 "核心原则（图谱式可观察边界）：\n"
-                "- 当前脚本的语义职责以 current script FunctionItem（通过现有 requirements/responsibility_requirements payload 传输）的 purpose、must_do、must_not_do 和 constraints 为准；inputs/outputs 只是接口提示。\n"
+                "- 当前脚本的语义职责以 current script FunctionItem（通过现有 requirements/responsibility_requirements payload 传输）的 purpose、must_do、must_not_do 和 constraints 为准；inputs、outputs 和相连 ResponsibilityEdges 是已确认的接口合同。\n"
+                "- 不得重新命名 input/output 字段，不得把已声明的结构化 stdout 字段解释为 raw string，也不得以更自然的名称替换既定合同。若源码不一致，应判定当前脚本偏离既定合同，修复方向只能让脚本回到 FunctionItem/edge 合同。\n"
                 "- FunctionItem describes what the current script owns. Incoming ResponsibilityEdges describe what upstream responsibilities must provide to the current script. Outgoing ResponsibilityEdges describe what the current script must make available to downstream responsibilities. Required edge constraints must be checked against the current FunctionItem implementation.\n"
                 "- requirements.constraints 是当前文件拥有的开放责任约束。\n"
                 "- 所有 required=true constraints 都必须检查实现证据。\n"
@@ -4951,6 +4968,11 @@ async def _run_script_responsibility_review(
                 "- 工具合同只用于理解源码语义和判断当前职责是否真实使用已有能力；不得借此新增工具、授权工具或要求 ToolPool 外工具。\n"
                 "- 如果当前源码没有调用某个已授权工具，不得因为工具已授权就假定其效果已经发生。\n"
                 "- 如果源码调用工具，但返回值没有进入当前职责要求的结果或 artifact，不得仅凭存在 tool call 判定职责完成。\n\n"
+                "stdout 合同规则：FunctionItem.outputs 是必须交付的字段，不自动意味着 stdout 只能包含这些字段。必须以 Current stdout contract 判断额外字段：additionalProperties=true 时，不能仅因额外字段未出现在 FunctionItem.outputs 中判 blocking；additionalProperties=false 时才按 schema 禁止额外字段。不得为此硬编码任何字段名。\n"
+                "事实优先级：FunctionItem、相连 ResponsibilityEdges、FunctionItem constraints、已声明 dependency/reference、purpose_short_contract/workflow summary。后两项只是摘要/辅助解释，不得新增 input/output/runtime protocol/parser/独占数据源/模板引擎/格式契约。reference 只表示静态依赖或参考；除非 constraints 明确要求，不得要求解析其格式或让它替代 runtime inputs。核心 runtime inputs 必须实际参与当前结果，读取 reference 不能替代这种消费。\n"
+                "返回 passed=true 前必须以实际源码确认既定 inputs 被脚本接受且参与职责实现，不能因 FunctionItem 描述而假定源码已实现。仅在 guard 中接受但未进入核心 transform/tool call/construction/declared output 的输入仍可能是语义职责未完成。\n"
+                "如果 Tool Registry return contract 已保证字段或返回形态，不得仅为防御性编程要求额外字段存在性、try/except、路径可访问性或格式检查；除非 FunctionItem、constraint 或工具合同明确要求。\n\n"
+
                 "工具合同判断规则：你必须根据 Current File ToolPool contracts 与完整源码判断工具使用事实。"
                 "如果源码调用的平台工具不在当前 ToolPool 合同中，输出 blocking issue id=tool_contract_mismatch。"
                 "如果当前 ToolPool 缺少完成 FunctionItem 所需能力，输出 blocking issue id=tool_support_insufficient。"
@@ -5003,6 +5025,8 @@ async def _run_script_responsibility_review(
                 "当前文件 requirements / must_do：\n"
 
                 f"{json.dumps(req_payload, ensure_ascii=False, default=str)[:8000]}\n\n"
+                "Current stdout contract：\n"
+                f"{json.dumps(stdout_schema, ensure_ascii=False, default=str)[:8000]}\n\n"
                 "当前文件 available_tools（纯索引，来自 Current File Tool Binding）：\n"
                 f"{json.dumps(review_tool_context.get('available_tools') or [], ensure_ascii=False, default=str)[:8000]}\n\n"
                 "当前文件已授权工具合同"
@@ -5022,8 +5046,8 @@ async def _run_script_responsibility_review(
 
                 "审查要求：\n"
                 "1. 只判断当前脚本是否完成 purpose 短合同和 current script FunctionItem。\n"
-                "2. 不要判断其它非职责问题，不要按字段名/变量名/固定函数名/脚本类型词表判错。\n"
-                "3. 检查脚本是否保持自己可观察的输入关系，并交付 current script FunctionItem 要求的输出/产物。\n"
+                "2. 不要判断其它非职责问题，不要按局部变量名、固定函数名或脚本类型词表判错；但必须按 FunctionItem inputs/outputs 和连接 edges 的既定字段名检查脚本接口。\n"
+                "3. 检查脚本是否保持自己可观察的输入关系，并以既定结构化 stdout 字段交付 current script FunctionItem 要求的输出/产物；不得建议改成 raw value。\n"
                 "4. 不要要求当前脚本验证无法从输入、依赖、工具或声明能力中观察的信息。\n"
                 "5. requirements.constraints 是开放责任约束；所有 required=true constraints 都必须检查实现证据。\n"
                 "6. 不得忽略不认识的 constraint，也不得重新创造 current script FunctionItem 中不存在的 constraint。\n"
@@ -5145,6 +5169,35 @@ async def _run_script_responsibility_review(
             "model": route.model,
             "advisory_notes": data.get("advisory_notes") if isinstance(data.get("advisory_notes"), list) else [],
         }
+    required_input_fields = _stable_unique([
+        field
+        for item in req_items
+        for field in _string_list(getattr(item, "inputs", []))
+    ])
+    from .contracts import extract_python_strict_argv_schema
+    argv_schema = extract_python_strict_argv_schema(script_content) if required_input_fields and str(getattr(skill_plan_entry, "runtime", "") or "").lower() == "python" else {}
+    accepted_argv_keys = set()
+    for key in ("allowed_keys", "required_keys", "optional_keys", "defaulted_keys"):
+        accepted_argv_keys.update(_string_list(argv_schema.get(key)))
+    missing_input_fields = [field for field in required_input_fields if field not in accepted_argv_keys]
+    if missing_input_fields:
+        return {
+            "passed": False,
+            "issues": [{
+                "id": "script_responsibility.function_item_inputs_not_accepted",
+                "failed_file": file_path,
+                "failed_function": "strict_json_argv_guard",
+                "code_region": "argv schema",
+                "reason": "当前脚本没有真实接受 FunctionItem 已确定的输入字段：" + ", ".join(missing_input_fields),
+                "minimal_edit": "在当前脚本 strict_json_argv_guard spec 中原样接受缺失的 FunctionItem inputs，并由 run(args) 使用。",
+                "allowed_scope": "只修改当前脚本 argv guard 和职责实现。",
+                "details": {"required_inputs": required_input_fields, "accepted_argv_keys": sorted(accepted_argv_keys)},
+            }],
+            "repair_instructions": "让当前脚本 argv 接口回到既定 FunctionItem inputs；不要使用字段别名。",
+            "failure_type": "script_requirement_failed",
+            "model": route.model,
+        }
+
     logger.info("[Creator][script_responsibility][result] %s", json.dumps({
         "event": "script_responsibility_result",
         "file_path": file_path,

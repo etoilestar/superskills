@@ -784,3 +784,64 @@ def test_generate_file_prefers_persisted_file_binding_before_skill_projection():
     block = source[start:source.index('if request.file_path.startswith("scripts/"):', start + 1)]
     assert "current_file_binding = get_file_binding" in block
     assert block.index("current_file_binding = get_file_binding") < block.index("get_skill_tool_binding")
+
+
+@pytest.mark.asyncio
+async def test_responsibility_reviewer_preserves_structured_stdout_contract_and_semantic_judgment(monkeypatch):
+    class Route:
+        model = "unit-test-model"
+
+    captured = {}
+    monkeypatch.setattr(repair, "route_model", lambda *a, **k: Route())
+
+    async def fake_complete(messages, model):
+        captured["messages"] = messages
+        return json.dumps({
+            "passed": False,
+            "blocking_issues": [{
+                "issue_type": "semantic_action_incomplete",
+                "semantic_failure": "Only one result is generated although the FunctionItem requires multiple outputs.",
+                "minimal_edit": "Return {'generated_text': generated} and generate the declared multiple outputs.",
+            }],
+            "repair_instructions": "Restore generated_text instead of returning a raw value.",
+        })
+
+    monkeypatch.setattr(repair, "complete_chat_once", fake_complete)
+    requirement = repair.FunctionItem(
+        target_file="scripts/main.py", purpose="generate multiple outputs", role="generic_script",
+        inputs=["source_value"], outputs=["generated_text"],
+        must_do=["Generate multiple outputs rather than one result."],
+    )
+    result = await repair._run_script_responsibility_review(
+        file_path="scripts/main.py",
+        script_content="def run(args):\n    generated = 'one'\n    return {'text': generated}\n",
+        skill_plan_entry=SkillPlanEntry(
+            path="scripts/main.py", role="generic_script", file_type="script", purpose="generate multiple outputs",
+            runtime="python", language="python", inputs=["source_value"], outputs=["generated_text"],
+        ),
+        requirements=[requirement],
+        review_context={},
+    )
+
+    assert result["passed"] is False
+    review_prompt = "\n".join(message["content"] for message in captured.get("messages", []))
+    assert "generated_text" in review_prompt
+    assert "不得把已声明的结构化 stdout 字段解释为 raw string" in review_prompt
+    assert "既定字段名检查脚本接口" in review_prompt
+    assert result["issues"]  # Semantic failure remains a blocking review outcome.
+
+
+@pytest.mark.asyncio
+async def test_responsibility_pass_is_blocked_when_function_item_inputs_are_not_accepted(monkeypatch):
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(repair, "route_model", lambda *args, **kwargs: Route())
+    monkeypatch.setattr(repair, "complete_chat_once", lambda *args, **kwargs: __import__("asyncio").sleep(0, result=json.dumps({"passed": True, "blocking_issues": []})))
+    requirement = repair.FunctionItem(target_file="scripts/main.py", inputs=["source_value", "count"], outputs=["result"])
+    source = '''from backend.services.runtime_tools import strict_json_argv_guard\ndef run(args): return {"result": args["alias_value"]}\ndef main(payload):\n    args = strict_json_argv_guard(payload, {"alias_value": {"required": True}})\n    return run(args)'''
+    result = await repair._run_script_responsibility_review(
+        file_path="scripts/main.py", script_content=source, skill_plan_entry=_entry(), requirements=[requirement], review_context={},
+    )
+    assert result["passed"] is False
+    assert result["issues"][0]["id"] == "script_responsibility.function_item_inputs_not_accepted"

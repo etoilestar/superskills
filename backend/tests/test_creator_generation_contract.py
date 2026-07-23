@@ -417,3 +417,124 @@ def test_current_skill_binding_overrides_stale_guard_only_runtime_contract_with_
         assert tool.get("signature")
     assert set(payload["current_file_tool_binding"]["allowed_import_paths"]) == {tool["import_path"] for tool in payload["resolved_tools"]}
     assert stale_entry["runtime_contract"]["tool_binding_summary"]["available_tools"][0]["tool_id"] == "script_argv_guard"
+
+
+def test_script_prompt_projects_current_function_item_and_expands_only_relevant_tools():
+    """Script A sees its graph contract and tool A's detail, not tool B's card."""
+    from backend.services.creator.common import FunctionItem, ResponsibilityGraph, build_function_execution_context
+    from backend.services.creator.generation import _build_script_generate_file_prompt_variant
+
+    clear_registered_tool_capabilities()
+    for capability, function_name in (
+        ("source_reader", "read_source"),
+        ("binding_secondary", "use_secondary"),
+        ("unrelated_writer", "write_unrelated"),
+    ):
+        register_tool_capability(ToolCapability(
+            name=capability,
+            display_name=capability,
+            category="test",
+            roles=["generic_script"],
+            functions=[ToolFunctionManifest(
+                function_name=function_name,
+                import_path=f"backend.services.runtime_tools.custom_tools.{capability}",
+                short_description=f"{capability} helper",
+                when_to_use=f"Use {capability}",
+                signature=f"{function_name}(value: str) -> dict",
+                input_schema={"type": "object"},
+                output_schema={"type": "object"},
+            )],
+        ))
+    try:
+        current = FunctionItem(
+            target_file="scripts/a.py", purpose="produce paths", role="generic_script",
+            inputs=["source_value", "count"], outputs=["result_paths"],
+            required_tools=["source_reader"],
+        )
+        other = FunctionItem(
+            target_file="scripts/b.py", purpose="unrelated", role="generic_script",
+            inputs=["other_input"], outputs=["other_output"],
+            required_tools=["unrelated_writer"],
+        )
+        graph = ResponsibilityGraph(
+            requirements=[current, other],
+            dataflow_edges=[
+                {"from_node": "platform_input_node", "from_output": "source_value", "to_node": "scripts/a.py", "to_input": "source_value"},
+                {"from_node": "scripts/a.py", "from_output": "result_paths", "to_node": "scripts/b.py", "to_input": "other_input"},
+            ],
+        )
+        entry = _entry(
+            inputs=current.inputs, outputs=current.outputs, required_capabilities=["source_reader"],
+            runtime_contract={"tool_binding_summary": {"available_tools": [
+                {"tool_id": "source_reader.read_source", "function_name": "read_source"},
+                {"tool_id": "binding_secondary.use_secondary", "function_name": "use_secondary"},
+                {"tool_id": "unrelated_writer.write_unrelated", "function_name": "write_unrelated"},
+            ], "secondary_tool_ids": ["binding_secondary"]}},
+        )
+        entry_payload = dict(entry.__dict__)
+        entry_payload["tool_binding_summary"] = entry.runtime_contract["tool_binding_summary"]
+        messages = _build_script_generate_file_prompt_variant(
+            file_path="scripts/a.py", skill_name="demo", purpose=current.purpose,
+            blueprint_text="", role="generic_script", skill_plan_entry=entry_payload,
+            requirements=graph.requirements, responsibility_graph=graph,
+            function_execution_context=build_function_execution_context(graph=graph, target_file="scripts/a.py"),
+            variant="standard",
+        )
+        text = "\n".join(message["content"] for message in messages)
+        assert "CURRENT SCRIPT CONTRACT" in text
+        assert "source_value" in text and "result_paths" in text
+        assert "不得改成同义词、别名" in text
+        assert "read_source(value: str)" in text
+        assert "use_secondary(value: str)" in text
+        assert "write_unrelated(value: str)" not in text
+        assert "other_output" not in text
+    finally:
+        clear_registered_tool_capabilities()
+        from backend.services import creator_tool_registry
+        creator_tool_registry._load_registered_tools_from_disk()
+
+
+def test_rich_tool_projection_uses_required_capability_without_file_binding():
+    clear_registered_tool_capabilities()
+    for capability, function_name in (("capability_a", "call_a"), ("capability_b", "call_b")):
+        register_tool_capability(ToolCapability(
+            name=capability, display_name=capability, category="test", roles=["generic_script"],
+            functions=[ToolFunctionManifest(
+                function_name=function_name,
+                import_path=f"backend.services.runtime_tools.custom_tools.{capability}",
+                short_description=capability, when_to_use=capability,
+                signature=f"{function_name}(value: str) -> dict", input_schema={}, output_schema={},
+            )],
+        ))
+    try:
+        context = build_available_tool_context({"available_tools": [
+            {"tool_id": "capability_a.call_a", "function_name": "call_a"},
+            {"tool_id": "capability_b.call_b", "function_name": "call_b"},
+        ]}, required_capabilities=["capability_a"])
+        assert [tool["tool_id"] for tool in context["available_tools"]] == ["capability_a.call_a", "capability_b.call_b"]
+        assert [tool["function_name"] for tool in context["resolved_tools"]] == ["call_a"]
+        assert context["projection"]["projection_fallback_used"] is False
+    finally:
+        clear_registered_tool_capabilities()
+        from backend.services import creator_tool_registry
+        creator_tool_registry._load_registered_tools_from_disk()
+
+
+def test_rich_tool_projection_uses_legacy_fallback_without_current_file_signal():
+    clear_registered_tool_capabilities()
+    for capability, function_name in (("legacy_a", "call_a"), ("legacy_b", "call_b")):
+        register_tool_capability(ToolCapability(
+            name=capability, display_name=capability, category="test", roles=["generic_script"],
+            functions=[ToolFunctionManifest(function_name=function_name, import_path=f"backend.services.runtime_tools.custom_tools.{capability}", short_description=capability, when_to_use=capability, signature=f"{function_name}()", input_schema={}, output_schema={})],
+        ))
+    try:
+        context = build_available_tool_context({"available_tools": [
+            {"tool_id": "legacy_a.call_a", "function_name": "call_a"},
+            {"tool_id": "legacy_b.call_b", "function_name": "call_b"},
+        ]})
+        assert [tool["function_name"] for tool in context["resolved_tools"]] == ["call_a", "call_b"]
+        assert context["projection"]["projection_fallback_reason"] == "no_projection_signal"
+    finally:
+        clear_registered_tool_capabilities()
+        from backend.services import creator_tool_registry
+        creator_tool_registry._load_registered_tools_from_disk()

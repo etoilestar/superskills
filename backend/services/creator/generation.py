@@ -950,6 +950,8 @@ def build_available_tool_context(
     *,
     role: str = "",
     file_path: str = "",
+    required_capabilities: list[str] | None = None,
+    relevant_tool_ids: list[str] | None = None,
     max_snippets: int = 8,
     failure_layer: str | None = None,
     error_text: str | None = None,
@@ -986,15 +988,70 @@ def build_available_tool_context(
         )
 
     (
-        available_tools,
-        tool_function_cards,
+        authorized_tools,
+        _authorized_tool_function_cards,
         selected_tool_names,
     ) = _available_tool_cards_from_binding(binding)
 
+    # ToolPool authorization remains Skill-wide.  The code model only needs
+    # rich signatures for helpers that serve this FunctionItem; the compact
+    # available_tools index still exposes every authorized callable.
+    required_capability_names = set(_string_list(required_capabilities))
+    binding_relevant_tool_ids = set(_string_list(relevant_tool_ids))
+    projection_signal_present = bool(required_capability_names or binding_relevant_tool_ids)
+    registry_callable_identities: set[tuple[str, str]] = set()
+    for capability_name in required_capability_names:
+        capability = get_tool_capability(capability_name)
+        for function in getattr(capability, "functions", []) or []:
+            registry_callable_identities.add((
+                str(getattr(function, "function_name", "") or "").strip(),
+                str(getattr(function, "import_path", "") or "").strip(),
+            ))
+
+    def is_relevant_tool(tool: dict[str, Any]) -> bool:
+        tool_id = str(tool.get("tool_id") or "").strip()
+        capability_name = str(tool.get("capability_name") or "").strip()
+        callable_identity = (
+            str(tool.get("function_name") or "").strip(),
+            str(tool.get("import_path") or "").strip(),
+        )
+        return (
+            str(tool.get("function_name") or "").strip() == "strict_json_argv_guard"
+            or capability_name in required_capability_names
+            or tool_id in required_capability_names
+            or callable_identity in registry_callable_identities
+            or any(tool_id == relevant_id or tool_id.startswith(f"{relevant_id}.") for relevant_id in binding_relevant_tool_ids)
+        )
+
+    relevant_available_tools = [tool for tool in authorized_tools if is_relevant_tool(tool)]
+    projection_fallback_used = False
+    projection_fallback_reason = ""
+    if not projection_signal_present:
+        # Legacy plans without current-file responsibility/tool facts retain the
+        # old broad detail view rather than losing implementation guidance.
+        available_tools = authorized_tools
+        projection_fallback_used = True
+        projection_fallback_reason = "no_projection_signal"
+    elif any(str(tool.get("function_name") or "").strip() != "strict_json_argv_guard" for tool in relevant_available_tools):
+        available_tools = relevant_available_tools
+    else:
+        # Do not silently hide details after a malformed or stale projection.
+        available_tools = authorized_tools
+        projection_fallback_used = True
+        projection_fallback_reason = "projection_signal_matched_no_authorized_callable"
+    tool_function_cards = [
+        _tool_function_card_from_available_tool(tool)
+        for tool in available_tools
+    ]
+
+    expanded_capability_names = {
+        str(tool.get("capability_name") or "").strip()
+        for tool in available_tools
+    }
     capability_ids = [
         tool_name
         for tool_name in selected_tool_names
-        if get_tool_capability(tool_name) is not None
+        if tool_name in expanded_capability_names and get_tool_capability(tool_name) is not None
     ]
     snippets = _filter_snippets_to_available_callables(
         resolve_tool_snippets_for_context(
@@ -1035,6 +1092,15 @@ def build_available_tool_context(
         "allowed_import_paths": allowed_import_paths,
         "allowed_function_imports": allowed_function_imports,
         "allowed_helper_imports": allowed_helper_imports,
+        "projection": {
+            "authorized_tool_count": len(authorized_tools),
+            "required_capabilities": sorted(required_capability_names),
+            "binding_relevant_tool_ids": sorted(binding_relevant_tool_ids),
+            "projected_tool_count": len(available_tools),
+            "projection_signal_present": projection_signal_present,
+            "projection_fallback_used": projection_fallback_used,
+            "projection_fallback_reason": projection_fallback_reason,
+        },
     }
 
 def _script_local_contract_payload(
@@ -1142,10 +1208,26 @@ def _script_local_contract_payload(
             )
         )
 
+    function_item_capabilities = _stable_unique([
+        capability
+        for item in responsibility_requirements
+        for capability in _string_list(item.get("required_tools"))
+    ])
+    prompt_required_capabilities = _stable_unique([
+        *function_item_capabilities,
+        *_string_list(plan_entry.required_capabilities),
+        *_string_list(plan_entry.raw_capability_hints),
+    ])
+    binding_relevant_tool_ids = _stable_unique([
+        *_string_list(tool_binding_summary.get("primary_tool_ids")),
+        *_string_list(tool_binding_summary.get("secondary_tool_ids")),
+    ])
     tool_context = build_available_tool_context(
         tool_binding_summary,
         role=plan_entry.role or "",
         file_path=file_path,
+        required_capabilities=prompt_required_capabilities or None,
+        relevant_tool_ids=binding_relevant_tool_ids or None,
         max_snippets=8,
     )
     available_tools = tool_context["available_tools"]
@@ -1183,9 +1265,21 @@ def _script_local_contract_payload(
                 tool_snippets
             )
         ),
-        "current_file_tool_binding": (
-            prompt_tool_binding_summary
-        ),
+        "tool_projection": tool_context.get("projection") or {},
+        "current_file_tool_binding": {
+            # Keep authorization visible without repeating Skill-wide registry
+            # metadata that is irrelevant to this script implementation.
+            "target_file": prompt_tool_binding_summary.get("target_file", file_path),
+            "allowed_tool_ids": prompt_tool_binding_summary.get("allowed_tool_ids", []),
+            "primary_tool_ids": prompt_tool_binding_summary.get("primary_tool_ids", []),
+            "secondary_tool_ids": prompt_tool_binding_summary.get("secondary_tool_ids", []),
+            "available_tools": available_tools,
+            "expanded_tool_ids": [tool.get("tool_id") for tool in resolved_tools],
+            "allowed_import_paths": tool_context["allowed_import_paths"],
+            "allowed_function_imports": tool_context["allowed_function_imports"],
+            "allowed_helper_imports": tool_context["allowed_helper_imports"],
+            "dependencies": prompt_tool_binding_summary.get("dependencies", []),
+        },
         "allowed_helper_imports": (
             prompt_tool_binding_summary.get(
                 "allowed_helper_imports",
@@ -1822,6 +1916,23 @@ def _build_script_generate_file_prompt_variant(
         None,
     )
 
+    logger.info(
+        "[Creator][script_generation_context] file_path=%s input_count=%d output_count=%d incoming_edge_count=%d outgoing_edge_count=%d authorized_tool_count=%d required_capabilities=%s binding_relevant_tool_ids=%s projected_tool_count=%d projection_signal_present=%s projection_fallback_used=%s projection_fallback_reason=%s expanded_tool_count=%d",
+        file_path,
+        len(local_contract.get("inputs") or []),
+        len(local_contract.get("outputs") or []),
+        len((local_contract.get("function_item_graph_context") or {}).get("incoming_edges") or []),
+        len((local_contract.get("function_item_graph_context") or {}).get("outgoing_edges") or []),
+        int((local_contract.get("tool_projection") or {}).get("authorized_tool_count") or 0),
+        json.dumps((local_contract.get("tool_projection") or {}).get("required_capabilities") or [], ensure_ascii=False),
+        json.dumps((local_contract.get("tool_projection") or {}).get("binding_relevant_tool_ids") or [], ensure_ascii=False),
+        int((local_contract.get("tool_projection") or {}).get("projected_tool_count") or 0),
+        bool((local_contract.get("tool_projection") or {}).get("projection_signal_present")),
+        bool((local_contract.get("tool_projection") or {}).get("projection_fallback_used")),
+        str((local_contract.get("tool_projection") or {}).get("projection_fallback_reason") or ""),
+        len(tool_function_cards),
+    )
+
     instruction = [
         (
             f'你正在为 Skill 包 "{skill_name}" '
@@ -1858,10 +1969,10 @@ def _build_script_generate_file_prompt_variant(
             "strict_json_argv_guard(payload, {})，保持统一入口协议。"
         ),
         (
-            "脚本第一轮可以选择清晰、稳定的 argv key；"
-            "SkillPlan/ResponsibilityGraph/workflow allocation/"
-            "local_contract 中的 inputs 只提供语义输入提示和 "
-            "SKILL.md block 参考，不是 argv key 白名单。"
+            "CURRENT SCRIPT CONTRACT：local_contract 中 inputs 和 outputs 是本 Skill 已确定的接口字段。"
+            "必须原样实现这些字段；不得改成同义词、别名或更自然的名称。"
+            "inputs 必须作为脚本 JSON argv/guard 和 run(args) 消费的字段，"
+            "outputs 必须作为 stdout JSON 字段交付。"
         ),
         (
             "command_argv_contract、SKILL.md command、E2E repair trace "
@@ -1919,8 +2030,8 @@ def _build_script_generate_file_prompt_variant(
             "所有 required=true constraints 都必须实现；"
             "根据完整 constraint object 理解其语义，不存在固定 constraint vocabulary，"
             "不要忽略不认识的 constraint；"
-            "inputs/outputs 表达语义责任，不要求局部变量名或 argv key "
-            "与这些文本逐字一致。"
+            "FunctionItem 的 inputs/outputs 是已确认接口合同：argv/guard、run(args)、"
+            "stdout JSON 和 edge 字段必须逐字使用，不得重新命名或解释为 raw value。"
         ),
         (
             "coverage_requirements 是职责覆盖约束，不是 argv/stdout 字段；"
