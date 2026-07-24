@@ -2090,16 +2090,196 @@ async def test_alignment_final_review_failure_blocks_after_bounded_calls(monkeyp
     assert repair_calls == 1
 
 
-def test_alignment_review_and_repair_prompts_are_abstract_and_bounded():
+def test_alignment_review_prompt_has_bounded_reviewer_authority():
     import inspect
 
     review_source = inspect.getsource(api._review_responsibility_graph_alignment)
     repair_source = inspect.getsource(api._repair_responsibility_graph_alignment)
-    for text in ["requirement", "traceability", "dependency", "executability", "frozen FilePlan", "platform boundary closure", "required runtime inputs", "required final results"]:
-        assert text in review_source or text in repair_source
+
+    # Assert durable authority boundaries, rather than the full prompt wording.
+    for text in [
+        "read-only ResponsibilityGraph Alignment Reviewer",
+        "Do not redesign it.",
+        "Do not improve it.",
+        "CONFIRMED Blueprint",
+        "Check ONLY these three principles",
+        "Sufficient is PASS.",
+        "runtime implementation verification",
+        "feedback loops",
+        "synchronization mechanisms",
+        "file existence",
+        "Do not propose FilePlan changes.",
+    ]:
+        assert text in review_source
+    assert "the same Blueprint Planner acting only" not in review_source
+    assert "actual host execution model" not in review_source
     assert "localized" in repair_source
-    assert "while " not in review_source
-    assert "while " not in repair_source
+
+
+def test_alignment_review_prompt_preserves_semantic_mismatch_regression_boundary():
+    import inspect
+
+    review_source = inspect.getsource(api._review_responsibility_graph_alignment)
+
+    # A declared result mismatch remains reviewable; this is not a
+    # field-presence-only reviewer.
+    assert "producer output and consumer input" in review_source
+    assert "story_text into story_segments" in review_source
+    assert "affected_edge_indexes must include that edge's index" in review_source
+
+
+def test_alignment_review_prompt_stops_for_closed_multi_input_and_output_graphs():
+    import inspect
+
+    review_source = inspect.getsource(api._review_responsibility_graph_alignment)
+
+    # These boundaries cover the repaired graph: generation based on source
+    # content, two inputs consumed by one owner, a terminal artifact edge, and
+    # internal-only intermediate outputs.
+    for text in [
+        "owns generation",
+        "separate synchronization, pairing, or mapping responsibility",
+        "incoming declared\ndependencies are sufficient",
+        "sufficient platform-output closure",
+        "OUTPUT_DIR",
+        "output MAY be internal-only",
+        "post-generation validation",
+    ]:
+        assert text in review_source
+
+
+@pytest.mark.asyncio
+async def test_alignment_review_payload_contains_only_graph_authorities(monkeypatch):
+    import json
+
+    captured_messages = []
+
+    async def fake_complete_creator_role_once(messages, role, fallback_model):
+        captured_messages.extend(messages)
+        assert role == "reviewer"
+        assert fallback_model == "planner"
+        return '{"passed": true, "issues": []}'
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete_creator_role_once)
+    request = _request(
+        conversation_history=[{"role": "user", "content": "add visual validation"}],
+        user_request="an obsolete raw request",
+        human_feedback="add a feedback loop",
+        previous_blueprint_text="previous blueprint required validation",
+    )
+    function_items = [{
+        **_function_item("scripts/document_builder.py"),
+        "outputs": ["pdf_path"],
+    }]
+    responsibility_edges = [{
+        "from_node": "scripts/document_builder.py",
+        "from_output": "pdf_path",
+        "to_node": "platform_output_node",
+        "to_input": "pdf_path",
+        "purpose": "deliver the document",
+        "constraints": [],
+    }]
+
+    review = await api._review_responsibility_graph_alignment(
+        request=request,
+        frozen_blueprint_text="confirmed blueprint only",
+        allowed_function_item_targets=["scripts/document_builder.py"],
+        function_items=function_items,
+        responsibility_edges=responsibility_edges,
+        planner_model="planner",
+    )
+
+    assert review == {"passed": True, "issues": []}
+    payload = json.loads(captured_messages[1]["content"])
+    assert payload == {
+        "task": "review_responsibility_graph_alignment",
+        "confirmed_blueprint": "confirmed blueprint only",
+        "allowed_function_item_targets": ["scripts/document_builder.py"],
+        "function_items": function_items,
+        "responsibility_edges": responsibility_edges,
+        "platform_boundary_contract": {
+            "input_fields": api.build_platform_io_contract()["platform_skill_boundary"]["input_envelope_fields"],
+            "final_output_fields": api.build_platform_io_contract()["platform_skill_boundary"]["final_output_fields"],
+        },
+    }
+
+    serialized_payload = json.dumps(payload, ensure_ascii=False)
+    for forbidden_text in [
+        "OUTPUT_DIR",
+        "artifact helper",
+        "allowed_artifact_roots",
+        "helper_filename_rule",
+        "valid_absolute_paths",
+        "forbidden_patterns",
+        "basename only",
+        "file exists",
+        "os.path.join(OUTPUT_DIR",
+        "stdout JSON transport",
+        "argv conventions",
+        "conversation_history",
+        "previous_blueprint_text",
+        "human_feedback",
+        "an obsolete raw request",
+    ]:
+        assert forbidden_text not in serialized_payload
+    assert "user_request" not in payload
+    assert "user_request" in payload["platform_boundary_contract"]["input_fields"]
+
+
+def test_responsibility_graph_transport_validator_rejects_missing_declared_io():
+    from backend.services.skill_plan import validate_structured_responsibility_edge_transport
+
+    producer = {**_function_item("scripts/producer.py"), "outputs": ["foo"]}
+    consumer = {**_function_item("scripts/consumer.py"), "inputs": ["foo"]}
+    missing_output = {
+        "from_node": "scripts/producer.py", "from_output": "bar",
+        "to_node": "scripts/consumer.py", "to_input": "foo",
+        "purpose": "invalid source", "constraints": [],
+    }
+    missing_input = {**missing_output, "from_output": "foo", "to_input": "bar"}
+
+    with pytest.raises(ValueError, match="undefined FunctionItem source output"):
+        validate_structured_responsibility_edge_transport(
+            [missing_output], function_items=[producer, consumer], source="planner")
+    with pytest.raises(ValueError, match="undefined FunctionItem target input"):
+        validate_structured_responsibility_edge_transport(
+            [missing_input], function_items=[producer, consumer], source="planner")
+
+
+def test_alignment_review_discards_platform_claim_contradicted_by_graph():
+    terminal_edge = {
+        "from_node": "scripts/builder.py", "from_output": "pdf_path",
+        "to_node": "platform_output_node", "to_input": "pdf_path",
+        "purpose": "deliver", "constraints": [],
+    }
+    issue = {
+        "id": "false_platform_claim", "target_files": [], "affected_edge_indexes": [],
+        "reason": "platform output is not connected", "evidence": "missing platform output",
+        "repair_guidance": "add a platform output edge",
+    }
+    assert api._admissible_responsibility_graph_review_issues([issue], [terminal_edge]) == []
+
+
+@pytest.mark.asyncio
+async def test_alignment_repair_payload_contains_only_graph_authorities(monkeypatch):
+    import json
+
+    captured_messages = []
+
+    async def fake_complete_creator_role_once(messages, role, fallback_model):
+        captured_messages.extend(messages)
+        return '{"function_items": [], "responsibility_edges": []}'
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete_creator_role_once)
+    await api._repair_responsibility_graph_alignment(
+        request=_request(conversation_history=[{"role": "user", "content": "obsolete"}], human_feedback="obsolete", previous_blueprint_text="obsolete"),
+        frozen_blueprint_text="confirmed blueprint", allowed_function_item_targets=[],
+        function_items=[], responsibility_edges=[], review_issues=[], planner_model="planner",
+    )
+    serialized_payload = captured_messages[1]["content"]
+    for forbidden_text in ["OUTPUT_DIR", "artifact helper", "conversation_history", "previous_blueprint_text", "human_feedback"]:
+        assert forbidden_text not in serialized_payload
+    assert json.loads(serialized_payload)["platform_boundary_contract"]
 
 
 @pytest.mark.asyncio
