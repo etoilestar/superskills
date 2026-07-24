@@ -511,6 +511,24 @@ def validate_structured_responsibility_edge_transport(
             for item in normalized_function_items
             if str(item.get("target_file") or "").strip()
         }
+        function_item_io = {
+            str(item.get("target_file") or "").strip(): {
+                "inputs": {
+                    str(value)
+                    for value in (item.get("inputs") or [])
+                    if str(value or "").strip()
+                },
+                "outputs": {
+                    str(value)
+                    for value in (item.get("outputs") or [])
+                    if str(value or "").strip()
+                },
+            }
+            for item in normalized_function_items
+            if str(item.get("target_file") or "").strip()
+        }
+    else:
+        function_item_io = {}
 
     for index, edge in enumerate(normalized_edges):
         from_node = str(edge.get("from_node") or "")
@@ -577,6 +595,28 @@ def validate_structured_responsibility_edge_transport(
                 "target endpoint; "
                 f"index={index}; "
                 f"to_node={to_node}"
+            )
+
+        if (
+            function_item_targets is not None
+            and from_node != "platform_input_node"
+            and from_output not in function_item_io[from_node]["outputs"]
+        ):
+            raise ValueError(
+                f"{source}.responsibility_edges references undefined FunctionItem "
+                "source output; "
+                f"index={index}; from_node={from_node}; from_output={from_output}"
+            )
+
+        if (
+            function_item_targets is not None
+            and to_node != "platform_output_node"
+            and to_input not in function_item_io[to_node]["inputs"]
+        ):
+            raise ValueError(
+                f"{source}.responsibility_edges references undefined FunctionItem "
+                "target input; "
+                f"index={index}; to_node={to_node}; to_input={to_input}"
             )
 
     return normalized_edges
