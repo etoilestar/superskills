@@ -6400,10 +6400,12 @@ Check ONLY these three principles:
    mismatch such as transporting story_text into story_segments. Do not infer
    Python control flow, serialization, helper calls, file storage, or transport
    implementation details.
-3. Platform boundary closure: explicitly required platform inputs connect to an
-   appropriate FunctionItem input, and explicitly required platform final
-   outputs connect from a FunctionItem output to an allowed immutable platform
-   output slot.
+3. Responsibility boundary consistency: a FunctionItem's role, purpose, inputs,
+   outputs, capabilities, and constraints do not express a current business
+   responsibility contradiction.
+
+Platform topology, endpoint presence, and platform-slot legality are determined
+by the backend validator. Do not independently report or repair those facts.
 
 At ResponsibilityGraph review time, executability means only that every
 required declared responsibility has an existing FunctionItem owner, every
@@ -6535,7 +6537,7 @@ You are the same Blueprint Planner repairing your responsibility graph after a
 read-only alignment review. Perform one minimal coherent localized repair using
 the review issues. Restore requirement traceability, responsibility ownership,
 responsibility boundary consistency, input/output alignment, dependency closure,
-and constraint ownership with actual host executability preserved.
+and constraint ownership using only the declared graph contract.
 
 The FilePlan is frozen. Preserve the exact allowed_function_item_targets and
 current wire schema. Do not add, remove, rename, split, or merge files. Do not
@@ -6547,20 +6549,18 @@ only when needed for a coherent repair. Do not rewrite unrelated FunctionItems.
 Return only strict JSON:
 {"function_items": [...], "responsibility_edges": [...]}
 """.strip()
+    platform_contract = build_platform_io_contract()
+    platform_boundary = platform_contract["platform_skill_boundary"]
     payload = {
         "task": "repair_responsibility_graph_alignment",
-        "frozen_file_plan": frozen_blueprint_text,
+        "confirmed_blueprint": frozen_blueprint_text,
         "allowed_function_item_targets": allowed_function_item_targets,
         "function_items": function_items,
         "responsibility_edges": responsibility_edges,
         "review_issues": review_issues,
-        "platform_io_contract": platform_io_contract_prompt_text(),
-        "confirmed_decision_context": {
-            "conversation_history": request.conversation_history,
-            "user_request": request.user_request,
-            "human_feedback": request.human_feedback,
-            "previous_blueprint_text": request.previous_blueprint_text,
-            "skill_name": request.skill_name,
+        "platform_boundary_contract": {
+            "input_fields": platform_boundary["input_envelope_fields"],
+            "final_output_fields": platform_boundary["final_output_fields"],
         },
     }
     text = await complete_creator_role_once(
@@ -7748,13 +7748,13 @@ Blueprint Planner 只规划业务责任。
                     _validate_responsibility_graph_boundary_presence(current_edges, allowed_function_item_targets)
                 except ValueError as exc:
                     boundary_error = str(exc)
+                current_issues = list(alignment_review["issues"])
                 if alignment_review["passed"] and not boundary_error:
                     data["function_items"] = current_function_items
                     data["responsibility_edges"] = current_edges
                     data["internal_blueprint_text"] = _render_structured_responsibility_view(
                         frozen_blueprint_text, current_function_items, current_edges)
                     break
-                current_issues = list(alignment_review["issues"])
                 if boundary_error:
                     current_issues.append({"id": "platform_boundary_presence", "target_files": [],
                         "affected_edge_indexes": [], "reason": boundary_error,
