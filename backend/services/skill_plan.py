@@ -534,6 +534,7 @@ def validate_structured_responsibility_edge_transport(
         boundary.get("preferred_structured_input_root") or ""
     ).strip()
 
+    provenance_by_input: dict[tuple[str, str], list[tuple[int, str]]] = {}
     for index, edge in enumerate(normalized_edges):
         from_node = str(edge.get("from_node") or "")
         from_output = str(edge.get("from_output") or "")
@@ -658,6 +659,18 @@ def validate_structured_responsibility_edge_transport(
                 f"index={index}; to_node={to_node}; to_input={to_input}"
             )
 
+        if to_node != "platform_output_node":
+            source_kind = "platform" if from_node == "platform_input_node" else "upstream"
+            provenance_by_input.setdefault((to_node, to_input), []).append((index, source_kind))
+
+    for (target_file, target_input), sources in provenance_by_input.items():
+        source_kinds = {kind for _index, kind in sources}
+        if source_kinds == {"platform", "upstream"}:
+            raise ValueError(
+                f"conflicting_input_provenance: target_file={target_file}; "
+                f"target_input={target_input}; edge_indexes={[index for index, _kind in sources]}"
+            )
+
     return normalized_edges
 
 
@@ -667,7 +680,13 @@ def structured_responsibility_graph_input_provenance_gaps(
     *,
     source: str = "planner",
 ) -> list[tuple[str, str]]:
-    """Return declared FunctionItem inputs that have no incoming graph edge."""
+    """Return declared inputs unresolved by an existing deterministic source.
+
+    In the current wire schema both upstream values and platform/static
+    parameter bindings are represented by incoming ResponsibilityEdges. An
+    optional platform parameter is resolved by that edge plus its explicit
+    default, which transport validation checks separately.
+    """
     normalized_function_items = normalize_structured_function_items(
         function_items, source=source
     )

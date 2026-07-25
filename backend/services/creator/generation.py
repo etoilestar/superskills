@@ -2234,7 +2234,7 @@ def _build_generate_file_prompt(
         )
 
     clean_blueprint_text = _clean_blueprint_for_file_prompt(blueprint_text)
-    declared_paths = _extract_declared_skill_paths(blueprint_text)
+    declared_paths = _authoritative_blueprint_skill_paths(blueprint_text)
     declared_paths_text = "\n".join(f"- {path}" for path in declared_paths) or "- （蓝图未显式列出资源文件）"
 
     plan_entry = _skill_plan_entry_for_file(
