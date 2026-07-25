@@ -1,8 +1,9 @@
 import json
+import inspect
 
 import pytest
 
-from backend.services.creator import contracts
+from backend.services.creator import api, contracts
 from backend.services.creator.common import (
     _authoritative_blueprint_skill_paths,
     _paths_requiring_skill_md_mentions,
@@ -127,6 +128,56 @@ def test_platform_input_binding_resolves_input():
     }])]
     validate_structured_responsibility_edge_transport(edges, function_items=items)
     assert structured_responsibility_graph_input_provenance_gaps(items, edges) == []
+
+
+def test_graph_construction_context_contains_only_frozen_structured_topology():
+    item = _function("scripts/a.py", ["value"], ["result"])
+    context = api._build_responsibility_graph_construction_context(
+        frozen_blueprint_text="Prose mentions scripts/extra.py and an unrelated_input.",
+        allowed_function_item_targets=["scripts/a.py"],
+        function_items=[item],
+        responsibility_edges=[],
+    )
+    assert context["allowed_function_targets"] == ["scripts/a.py"]
+    assert context["function_items"] == [{
+        "target_file": "scripts/a.py",
+        "purpose": "perform assigned responsibility",
+        "inputs": ["value"],
+        "outputs": ["result"],
+        "static_configuration": [],
+    }]
+    assert "scripts/extra.py" not in json.dumps(context)
+    assert context["platform_input_contract"]["input_fields"]
+    assert context["platform_output_contract"]["final_output_fields"]
+
+
+def test_blueprint_prompt_includes_lightweight_runtime_contract_self_check():
+    source = inspect.getsource(api._generate_internal_blueprint_or_questions)
+    assert "lightweight runtime-contract self-check" in source
+    assert "creation-time fixed、default 或 static configuration" in source
+    assert "不生成或描述具体 ResponsibilityEdge" in source
+    assert "不要为了“可能有用”额外创造 input 或 output" in source
+
+
+@pytest.mark.asyncio
+async def test_localized_repair_rejects_function_boundary_changes(monkeypatch):
+    item = _function("scripts/a.py", ["value"], ["result"])
+
+    async def repair(*args, **kwargs):
+        changed = {**item, "inputs": ["other"]}
+        return json.dumps({"function_items": [changed], "responsibility_edges": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", repair)
+    with pytest.raises(ValueError, match="requires upstream FunctionItem replanning"):
+        await api._repair_responsibility_graph_alignment(
+            request=api.PreparePlanRequest(user_request="test"),
+            frozen_blueprint_text="frozen",
+            allowed_function_item_targets=["scripts/a.py"],
+            function_items=[item],
+            responsibility_edges=[],
+            review_issues=[],
+            planner_model="unit-test-model",
+        )
 
 
 def test_upstream_and_platform_binding_for_same_input_conflict():
