@@ -126,6 +126,11 @@ class ToolCapability:
     name: str
     display_name: str
     category: str
+    # Explicit capabilities offered by this tool.  ``name`` remains the stable
+    # Tool ID; it is not a Python callable identity.  Empty lists retain
+    # compatibility with registry records where the Tool ID is also the sole
+    # advertised capability.
+    capabilities: list[str] = field(default_factory=list)
     roles: list[str] = field(default_factory=list)
     enabled_by_default: bool = True
     allow_creator_use: bool = True

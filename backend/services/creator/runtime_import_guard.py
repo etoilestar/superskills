@@ -2,6 +2,7 @@
 from __future__ import annotations
 import ast
 import inspect
+import logging
 from typing import Any
 from backend.services.creator_tool_registry import get_tool_capability
 from backend.services.runtime_tools import __all__ as RUNTIME_TOOLS_ALL
@@ -9,11 +10,27 @@ from .tool_pool_models import RuntimeImportGuardResult, ToolPoolFileBinding
 
 _CUSTOM_PREFIX = 'backend.services.runtime_tools.custom_tools'
 _RUNTIME_PREFIX = 'backend.services.runtime_tools'
+logger = logging.getLogger(__name__)
 
 def _binding_available_tools(binding: ToolPoolFileBinding | dict[str, Any] | None) -> list[dict[str, Any]]:
     if binding is None:
         return []
     raw = getattr(binding, 'available_tools', None) if isinstance(binding, ToolPoolFileBinding) else binding.get('available_tools')
+    if raw is None and isinstance(binding, dict):
+        # Per-file Execution Contract shape.  Flatten callables without ever
+        # re-resolving or guessing Tool IDs/function names.
+        return [
+            {
+                'tool_id': tool.get('tool_id'),
+                'capability_name': (tool.get('capabilities') or [''])[0],
+                'function_name': callable_fact.get('function'),
+                'import_path': callable_fact.get('import_path'),
+                'signature': callable_fact.get('signature', ''),
+                '_execution_contract_fact': True,
+            }
+            for tool in (binding.get('allowed_tools') or []) if isinstance(tool, dict)
+            for callable_fact in (tool.get('callables') or []) if isinstance(callable_fact, dict)
+        ]
     return [item for item in (raw or []) if isinstance(item, dict)]
 
 def _allowed_imports_from_available_tools(binding: ToolPoolFileBinding | dict[str, Any] | None) -> set[tuple[str, str]]:
@@ -60,6 +77,9 @@ def _registry_tool_from_index(item: dict[str, Any]) -> dict[str, Any] | None:
 def _tools_by_import(binding: ToolPoolFileBinding | dict[str, Any] | None) -> dict[tuple[str, str], dict[str, Any]]:
     out: dict[tuple[str, str], dict[str, Any]] = {}
     for item in _binding_available_tools(binding):
+        if item.get('_execution_contract_fact') and item.get('import_path') and item.get('function_name'):
+            out[(str(item['import_path']), str(item['function_name']))] = dict(item)
+            continue
         resolved = _registry_tool_from_index(item)
         if not resolved:
             continue
@@ -133,6 +153,8 @@ def _validate_tool_call(node: ast.Call, tool: dict[str, Any], tool_key: tuple[st
     return errors
 
 def guard_runtime_imports(source: str, target_file: str, file_binding: ToolPoolFileBinding | dict[str, Any] | None = None) -> RuntimeImportGuardResult:
+    if isinstance(file_binding, dict) and file_binding.get('contract_digest'):
+        logger.info('[Creator][downstream_authority] phase=runtime_guard target=%s contract_digest=%s', target_file, file_binding['contract_digest'])
     tools_by_import = _tools_by_import(file_binding)
     allowed_imports = set(tools_by_import)
     allowed_helpers = sorted(function for module, function in allowed_imports if module == _RUNTIME_PREFIX)

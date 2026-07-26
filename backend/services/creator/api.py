@@ -43,8 +43,10 @@ from .tool_pool_models import (
     ToolPoolMissingRequest,
     ToolPoolModel,
     ToolPoolTool,
+    ToolPoolFileBinding,
 )
-from ..creator_tool_registry import get_tool_capability
+from ..creator_tool_registry import get_tool_capability, list_tool_capabilities
+from .execution_contract import ExecutionContractError, project_per_file_execution_contract
 from .runtime_import_guard import guard_runtime_imports
 from .basic_format import check_patch_candidate_basic_format
 from .command_normalizer import _effective_command_lines
@@ -3294,17 +3296,71 @@ async def _plan_final_tool_pool(
     )
     unavailable_tool_ids = sorted(recalled_candidate_set - set(available_optional_tool_ids))
 
-    updated_pool.file_bindings = []
+    frozen_items = (
+        (responsibility_graph or {}).get("function_items")
+        or (responsibility_graph or {}).get("requirements")
+        or []
+    )
+    allowed_registry_ids = {
+        str(tool.tool_id)
+        for tool in updated_pool.tools
+        if tool.status == "allowed"
+    }
+    registry = [
+        tool for tool in list_tool_capabilities()
+        if tool.name in allowed_registry_ids
+    ]
+    tool_bindings_by_file: dict[str, dict[str, Any]] = {}
+    pool_bindings: list[ToolPoolFileBinding] = []
+    for raw in frozen_items or []:
+        if not isinstance(raw, dict):
+            continue
+        target = str(raw.get("target_file") or raw.get("path") or "").strip()
+        if not target.startswith("scripts/"):
+            continue
+        required = raw.get("required_tools") or raw.get("required_capabilities") or []
+        forbidden = raw.get("forbidden_capabilities") or raw.get("business_forbidden_capabilities") or []
+        try:
+            execution_contract = project_per_file_execution_contract(
+                target_file=target,
+                inputs=raw.get("inputs") or raw.get("semantic_inputs") or [],
+                outputs=raw.get("outputs") or raw.get("semantic_outputs") or [],
+                required_capabilities=required,
+                forbidden_capabilities=forbidden,
+                required_resources=raw.get("dependencies") or raw.get("required_resources") or [],
+                registry=registry,
+            )
+        except ExecutionContractError as exc:
+            raise HTTPException(status_code=422, detail=exc.failure) from exc
+        allowed_callables = [
+            {**callable_fact, "tool_id": tool["tool_id"]}
+            for tool in execution_contract["allowed_tools"]
+            for callable_fact in tool["callables"]
+        ]
+        tool_bindings_by_file[target] = {
+            "allowed_tool_ids": [tool["tool_id"] for tool in execution_contract["allowed_tools"]],
+            "allowed_callables": allowed_callables,
+            "per_file_execution_contract": execution_contract,
+            "contract_digest": execution_contract["contract_digest"],
+        }
+        pool_bindings.append(ToolPoolFileBinding(
+            target_file=target,
+            allowed_tool_ids=tool_bindings_by_file[target]["allowed_tool_ids"],
+            available_tools=[{
+                "tool_id": item["tool_id"],
+                "function_name": item["function"],
+                "import_path": item["import_path"],
+            } for item in allowed_callables],
+        ))
+    updated_pool.file_bindings = pool_bindings
     save_tool_pool(skill_dir, updated_pool)
     updated_pool = load_tool_pool(skill_dir)
-
-    tool_bindings_by_file: dict[str, list[str]] = {}
 
     normalized_selector_output = {
         "recalled_candidate_tool_ids": recalled_candidate_tool_ids,
         "available_optional_tool_ids": available_optional_tool_ids,
         "unavailable_tool_ids": unavailable_tool_ids,
-        "tool_bindings_by_file": {},
+        "tool_bindings_by_file": tool_bindings_by_file,
         "desired_tool_ids": recalled_candidate_tool_ids,
         "authorized_tool_ids": available_optional_tool_ids,
         "candidate_tool_ids": recalled_candidate_tool_ids,
@@ -3323,7 +3379,7 @@ async def _plan_final_tool_pool(
                 "recalled_candidate_tool_ids": recalled_candidate_tool_ids,
                 "available_optional_tool_ids": available_optional_tool_ids,
                 "unavailable_tool_ids": unavailable_tool_ids,
-                "tool_bindings_by_file": {},
+                "tool_bindings_by_file": tool_bindings_by_file,
                 "add_tool_ids": add_tool_ids,
                 "remove_tool_ids": remove_tool_ids,
                 "llm_selector_used": False,
@@ -3340,7 +3396,7 @@ async def _plan_final_tool_pool(
         "recalled_candidate_tool_ids": recalled_candidate_tool_ids,
         "available_optional_tool_ids": available_optional_tool_ids,
         "unavailable_tool_ids": unavailable_tool_ids,
-        "tool_bindings_by_file": {},
+        "tool_bindings_by_file": tool_bindings_by_file,
         "desired_tool_ids": recalled_candidate_tool_ids,
         "authorized_tool_ids": available_optional_tool_ids,
         "tool_pool": updated_pool,
