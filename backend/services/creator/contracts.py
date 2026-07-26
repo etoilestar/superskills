@@ -6220,67 +6220,76 @@ def extract_python_strict_argv_schema(content: str) -> dict[str, Any]:
     }
 
 
-def _python_provable_stdout_fields(content: str) -> set[str]:
-    """Return literal JSON object fields that can be proven to reach stdout."""
+def _python_provable_run_return_fields(content: str) -> set[str]:
+    """Return fields guaranteed by every statically resolvable top-level run() return."""
     try:
         tree = ast.parse(content)
     except SyntaxError:
         return set()
 
-    assignments: dict[str, ast.AST] = {}
-    function_returns: dict[str, list[ast.AST]] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            value = node.value
-            if value is not None:
-                for target in targets:
-                    if isinstance(target, ast.Name):
-                        assignments[target.id] = value
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            returns = [
-                child.value
-                for child in ast.walk(node)
-                if isinstance(child, ast.Return) and child.value is not None
-            ]
-            if returns:
-                function_returns[node.name] = returns
+    run_function = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run"
+        ),
+        None,
+    )
+    if run_function is None:
+        return set()
 
-    def fields(expr: ast.AST, seen: set[str] | None = None) -> set[str] | None:
+    assignments: dict[str, list[ast.AST]] = {}
+    returns: list[ast.AST | None] = []
+
+    class RunScopeVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments.setdefault(target.id, []).append(node.value)
+            self.generic_visit(node.value)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            if isinstance(node.target, ast.Name) and node.value is not None:
+                assignments.setdefault(node.target.id, []).append(node.value)
+            if node.value is not None:
+                self.generic_visit(node.value)
+
+        def visit_Return(self, node: ast.Return) -> None:
+            returns.append(node.value)
+
+    visitor = RunScopeVisitor()
+    for statement in run_function.body:
+        visitor.visit(statement)
+
+    def fields(expr: ast.AST | None, seen: set[str] | None = None) -> set[str] | None:
+        if expr is None:
+            return None
         seen = set(seen or ())
         literal = _literal_dict_string_keys(expr)
         if literal is not None:
             return literal
         if isinstance(expr, ast.Name) and expr.id in assignments and expr.id not in seen:
-            return fields(assignments[expr.id], seen | {expr.id})
-        if isinstance(expr, ast.Call):
-            if isinstance(expr.func, ast.Attribute) and expr.func.attr in {"dumps", "dump"} and expr.args:
-                return fields(expr.args[0], seen)
-            if isinstance(expr.func, ast.Name) and expr.func.id in function_returns:
-                return_sets = [fields(value, seen | {expr.func.id}) for value in function_returns[expr.func.id]]
-                proven = [value for value in return_sets if value is not None]
-                if len(proven) == len(return_sets) and proven:
-                    return set.intersection(*proven)
+            assignment_fields = [fields(value, seen | {expr.id}) for value in assignments[expr.id]]
+            if assignment_fields and all(value is not None for value in assignment_fields):
+                return set.intersection(*(value for value in assignment_fields if value is not None))
         return None
 
-    stdout_fields: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not node.args:
-            continue
-        is_print = isinstance(node.func, ast.Name) and node.func.id == "print"
-        is_stdout_write = (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "write"
-            and isinstance(node.func.value, ast.Attribute)
-            and isinstance(node.func.value.value, ast.Name)
-            and node.func.value.value.id == "sys"
-            and node.func.value.attr == "stdout"
-        )
-        if is_print or is_stdout_write:
-            proven = fields(node.args[0])
-            if proven is not None:
-                stdout_fields.update(proven)
-    return stdout_fields
+    return_fields = [fields(value) for value in returns]
+    if not return_fields or any(value is None for value in return_fields):
+        return set()
+    return set.intersection(*(value for value in return_fields if value is not None))
 
 
 def validate_script_io_contract(
@@ -6297,7 +6306,7 @@ def validate_script_io_contract(
     actual_inputs = set(schema.get("allowed_keys") or [])
     missing_inputs = sorted(expected_inputs - actual_inputs)
     unexpected_inputs = sorted(actual_inputs - expected_inputs)
-    actual_outputs = _python_provable_stdout_fields(content)
+    actual_outputs = _python_provable_run_return_fields(content)
     missing_outputs = sorted(expected_outputs - actual_outputs)
 
     return [
@@ -6320,12 +6329,12 @@ def validate_script_io_contract(
             passed=not missing_outputs,
             target=file_path,
             message=(
-                "Script stdout proves all frozen required output fields."
+                "Script run() return proves all frozen required output fields."
                 if not missing_outputs
-                else f"Script stdout cannot prove required fields; missing={missing_outputs}."
+                else f"Script run() return cannot prove required fields; missing={missing_outputs}."
             ),
-            expected="Frozen Script outputs must be a subset of provable stdout JSON fields.",
-            minimal_edit="Modify only the current Script so its stdout JSON includes every frozen required output field.",
+            expected="Frozen Script outputs must be a subset of provable canonical run() return fields.",
+            minimal_edit="Modify only the current Script so run() returns every frozen required output field.",
             details={"missing": missing_outputs, "actual": sorted(actual_outputs)},
             layer="script_output_contract_mismatch",
         ),
