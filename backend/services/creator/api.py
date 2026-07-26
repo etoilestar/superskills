@@ -52,6 +52,13 @@ from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
 
 
+def _uses_python_script_io_contract(skill_plan_entry: dict[str, Any] | None) -> bool:
+    """Use the Python-only IO validator solely from structured runtime identity."""
+    entry = skill_plan_entry if isinstance(skill_plan_entry, dict) else {}
+    runtime = str(entry.get("runtime") or entry.get("language") or "").strip().lower()
+    return runtime == "python"
+
+
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
     normalized = {
         "allowed_tool_ids": sorted(binding.get("allowed_tool_ids") or []),
@@ -13619,7 +13626,9 @@ async def generate_file(request: GenerateFileRequest):
                 if compile_stage_error is not None:
                     raise compile_stage_error
 
-                if request.file_path.startswith("scripts/"):
+                if request.file_path.startswith("scripts/") and _uses_python_script_io_contract(
+                    effective_skill_plan_entry
+                ):
                     io_contract_results = validate_script_io_contract(
                         file_path=request.file_path,
                         content=content,
@@ -13633,6 +13642,7 @@ async def generate_file(request: GenerateFileRequest):
                             layer=first_failure.layer,
                             detail=_format_contract_checks(failed_io_contracts, passed=False),
                         )
+                if request.file_path.startswith("scripts/"):
                     try:
                         import_guard_result = guard_runtime_imports(
                             content,

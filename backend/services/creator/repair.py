@@ -4766,6 +4766,13 @@ def _script_responsibility_validator_failure(
         "model": model,
     }
 
+
+_DETERMINISTIC_AUTHORITY_ISSUE_TYPES = {
+    "deterministic_authority_conflict",
+    "tool_contract_mismatch",
+}
+
+
 async def _run_script_responsibility_review(
     *,
     file_path: str,
@@ -5103,7 +5110,7 @@ async def _run_script_responsibility_review(
         for issue in blocking_issues
         if isinstance(issue, dict)
         and str(issue.get("issue_type") or issue.get("category") or "").strip()
-        == "deterministic_authority_conflict"
+        in _DETERMINISTIC_AUTHORITY_ISSUE_TYPES
     ]
     if authority_overreach:
         blocking_issues = [issue for issue in blocking_issues if issue not in authority_overreach]

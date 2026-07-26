@@ -4,7 +4,7 @@ import json
 import pytest
 
 from backend.services.creator import repair
-from backend.services.creator.api import generate_file
+from backend.services.creator.api import _uses_python_script_io_contract, generate_file
 from backend.services.creator.contracts import validate_script_io_contract
 from backend.services.creator.runtime_import_guard import guard_runtime_imports
 from backend.services.creator_tool_registry import (
@@ -104,6 +104,16 @@ def test_contract_and_import_gates_precede_reviewer_and_repairs_reenter_gates():
     assert loop < contract_gate < import_gate < reviewer < repair < reenter
 
 
+@pytest.mark.parametrize("runtime", ["node", "bash", "shell"])
+def test_non_python_structured_runtime_skips_python_io_gate_but_keeps_later_gates(runtime):
+    assert not _uses_python_script_io_contract({"runtime": runtime, "file_type": "script"})
+    source = inspect.getsource(generate_file)
+    runtime_gate = source.index("_uses_python_script_io_contract")
+    python_io_gate = source.index("validate_script_io_contract", runtime_gate)
+    import_gate = source.index('if request.file_path.startswith("scripts/"):', python_io_gate)
+    assert runtime_gate < python_io_gate < import_gate < source.index("guard_runtime_imports", import_gate)
+
+
 def test_output_contract_proves_run_local_variable_return():
     content = _script(["input_a"], ["output_a"]).replace(
         'return {"output_a": "value"}',
@@ -131,8 +141,14 @@ def test_unused_print_cannot_prove_run_output():
     assert failure.id == "script_output_contract_mismatch"
 
 
+@pytest.mark.parametrize(
+    "authority_issue_type",
+    ["deterministic_authority_conflict", "tool_contract_mismatch"],
+)
 @pytest.mark.asyncio
-async def test_reviewer_authority_overreach_cannot_reject_legal_callable(monkeypatch, caplog):
+async def test_reviewer_authority_overreach_cannot_reject_legal_callable(
+    monkeypatch, caplog, authority_issue_type
+):
     clear_registered_tool_capabilities()
     register_tool_capability(ToolCapability(
         name="tool_alpha",
@@ -159,7 +175,7 @@ async def test_reviewer_authority_overreach_cannot_reject_legal_callable(monkeyp
         return json.dumps({
             "passed": False,
             "blocking_issues": [{
-                "issue_type": "deterministic_authority_conflict",
+                "issue_type": authority_issue_type,
                 "scope": "current_file_only",
                 "failure_layer": "responsibility",
                 "severity": "error",
@@ -188,3 +204,52 @@ async def test_reviewer_authority_overreach_cannot_reject_legal_callable(monkeyp
     assert result["passed"] is True
     assert result["issues"] == []
     assert "authority_overreach_ignored" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_authority_overreach_filter_preserves_semantic_blocker(monkeypatch):
+    class Route:
+        model = "unit-test-model"
+
+    async def reviewer_response(messages, role, fallback_model=None):
+        return json.dumps({
+            "passed": False,
+            "blocking_issues": [
+                {
+                    "issue_type": "tool_contract_mismatch",
+                    "scope": "current_file_only",
+                    "failure_layer": "responsibility",
+                    "severity": "error",
+                    "failed_file": "scripts/main.py",
+                    "semantic_failure": "Re-evaluate a deterministic tool authorization.",
+                },
+                {
+                    "issue_type": "semantic_responsibility_incomplete",
+                    "scope": "current_file_only",
+                    "failure_layer": "responsibility",
+                    "severity": "error",
+                    "failed_file": "scripts/main.py",
+                    "semantic_failure": "The implementation does not consume its input.",
+                },
+            ],
+            "repair_instructions": "Make the input participate in the semantic result.",
+        })
+
+    monkeypatch.setattr(repair, "route_model", lambda *args, **kwargs: Route())
+    monkeypatch.setattr(repair, "complete_creator_role_once", reviewer_response)
+    result = await repair._run_script_responsibility_review(
+        file_path="scripts/main.py",
+        script_content="def run(args):\n    return {'output_a': 'constant'}\n",
+        skill_plan_entry=SkillPlanEntry(
+            path="scripts/main.py",
+            role="generic_script",
+            file_type="script",
+            purpose="Transform the input.",
+            runtime="python",
+            inputs=["input_a"],
+            outputs=["output_a"],
+        ),
+    )
+    assert result["passed"] is False
+    assert len(result["issues"]) == 1
+    assert result["issues"][0]["details"]["issue_type"] == "semantic_responsibility_incomplete"
