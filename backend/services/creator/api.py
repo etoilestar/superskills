@@ -52,6 +52,13 @@ from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
 
 
+def _uses_python_script_io_contract(skill_plan_entry: dict[str, Any] | None) -> bool:
+    """Use the Python-only IO validator solely from structured runtime identity."""
+    entry = skill_plan_entry if isinstance(skill_plan_entry, dict) else {}
+    runtime = str(entry.get("runtime") or entry.get("language") or "").strip().lower()
+    return runtime == "python"
+
+
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
     normalized = {
         "allowed_tool_ids": sorted(binding.get("allowed_tool_ids") or []),
@@ -13619,6 +13626,22 @@ async def generate_file(request: GenerateFileRequest):
                 if compile_stage_error is not None:
                     raise compile_stage_error
 
+                if request.file_path.startswith("scripts/") and _uses_python_script_io_contract(
+                    effective_skill_plan_entry
+                ):
+                    io_contract_results = validate_script_io_contract(
+                        file_path=request.file_path,
+                        content=content,
+                        skill_plan_entry=effective_skill_plan_entry or {},
+                    )
+                    failed_io_contracts = [result for result in io_contract_results if not result.passed]
+                    if failed_io_contracts:
+                        first_failure = failed_io_contracts[0]
+                        raise FileGenerationStageError(
+                            source=first_failure.id,
+                            layer=first_failure.layer,
+                            detail=_format_contract_checks(failed_io_contracts, passed=False),
+                        )
                 if request.file_path.startswith("scripts/"):
                     try:
                         import_guard_result = guard_runtime_imports(
@@ -13627,6 +13650,14 @@ async def generate_file(request: GenerateFileRequest):
                             current_skill_binding_payload,
                         )
                         last_import_guard_result = import_guard_result
+                        if import_guard_result.success is False:
+                            raise FileGenerationStageError(
+                                source=str(import_guard_result.error_type or "runtime_import_contract_mismatch"),
+                                layer="runtime_import_contract",
+                                detail=json.dumps(import_guard_result.model_dump(mode="json"), ensure_ascii=False),
+                            )
+                    except FileGenerationStageError:
+                        raise
                     except Exception as guard_exc:
                         logger.warning(
                             "[Creator][first_round_tool_observation_error] skill=%s file=%s error=%s: %s",

@@ -6220,6 +6220,127 @@ def extract_python_strict_argv_schema(content: str) -> dict[str, Any]:
     }
 
 
+def _python_provable_run_return_fields(content: str) -> set[str]:
+    """Return fields guaranteed by every statically resolvable top-level run() return."""
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return set()
+
+    run_function = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run"
+        ),
+        None,
+    )
+    if run_function is None:
+        return set()
+
+    assignments: dict[str, list[ast.AST]] = {}
+    returns: list[ast.AST | None] = []
+
+    class RunScopeVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments.setdefault(target.id, []).append(node.value)
+            self.generic_visit(node.value)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            if isinstance(node.target, ast.Name) and node.value is not None:
+                assignments.setdefault(node.target.id, []).append(node.value)
+            if node.value is not None:
+                self.generic_visit(node.value)
+
+        def visit_Return(self, node: ast.Return) -> None:
+            returns.append(node.value)
+
+    visitor = RunScopeVisitor()
+    for statement in run_function.body:
+        visitor.visit(statement)
+
+    def fields(expr: ast.AST | None, seen: set[str] | None = None) -> set[str] | None:
+        if expr is None:
+            return None
+        seen = set(seen or ())
+        literal = _literal_dict_string_keys(expr)
+        if literal is not None:
+            return literal
+        if isinstance(expr, ast.Name) and expr.id in assignments and expr.id not in seen:
+            assignment_fields = [fields(value, seen | {expr.id}) for value in assignments[expr.id]]
+            if assignment_fields and all(value is not None for value in assignment_fields):
+                return set.intersection(*(value for value in assignment_fields if value is not None))
+        return None
+
+    return_fields = [fields(value) for value in returns]
+    if not return_fields or any(value is None for value in return_fields):
+        return set()
+    return set.intersection(*(value for value in return_fields if value is not None))
+
+
+def validate_script_io_contract(
+    *,
+    file_path: str,
+    content: str,
+    skill_plan_entry: dict[str, Any] | SkillPlanEntry,
+) -> list[ContractCheckResult]:
+    """Hard-check frozen Script inputs and required stdout fields exactly."""
+    entry = skill_plan_entry.__dict__ if isinstance(skill_plan_entry, SkillPlanEntry) else skill_plan_entry
+    expected_inputs = {str(value).strip() for value in (entry.get("inputs") or []) if str(value).strip()}
+    expected_outputs = {str(value).strip() for value in (entry.get("outputs") or []) if str(value).strip()}
+    schema = extract_python_strict_argv_schema(content)
+    actual_inputs = set(schema.get("allowed_keys") or [])
+    missing_inputs = sorted(expected_inputs - actual_inputs)
+    unexpected_inputs = sorted(actual_inputs - expected_inputs)
+    actual_outputs = _python_provable_run_return_fields(content)
+    missing_outputs = sorted(expected_outputs - actual_outputs)
+
+    return [
+        ContractCheckResult(
+            id="script_input_contract_mismatch",
+            passed=not missing_inputs and not unexpected_inputs,
+            target=file_path,
+            message=(
+                "Script strict_json_argv_guard keys match the frozen inputs."
+                if not missing_inputs and not unexpected_inputs
+                else f"Script argv keys do not match frozen inputs; missing={missing_inputs}; unexpected={unexpected_inputs}."
+            ),
+            expected="strict_json_argv_guard keys must exactly equal frozen Script inputs (order-independent).",
+            minimal_edit="Modify only the current Script argv schema to use the exact frozen input names.",
+            details={"missing": missing_inputs, "unexpected": unexpected_inputs, "actual": sorted(actual_inputs)},
+            layer="script_input_contract_mismatch",
+        ),
+        ContractCheckResult(
+            id="script_output_contract_mismatch",
+            passed=not missing_outputs,
+            target=file_path,
+            message=(
+                "Script run() return proves all frozen required output fields."
+                if not missing_outputs
+                else f"Script run() return cannot prove required fields; missing={missing_outputs}."
+            ),
+            expected="Frozen Script outputs must be a subset of provable canonical run() return fields.",
+            minimal_edit="Modify only the current Script so run() returns every frozen required output field.",
+            details={"missing": missing_outputs, "actual": sorted(actual_outputs)},
+            layer="script_output_contract_mismatch",
+        ),
+    ]
+
+
 def _python_imports_strict_argv_guard(tree: ast.AST) -> bool:
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "backend.services.runtime_tools":

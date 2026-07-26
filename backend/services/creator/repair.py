@@ -4766,6 +4766,13 @@ def _script_responsibility_validator_failure(
         "model": model,
     }
 
+
+_DETERMINISTIC_AUTHORITY_ISSUE_TYPES = {
+    "deterministic_authority_conflict",
+    "tool_contract_mismatch",
+}
+
+
 async def _run_script_responsibility_review(
     *,
     file_path: str,
@@ -4951,11 +4958,10 @@ async def _run_script_responsibility_review(
                 "- 工具合同只用于理解源码语义和判断当前职责是否真实使用已有能力；不得借此新增工具、授权工具或要求 ToolPool 外工具。\n"
                 "- 如果当前源码没有调用某个已授权工具，不得因为工具已授权就假定其效果已经发生。\n"
                 "- 如果源码调用工具，但返回值没有进入当前职责要求的结果或 artifact，不得仅凭存在 tool call 判定职责完成。\n\n"
-                "工具合同判断规则：你必须根据 Current File ToolPool contracts 与完整源码判断工具使用事实。"
-                "如果源码调用的平台工具不在当前 ToolPool 合同中，输出 blocking issue id=tool_contract_mismatch。"
-                "如果当前 ToolPool 缺少完成 FunctionItem 所需能力，输出 blocking issue id=tool_support_insufficient。"
-                "如果工具已提供但源码没有正确使用导致职责未完成，输出普通 semantic blocking issue。"
-                "Backend 只确认工具事实是否真实，不根据模块名、函数名、角色或 capability 映射替你判断工具语义。\n\n"
+                "Deterministic authority boundary:\n"
+                "Before this review, the Script has already passed frozen input/output contract validation and runtime import/tool authorization validation.\n"
+                "Do not re-evaluate or override whether an import is authorized, whether a Registry callable exists, whether a callable belongs to the current ToolPool, or whether a Tool ID should be used as a Python function name.\n"
+                "Review only semantic responsibility and implementation completeness. Tool contracts may still be used to judge whether a legal tool result is correctly consumed.\n\n"
 
                 "返回 JSON object：\n"
                 "{\n"
@@ -5027,7 +5033,7 @@ async def _run_script_responsibility_review(
                 "4. 不要要求当前脚本验证无法从输入、依赖、工具或声明能力中观察的信息。\n"
                 "5. requirements.constraints 是开放责任约束；所有 required=true constraints 都必须检查实现证据。\n"
                 "6. 不得忽略不认识的 constraint，也不得重新创造 current script FunctionItem 中不存在的 constraint。\n"
-                "7. 检查源码调用的平台工具是否存在于 Current File ToolPool contracts；ToolPool 外工具使用输出 tool_contract_mismatch，工具不足输出 tool_support_insufficient。不得要求删除工具调用并改成本地假实现。\n"
+                "7. import、Registry callable、ToolPool authorization 和 Tool ID/callable identity 已由 Backend 确定性校验；不得重新裁决。只检查合法工具结果是否被正确消费并完成语义职责。\n"
             ),
         },
     ]
@@ -5098,6 +5104,25 @@ async def _run_script_responsibility_review(
 
     blocking = data.get("blocking_issues")
     blocking_issues = blocking if isinstance(blocking, list) else []
+
+    authority_overreach = [
+        issue
+        for issue in blocking_issues
+        if isinstance(issue, dict)
+        and str(issue.get("issue_type") or issue.get("category") or "").strip()
+        in _DETERMINISTIC_AUTHORITY_ISSUE_TYPES
+    ]
+    if authority_overreach:
+        blocking_issues = [issue for issue in blocking_issues if issue not in authority_overreach]
+        data["blocking_issues"] = blocking_issues
+        logger.warning(
+            "[Creator][script_responsibility][authority_overreach_ignored] file=%s count=%d",
+            file_path,
+            len(authority_overreach),
+        )
+        if not blocking_issues:
+            data["passed"] = True
+            data["repair_instructions"] = ""
 
     if data.get("passed") is False:
         issues = _normalize_responsibility_review_issues(data, file_path=file_path)
