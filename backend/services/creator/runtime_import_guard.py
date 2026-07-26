@@ -16,20 +16,18 @@ def _binding_available_tools(binding: ToolPoolFileBinding | dict[str, Any] | Non
     if binding is None:
         return []
     raw = getattr(binding, 'available_tools', None) if isinstance(binding, ToolPoolFileBinding) else binding.get('available_tools')
-    if raw is None and isinstance(binding, dict):
-        # Per-file Execution Contract shape.  Flatten callables without ever
-        # re-resolving or guessing Tool IDs/function names.
+    if raw is None and isinstance(binding, dict) and 'allowed_callables' in binding:
+        # Frozen Skill Tool Contract shape. Every script in the Skill consumes
+        # this same callable domain; target_file never changes authorization.
         return [
             {
-                'tool_id': tool.get('tool_id'),
-                'capability_name': (tool.get('capabilities') or [''])[0],
+                'tool_id': callable_fact.get('tool_id'),
                 'function_name': callable_fact.get('function'),
                 'import_path': callable_fact.get('import_path'),
                 'signature': callable_fact.get('signature', ''),
-                '_execution_contract_fact': True,
+                '_skill_tool_contract_fact': True,
             }
-            for tool in (binding.get('allowed_tools') or []) if isinstance(tool, dict)
-            for callable_fact in (tool.get('callables') or []) if isinstance(callable_fact, dict)
+            for callable_fact in (binding.get('allowed_callables') or []) if isinstance(callable_fact, dict)
         ]
     return [item for item in (raw or []) if isinstance(item, dict)]
 
@@ -77,7 +75,7 @@ def _registry_tool_from_index(item: dict[str, Any]) -> dict[str, Any] | None:
 def _tools_by_import(binding: ToolPoolFileBinding | dict[str, Any] | None) -> dict[tuple[str, str], dict[str, Any]]:
     out: dict[tuple[str, str], dict[str, Any]] = {}
     for item in _binding_available_tools(binding):
-        if item.get('_execution_contract_fact') and item.get('import_path') and item.get('function_name'):
+        if item.get('_skill_tool_contract_fact') and item.get('import_path') and item.get('function_name'):
             out[(str(item['import_path']), str(item['function_name']))] = dict(item)
             continue
         resolved = _registry_tool_from_index(item)
@@ -152,10 +150,11 @@ def _validate_tool_call(node: ast.Call, tool: dict[str, Any], tool_key: tuple[st
         errors.append(f'{label} {category}: {message}')
     return errors
 
-def guard_runtime_imports(source: str, target_file: str, file_binding: ToolPoolFileBinding | dict[str, Any] | None = None) -> RuntimeImportGuardResult:
-    if isinstance(file_binding, dict) and file_binding.get('contract_digest'):
-        logger.info('[Creator][downstream_authority] phase=runtime_guard target=%s contract_digest=%s', target_file, file_binding['contract_digest'])
-    tools_by_import = _tools_by_import(file_binding)
+def guard_runtime_imports(source: str, target_file: str, file_binding: ToolPoolFileBinding | dict[str, Any] | None = None, *, skill_tool_contract: dict[str, Any] | None = None) -> RuntimeImportGuardResult:
+    authority = skill_tool_contract if skill_tool_contract is not None else file_binding
+    if isinstance(authority, dict) and authority.get('skill_tool_contract_digest'):
+        logger.info('[Creator][downstream_authority] phase=runtime_guard target=%s skill_tool_contract_digest=%s', target_file, authority['skill_tool_contract_digest'])
+    tools_by_import = _tools_by_import(authority)
     allowed_imports = set(tools_by_import)
     allowed_helpers = sorted(function for module, function in allowed_imports if module == _RUNTIME_PREFIX)
     allowed_modules = {module for module, _ in allowed_imports}

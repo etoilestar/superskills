@@ -4,7 +4,6 @@ from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
 from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
-from .execution_contract import log_downstream_authority
 
 def _is_valid_normalized_script_source(file_path: str, content: str) -> bool:
     """Return whether content is safe to accept as the requested raw script.
@@ -1324,10 +1323,12 @@ def _script_local_contract_payload(
             ),
         },
     }
-    execution_contract = (plan_entry.runtime_contract or {}).get("per_file_execution_contract")
-    if isinstance(execution_contract, dict):
-        payload["per_file_execution_contract"] = execution_contract
-        log_downstream_authority("generator", execution_contract)
+    script_contract = (plan_entry.runtime_contract or {}).get("frozen_script_contract")
+    skill_tool_contract = (plan_entry.runtime_contract or {}).get("frozen_skill_tool_contract")
+    if isinstance(script_contract, dict):
+        payload["frozen_script_contract"] = script_contract
+    if isinstance(skill_tool_contract, dict):
+        payload["frozen_skill_tool_contract"] = skill_tool_contract
     return payload
 
 

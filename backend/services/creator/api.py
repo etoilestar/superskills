@@ -43,10 +43,13 @@ from .tool_pool_models import (
     ToolPoolMissingRequest,
     ToolPoolModel,
     ToolPoolTool,
-    ToolPoolFileBinding,
 )
-from ..creator_tool_registry import get_tool_capability, list_tool_capabilities
-from .execution_contract import ExecutionContractError, project_per_file_execution_contract
+from ..creator_tool_registry import get_tool_capability
+from .execution_contract import (
+    project_frozen_script_contract,
+    project_frozen_skill_tool_contract,
+    validate_script_execution_contract,
+)
 from .runtime_import_guard import guard_runtime_imports
 from .basic_format import check_patch_candidate_basic_format
 from .command_normalizer import _effective_command_lines
@@ -3296,71 +3299,17 @@ async def _plan_final_tool_pool(
     )
     unavailable_tool_ids = sorted(recalled_candidate_set - set(available_optional_tool_ids))
 
-    frozen_items = (
-        (responsibility_graph or {}).get("function_items")
-        or (responsibility_graph or {}).get("requirements")
-        or []
-    )
-    allowed_registry_ids = {
-        str(tool.tool_id)
-        for tool in updated_pool.tools
-        if tool.status == "allowed"
-    }
-    registry = [
-        tool for tool in list_tool_capabilities()
-        if tool.name in allowed_registry_ids
-    ]
-    tool_bindings_by_file: dict[str, dict[str, Any]] = {}
-    pool_bindings: list[ToolPoolFileBinding] = []
-    for raw in frozen_items or []:
-        if not isinstance(raw, dict):
-            continue
-        target = str(raw.get("target_file") or raw.get("path") or "").strip()
-        if not target.startswith("scripts/"):
-            continue
-        required = raw.get("required_tools") or raw.get("required_capabilities") or []
-        forbidden = raw.get("forbidden_capabilities") or raw.get("business_forbidden_capabilities") or []
-        try:
-            execution_contract = project_per_file_execution_contract(
-                target_file=target,
-                inputs=raw.get("inputs") or raw.get("semantic_inputs") or [],
-                outputs=raw.get("outputs") or raw.get("semantic_outputs") or [],
-                required_capabilities=required,
-                forbidden_capabilities=forbidden,
-                required_resources=raw.get("dependencies") or raw.get("required_resources") or [],
-                registry=registry,
-            )
-        except ExecutionContractError as exc:
-            raise HTTPException(status_code=422, detail=exc.failure) from exc
-        allowed_callables = [
-            {**callable_fact, "tool_id": tool["tool_id"]}
-            for tool in execution_contract["allowed_tools"]
-            for callable_fact in tool["callables"]
-        ]
-        tool_bindings_by_file[target] = {
-            "allowed_tool_ids": [tool["tool_id"] for tool in execution_contract["allowed_tools"]],
-            "allowed_callables": allowed_callables,
-            "per_file_execution_contract": execution_contract,
-            "contract_digest": execution_contract["contract_digest"],
-        }
-        pool_bindings.append(ToolPoolFileBinding(
-            target_file=target,
-            allowed_tool_ids=tool_bindings_by_file[target]["allowed_tool_ids"],
-            available_tools=[{
-                "tool_id": item["tool_id"],
-                "function_name": item["function"],
-                "import_path": item["import_path"],
-            } for item in allowed_callables],
-        ))
-    updated_pool.file_bindings = pool_bindings
+    updated_pool.file_bindings = []
     save_tool_pool(skill_dir, updated_pool)
     updated_pool = load_tool_pool(skill_dir)
+    skill_tool_contract = project_frozen_skill_tool_contract(updated_pool)
 
     normalized_selector_output = {
         "recalled_candidate_tool_ids": recalled_candidate_tool_ids,
         "available_optional_tool_ids": available_optional_tool_ids,
         "unavailable_tool_ids": unavailable_tool_ids,
-        "tool_bindings_by_file": tool_bindings_by_file,
+        "tool_bindings_by_file": {},
+        "skill_tool_contract": skill_tool_contract,
         "desired_tool_ids": recalled_candidate_tool_ids,
         "authorized_tool_ids": available_optional_tool_ids,
         "candidate_tool_ids": recalled_candidate_tool_ids,
@@ -3379,7 +3328,7 @@ async def _plan_final_tool_pool(
                 "recalled_candidate_tool_ids": recalled_candidate_tool_ids,
                 "available_optional_tool_ids": available_optional_tool_ids,
                 "unavailable_tool_ids": unavailable_tool_ids,
-                "tool_bindings_by_file": tool_bindings_by_file,
+                "tool_bindings_by_file": {},
                 "add_tool_ids": add_tool_ids,
                 "remove_tool_ids": remove_tool_ids,
                 "llm_selector_used": False,
@@ -3396,7 +3345,8 @@ async def _plan_final_tool_pool(
         "recalled_candidate_tool_ids": recalled_candidate_tool_ids,
         "available_optional_tool_ids": available_optional_tool_ids,
         "unavailable_tool_ids": unavailable_tool_ids,
-        "tool_bindings_by_file": tool_bindings_by_file,
+        "tool_bindings_by_file": {},
+        "skill_tool_contract": skill_tool_contract,
         "desired_tool_ids": recalled_candidate_tool_ids,
         "authorized_tool_ids": available_optional_tool_ids,
         "tool_pool": updated_pool,
@@ -13454,6 +13404,8 @@ async def generate_file(request: GenerateFileRequest):
             entry_requirements: list[RequirementItem] = []
             current_skill_binding_payload: dict[str, Any] = {}
             current_tool_pool_summary: dict[str, Any] = {}
+            frozen_skill_tool_contract: dict[str, Any] = {}
+            frozen_script_contract: dict[str, Any] = {}
             tool_readiness_observations: list[dict[str, Any]] = []
 
             if request.file_path.startswith("scripts/"):
@@ -13471,6 +13423,7 @@ async def generate_file(request: GenerateFileRequest):
                     )
                 current_skill_binding_payload = current_file_binding.model_dump(mode="json")
                 current_tool_pool_summary = current_tool_pool.model_dump(mode="json")
+                frozen_skill_tool_contract = project_frozen_skill_tool_contract(current_tool_pool)
                 logger.info(
                     "[Creator][generate_file][producer_tool_pool] skill=%s file=%s summary=%s",
                     skill_name,
@@ -13497,6 +13450,13 @@ async def generate_file(request: GenerateFileRequest):
                 effective_skill_plan_entry = dict(
                     getattr(entry_obj, "__dict__", {}) or {}
                 )
+                frozen_script_contract = project_frozen_script_contract(
+                    target_file=request.file_path,
+                    inputs=entry_obj.inputs or [],
+                    outputs=entry_obj.outputs or [],
+                    responsibility=entry_obj.purpose or request.purpose,
+                    required_resources=entry_obj.dependencies or [],
+                )
                 entry_requirements = _requirements_for_generated_file(
                     skill_name=skill_name,
                     file_path=request.file_path,
@@ -13510,6 +13470,10 @@ async def generate_file(request: GenerateFileRequest):
                     effective_skill_plan_entry,
                     current_skill_binding_payload,
                 )
+                runtime_contract = dict(effective_skill_plan_entry.get("runtime_contract") or {})
+                runtime_contract["frozen_script_contract"] = frozen_script_contract
+                runtime_contract["frozen_skill_tool_contract"] = frozen_skill_tool_contract
+                effective_skill_plan_entry["runtime_contract"] = runtime_contract
                 _, tool_blockers = _creator_tool_readiness_blockers(
                     effective_skill_plan_entry
                 )
@@ -13676,11 +13640,22 @@ async def generate_file(request: GenerateFileRequest):
                     raise compile_stage_error
 
                 if request.file_path.startswith("scripts/"):
+                    structural_result = validate_script_execution_contract(
+                        content,
+                        script_contract=frozen_script_contract,
+                        tool_contract=frozen_skill_tool_contract,
+                    )
+                    if not structural_result["success"]:
+                        raise FileGenerationStageError(
+                            source="script_contract_validation",
+                            layer="script_contract_validation",
+                            detail=json.dumps(structural_result, ensure_ascii=False, sort_keys=True),
+                        )
                     try:
                         import_guard_result = guard_runtime_imports(
                             content,
                             request.file_path,
-                            current_skill_binding_payload,
+                            skill_tool_contract=frozen_skill_tool_contract,
                         )
                         last_import_guard_result = import_guard_result
                     except Exception as guard_exc:
@@ -14469,7 +14444,7 @@ async def generate_file(request: GenerateFileRequest):
                                         last_import_guard_result = guard_runtime_imports(
                                             candidate or "",
                                             request.file_path,
-                                            current_skill_binding_payload,
+                                            skill_tool_contract=frozen_skill_tool_contract,
                                         )
                                     except Exception as guard_exc:
                                         logger.warning(
