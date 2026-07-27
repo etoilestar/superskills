@@ -2,6 +2,7 @@
 
 import hashlib
 import uuid
+from collections import Counter
 
 from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
@@ -4091,17 +4092,20 @@ def _is_imported_callable_identity_failure(errors: list[str]) -> bool:
     return bool(re.search(r"ImportError[^\n]*cannot import name", text, re.I))
 
 
-def _registry_callable_identities(context: dict[str, Any] | None) -> set[tuple[str, str]]:
-    """Collect only explicit Registry import/function pairs from selected-tool facts."""
-    identities: set[tuple[str, str]] = set()
+def _registry_callable_owners(
+    context: dict[str, Any] | None,
+) -> dict[tuple[str, str], set[str]]:
+    """Map explicit Registry callable identities to their selected Tool owners."""
+    owners: dict[tuple[str, str], set[str]] = {}
 
     def visit(value: Any) -> None:
         if isinstance(value, dict):
+            tool_id = value.get("tool_id")
             import_path = value.get("import_path")
             function_name = value.get("function_name")
-            if isinstance(import_path, str) and isinstance(function_name, str):
-                if import_path.strip() and function_name.strip():
-                    identities.add((import_path.strip(), function_name.strip()))
+            if all(isinstance(item, str) and item.strip() for item in (tool_id, import_path, function_name)):
+                identity = (import_path.strip(), function_name.strip())
+                owners.setdefault(identity, set()).add(tool_id.strip())
             for child in value.values():
                 visit(child)
         elif isinstance(value, list):
@@ -4109,6 +4113,39 @@ def _registry_callable_identities(context: dict[str, Any] | None) -> set[tuple[s
                 visit(child)
 
     visit(context or {})
+    return owners
+
+
+def _registry_callable_identities(context: dict[str, Any] | None) -> set[tuple[str, str]]:
+    """Compatibility projection of callable identities from owner-preserving facts."""
+    return set(_registry_callable_owners(context))
+
+
+def _called_identities(tree: ast.AST) -> Counter[tuple[str, str]]:
+    """Resolve imported Call identities while retaining occurrence counts."""
+    module_aliases: dict[str, str] = {}
+    callable_aliases: dict[str, tuple[str, str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                module_aliases[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                if alias.name != "*":
+                    callable_aliases[alias.asname or alias.name] = (node.module, alias.name)
+
+    identities: Counter[tuple[str, str]] = Counter()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id in callable_aliases:
+            identities[callable_aliases[node.func.id]] += 1
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in module_aliases
+        ):
+            identities[(module_aliases[node.func.value.id], node.func.attr)] += 1
     return identities
 
 
@@ -4116,7 +4153,7 @@ def _unauthorized_callable_identity_change(
     before: str,
     after: str,
     context: dict[str, Any] | None,
-) -> list[tuple[str, str]]:
+) -> list[dict[str, Any]]:
     """Reject new/replaced Call identities without exact selected Registry evidence."""
     try:
         before_tree = ast.parse(before)
@@ -4124,35 +4161,49 @@ def _unauthorized_callable_identity_change(
     except (SyntaxError, ValueError):
         return []
 
-    def called_identities(tree: ast.AST) -> set[tuple[str, str]]:
-        module_aliases: dict[str, str] = {}
-        callable_aliases: dict[str, tuple[str, str]] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    module_aliases[alias.asname or alias.name] = alias.name
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                for alias in node.names:
-                    if alias.name != "*":
-                        callable_aliases[alias.asname or alias.name] = (node.module, alias.name)
+    before_calls = _called_identities(before_tree)
+    after_calls = _called_identities(after_tree)
+    added = after_calls - before_calls
+    removed = before_calls - after_calls
+    if not added:
+        return []
 
-        identities: set[tuple[str, str]] = set()
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            if isinstance(node.func, ast.Name) and node.func.id in callable_aliases:
-                identities.add(callable_aliases[node.func.id])
-            elif (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in module_aliases
-            ):
-                identities.add((module_aliases[node.func.value.id], node.func.attr))
-        return identities
+    owners = _registry_callable_owners(context)
+    selected_tool_ids = {
+        str(tool_id)
+        for tool_id in ((context or {}).get("selected_tool_ids") or [])
+        if str(tool_id).strip()
+    }
 
-    added = called_identities(after_tree) - called_identities(before_tree)
-    authorized = _registry_callable_identities(context)
-    return sorted(identity for identity in added if identity not in authorized)
+    def identity_owners(identity: tuple[str, str]) -> set[str]:
+        exact_tool_id = identity[1] if identity[1] in selected_tool_ids else ""
+        return set(owners.get(identity) or set()) | ({exact_tool_id} if exact_tool_id else set())
+
+    origin_owners = {
+        owner
+        for identity in removed
+        for owner in identity_owners(identity)
+    }
+    origin_identities = [list(identity) for identity in sorted(removed.elements())]
+    rejections: list[dict[str, Any]] = []
+    for identity in sorted(added.elements()):
+        proposed_owners = identity_owners(identity)
+        if not proposed_owners:
+            reason = "callable_repair_evidence_missing"
+        elif not origin_owners:
+            reason = "callable_origin_tool_unresolved"
+        elif not (origin_owners & proposed_owners):
+            reason = "callable_tool_identity_changed"
+        else:
+            continue
+        rejections.append({
+            "reason": reason,
+            "origin_tool_ids": sorted(origin_owners),
+            "proposed_tool_ids": sorted(proposed_owners),
+            "before_callable_identities": origin_identities,
+            "after_callable_identity": list(identity),
+        })
+    return rejections
 
 
 def _is_skill_repair_target(skill_dir: Path, target: str) -> bool:
@@ -4182,7 +4233,9 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
         "follow Python 'Did you mean' suggestions as authorization. Do not use semantic or naming similarity, "
         "source-code autocomplete, module discovery, or general model knowledge. A callable identity change is valid "
         "only when the exact import_path/function_name appears in read_only_callable_context. If no matching Registry "
-        "fact exists, report callable_repair_evidence_missing instead of proposing another callable."
+        "fact exists, report callable_repair_evidence_missing instead of proposing another callable. Even when multiple "
+        "tools are authorized in the Skill-wide ToolPool, E2E repair must not switch from one tool to another. Callable "
+        "repair may only correct the invocation of the tool already represented by the failing source call."
     )
     messages = [{"role": "system", "content": "You diagnose a Creator E2E breakpoint. Output only JSON. Select exactly one primary repair_target. It must be SKILL.md or an existing scripts/*.py in this Skill. Do not propose edits or backend/runtime/tool changes." + callable_boundary}, {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, default=str) + "\nReturn {repair_target, root_cause_hypothesis, evidence, repair_instruction, confidence}. These are real Sandbox experiments with stable failure identities and patch digests. Do not re-propose the same target, breakpoint, and repair region merely by changing hypothesis wording." + callable_boundary}]
     for proposal_attempt in range(3):
@@ -4543,6 +4596,8 @@ async def _repair_existing_file_for_e2e_failure(
             "Only modify callable identity to an exact Registry callable contained in read_only_callable_context. "
             "Do not invent, infer, autocomplete, substitute, or choose a callable outside that context. "
             "Traceback suggestions are evidence of Python namespace similarity only; they are not Tool authorization.",
+            "Do not replace the failing Tool with another Tool from the same Skill ToolPool. "
+            "A replacement callable must belong to the same Registry tool identity as the failing call being repaired.",
             "若 E2E 发现缺少第三方依赖，交给 dependency/environment 链路处理，"
             "不得通过重新选工具或改业务职责绕过。",
             "优先输出 edits old_lines/new_lines exact_replace patch，不要输出完整文件。",
@@ -4688,6 +4743,8 @@ async def _repair_existing_file_for_e2e_failure(
             "Only modify callable identity to an exact Registry callable contained in read_only_callable_context.\n"
             "Do not invent, infer, autocomplete, substitute, or choose a callable outside that context.\n"
             "Traceback suggestions are evidence of Python namespace similarity only; they are not Tool authorization.\n"
+            "Do not replace the failing Tool with another Tool from the same Skill ToolPool.\n"
+            "A replacement callable must belong to the same Registry tool identity as the failing call being repaired.\n"
             "如果当前脚本的核心动作依赖一个已经授权的 callable，不得通过删除 import 但保留未定义调用、"
             "fixed text、返回示例文本、fake path、写入空文件、注释掉核心调用、mock / placeholder / simulated 实现来绕过 ImportError 或调用错误。\n"
             "应优先依据 read_only_callable_context 修正准确 import path、函数名、参数和返回字段。\n"
@@ -5007,10 +5064,10 @@ async def _repair_existing_file_for_e2e_failure(
                     read_only_callable_context,
                 )
             if unauthorized_callable_identities:
+                compact_rejection = unauthorized_callable_identities[0]
                 last_failure = (
-                    "callable_repair_evidence_missing: proposed callable import is not an exact "
-                    "import_path/function_name pair in the selected ToolPool read-only Registry facts. "
-                    "Traceback suggestions and module namespace similarity are not authorization."
+                    f"{compact_rejection['reason']}: callable repair must preserve the failing Tool identity. "
+                    f"facts={json.dumps(compact_rejection, ensure_ascii=False, sort_keys=True)}"
                 )
                 repair_feedback = deterministic_error + "\n\n" + last_failure
                 continue

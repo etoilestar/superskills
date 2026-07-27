@@ -839,7 +839,7 @@ def test_callable_import_change_rejects_did_you_mean_name_without_registry_evide
         context,
     )
 
-    assert rejected == [("module_x", "fn_other")]
+    assert rejected[0]["reason"] == "callable_repair_evidence_missing"
 
 
 def test_callable_import_change_excludes_global_registry_tools_not_in_selected_context():
@@ -857,7 +857,7 @@ def test_callable_import_change_excludes_global_registry_tools_not_in_selected_c
         "from module_x import fn_wrong\nfn_wrong()\n",
         "from module_x import fn_beta\nfn_beta()\n",
         selected_context,
-    ) == [("module_x", "fn_beta")]
+    )[0]["reason"] == "callable_repair_evidence_missing"
 
 
 def test_callable_identity_change_rejects_unauthorized_module_alias_call_replacement():
@@ -874,7 +874,78 @@ def test_callable_identity_change_rejects_unauthorized_module_alias_call_replace
         "import module_x as m\nm.fn_alpha()\n",
         "import module_x as m\nm.fn_beta()\n",
         selected_context,
-    ) == [("module_x", "fn_beta")]
+    )[0]["reason"] == "callable_repair_evidence_missing"
+
+
+def _multi_tool_callable_context():
+    return {
+        "selected_tool_ids": ["tool_alpha", "tool_beta"],
+        "resolved_tools": [
+            {"tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_alpha"},
+            {"tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_alpha_v2"},
+            {"tool_id": "tool_beta", "import_path": "module_x", "function_name": "fn_beta"},
+        ],
+    }
+
+
+def test_callable_identity_change_rejects_other_skill_tool_direct_call():
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha\nfn_alpha()\n",
+        "from module_x import fn_beta\nfn_beta()\n",
+        _multi_tool_callable_context(),
+    )
+
+    assert rejected[0]["reason"] == "callable_tool_identity_changed"
+    assert rejected[0]["origin_tool_ids"] == ["tool_alpha"]
+    assert rejected[0]["proposed_tool_ids"] == ["tool_beta"]
+
+
+def test_callable_identity_change_rejects_other_skill_tool_module_alias_call():
+    rejected = e2e._unauthorized_callable_identity_change(
+        "import module_x as m\nm.fn_alpha()\n",
+        "import module_x as m\nm.fn_beta()\n",
+        _multi_tool_callable_context(),
+    )
+
+    assert rejected[0]["reason"] == "callable_tool_identity_changed"
+
+
+def test_callable_identity_change_allows_same_tool_callable_correction():
+    assert e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha\nfn_alpha()\n",
+        "from module_x import fn_alpha_v2\nfn_alpha_v2()\n",
+        _multi_tool_callable_context(),
+    ) == []
+
+
+def test_callable_identity_change_allows_exact_tool_id_to_owned_callable():
+    assert e2e._unauthorized_callable_identity_change(
+        "from module_x import tool_alpha\ntool_alpha()\n",
+        "from module_x import fn_alpha\nfn_alpha()\n",
+        _multi_tool_callable_context(),
+    ) == []
+
+
+def test_callable_identity_change_rejects_unresolved_origin_tool():
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import unknown_callable\nunknown_callable()\n",
+        "from module_x import fn_alpha\nfn_alpha()\n",
+        _multi_tool_callable_context(),
+    )
+
+    assert rejected[0]["reason"] == "callable_origin_tool_unresolved"
+
+
+def test_callable_identity_change_counter_detects_same_set_cross_tool_replacement():
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha, fn_beta\nfn_alpha()\nfn_alpha()\nfn_beta()\n",
+        "from module_x import fn_alpha, fn_beta\nfn_alpha()\nfn_beta()\nfn_beta()\n",
+        _multi_tool_callable_context(),
+    )
+
+    assert rejected[0]["reason"] == "callable_tool_identity_changed"
+    assert rejected[0]["before_callable_identities"] == [["module_x", "fn_alpha"]]
+    assert rejected[0]["after_callable_identity"] == ["module_x", "fn_beta"]
 
 
 @pytest.mark.asyncio
