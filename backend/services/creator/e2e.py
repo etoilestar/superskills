@@ -4112,28 +4112,45 @@ def _registry_callable_identities(context: dict[str, Any] | None) -> set[tuple[s
     return identities
 
 
-def _unauthorized_callable_import_change(
+def _unauthorized_callable_identity_change(
     before: str,
     after: str,
     context: dict[str, Any] | None,
 ) -> list[tuple[str, str]]:
-    """Reject newly imported callable identities without exact selected Registry evidence."""
+    """Reject new/replaced Call identities without exact selected Registry evidence."""
     try:
         before_tree = ast.parse(before)
         after_tree = ast.parse(after)
     except (SyntaxError, ValueError):
         return []
 
-    def imported_identities(tree: ast.AST) -> set[tuple[str, str]]:
-        return {
-            (node.module or "", alias.name)
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom)
-            for alias in node.names
-            if alias.name != "*"
-        }
+    def called_identities(tree: ast.AST) -> set[tuple[str, str]]:
+        module_aliases: dict[str, str] = {}
+        callable_aliases: dict[str, tuple[str, str]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_aliases[alias.asname or alias.name] = alias.name
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                for alias in node.names:
+                    if alias.name != "*":
+                        callable_aliases[alias.asname or alias.name] = (node.module, alias.name)
 
-    added = imported_identities(after_tree) - imported_identities(before_tree)
+        identities: set[tuple[str, str]] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id in callable_aliases:
+                identities.add(callable_aliases[node.func.id])
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in module_aliases
+            ):
+                identities.add((module_aliases[node.func.value.id], node.func.attr))
+        return identities
+
+    added = called_identities(after_tree) - called_identities(before_tree)
     authorized = _registry_callable_identities(context)
     return sorted(identity for identity in added if identity not in authorized)
 
@@ -4982,14 +4999,14 @@ async def _repair_existing_file_for_e2e_failure(
                 )
             )
 
-            unauthorized_callable_imports = []
+            unauthorized_callable_identities = []
             if target_path.endswith(".py") and _is_callable_identity_failure(baseline_errors):
-                unauthorized_callable_imports = _unauthorized_callable_import_change(
+                unauthorized_callable_identities = _unauthorized_callable_identity_change(
                     current_content,
                     sanitized,
                     read_only_callable_context,
                 )
-            if unauthorized_callable_imports:
+            if unauthorized_callable_identities:
                 last_failure = (
                     "callable_repair_evidence_missing: proposed callable import is not an exact "
                     "import_path/function_name pair in the selected ToolPool read-only Registry facts. "
