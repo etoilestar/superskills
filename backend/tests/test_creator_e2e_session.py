@@ -804,6 +804,134 @@ async def test_import_error_repair_prompt_receives_read_only_callable_context(tm
     assert "real_callable_name(text: str) -> dict" in prompt
 
 
+def test_callable_import_change_accepts_exact_selected_registry_identity():
+    context = {
+        "selected_tool_ids": ["tool_alpha"],
+        "resolved_tools": [{
+            "tool_id": "tool_alpha",
+            "import_path": "module_x",
+            "function_name": "fn_alpha",
+        }],
+    }
+
+    rejected = e2e._unauthorized_callable_import_change(
+        "from module_x import tool_alpha\n",
+        "from module_x import fn_alpha\n",
+        context,
+    )
+
+    assert rejected == []
+
+
+def test_callable_import_change_rejects_did_you_mean_name_without_registry_evidence():
+    context = {
+        "selected_tool_ids": ["tool_alpha"],
+        "resolved_tools": [{
+            "tool_id": "tool_alpha",
+            "import_path": "module_x",
+            "function_name": "fn_alpha",
+        }],
+    }
+
+    rejected = e2e._unauthorized_callable_import_change(
+        "from module_x import fn_wrong\n",
+        "from module_x import fn_other\n",
+        context,
+    )
+
+    assert rejected == [("module_x", "fn_other")]
+
+
+def test_callable_import_change_excludes_global_registry_tools_not_in_selected_context():
+    selected_context = {
+        "selected_tool_ids": ["tool_alpha"],
+        "resolved_tools": [{
+            "tool_id": "tool_alpha",
+            "import_path": "module_x",
+            "function_name": "fn_alpha",
+        }],
+    }
+
+    assert e2e._registry_callable_identities(selected_context) == {("module_x", "fn_alpha")}
+    assert e2e._unauthorized_callable_import_change(
+        "from module_x import fn_wrong\n",
+        "from module_x import fn_beta\n",
+        selected_context,
+    ) == [("module_x", "fn_beta")]
+
+
+@pytest.mark.asyncio
+async def test_import_error_without_callable_context_fails_closed(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    skill_dir = root / "demo"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    (skill_dir / "scripts" / "one.py").write_text("print('before')\n", encoding="utf-8")
+    monkeypatch.setattr(e2e.settings, "skills_path", root)
+    monkeypatch.setattr(
+        e2e,
+        "_complete_chat_once_sync_for_e2e",
+        lambda *_args: pytest.fail("diagnosis must not guess without callable evidence"),
+    )
+
+    result = await e2e._repair_existing_file_for_e2e_failure(
+        skill_name="demo",
+        target_path="scripts/one.py",
+        e2e_errors=[
+            "E2E_REPAIR_TARGET=scripts/one.py\nE2E_LAYER=script_exit\n"
+            "ImportError: cannot import name 'fn_wrong' from 'module_x'\n"
+            "Did you mean: 'fn_other'?"
+        ],
+        read_only_callable_context={},
+    )
+
+    assert result["status"] == "still_failed_same_target"
+    assert result["rejection_reason"] == "callable_repair_evidence_missing"
+    assert result["sandbox_executed"] is False
+    assert (skill_dir / "scripts" / "one.py").read_text(encoding="utf-8") == "print('before')\n"
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_receives_selected_callable_facts_and_forbids_traceback_guessing(tmp_path, monkeypatch):
+    skill_dir = _make_skill(tmp_path)
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+    captured = {}
+
+    def fake_complete(messages, *_args):
+        captured["messages"] = messages
+        return json.dumps({
+            "repair_target": "scripts/one.py",
+            "root_cause_hypothesis": "Use the selected Registry callable.",
+            "repair_instruction": "Use fn_alpha from module_x.",
+        })
+
+    monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", fake_complete)
+    context = {
+        "selected_tool_ids": ["tool_alpha"],
+        "resolved_tools": [{
+            "tool_id": "tool_alpha",
+            "import_path": "module_x",
+            "function_name": "fn_alpha",
+        }],
+    }
+
+    diagnosis = await e2e._diagnose_e2e_failure_for_repair(
+        skill_name="demo",
+        skill_dir=skill_dir,
+        e2e_errors=["ImportError: cannot import name 'fn_wrong' from 'module_x'; Did you mean fn_beta?"],
+        e2e_session=session,
+        read_only_callable_context=context,
+    )
+
+    prompt = "\n".join(message["content"] for message in captured["messages"])
+    assert diagnosis["repair_instruction"] == "Use fn_alpha from module_x."
+    assert '"selected_tool_ids": ["tool_alpha"]' in prompt
+    assert '"function_name": "fn_alpha"' in prompt
+    assert "Did you mean" in prompt
+    assert "exact import_path/function_name" in prompt
+    assert "callable_repair_evidence_missing" in prompt
+
+
 def test_callable_runtime_failure_filters_business_type_errors_and_tool_type_errors():
     from backend.services.creator import api
     context = _callable_context()
