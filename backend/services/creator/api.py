@@ -6142,6 +6142,9 @@ platform boundary contract and the canonical ResponsibilityEdge wire fields:
 from_node, from_output, to_node, to_input, purpose, constraints.
 
 Before returning, replay the complete graph and verify:
+0. Valid node identities are only platform_input_node,
+   platform_output_node, and exact authoritative script paths. Never use a
+   role, basename, capability, shorthand, or other alias.
 1. Every declared runtime input has exactly one legal provenance.
 2. Every from_output exists in the supplied legal source domain.
 3. Every to_input exists on the frozen target FunctionItem.
@@ -6872,6 +6875,9 @@ to_input, purpose, constraints. Platform endpoints and slots must come from the
 supplied platform contracts. Do not infer aliases or invent endpoints.
 
 Before returning, replay the complete graph and verify:
+0. Valid node identities are only platform_input_node,
+   platform_output_node, and exact authoritative script paths. Never use a
+   role, basename, capability, shorthand, or other alias.
 1. Every declared runtime input has exactly one legal provenance.
 2. Every from_output exists in the supplied legal source domain.
 3. Every to_input exists on the frozen target FunctionItem.
@@ -6914,6 +6920,14 @@ implement. Identify every explicit core independently verifiable final-capabilit
 requirement even when the current Blueprint does not currently provide a
 legitimate FunctionItem owner.
 
+Requirements may come only from the original user request or explicit user
+clarification answers. Blueprint implementation details are evidence for
+allocation only; never turn them into user requirements. A default value,
+internal parameter, file split, file name, intermediate output, model-selected
+quantity, layout choice, template choice, or helper strategy is not a
+requirement unless the user explicitly requested it. For example, a Blueprint
+default max_images=5 does not mean the user requested configurable max_images.
+
 Allocate a requirement only to FunctionItems that genuinely own or co-own that
 responsibility. If no current FunctionItem legitimately owns a core requirement,
 keep that requirement in requirement_allocations, return owners=[], do not omit
@@ -6921,6 +6935,13 @@ the requirement, do not force an unrelated owner merely to avoid an empty owner
 list, and do not invent a new FunctionItem during requirement allocation.
 owners=[] means only that the current Blueprint has no legitimate owner; it does
 not mean that the requirement is unimportant, ignorable, or already complete.
+
+authoritative_scripts is the complete owner identity domain. Every owners value
+MUST be copied verbatim from authoritative_scripts. Do not output a role,
+basename, capability, shorthand, or custom identifier, and do not infer aliases.
+For authoritative_scripts=["scripts/a.py", "scripts/b.py"], owners=["scripts/a.py"]
+is valid; owners=["a"], owners=["text_generator"], and owners=["generator"] are
+invalid.
 
 One FunctionItem may legitimately own multiple requirements. Multiple
 FunctionItems may legitimately cooperate on one requirement. There is no
@@ -6939,6 +6960,11 @@ plan. Do not add files, FunctionItems, or requirements merely for closure.
         "human_feedback": request.human_feedback,
         "current_blueprint": blueprint_text,
         "function_items": function_items,
+        "authoritative_scripts": [
+            str(item.get("target_file") or "").strip()
+            for item in function_items
+            if str(item.get("target_file") or "").strip()
+        ],
     }
     text = await complete_creator_role_once(
         [{"role": "system", "content": prompt},
@@ -6973,9 +6999,30 @@ An ownerless requirement allocation is a legitimate diagnostic state indicating
 that the current Blueprint may have failed to cover a core user requirement. Do
 not treat owners=[] as malformed. Semantic closure must not pass while a genuine
 core requirement remains ownerless.
+
+You may review only the supplied requirements. requirement_uncovered and
+requirement_partially_covered MUST reference an existing supplied requirement_id.
+Do not create requirements from implementation preferences, quality
+improvements, style preferences, richer designs, inferred hidden requirements,
+or Blueprint implementation details. An observation that does not map to an
+existing supplied requirement_id is advisory only and must not be blocking.
+
+Capability is determined by the actual operation and actual Tool capability used
+by the current file, never by how its output is used downstream. A
+text_generation Tool producing image-prompt text is still text_generation;
+generating SQL text is not database execution; generating a search query is not
+web retrieval; and generating an outline is not document generation. Only actual
+image generation behavior or image-generation Tool usage is image_generation.
+
 Also review declared dependencies/resources: whether each is actually required
 static content, whether it is Creator-generated guidance or pre-existing static
 material, and whether a static dependency lacks a real source/provenance.
+The current phase is Blueprint planning, so references/assets may not have been
+generated yet. Do not reject a planned resource because its file does not exist,
+is empty, has no generated body yet, or is not yet detailed. At this stage review
+only its planned responsibility, dependency relationship, declared source,
+SkillPlan consistency, and semantic justification. Actual resource content
+quality is reviewed after file generation.
 Do not infer from filenames, suffixes, keywords, or a business taxonomy.
 
 Return strict JSON only: {"passed":true,"issues":[]} or a failed result whose
@@ -7005,6 +7052,20 @@ conflict may additionally include resource.
             for item in function_items
         ],
     )
+    valid_requirement_ids = {
+        str(allocation.get("requirement_id") or "").strip()
+        for allocation in requirement_allocations
+        if str(allocation.get("requirement_id") or "").strip()
+    }
+    coverage_issue_types = {
+        "requirement_uncovered", "requirement_partially_covered"
+    }
+    review["issues"] = [
+        issue for issue in review["issues"]
+        if issue["issue_type"] not in coverage_issue_types
+        or str(issue.get("requirement_id") or "").strip() in valid_requirement_ids
+    ]
+    review["passed"] = not review["issues"]
     if review["passed"]:
         uncovered_allocation_ids = [
             str(allocation.get("requirement_id") or "")
@@ -7049,6 +7110,14 @@ uncovered requirement with no affected target, you may add new FunctionItems but
 must not modify existing FunctionItems or resources. To modify an existing
 FunctionItem, the Reviewer must name it in affected_targets. Do not remove
 existing paths. Return strict JSON only:
+
+This is coverage repair, not Skill redesign. Repair only the supplied blocking
+issues. Every requirement coverage repair must correspond to an existing
+supplied requirement_id, and the original Requirement Set must remain unchanged.
+Do not add new requirements, style constraints, quantity constraints, layout
+rules, templates, resources, or capabilities unless strictly necessary for an
+existing supplied requirement; then make only the minimum required change.
+
 {"internal_blueprint_text":"...","changed_targets":[],"added_targets":[],"changed_resources":[]}
 """.strip()
     payload = {"original_user_requirement": request.user_request, "current_blueprint": blueprint_text,
@@ -7647,6 +7716,10 @@ Blueprint Planner 只规划业务责任。
 
 - 只有用户需求或实际 Script responsibility 明确需要持久资源时才创建 references/assets；
   能直接由 Script 或 Tool 完成的内容，不要额外创建静态模板、logo 或说明资源。
+
+- references/assets 默认应为空。只有用户明确要求、用户实际上传/提供，或核心责任确实需要无法合理放入
+  Script 或现有 Tool usage 的持久静态可复用内容时，才创建持久资源。不得仅为让 Skill 显得完整而创建资源。
+  除非当前请求上下文包含用户实际提供的文件，绝不能声明 source=user_upload。
 
 - Script 声明的 references/assets 必须已经属于当前 FilePlan。
 
