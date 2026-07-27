@@ -1801,6 +1801,10 @@ def _build_script_generate_file_prompt_variant(
             "input_schema": tool.get("input_schema") or {},
             "output_schema": tool.get("output_schema") or {},
             "return_contract": tool.get("return_contract"),
+            "example_call": tool.get("example_call") or tool.get("call_template"),
+            "example_return": tool.get("example_return"),
+            "example_stdout": tool.get("example_stdout"),
+            "common_mistakes": tool.get("common_mistakes") or [],
             "artifact_outputs": tool.get("artifact_outputs") or [],
             "side_effects": tool.get("side_effects") or [],
         }
@@ -2125,6 +2129,13 @@ def _build_script_generate_file_prompt_variant(
             compact_code_tools,
             ensure_ascii=False,
             indent=2,
+        ),
+        (
+            "调用 available Tool 前依次阅读 import_path/function_name、signature/input_schema、"
+            "return_contract/example_return、example_call、common_mistakes；不得猜测参数名、"
+            "返回类型或返回字段。Code-callable Tool Contracts 是调用事实；Snippet 仅是辅助示例，"
+            "不得据其扩展参数或返回字段。output_contract.stdout_schema 描述脚本最终 stdout，"
+            "不是 Tool helper 返回值；脚本应依据 Tool contract 将中间结果映射为自己的 stdout。"
         ),
         (
             "动态工具 Snippet 指南（从 registry/manifest 读取，"

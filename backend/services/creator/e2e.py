@@ -4248,7 +4248,11 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
     rejected = [a for a in e2e_session.debug_attempts if a.get("result") == "no_progress"]
     prompt = {"structured_failure": failure, "symptom_file": symptom, "layer": failure.get("layer"), "filesystem_trace": details.get("filesystem_trace", {}), "runtime_binding_trace": details.get("runtime_binding_trace", {}), "previous_step_traces": traces, "skill_files": related, "platform_io_facts": _platform_io_repair_summary(), "read_only_callable_context": read_only_callable_context or {}, "previous_debug_attempts": rejected, "retry_reason": retry_reason}
     callable_boundary = (
-        " For import, name, or signature failures, do not infer a replacement callable from traceback wording or "
+        " If the failing script calls a Registry Tool, first read its current usage facts, locate the nearest "
+        "traceback site, compare call arguments and result access with the contract and runtime stdout/stderr/actual "
+        "evidence, and decide whether the code's assumption conflicts with that evidence before selecting the root cause. "
+        "The current_used_tool_context is read-only usage for calls already in source: it does not select or add Tools, "
+        "change ToolPool, require continued use, or permit an identity switch. For callable repairs, do not infer a replacement callable from traceback wording or "
         "follow Python 'Did you mean' suggestions as authorization. Do not use semantic or naming similarity, "
         "source-code autocomplete, module discovery, or general model knowledge. A callable identity change is valid "
         "only when the exact import_path/function_name appears in read_only_callable_context. If no matching Registry "
@@ -4609,8 +4613,7 @@ async def _repair_existing_file_for_e2e_failure(
             "不得请求工具探索或 tool_pool_patch。",
             "E2E 阶段禁止工具库探索：不得请求 tool_pool_patch.add_tool_requests，"
             "不得探索或扩展工具池。",
-            "当且仅当真实 traceback 是 import/name/signature 错误时，可以读取 "
-            "read_only_callable_context 中已经授权的 Registry callable facts，修正当前报错调用的 "
+            "当前失败源码已经调用 Registry Tool 时，应读取 read_only_callable_context 中的只读 usage facts，修正当前报错调用的 "
             "import_path、function_name、signature、参数名或返回字段读取；该 context 不是新的工具选择建议。",
             "Only modify callable identity to an exact Registry callable contained in read_only_callable_context. "
             "Do not invent, infer, autocomplete, substitute, or choose a callable outside that context. "
@@ -4755,7 +4758,7 @@ async def _repair_existing_file_for_e2e_failure(
             "不得检查 required_capabilities 或 coverage_requirements。\n"
             "不得重新选择、扩展、删除或重排 ToolPool；不得重新判断工具是否应该承担当前职责；"
             "不得请求工具探索或 tool_pool_patch。\n"
-            "当且仅当真实 traceback 是 import/name/signature 错误时，可以读取 read_only_callable_context "
+            "当前失败源码已经调用 Registry Tool 时，可以读取 read_only_callable_context "
             "中已经授权的 Registry callable facts（含 binding_digest、resolved_tools、import_path、signature），"
             "修正当前报错调用的 import_path、function_name、signature、参数名或返回字段读取。\n"
             "该 context 不是新的工具选择建议。\n"
@@ -4767,6 +4770,8 @@ async def _repair_existing_file_for_e2e_failure(
             "如果当前脚本的核心动作依赖一个已经授权的 callable，不得通过删除 import 但保留未定义调用、"
             "fixed text、返回示例文本、fake path、写入空文件、注释掉核心调用、mock / placeholder / simulated 实现来绕过 ImportError 或调用错误。\n"
             "应优先依据 read_only_callable_context 修正准确 import path、函数名、参数和返回字段。\n"
+            "若 runtime evidence 已足够，不得只改异常消息、追加 Got: result、增加 debug print 或扩大日志；"
+            "这不解决根因。应结合当前 Tool usage 和 runtime evidence 直接修正错误调用或结果处理。\n"
             "若只读合同中没有可完成该核心动作的 callable，不要伪造实现；保留阻塞状态，让上层重新进入第一轮工具规划或人工修复。\n"
             "不得改其它文件或已通过步骤。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。"
@@ -4845,7 +4850,7 @@ async def _repair_existing_file_for_e2e_failure(
 
     if target_path.startswith("scripts/") and read_only_callable_context:
         base_task_context += (
-            "\n\n只读 callable facts（read_only=true，仅用于修正真实 import/name/signature 错误；不是工具选择建议）：\n"
+            "\n\ncurrent_used_tool_context（read_only=true；仅为当前源码已调用 Tool 的使用事实，不选择/新增 Tool、不改变 ToolPool、也不允许切换 identity）：\n"
             + json.dumps(
                 read_only_callable_context,
                 ensure_ascii=False,
