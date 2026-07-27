@@ -115,6 +115,14 @@ def _build_e2e_callable_repair_context(
     if not context.get("resolved_tools"):
         return {}
 
+    # This is a read-only projection of calls already present in the failing
+    # source. It neither selects a Tool nor changes the frozen Skill ToolPool.
+    source_path = settings.skills_path / skill_name / target_file
+    try:
+        called = set(_called_identities(ast.parse(source_path.read_text(encoding="utf-8"))))
+    except (OSError, SyntaxError, ValueError):
+        called = set()
+
     selected_tool_ids = {
         str(tool_id)
         for key in ("allowed_tool_ids", "primary_tool_ids", "secondary_tool_ids")
@@ -127,6 +135,12 @@ def _build_e2e_callable_repair_context(
             continue
         if str(tool.get("tool_id") or "") not in selected_tool_ids:
             continue
+        identity = (
+            str(tool.get("import_path") or "").strip(),
+            str(tool.get("function_name") or "").strip(),
+        )
+        if identity not in called:
+            continue
         compact_tools.append({
             "tool_id": tool.get("tool_id"),
             "capability_name": tool.get("capability_name"),
@@ -137,6 +151,8 @@ def _build_e2e_callable_repair_context(
             "output_schema": tool.get("output_schema"),
             "return_contract": tool.get("return_contract"),
             "example_call": tool.get("call_template"),
+            "example_return": tool.get("example_return"),
+            "example_stdout": tool.get("example_stdout"),
             "common_mistakes": tool.get("common_mistakes"),
         })
     if not compact_tools:
@@ -5150,9 +5166,15 @@ async def _repair_prepare_blueprint_protocol(
         protocol_errors or []
     )
 
-    for _ in range(
+    for attempt in range(
         MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS
     ):
+        logger.info(
+            "[Creator][blueprint_repair] attempt=%d issue_codes=%s issue_paths=%s",
+            attempt + 1,
+            [issue.get("code") or issue.get("id") for issue in current_errors],
+            [issue.get("path") or issue.get("field") for issue in current_errors],
+        )
         prompt = (
             load_kernel_creator_for_phase(
                 "prepare_plan"
@@ -5176,11 +5198,16 @@ async def _repair_prepare_blueprint_protocol(
 
 修复要求：
 
-- 只根据 protocol_errors 修复对应协议问题。
+- 这是协议/一致性返修，不是重新设计 Skill。只根据 current validation issues 修复明确问题及其直接关联区域。
 - 保留已经正确的业务目标。
+- 保留已确认 workflow、正确的 SkillPlan entries、input/output semantic identity。
 - 保留已经正确的文件职责。
 - 保留已经正确的脚本文件拓扑。
 - 不新增与 protocol_errors 无关的业务流程。
+- 不因局部格式错误重命名字段、重新拆文件、增加 references/assets 或改变业务职责。
+- protocol_errors 中的 code/path/message/actual 是 validator 事实，必须逐项优先消除，不要猜规则。
+- inputs / outputs 只允许纯字段 identity；例如 count=3 不是合法 identity，应保留为 count。
+- 若本轮仍收到同一 issue，表示上一轮修复未解决它，本轮必须优先消除 remaining issue。
 
 Creator 协议边界：
 
@@ -5274,6 +5301,13 @@ Creator 协议边界：
 
         if not current_errors:
             break
+
+    if current_errors:
+        logger.warning(
+            "[Creator][blueprint_repair] remaining_issue_codes=%s remaining_issue_paths=%s",
+            [issue.get("code") or issue.get("id") for issue in current_errors],
+            [issue.get("path") or issue.get("field") for issue in current_errors],
+        )
 
     return repaired
 
@@ -7208,6 +7242,16 @@ review_summary 只是同一响应中的临时展示摘要。
 不得反过来根据摘要扩写蓝图。
 
 当前阶段不是 Tool Registry 发现阶段。
+
+## Blueprint 收敛规则
+
+- inputs / outputs 只允许字段 identity。正确：inputs: [story_theme, max_paragraphs]；错误：inputs: [story_theme, max_paragraphs=5]。正确：outputs: [story_text, story_sections]；错误：outputs: [story_text:string, story_sections=[]]。
+- 最终 workflow 必须覆盖 SkillPlan 每一个 substantive script 的核心动作；若包含 text generation、image generation、document assembly，workflow 必须依职责依赖顺序表达全部动作。
+- 只有用户需求或实现责任确实需要持久静态资源时才创建 references/assets；不要为了完整感创建模板、logo、说明文件或可由脚本/Tool 直接生成的资源。
+- dependencies/references 中的静态 resource path 必须存在对应 FilePlan entry；不要声明未进入 FilePlan 的静态 resource path。
+- needs_clarification 只用于会改变核心 Skill responsibility/workflow 的缺失信息；ready 表示已足够生成 Blueprint。文件名、命名前缀、内部变量和一般默认值不是 blocker，应合理默认。
+- 每轮仅问一个真正阻塞问题，优先询问会改变核心输入、核心输出、核心 workflow，或决定资源由用户提供还是 Skill 生成的问题。
+- 输出 status=ready 前内部检查：workflow 覆盖全部 substantive scripts；inputs/outputs 均为纯字段名；dependencies/references 均有 FilePlan entry；静态资源确有必要；workflow 顺序符合职责依赖；ready 时不再提出业务澄清。只输出最终结果，不输出检查过程。
 
 禁止：
 
@@ -14996,13 +15040,7 @@ async def validate_skill(request: SkillActionRequest):
                         skill_name=skill_name,
                         target_file=target_path,
                     )
-                    if (
-                        candidate_callable_context
-                        and _is_callable_runtime_failure(
-                            structured_e2e_failure,
-                            candidate_callable_context,
-                        )
-                    ):
+                    if candidate_callable_context:
                         e2e_callable_repair_context = candidate_callable_context
                 except Exception as callable_context_exc:
                     logger.warning(

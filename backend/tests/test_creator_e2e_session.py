@@ -778,6 +778,7 @@ async def test_import_error_repair_prompt_receives_read_only_callable_context(tm
 
     async def fake_patch(**kwargs):
         captured["task_context"] = kwargs["task_context"]
+        captured["target_rule"] = kwargs["target_rule"]
         return None, "print('after')\n", {"changed_line_count": 1, "applied": [{"fallback_type": "test"}]}
 
     monkeypatch.setattr(e2e, "_request_and_apply_repair_patch", fake_patch)
@@ -802,6 +803,43 @@ async def test_import_error_repair_prompt_receives_read_only_callable_context(tm
     assert "resolved_tools" in prompt
     assert "tests.fixtures.creator_tools" in prompt
     assert "real_callable_name(text: str) -> dict" in prompt
+    assert "不得只改异常消息" in captured["target_rule"]
+
+
+@pytest.mark.asyncio
+async def test_key_error_diagnosis_receives_current_used_tool_contract(tmp_path, monkeypatch):
+    skill_dir = _make_skill(tmp_path)
+    (skill_dir / "scripts" / "one.py").write_text(
+        "from module_x import fn_alpha\nresult = fn_alpha(topic='x')\nprint(result['wrong_field'])\n",
+        encoding="utf-8",
+    )
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+    captured = {}
+
+    def fake_complete(messages, *_args):
+        captured["prompt"] = "\n".join(message["content"] for message in messages)
+        return json.dumps({
+            "repair_target": "scripts/one.py",
+            "root_cause_hypothesis": "The result field contradicts the Tool contract.",
+            "repair_instruction": "Read the declared field.",
+        })
+
+    monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", fake_complete)
+    context = {"read_only": True, "resolved_tools": [{
+        "tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_alpha",
+        "signature": "fn_alpha(topic: str) -> dict",
+        "example_return": {"result_path": "..."},
+        "common_mistakes": ["Do not read wrong_field"],
+    }]}
+    await e2e._diagnose_e2e_failure_for_repair(
+        skill_name="demo", skill_dir=skill_dir,
+        e2e_errors=["KeyError: wrong_field"], e2e_session=session,
+        read_only_callable_context=context,
+    )
+
+    assert "fn_alpha(topic: str) -> dict" in captured["prompt"]
+    assert "Do not read wrong_field" in captured["prompt"]
+    assert "first read its current usage facts" in captured["prompt"]
 
 
 def test_callable_import_change_accepts_exact_selected_registry_identity():
@@ -1113,8 +1151,14 @@ def test_e2e_callable_context_builder_is_read_only_and_empty_context_is_not_call
     ) is False
 
 
-def test_e2e_callable_context_builder_projects_only_selected_toolpool_facts(monkeypatch):
+def test_e2e_callable_context_builder_projects_only_currently_called_selected_toolpool_facts(tmp_path, monkeypatch):
     from backend.services.creator import api
+
+    skill_root = tmp_path / "skills"
+    source = skill_root / "demo" / "scripts" / "one.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("from module_x import fn_alpha\nfn_alpha()\n", encoding="utf-8")
+    monkeypatch.setattr(api.settings, "skills_path", skill_root)
 
     binding = SimpleNamespace(model_dump=lambda **_kwargs: {
         "allowed_tool_ids": ["tool_alpha"],

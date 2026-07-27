@@ -480,6 +480,7 @@ def test_script_prompt_deduplicates_equivalent_graph_and_tool_binding_representa
             input_schema={"type": "object", "required": ["input_alpha"]},
             output_schema={"type": "object", "required": ["result_gamma"]},
             return_contract="RETURN_SENTINEL_789",
+            example_call="from test_tools import call_a\nresult = call_a(input_alpha='topic')",
             example_return="EXAMPLE_RETURN_SENTINEL",
             example_stdout="EXAMPLE_STDOUT_SENTINEL",
             common_mistakes=["COMMON_MISTAKE_SENTINEL"],
@@ -554,9 +555,11 @@ def test_script_prompt_deduplicates_equivalent_graph_and_tool_binding_representa
         assert registry_tool["example_stdout"] == "EXAMPLE_STDOUT_SENTINEL"
         assert registry_tool["common_mistakes"] == ["COMMON_MISTAKE_SENTINEL"]
         assert registry_tool["required_secrets"] == ["REQUIRED_SECRET_SENTINEL"]
-        assert "EXAMPLE_RETURN_SENTINEL" not in prompt
-        assert "EXAMPLE_STDOUT_SENTINEL" not in prompt
-        assert "COMMON_MISTAKE_SENTINEL" not in prompt
+        assert "result = call_a(input_alpha='topic')" in prompt
+        assert "EXAMPLE_RETURN_SENTINEL" in prompt
+        assert "EXAMPLE_STDOUT_SENTINEL" in prompt
+        assert "COMMON_MISTAKE_SENTINEL" in prompt
+        assert "output_contract.stdout_schema" in prompt
         assert "REQUIRED_SECRET_SENTINEL" not in prompt
     finally:
         clear_registered_tool_capabilities()
