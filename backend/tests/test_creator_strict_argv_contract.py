@@ -207,7 +207,10 @@ def test_argv_schema_run_args_ast_detection():
     assert details["primary_target"] == "SKILL.md"
     assert details["script_run_optional_read_keys"] == ["style"]
 
-from backend.services.creator.generation import _script_generation_skeleton
+from backend.services.creator.generation import (
+    _build_script_generate_file_prompt_variant,
+    _script_generation_skeleton,
+)
 
 
 def test_generation_skeleton_uses_mandatory_guard_import_call_not_inline_validate():
@@ -215,6 +218,49 @@ def test_generation_skeleton_uses_mandatory_guard_import_call_not_inline_validat
     assert "from backend.services.runtime_tools import strict_json_argv_guard" in skeleton
     assert "strict_json_argv_guard(payload" in skeleton
     assert "def validate_payload" not in skeleton
+
+
+def test_generation_skeleton_displays_current_planned_interface_names():
+    skeleton = _script_generation_skeleton(
+        "scripts/main.py",
+        "test",
+        "",
+        skill_plan_entry={
+            "path": "scripts/main.py",
+            "runtime": "python",
+            "inputs": ["input_a"],
+            "outputs": ["output_a"],
+        },
+    )
+
+    assert 'inputs: ["input_a"]' in skeleton
+    assert 'outputs: ["output_a"]' in skeleton
+    assert "Prefer these input names for strict_json_argv_guard" in skeleton
+    assert "these output names for the final stdout object" in skeleton
+
+
+def test_script_producer_prompt_no_longer_encourages_argv_key_renaming():
+    prompt_text = "\n".join(
+        value
+        for value in _build_script_generate_file_prompt_variant.__code__.co_consts
+        if isinstance(value, str)
+    )
+
+    assert "inputs 只提供语义输入提示" not in prompt_text
+    assert "不是 argv key 白名单" not in prompt_text
+    assert "脚本第一轮可以选择清晰、稳定的 argv key" not in prompt_text
+    assert "应优先直接沿用这些 input 字段名" in prompt_text
+
+
+def test_script_producer_prompt_preserves_internal_naming_freedom():
+    prompt_text = "\n".join(
+        value
+        for value in _build_script_generate_file_prompt_variant.__code__.co_consts
+        if isinstance(value, str)
+    )
+
+    assert "脚本内部局部变量名、helper 参数名和 Tool 调用参数名可以自由设计" in prompt_text
+    assert "脚本内部局部变量、helper 参数和 Tool 参数仍由实现自由决定" in prompt_text
 
 
 def test_argv_schema_repair_instruction_treats_guard_as_probe():
