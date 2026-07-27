@@ -115,9 +115,17 @@ def _build_e2e_callable_repair_context(
     if not context.get("resolved_tools"):
         return {}
 
+    selected_tool_ids = {
+        str(tool_id)
+        for key in ("allowed_tool_ids", "primary_tool_ids", "secondary_tool_ids")
+        for tool_id in (binding.get(key) or [])
+        if str(tool_id).strip()
+    }
     compact_tools = []
     for tool in context.get("resolved_tools") or []:
         if not isinstance(tool, dict):
+            continue
+        if str(tool.get("tool_id") or "") not in selected_tool_ids:
             continue
         compact_tools.append({
             "tool_id": tool.get("tool_id"),
@@ -131,11 +139,18 @@ def _build_e2e_callable_repair_context(
             "example_call": tool.get("call_template"),
             "common_mistakes": tool.get("common_mistakes"),
         })
+    if not compact_tools:
+        return {}
     return {
         "authorization_scope": "skill",
         "read_only": True,
         "binding_digest": _tool_binding_digest(binding),
-        "available_tools": context.get("available_tools") or [],
+        "selected_tool_ids": sorted(selected_tool_ids),
+        "available_tools": [
+            tool
+            for tool in (context.get("available_tools") or [])
+            if isinstance(tool, dict) and str(tool.get("tool_id") or "") in selected_tool_ids
+        ],
         "resolved_tools": compact_tools,
     }
 

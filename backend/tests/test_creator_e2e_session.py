@@ -804,6 +804,278 @@ async def test_import_error_repair_prompt_receives_read_only_callable_context(tm
     assert "real_callable_name(text: str) -> dict" in prompt
 
 
+def test_callable_import_change_accepts_exact_selected_registry_identity():
+    context = {
+        "selected_tool_ids": ["tool_alpha"],
+        "resolved_tools": [{
+            "tool_id": "tool_alpha",
+            "import_path": "module_x",
+            "function_name": "fn_alpha",
+        }],
+    }
+
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import tool_alpha\ntool_alpha()\n",
+        "from module_x import fn_alpha\nfn_alpha()\n",
+        context,
+    )
+
+    assert rejected == []
+
+
+def test_callable_import_change_rejects_did_you_mean_name_without_registry_evidence():
+    context = {
+        "selected_tool_ids": ["tool_alpha"],
+        "resolved_tools": [{
+            "tool_id": "tool_alpha",
+            "import_path": "module_x",
+            "function_name": "fn_alpha",
+        }],
+    }
+
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_wrong\nfn_wrong()\n",
+        "from module_x import fn_other\nfn_other()\n",
+        context,
+    )
+
+    assert rejected[0]["reason"] == "callable_repair_evidence_missing"
+
+
+def test_callable_import_change_excludes_global_registry_tools_not_in_selected_context():
+    selected_context = {
+        "selected_tool_ids": ["tool_alpha"],
+        "resolved_tools": [{
+            "tool_id": "tool_alpha",
+            "import_path": "module_x",
+            "function_name": "fn_alpha",
+        }],
+    }
+
+    assert e2e._registry_callable_identities(selected_context) == {("module_x", "fn_alpha")}
+    assert e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_wrong\nfn_wrong()\n",
+        "from module_x import fn_beta\nfn_beta()\n",
+        selected_context,
+    )[0]["reason"] == "callable_repair_evidence_missing"
+
+
+def test_callable_identity_change_rejects_unauthorized_module_alias_call_replacement():
+    selected_context = {
+        "selected_tool_ids": ["tool_alpha"],
+        "resolved_tools": [{
+            "tool_id": "tool_alpha",
+            "import_path": "module_x",
+            "function_name": "fn_alpha",
+        }],
+    }
+
+    assert e2e._unauthorized_callable_identity_change(
+        "import module_x as m\nm.fn_alpha()\n",
+        "import module_x as m\nm.fn_beta()\n",
+        selected_context,
+    )[0]["reason"] == "callable_repair_evidence_missing"
+
+
+def _multi_tool_callable_context():
+    return {
+        "selected_tool_ids": ["tool_alpha", "tool_beta"],
+        "resolved_tools": [
+            {"tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_alpha"},
+            {"tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_alpha_v2"},
+            {"tool_id": "tool_beta", "import_path": "module_x", "function_name": "fn_beta"},
+            {"tool_id": "tool_beta", "import_path": "module_x", "function_name": "fn_beta_v2"},
+        ],
+    }
+
+
+def test_callable_identity_change_rejects_other_skill_tool_direct_call():
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha\nfn_alpha()\n",
+        "from module_x import fn_beta\nfn_beta()\n",
+        _multi_tool_callable_context(),
+    )
+
+    assert rejected[0]["reason"] == "callable_tool_identity_changed"
+    assert rejected[0]["before_tool_owner_counts"] == {"tool_alpha": 1}
+    assert rejected[0]["after_tool_owner_counts"] == {"tool_beta": 1}
+
+
+def test_callable_identity_change_rejects_other_skill_tool_module_alias_call():
+    rejected = e2e._unauthorized_callable_identity_change(
+        "import module_x as m\nm.fn_alpha()\n",
+        "import module_x as m\nm.fn_beta()\n",
+        _multi_tool_callable_context(),
+    )
+
+    assert rejected[0]["reason"] == "callable_tool_identity_changed"
+
+
+def test_callable_identity_change_allows_same_tool_callable_correction():
+    assert e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha\nfn_alpha()\n",
+        "from module_x import fn_alpha_v2\nfn_alpha_v2()\n",
+        _multi_tool_callable_context(),
+    ) == []
+
+
+def test_callable_identity_change_allows_exact_tool_id_to_owned_callable():
+    assert e2e._unauthorized_callable_identity_change(
+        "from module_x import tool_alpha\ntool_alpha()\n",
+        "from module_x import fn_alpha\nfn_alpha()\n",
+        _multi_tool_callable_context(),
+    ) == []
+
+
+def test_callable_identity_change_rejects_unresolved_origin_tool():
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import unknown_callable\nunknown_callable()\n",
+        "from module_x import fn_alpha\nfn_alpha()\n",
+        _multi_tool_callable_context(),
+    )
+
+    assert rejected[0]["reason"] == "callable_origin_tool_unresolved"
+
+
+def test_callable_identity_change_counter_detects_same_set_cross_tool_replacement():
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha, fn_beta\nfn_alpha()\nfn_alpha()\nfn_beta()\n",
+        "from module_x import fn_alpha, fn_beta\nfn_alpha()\nfn_beta()\nfn_beta()\n",
+        _multi_tool_callable_context(),
+    )
+
+    assert rejected[0]["reason"] == "callable_tool_identity_changed"
+    assert rejected[0]["before_callable_identities"] == [["module_x", "fn_alpha"]]
+    assert rejected[0]["after_callable_identities"] == [["module_x", "fn_beta"]]
+
+
+def test_callable_identity_change_rejects_multi_tool_owner_collapse():
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha, fn_beta\nfn_alpha()\nfn_beta()\n",
+        "from module_x import fn_alpha_v2\nfn_alpha_v2()\nfn_alpha_v2()\n",
+        _multi_tool_callable_context(),
+    )
+
+    assert rejected[0]["reason"] == "callable_tool_identity_changed"
+    assert rejected[0]["before_tool_owner_counts"] == {"tool_alpha": 1, "tool_beta": 1}
+    assert rejected[0]["after_tool_owner_counts"] == {"tool_alpha": 2}
+
+
+def test_callable_identity_change_rejects_reverse_multi_tool_owner_collapse():
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha, fn_beta\nfn_alpha()\nfn_beta()\n",
+        "from module_x import fn_beta\nfn_beta()\nfn_beta()\n",
+        _multi_tool_callable_context(),
+    )
+
+    assert rejected[0]["reason"] == "callable_tool_identity_changed"
+    assert rejected[0]["after_tool_owner_counts"] == {"tool_beta": 2}
+
+
+def test_callable_identity_change_allows_multi_tool_owner_preserving_repair():
+    assert e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha, fn_beta\nfn_alpha()\nfn_beta()\n",
+        "from module_x import fn_alpha_v2, fn_beta_v2\nfn_alpha_v2()\nfn_beta_v2()\n",
+        _multi_tool_callable_context(),
+    ) == []
+
+
+def test_callable_identity_change_allows_same_tool_count_preserving_repair():
+    assert e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha\nfn_alpha()\nfn_alpha()\n",
+        "from module_x import fn_alpha_v2\nfn_alpha_v2()\nfn_alpha_v2()\n",
+        _multi_tool_callable_context(),
+    ) == []
+
+
+def test_callable_identity_change_fails_closed_for_shared_callable_owner():
+    context = _multi_tool_callable_context()
+    context["resolved_tools"].extend([
+        {"tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_shared"},
+        {"tool_id": "tool_beta", "import_path": "module_x", "function_name": "fn_shared"},
+    ])
+
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_shared\nfn_shared()\n",
+        "from module_x import fn_alpha\nfn_alpha()\n",
+        context,
+    )
+
+    assert rejected[0]["reason"] == "callable_origin_tool_ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_import_error_without_callable_context_fails_closed(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    skill_dir = root / "demo"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    (skill_dir / "scripts" / "one.py").write_text("print('before')\n", encoding="utf-8")
+    monkeypatch.setattr(e2e.settings, "skills_path", root)
+    monkeypatch.setattr(
+        e2e,
+        "_complete_chat_once_sync_for_e2e",
+        lambda *_args: pytest.fail("diagnosis must not guess without callable evidence"),
+    )
+
+    result = await e2e._repair_existing_file_for_e2e_failure(
+        skill_name="demo",
+        target_path="scripts/one.py",
+        e2e_errors=[
+            "E2E_REPAIR_TARGET=scripts/one.py\nE2E_LAYER=script_exit\n"
+            "ImportError: cannot import name 'fn_wrong' from 'module_x'\n"
+            "Did you mean: 'fn_other'?"
+        ],
+        read_only_callable_context={},
+    )
+
+    assert result["status"] == "still_failed_same_target"
+    assert result["rejection_reason"] == "callable_repair_evidence_missing"
+    assert result["sandbox_executed"] is False
+    assert (skill_dir / "scripts" / "one.py").read_text(encoding="utf-8") == "print('before')\n"
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_receives_selected_callable_facts_and_forbids_traceback_guessing(tmp_path, monkeypatch):
+    skill_dir = _make_skill(tmp_path)
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+    captured = {}
+
+    def fake_complete(messages, *_args):
+        captured["messages"] = messages
+        return json.dumps({
+            "repair_target": "scripts/one.py",
+            "root_cause_hypothesis": "Use the selected Registry callable.",
+            "repair_instruction": "Use fn_alpha from module_x.",
+        })
+
+    monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", fake_complete)
+    context = {
+        "selected_tool_ids": ["tool_alpha"],
+        "resolved_tools": [{
+            "tool_id": "tool_alpha",
+            "import_path": "module_x",
+            "function_name": "fn_alpha",
+        }],
+    }
+
+    diagnosis = await e2e._diagnose_e2e_failure_for_repair(
+        skill_name="demo",
+        skill_dir=skill_dir,
+        e2e_errors=["ImportError: cannot import name 'fn_wrong' from 'module_x'; Did you mean fn_beta?"],
+        e2e_session=session,
+        read_only_callable_context=context,
+    )
+
+    prompt = "\n".join(message["content"] for message in captured["messages"])
+    assert diagnosis["repair_instruction"] == "Use fn_alpha from module_x."
+    assert '"selected_tool_ids": ["tool_alpha"]' in prompt
+    assert '"function_name": "fn_alpha"' in prompt
+    assert "Did you mean" in prompt
+    assert "exact import_path/function_name" in prompt
+    assert "callable_repair_evidence_missing" in prompt
+
+
 def test_callable_runtime_failure_filters_business_type_errors_and_tool_type_errors():
     from backend.services.creator import api
     context = _callable_context()
@@ -839,6 +1111,38 @@ def test_e2e_callable_context_builder_is_read_only_and_empty_context_is_not_call
         {"stderr": "TypeError: whatever() got an unexpected keyword argument"},
         {"resolved_tools": []},
     ) is False
+
+
+def test_e2e_callable_context_builder_projects_only_selected_toolpool_facts(monkeypatch):
+    from backend.services.creator import api
+
+    binding = SimpleNamespace(model_dump=lambda **_kwargs: {
+        "allowed_tool_ids": ["tool_alpha"],
+        "primary_tool_ids": ["tool_alpha"],
+        "secondary_tool_ids": [],
+    })
+    monkeypatch.setattr(api, "load_tool_pool", lambda *_args: object())
+    monkeypatch.setattr(api, "get_file_binding", lambda *_args: binding)
+    monkeypatch.setattr(api, "build_available_tool_context", lambda *_args, **_kwargs: {
+        "available_tools": [
+            {"tool_id": "tool_alpha"},
+            {"tool_id": "tool_beta"},
+        ],
+        "resolved_tools": [
+            {"tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_alpha"},
+            {"tool_id": "tool_beta", "import_path": "module_x", "function_name": "fn_beta"},
+        ],
+    })
+
+    context = api._build_e2e_callable_repair_context(
+        skill_name="demo",
+        target_file="scripts/one.py",
+    )
+
+    assert context["selected_tool_ids"] == ["tool_alpha"]
+    assert [tool["tool_id"] for tool in context["available_tools"]] == ["tool_alpha"]
+    assert [tool["tool_id"] for tool in context["resolved_tools"]] == ["tool_alpha"]
+    assert e2e._registry_callable_identities(context) == {("module_x", "fn_alpha")}
 
 
 def test_e2e_repair_source_forbids_tool_exploration_and_mock_fallbacks():

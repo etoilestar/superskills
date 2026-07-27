@@ -499,16 +499,23 @@ def _script_generation_skeleton(
         role=role,
         skill_plan_entry=skill_plan_entry,
     )
-    input_keys = list(plan_entry.inputs or ["payload"])
+    input_keys = [key for key in (plan_entry.inputs or []) if isinstance(key, str) and key.strip()]
     output_keys = [key for key in (plan_entry.outputs or []) if isinstance(key, str) and key.strip()]
-    if not output_keys:
-        output_keys = ["text"]
+
+    planned_interface_hint = (
+        "Current planned interface:\n"
+        f"inputs: {json.dumps(input_keys, ensure_ascii=False)}\n"
+        f"outputs: {json.dumps(output_keys, ensure_ascii=False)}\n"
+        "Prefer these input names for strict_json_argv_guard and these output names "
+        "for the final stdout object. Do not copy generic field names from examples.\n"
+    )
 
     component_hint = getattr(plan_entry, "component_hint", "") or getattr(plan_entry, "role", "")
     helper_hint = f"# component_hint: {component_hint}\n"
 
     if plan_entry.runtime == "node":
         return (
+            planned_interface_hint +
             "协议骨架（只约束 argv/run/stdout；具体工具调用必须来自 Tool Registry snippets/function cards）：\n"
             + helper_hint +
             "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
@@ -523,6 +530,7 @@ def _script_generation_skeleton(
     if plan_entry.runtime in {"bash", "shell"}:
         helper = "import json,sys; json.loads(sys.argv[1] or '{}'); print(json.dumps({}))"
         return (
+            planned_interface_hint +
             "协议骨架（只约束 $1 JSON argv 与 stdout JSON；具体工具调用必须来自 Tool Registry snippets/function cards）：\n"
             + helper_hint +
             "#!/usr/bin/env bash\n"
@@ -532,6 +540,7 @@ def _script_generation_skeleton(
         )
 
     return (
+        planned_interface_hint +
         "协议骨架（只约束 parse_args/run/main/stdout JSON；具体工具调用必须来自 Tool Registry snippets/function cards）：\n"
         + helper_hint +
         "import json\n"
@@ -542,7 +551,7 @@ def _script_generation_skeleton(
         "        raise ValueError('missing JSON argv')\n"
         "    payload = json.loads(sys.argv[1])\n"
         "    return strict_json_argv_guard(payload, {\n"
-        "        # Fill this spec with the actual argv keys used by run(args).\n"
+        "        # Fill this spec using the planned input names shown above whenever applicable.\n"
         "        # Use {} for true no-input scripts.\n"
         "        # Key names must come from the current script contract/SKILL.md command,\n"
         "        # never from placeholder examples such as input_text.\n"
@@ -1935,10 +1944,11 @@ def _build_script_generate_file_prompt_variant(
             "strict_json_argv_guard(payload, {})，保持统一入口协议。"
         ),
         (
-            "脚本第一轮可以选择清晰、稳定的 argv key；"
-            "SkillPlan/ResponsibilityGraph/workflow allocation/"
-            "local_contract 中的 inputs 只提供语义输入提示和 "
-            "SKILL.md block 参考，不是 argv key 白名单。"
+            "当前脚本结构化合同中的 inputs 是该脚本已规划的运行时输入接口。"
+            "生成 strict_json_argv_guard 时，应优先直接沿用这些 input 字段名，"
+            "不要无必要地重命名、创建同义字段或使用更泛化的字段替代。"
+            "脚本内部局部变量名、helper 参数名和 Tool 调用参数名可以自由设计，"
+            "不要求与外部接口字段同名。"
         ),
         (
             "command_argv_contract、SKILL.md command、E2E repair trace "
@@ -1996,8 +2006,10 @@ def _build_script_generate_file_prompt_variant(
             "所有 required=true constraints 都必须实现；"
             "根据完整 constraint object 理解其语义，不存在固定 constraint vocabulary，"
             "不要忽略不认识的 constraint；"
-            "inputs/outputs 表达语义责任，不要求局部变量名或 argv key "
-            "与这些文本逐字一致。"
+            "inputs/outputs 表达当前脚本与上下游之间已规划的接口语义。"
+            "对外接口应尽量保持一致：strict_json_argv_guard 的 argv keys "
+            "优先沿用 inputs；stdout 交付字段应与 outputs / output_contract 保持一致。"
+            "脚本内部局部变量、helper 参数和 Tool 参数仍由实现自由决定。"
         ),
         (
             "coverage_requirements 是职责覆盖约束，不是 argv/stdout 字段；"
@@ -2068,8 +2080,9 @@ def _build_script_generate_file_prompt_variant(
             "试运行输入只用于验证处理能力，不应写成业务常量。"
         ),
         (
-            "第一轮只生成当前脚本；上下游运行映射、placeholder、"
-            "command block 与脚本 guard 的最终对齐由 E2E 处理。"
+            "第一轮生成时应尽量保持当前 Script contract、argv、stdout "
+            "和已知上下游字段一致。E2E probe 用于观察真实执行映射并发现"
+            "生成阶段未预见的问题，不是主动偏离当前已知接口的理由。"
         ),
         f"prompt_variant: {variant}",
         "当前文件结构化合同：",
