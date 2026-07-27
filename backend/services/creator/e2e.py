@@ -4149,6 +4149,28 @@ def _called_identities(tree: ast.AST) -> Counter[tuple[str, str]]:
     return identities
 
 
+def _callable_owner_counter(
+    calls: Counter[tuple[str, str]],
+    owners: dict[tuple[str, str], set[str]],
+    selected_tool_ids: set[str],
+) -> tuple[Counter[str], Counter[tuple[str, str]], Counter[tuple[str, str]]]:
+    """Project calls to unique Tool owners, retaining unresolved/ambiguous facts."""
+    owner_counts: Counter[str] = Counter()
+    unresolved: Counter[tuple[str, str]] = Counter()
+    ambiguous: Counter[tuple[str, str]] = Counter()
+    for identity, count in calls.items():
+        identity_owners = set(owners.get(identity) or set())
+        if identity[1] in selected_tool_ids:
+            identity_owners.add(identity[1])
+        if not identity_owners:
+            unresolved[identity] += count
+        elif len(identity_owners) > 1:
+            ambiguous[identity] += count
+        else:
+            owner_counts[next(iter(identity_owners))] += count
+    return owner_counts, unresolved, ambiguous
+
+
 def _unauthorized_callable_identity_change(
     before: str,
     after: str,
@@ -4163,9 +4185,7 @@ def _unauthorized_callable_identity_change(
 
     before_calls = _called_identities(before_tree)
     after_calls = _called_identities(after_tree)
-    added = after_calls - before_calls
-    removed = before_calls - after_calls
-    if not added:
+    if before_calls == after_calls:
         return []
 
     owners = _registry_callable_owners(context)
@@ -4175,35 +4195,34 @@ def _unauthorized_callable_identity_change(
         if str(tool_id).strip()
     }
 
-    def identity_owners(identity: tuple[str, str]) -> set[str]:
-        exact_tool_id = identity[1] if identity[1] in selected_tool_ids else ""
-        return set(owners.get(identity) or set()) | ({exact_tool_id} if exact_tool_id else set())
+    before_owner_counts, before_unresolved, before_ambiguous = _callable_owner_counter(
+        before_calls, owners, selected_tool_ids,
+    )
+    after_owner_counts, after_unresolved, after_ambiguous = _callable_owner_counter(
+        after_calls, owners, selected_tool_ids,
+    )
+    added = after_calls - before_calls
+    removed = before_calls - after_calls
+    changed_identities = set(added) | set(removed)
 
-    origin_owners = {
-        owner
-        for identity in removed
-        for owner in identity_owners(identity)
-    }
-    origin_identities = [list(identity) for identity in sorted(removed.elements())]
-    rejections: list[dict[str, Any]] = []
-    for identity in sorted(added.elements()):
-        proposed_owners = identity_owners(identity)
-        if not proposed_owners:
-            reason = "callable_repair_evidence_missing"
-        elif not origin_owners:
-            reason = "callable_origin_tool_unresolved"
-        elif not (origin_owners & proposed_owners):
-            reason = "callable_tool_identity_changed"
-        else:
-            continue
-        rejections.append({
-            "reason": reason,
-            "origin_tool_ids": sorted(origin_owners),
-            "proposed_tool_ids": sorted(proposed_owners),
-            "before_callable_identities": origin_identities,
-            "after_callable_identity": list(identity),
-        })
-    return rejections
+    if any(identity in after_unresolved for identity in added):
+        reason = "callable_repair_evidence_missing"
+    elif any(identity in before_unresolved for identity in removed):
+        reason = "callable_origin_tool_unresolved"
+    elif any(identity in before_ambiguous or identity in after_ambiguous for identity in changed_identities):
+        reason = "callable_origin_tool_ambiguous"
+    elif before_owner_counts != after_owner_counts:
+        reason = "callable_tool_identity_changed"
+    else:
+        return []
+
+    return [{
+        "reason": reason,
+        "before_tool_owner_counts": dict(sorted(before_owner_counts.items())),
+        "after_tool_owner_counts": dict(sorted(after_owner_counts.items())),
+        "before_callable_identities": [list(identity) for identity in sorted(removed.elements())],
+        "after_callable_identities": [list(identity) for identity in sorted(added.elements())],
+    }]
 
 
 def _is_skill_repair_target(skill_dir: Path, target: str) -> bool:

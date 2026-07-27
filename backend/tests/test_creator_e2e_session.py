@@ -884,6 +884,7 @@ def _multi_tool_callable_context():
             {"tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_alpha"},
             {"tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_alpha_v2"},
             {"tool_id": "tool_beta", "import_path": "module_x", "function_name": "fn_beta"},
+            {"tool_id": "tool_beta", "import_path": "module_x", "function_name": "fn_beta_v2"},
         ],
     }
 
@@ -896,8 +897,8 @@ def test_callable_identity_change_rejects_other_skill_tool_direct_call():
     )
 
     assert rejected[0]["reason"] == "callable_tool_identity_changed"
-    assert rejected[0]["origin_tool_ids"] == ["tool_alpha"]
-    assert rejected[0]["proposed_tool_ids"] == ["tool_beta"]
+    assert rejected[0]["before_tool_owner_counts"] == {"tool_alpha": 1}
+    assert rejected[0]["after_tool_owner_counts"] == {"tool_beta": 1}
 
 
 def test_callable_identity_change_rejects_other_skill_tool_module_alias_call():
@@ -945,7 +946,62 @@ def test_callable_identity_change_counter_detects_same_set_cross_tool_replacemen
 
     assert rejected[0]["reason"] == "callable_tool_identity_changed"
     assert rejected[0]["before_callable_identities"] == [["module_x", "fn_alpha"]]
-    assert rejected[0]["after_callable_identity"] == ["module_x", "fn_beta"]
+    assert rejected[0]["after_callable_identities"] == [["module_x", "fn_beta"]]
+
+
+def test_callable_identity_change_rejects_multi_tool_owner_collapse():
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha, fn_beta\nfn_alpha()\nfn_beta()\n",
+        "from module_x import fn_alpha_v2\nfn_alpha_v2()\nfn_alpha_v2()\n",
+        _multi_tool_callable_context(),
+    )
+
+    assert rejected[0]["reason"] == "callable_tool_identity_changed"
+    assert rejected[0]["before_tool_owner_counts"] == {"tool_alpha": 1, "tool_beta": 1}
+    assert rejected[0]["after_tool_owner_counts"] == {"tool_alpha": 2}
+
+
+def test_callable_identity_change_rejects_reverse_multi_tool_owner_collapse():
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha, fn_beta\nfn_alpha()\nfn_beta()\n",
+        "from module_x import fn_beta\nfn_beta()\nfn_beta()\n",
+        _multi_tool_callable_context(),
+    )
+
+    assert rejected[0]["reason"] == "callable_tool_identity_changed"
+    assert rejected[0]["after_tool_owner_counts"] == {"tool_beta": 2}
+
+
+def test_callable_identity_change_allows_multi_tool_owner_preserving_repair():
+    assert e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha, fn_beta\nfn_alpha()\nfn_beta()\n",
+        "from module_x import fn_alpha_v2, fn_beta_v2\nfn_alpha_v2()\nfn_beta_v2()\n",
+        _multi_tool_callable_context(),
+    ) == []
+
+
+def test_callable_identity_change_allows_same_tool_count_preserving_repair():
+    assert e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_alpha\nfn_alpha()\nfn_alpha()\n",
+        "from module_x import fn_alpha_v2\nfn_alpha_v2()\nfn_alpha_v2()\n",
+        _multi_tool_callable_context(),
+    ) == []
+
+
+def test_callable_identity_change_fails_closed_for_shared_callable_owner():
+    context = _multi_tool_callable_context()
+    context["resolved_tools"].extend([
+        {"tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_shared"},
+        {"tool_id": "tool_beta", "import_path": "module_x", "function_name": "fn_shared"},
+    ])
+
+    rejected = e2e._unauthorized_callable_identity_change(
+        "from module_x import fn_shared\nfn_shared()\n",
+        "from module_x import fn_alpha\nfn_alpha()\n",
+        context,
+    )
+
+    assert rejected[0]["reason"] == "callable_origin_tool_ambiguous"
 
 
 @pytest.mark.asyncio
