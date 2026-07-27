@@ -2946,3 +2946,82 @@ def test_responsibility_graph_runtime_input_provenance_accepts_upstream_function
     edge = {"from_node": "scripts/a.py", "from_output": "result", "to_node": "scripts/b.py", "to_input": "input_value", "purpose": "handoff", "constraints": []}
     assert validate_structured_responsibility_edge_transport([edge], function_items=[producer, consumer]) == [edge]
     validate_structured_responsibility_graph_input_closure([producer, consumer], [edge])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reviewed_id", "expected_passed"),
+    [("", True), ("R999", True), ("R2", False)],
+)
+async def test_requirement_coverage_blocks_only_supplied_ids(
+    monkeypatch, reviewed_id, expected_passed,
+):
+    issue = {
+        "issue_type": "requirement_uncovered",
+        "requirement_id": reviewed_id,
+        "affected_targets": [],
+        "reason": "review observation",
+        "repair_guidance": "repair",
+    }
+
+    async def fake_complete(messages, *_args, **_kwargs):
+        return json.dumps({"passed": False, "issues": [issue]})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+    allocations = [
+        {"requirement_id": requirement_id, "requirement": requirement_id,
+         "owners": ["scripts/a.py"], "evidence": {}}
+        for requirement_id in ("R1", "R2")
+    ]
+    review = await api._review_blueprint_semantic_closure(
+        request=_request(), blueprint_text="blueprint",
+        function_items=[_function_item("scripts/a.py")],
+        requirement_allocations=allocations, planner_model="test",
+    )
+
+    assert review["passed"] is expected_passed
+    assert [item["requirement_id"] for item in review["issues"]] == (
+        [] if expected_passed else ["R2"]
+    )
+
+
+def test_requirement_allocation_owner_requires_exact_authoritative_path():
+    from backend.services.creator.contracts import validate_requirement_allocations
+
+    allocation = {
+        "requirement_id": "R1", "requirement": "deliver result",
+        "owners": ["scripts/a.py"],
+        "evidence": {"responsibility": "deliver", "outputs": [], "capabilities": []},
+    }
+    assert validate_requirement_allocations(
+        [allocation], allowed_owner_targets=["scripts/a.py", "scripts/b.py"]
+    )[0]["owners"] == ["scripts/a.py"]
+    with pytest.raises(ValueError, match="outside current FunctionItem domain"):
+        validate_requirement_allocations(
+            [{**allocation, "owners": ["text_generator"]}],
+            allowed_owner_targets=["scripts/a.py", "scripts/b.py"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_semantic_review_prompt_preserves_planning_phase_boundaries(monkeypatch):
+    captured = {}
+
+    async def fake_complete(messages, *_args, **_kwargs):
+        captured["prompt"] = messages[0]["content"]
+        return json.dumps({"passed": True, "issues": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+    await api._review_blueprint_semantic_closure(
+        request=_request(), blueprint_text="references/foo.md",
+        function_items=[_function_item("scripts/a.py")],
+        requirement_allocations=[{
+            "requirement_id": "R1", "requirement": "illustrated output",
+            "owners": ["scripts/a.py"], "evidence": {},
+        }], planner_model="test",
+    )
+
+    prompt = " ".join(captured["prompt"].split())
+    assert "file does not exist" in prompt
+    assert "Actual resource content quality is reviewed after file generation" in prompt
+    assert "text_generation Tool producing image-prompt text is still text_generation" in prompt
