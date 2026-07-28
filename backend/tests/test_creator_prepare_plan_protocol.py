@@ -596,6 +596,16 @@ def test_no_user_upload_asset_keeps_assets_to_upload_empty():
     assert summary.assets_to_upload == []
 
 
+def test_bundled_asset_requires_real_inventory_evidence(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "bundled_skills_path", tmp_path)
+    files = [_file("assets/template.png", asset_source="bundled")]
+    assert api._unresolved_bundled_asset_paths(files, skill_name="demo") == ["assets/template.png"]
+    asset = tmp_path / "demo" / "assets" / "template.png"
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(b"real bundled source")
+    assert api._unresolved_bundled_asset_paths(files, skill_name="demo") == []
+
+
 def test_sync_prepare_summary_files_filters_directories_and_dynamic_paths():
     summary = api.PreparePlanReviewSummary(files_to_create_or_update=["SKILL.md"])
     warnings = api._sync_prepare_summary_files_from_skill_plan(summary, [

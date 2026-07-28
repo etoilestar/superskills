@@ -343,6 +343,7 @@ _ALLOWED_FUNCTION_ITEM_FIELDS = {
     "outputs",
     "required_capabilities",
     "constraints",
+    "default_values",
 }
 
 
@@ -365,7 +366,7 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
     normalized: list[dict[str, object]] = []
     seen_targets: set[str] = set()
     invalid: list[dict[str, object]] = []
-    required = set(_ALLOWED_FUNCTION_ITEM_FIELDS)
+    required = set(_ALLOWED_FUNCTION_ITEM_FIELDS) - {"default_values"}
     for index, item in enumerate(raw_items):
         if not isinstance(item, dict):
             invalid.append({"index": index, "type": type(item).__name__})
@@ -406,6 +407,24 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
         except ValueError as exc:
             invalid.append({"index": index, "error": str(exc)})
             continue
+        normalized_inputs: list[str] = []
+        inline_defaults: dict[str, object] = {}
+        for raw_input in inputs:
+            input_name, inline_default = parse_schema_input_item(raw_input)
+            has_inline_default = "=" in raw_input or bool(re.search(r"(?:default|默认|缺省)", raw_input, re.I))
+            normalized_inputs.append(input_name or raw_input)
+            if input_name and has_inline_default:
+                inline_defaults[input_name] = inline_default
+        inputs = normalized_inputs
+        default_values = item.get("default_values") or {}
+        if not isinstance(default_values, dict):
+            invalid.append({"index": index, "field": "default_values"})
+            continue
+        default_values = {**inline_defaults, **default_values}
+        input_names = set(inputs)
+        if any(not isinstance(key, str) or key not in input_names for key in default_values):
+            invalid.append({"index": index, "field": "default_values", "reason": "keys_must_be_declared_inputs"})
+            continue
         constraints = item.get("constraints")
         if not isinstance(constraints, list) or not all(isinstance(constraint, dict) for constraint in constraints):
             invalid.append({"index": index, "field": "constraints"})
@@ -419,6 +438,7 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             "outputs": outputs,
             "required_capabilities": required_capabilities,
             "constraints": [dict(constraint) for constraint in constraints],
+            "default_values": dict(default_values),
         })
     if invalid:
         raise ValueError(f"{source}.function_items contains invalid function items: {invalid}")
@@ -571,6 +591,11 @@ def validate_structured_responsibility_edge_transport(
     ).strip()
 
     provenance_by_input: dict[tuple[str, str], list[tuple[int, str]]] = {}
+    locally_defaulted_inputs = {
+        (str(item.get("target_file") or ""), str(value))
+        for item in (normalized_function_items if function_items is not None else [])
+        for value in (item.get("default_values") or {})
+    }
     for index, edge in enumerate(normalized_edges):
         from_node = str(edge.get("from_node") or "")
         from_output = str(edge.get("from_output") or "")
@@ -723,6 +748,13 @@ def validate_structured_responsibility_edge_transport(
 
         if to_node != "platform_output_node":
             source_kind = "platform" if from_node == "platform_input_node" else "upstream"
+            if (to_node, to_input) in locally_defaulted_inputs:
+                raise GraphValidationError(
+                    f"provenance_class_conflict: target_file={to_node}; target_input={to_input}; "
+                    "FunctionItem declares a local frozen default but graph declares incoming provenance",
+                    code="provenance_class_conflict",
+                    details={"target_file": to_node, "target_input": to_input, "edge_index": index},
+                )
             provenance_by_input.setdefault((to_node, to_input), []).append((index, source_kind))
 
     for (target_file, target_input), sources in provenance_by_input.items():
@@ -765,11 +797,17 @@ def structured_responsibility_graph_input_provenance_gaps(
         (str(edge.get("to_node") or ""), str(edge.get("to_input") or ""))
         for edge in normalized_edges
     }
+    defaults = {
+        (str(item["target_file"]), str(input_name))
+        for item in normalized_function_items
+        for input_name in (item.get("default_values") or {})
+    }
     return [
         (str(item["target_file"]), input_name)
         for item in normalized_function_items
         for input_name in item["inputs"]
         if (str(item["target_file"]), input_name) not in incoming
+        and (str(item["target_file"]), input_name) not in defaults
     ]
 
 
@@ -978,13 +1016,21 @@ def render_script_command_from_runtime_schema(
         if isinstance(binding, dict) and str(binding.get("argv_key") or "").strip()
     }
 
+    allowed = script_argv_schema.get("allowed_keys") if isinstance(script_argv_schema, dict) else []
+    allowed_keys = {str(item) for item in (allowed or [])}
+    frozen_defaults = dict(getattr(entry, "default_values", {}) or {})
+    command_keys = set(str(item) for item in required if str(item or "").strip())
+    command_keys.update(key for key in frozen_defaults if not allowed_keys or key in allowed_keys)
     payload: dict[str, object] = {}
     missing_bindings: list[str] = []
-    for key in sorted(str(item) for item in required if str(item or "").strip()):
+    for key in sorted(command_keys):
         binding = binding_by_key.get(key)
         template = binding.get("value_template") if isinstance(binding, dict) else None
         if isinstance(template, str) and re.fullmatch(r"\{\{\s*[^{}]+?\s*\}\}", template.strip()):
             payload[key] = template.strip()
+            continue
+        if key in frozen_defaults:
+            payload[key] = frozen_defaults[key]
             continue
         # Without a graph edge/binding, do not invent an internal field name or
         # value template. E2E/dataflow validation should surface a repairable

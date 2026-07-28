@@ -1286,6 +1286,12 @@ def _resolve_patch_span(
             "policy": "generic_text",
         }
 
+    candidates = approx.get("candidates") or []
+    candidate_text = "\n\n".join(
+        f"CANDIDATE {index}:\n{item.get('matched_excerpt') or ''}\n"
+        f"similarity={float(item.get('similarity') or 0):.3f}"
+        for index, item in enumerate(candidates, 1)
+    )
     raise ValueError(
         f"edits[{edit_index}].old 在当前文件中没有 exact/normalized/fuzzy 唯一可靠匹配。"
         f"reason={approx.get('reason')}; "
@@ -1293,9 +1299,9 @@ def _resolve_patch_span(
         f"second_similarity={float(approx.get('second_similarity') or 0):.3f}; "
         f"full_file_similarity={full_similarity:.3f}; "
         "请提供更长唯一 old，或提交与当前全文高度一致的 full-file fallback。\n"
-        "最相近候选原文片段如下，可在下一轮直接复制为 old：\n"
+        "当前源码候选区域如下：\n"
         "```text\n"
-        f"{approx.get('matched_excerpt') or ''}\n"
+        f"{candidate_text or approx.get('matched_excerpt') or ''}\n"
         "```"
     )
 
@@ -1334,6 +1340,13 @@ def _find_approximate_substring_span(content: str, query: str) -> dict[str, Any]
 
     q_len = len(norm_query)
     candidate_ranges: set[tuple[int, int]] = set()
+    search_from = 0
+    while True:
+        exact_pos = norm_content.find(norm_query, search_from)
+        if exact_pos < 0:
+            break
+        candidate_ranges.add((exact_pos, exact_pos + q_len))
+        search_from = exact_pos + 1
     matcher = difflib.SequenceMatcher(None, norm_query, norm_content, autojunk=False)
     for block in matcher.get_matching_blocks():
         if block.size < max(4, min(20, q_len // 8)):
@@ -1394,6 +1407,18 @@ def _find_approximate_substring_span(content: str, query: str) -> dict[str, Any]
         if item["similarity"] >= best["similarity"] - 1e-9 and not substantially_overlaps(best, item)
     ]
     second_similarity = next((item["similarity"] for item in scored[1:] if not substantially_overlaps(best, item)), 0.0)
+    distinct_candidates: list[dict[str, Any]] = []
+    for item in scored:
+        if any(substantially_overlaps(item, existing) for existing in distinct_candidates):
+            continue
+        distinct_candidates.append(item)
+        if len(distinct_candidates) >= 3:
+            break
+    # These are source facts for the next model attempt, not a backend choice.
+    best["candidates"] = [
+        {"matched_excerpt": item["matched_excerpt"], "similarity": float(item["similarity"])}
+        for item in distinct_candidates
+    ]
     best["second_similarity"] = second_similarity
     best["candidate_count"] = len(scored)
 
@@ -2665,15 +2690,7 @@ async def _request_and_apply_repair_patch(
             if is_markdown_hard_format_regression:
                 raise
 
-            # repeated semantic patch 才直接停止。
-            #
-            # CreatorRepairNoopPatch 不再在这里 break，
-            # 必须进入下面的 NO_OP_PATCH_REJECTED feedback。
-            if (
-                "REPEATED_UNAPPLICABLE_PROPOSAL"
-                in str(exc)
-            ):
-                break
+            repeated_unapplicable = "REPEATED_UNAPPLICABLE_PROPOSAL" in str(exc)
 
             logger.warning(
                 "[Creator][repair_patch]"
@@ -2721,6 +2738,24 @@ async def _request_and_apply_repair_patch(
                     "NEW 在该片段基础上追加缺失内容。"
                 )
 
+            ambiguous_old = any(reason in str(exc) for reason in (
+                "matched_span_not_unique", "best_second_best_margin_too_small",
+            ))
+            ambiguity_note = (
+                "PATCH_OLD_AMBIGUOUS：上一轮 OLD 在当前文件中存在多个可靠候选，"
+                "Backend 无法安全确定修改位置。当前 proposal 已拒绝，但 repair 可以继续。\n"
+                "请重新提交相同修复目标的 patch：使用更长或更有区分度的 OLD，"
+                "增加目标前后的真实上下文，不要再次提交完全相同的 OLD。"
+                "Exact OLD is preferred but not required. The OLD must identify one intended "
+                "source region with sufficient uniqueness. Backend 仍允许 normalized/fuzzy matching。\n\n"
+                if ambiguous_old else ""
+            )
+            repeated_note = (
+                "REPEATED_UNAPPLICABLE_PROPOSAL 只拒绝当前 proposal；retry 尚未耗尽。"
+                "必须扩大 OLD 或加入不同的真实上下文。\n\n"
+                if repeated_unapplicable else ""
+            )
+
             apply_feedback = (
                 "\n\n"
                 "PATCH_APPLY_OR_PARSE_FAILED："
@@ -2728,14 +2763,15 @@ async def _request_and_apply_repair_patch(
                 f"失败类型："
                 f"{type(exc).__name__}\n"
                 f"失败原因：{exc}\n\n"
+                f"{ambiguity_note}{repeated_note}"
                 f"{runtime_priority_note}\n\n"
                 f"{no_op_note}\n\n"
                 "请重新输出 literal OLD/NEW exact_replace "
                 "patch envelope。"
                 "不要输出完整文件、JSON patch "
                 "或 unified diff。\n"
-                "OLD 必须从当前目标文件逐字复制，"
-                "且只出现一次。\n"
+                "Exact OLD is preferred but not required；"
+                "OLD 必须以足够唯一性标识一个目标源码区域。\n"
                 "NEW 必须真实改变当前失败内容。\n"
                 "OLD/NEW 中的引号和反斜杠"
                 "是目标文件字面内容；"
@@ -2792,7 +2828,7 @@ async def _request_and_apply_repair_patch(
     )
 
     raise ValueError(
-        "修复模型连续提出无法解析或无法应用的 patch，"
+        "repair_transport_exhausted：修复模型连续提出无法解析或无法应用的 patch，"
         "已停止本轮 repair。\n"
         f"target_file={file_path}\n"
         f"last_error={last_error_type}: "
@@ -3062,9 +3098,16 @@ async def _repair_generated_file_with_feedback(
     structured_failures: list[Mapping[str, Any]] = []
     parsed_failure_json = _parse_validator_json_object(failed_checks_text)
     if isinstance(parsed_failure_json, dict):
-        maybe = parsed_failure_json.get("failures") or parsed_failure_json.get("failed_checks")
+        maybe = (
+            parsed_failure_json.get("failures")
+            or parsed_failure_json.get("failed_checks")
+            or parsed_failure_json.get("issues")
+        )
         if isinstance(maybe, list):
-            structured_failures = [item for item in maybe if isinstance(item, Mapping)]
+            structured_failures = [
+                item for item in maybe
+                if isinstance(item, Mapping) and item.get("repair_ops")
+            ]
     else:
         try:
             maybe = json.loads(failed_checks_text) if failed_checks_text else None

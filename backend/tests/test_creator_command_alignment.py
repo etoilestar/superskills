@@ -62,3 +62,33 @@ def test_invalid_confirmed_binding_is_demoted_to_candidate():
     assert snapshot["confirmed_bindings"] == {}
     assert snapshot["candidate_bindings"]["content"]["source"] == "not_available"
     assert snapshot["candidate_bindings"]["content"]["source_available"] is False
+
+
+def test_snapshot_exposes_actual_schema_and_typed_frozen_defaults():
+    script = '''from backend.services.runtime_tools import strict_json_argv_guard
+def parse(payload):
+    return strict_json_argv_guard(payload, {"arg_A": {"type": "string"}, "arg_B": {"type": "integer"}})
+'''
+    snapshot = build_command_alignment_snapshot(
+        script_path="scripts/x.py", script_content=script,
+        platform_input_fields=["user_request"],
+        function_execution_context={"incoming_edges": [{"from_output": "user_request", "to_input": "arg_A"}]},
+        script_defaults={"arg_B": 3},
+    )
+    assert snapshot["actual_argv_schema"]["keys"] == ["arg_A", "arg_B"]
+    assert snapshot["frozen_defaults"] == {"arg_B": 3}
+    assert "arg_B" not in snapshot["unresolved_target_keys"]
+
+
+def test_snapshot_confirms_exact_platform_parameter_source_key():
+    snapshot = build_command_alignment_snapshot(
+        script_path="scripts/x.py", script_content=SCRIPT,
+        platform_input_fields=["fields"],
+        function_execution_context={"incoming_edges": [{
+            "from_node": "platform_input_node", "from_output": "fields",
+            "to_input": "content", "constraints": [{
+                "type": "platform_parameter_binding", "source_key": "topic",
+            }],
+        }]},
+    )
+    assert snapshot["confirmed_bindings"] == {"content": "fields.topic"}

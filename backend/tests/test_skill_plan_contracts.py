@@ -1959,6 +1959,25 @@ def test_runtime_schema_missing_binding_reports_diagnostic():
     assert exc_info.value.missing_keys == [argv_key]
 
 
+def test_runtime_schema_uses_actual_keys_graph_source_and_typed_frozen_default():
+    from backend.services.skill_plan import SkillPlanEntry, render_script_command_from_runtime_schema
+
+    entry = SkillPlanEntry(
+        path="scripts/story.py", file_type="script", role="worker", purpose="run",
+        runtime="python", default_values={"arg_B": 3},
+        command_arg_bindings=[{
+            "argv_key": "arg_A", "value_template": "{{user_request}}",
+        }],
+    )
+    command = render_script_command_from_runtime_schema(
+        entry,
+        {"allowed_keys": ["arg_A", "arg_B"], "required_keys": ["arg_A", "arg_B"],
+         "expected_types": {"arg_A": "string", "arg_B": "integer"}},
+    )
+    assert command == 'python scripts/story.py \'{"arg_A":"{{user_request}}","arg_B":3}\''
+    assert "story_text" not in command and "fields.arg_B" not in command
+
+
 def test_runtime_schema_renders_subsequent_stdout_placeholders():
     from backend.services.skill_plan import SkillPlanEntry, render_script_command_from_runtime_schema
     first_stdout_field = "dynamic_stdout_field"

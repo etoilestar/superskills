@@ -4173,6 +4173,22 @@ def _creator_upload_source_path(item: dict[str, Any]) -> Path:
         raise HTTPException(status_code=400, detail="confirmed_uploaded_assets 源文件必须来自 Creator 上传目录。")
     return source
 
+
+def _unresolved_bundled_asset_paths(
+    files: list[FileSpecOut], *, skill_name: str
+) -> list[str]:
+    """Require bundled declarations to resolve in the platform inventory."""
+    inventory_root = (settings.bundled_skills_path / skill_name).resolve()
+    unresolved: list[str] = []
+    for file_spec in files or []:
+        path = str(getattr(file_spec, "path", "") or "")
+        if not path.startswith("assets/") or getattr(file_spec, "asset_source", "") != "bundled":
+            continue
+        candidate = (inventory_root / path).resolve()
+        if not candidate.is_relative_to(inventory_root) or not candidate.is_file():
+            unresolved.append(path)
+    return unresolved
+
 def _copy_confirmed_uploaded_assets_to_skill(skill_name: str, confirmed_uploaded_assets: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     skill_dir = settings.skills_path / _validate_skill_name(skill_name)
     assets_dir = (skill_dir / "assets").resolve()
@@ -6354,6 +6370,9 @@ when required is false. A platform_parameter_binding is required only when
 selecting a dynamic child parameter; a whole structured input root may be passed
 directly without that constraint. Creation-time fixed configuration is an
 upstream Blueprint decision. Do not remove an input during localized graph repair.
+If a FunctionItem input has an explicit frozen/default value, it is locally
+resolved. Do not create a platform_input_node edge for it and do not externalize
+it merely to satisfy graph closure.
 
 Before returning, verify every declared runtime input has exactly one legal
 provenance; every from_output and to_input exists; required final outputs have a
@@ -6420,11 +6439,15 @@ def _build_responsibility_graph_construction_context(
             function_items, source="graph_construction_context"
         ):
             if item["target_file"] in allowed:
-                node_contracts.append({
+                node_contract = {
                     "node": item["target_file"],
                     "inputs": list(item["inputs"]),
                     "outputs": list(item["outputs"]),
-                })
+                }
+                frozen_defaults = dict(item.get("default_values") or {})
+                if frozen_defaults:
+                    node_contract["frozen_defaults"] = frozen_defaults
+                node_contracts.append(node_contract)
     else:
         parsed = parse_blueprint(
             [{"role": "assistant", "content": frozen_blueprint_text}], strict=True
@@ -6432,11 +6455,14 @@ def _build_responsibility_graph_construction_context(
         for entry in (parsed.skill_plan.files if parsed.skill_plan else []):
             if entry.path not in allowed:
                 continue
-            node_contracts.append({
+            node_contract = {
                 "node": entry.path,
                 "inputs": list(entry.inputs),
                 "outputs": list(entry.outputs),
-            })
+            }
+            if entry.default_values:
+                node_contract["frozen_defaults"] = dict(entry.default_values)
+            node_contracts.append(node_contract)
 
     platform_boundary = build_platform_io_contract()["platform_skill_boundary"]
     legal_sources = [
@@ -6455,6 +6481,7 @@ def _build_responsibility_graph_construction_context(
         }
         for item in node_contracts
         for input_name in item["inputs"]
+        if input_name not in item.get("frozen_defaults", {})
     ]
     allowed_nodes = [
         "platform_input_node",
@@ -6560,6 +6587,7 @@ def _frozen_function_items_from_blueprint(
             "outputs": list(entry.outputs),
             "required_capabilities": list(entry.required_capabilities),
             "constraints": list(entry.constraints),
+            "default_values": dict(entry.default_values),
         }
         for entry in (parsed.skill_plan.files if parsed.skill_plan else [])
         if entry.path in allowed
@@ -6601,6 +6629,9 @@ legal source domain but does not choose the semantically correct source for you.
 Close platform input/output boundaries and use only exact declared endpoints.
 Do not invent aliases, functions, inputs, outputs, or platform slots. If frozen
 FunctionItems make closure impossible, do not redesign them.
+An input with an explicit frozen/default value is locally resolved. Do not
+create a platform_input_node edge for it unless the frozen contract explicitly
+declares it runtime-configurable, and never externalize a default for closure.
 
 Before returning, verify every declared runtime input has exactly one legal
 provenance; every from_output and to_input exists; required final outputs have a
@@ -7280,7 +7311,7 @@ Do not emit FunctionItems in this first pass.
 Do not emit ResponsibilityEdges in this first pass.
 Do not plan the ResponsibilityGraph in this first pass.
 
-internal_blueprint_text is the human-readable Blueprint view and must contain the complete SkillPlan file responsibility information: path, role, purpose, inputs, outputs, dependencies, required_capabilities, forbidden_capabilities, references, constraints, and existing file-local metadata.
+internal_blueprint_text is the human-readable Blueprint view and must contain the complete SkillPlan file responsibility information: path, role, purpose, inputs, outputs, default_values, dependencies, required_capabilities, forbidden_capabilities, references, constraints, and existing file-local metadata. Any input decided as internal_default, constant, or creation-time fixed must be recorded in that script entry's structured default_values with its native JSON type; prose-only defaults are invalid.
 
 The first pass only follows the FilePlan protocol. It may plan SKILL.md, scripts/**, references/**, assets/**, and config files.
 
@@ -7512,7 +7543,7 @@ Blueprint / FilePlan 中必须存在真正拥有并执行该 action 的 scripts/
 
 ## file-local responsibility metadata
 
-每个 SkillPlan entry 都必须显式包含 path、role、purpose、inputs、outputs、dependencies、required_capabilities、forbidden_capabilities、references、constraints 以及现有 file-local metadata。
+每个 SkillPlan entry 都必须显式包含 path、role、purpose、inputs、outputs、default_values、dependencies、required_capabilities、forbidden_capabilities、references、constraints 以及现有 file-local metadata。internal_default、constant 或 creation-time fixed input 必须以原生 JSON 类型写入该脚本的 structured default_values，不能只写在 prose。
 
 每个 script 必须具有一个清晰的主要业务职责。
 
@@ -10676,6 +10707,25 @@ async def _prepare_plan_impl(
             plan.asset_requirements,
         )
     )
+    unresolved_bundled_assets = _unresolved_bundled_asset_paths(
+        plan.files, skill_name=skill_name
+    )
+    if unresolved_bundled_assets:
+        summary = await project_summary(plan.blueprint_text or blueprint_text, prepared)
+        return PreparePlanResponse(
+            status="blocked",
+            prepare_stage="asset_source_unresolved",
+            clarifying_questions=[],
+            review_summary=_strip_prepare_summary_risks(summary),
+            blueprint_text=plan.blueprint_text or blueprint_text,
+            skill_name=skill_name,
+            creation_blockers=[_prepare_protocol_issue(
+                "asset_source_unresolved",
+                "Bundled asset declaration has no matching file in the platform bundled inventory: "
+                + ", ".join(unresolved_bundled_assets),
+                field="SkillPlan",
+            )],
+        )
     missing_required_upload_assets = [
         path
         for path

@@ -98,7 +98,7 @@ def test_fallback_still_respects_changed_line_count_scope():
 
 
 @pytest.mark.asyncio
-async def test_repeated_unapplicable_proposal_is_rejected_without_third_retry(monkeypatch):
+async def test_repeated_unapplicable_proposal_consumes_full_retry_budget(monkeypatch):
     calls = 0
     proposal = _proposal(target_file="scripts/main.py", old="missing exact old", new="replacement")
 
@@ -110,7 +110,7 @@ async def test_repeated_unapplicable_proposal_is_rejected_without_third_retry(mo
     monkeypatch.setattr(repair, "_request_repair_diff_proposal", fake_request)
 
     scope = CreatorRepairScope(phase="test", repair_type="test", target_file="scripts/main.py")
-    with pytest.raises(ValueError, match="REPEATED_UNAPPLICABLE_PROPOSAL"):
+    with pytest.raises(ValueError, match="repair_transport_exhausted"):
         await _request_and_apply_repair_patch(
             model="test-model",
             file_path="scripts/main.py",
@@ -122,7 +122,16 @@ async def test_repeated_unapplicable_proposal_is_rejected_without_third_retry(mo
             patch_retry_limit=3,
         )
 
-    assert calls == 2
+    assert calls == 3
+
+
+def test_ambiguous_fuzzy_match_returns_multiple_real_source_candidates():
+    source = "PREFIX alpha target value one SUFFIX\nPREFIX alpha target value one SUFFIX\n"
+    result = repair._find_approximate_substring_span(source, "PREFIX alpha target value one SUFFIX")
+    assert result["accepted"] is False
+    assert result["reason"] in {"matched_span_not_unique", "best_second_best_margin_too_small"}
+    assert len(result["candidates"]) >= 2
+    assert all(candidate["matched_excerpt"] in source for candidate in result["candidates"])
 
 
 @pytest.mark.asyncio

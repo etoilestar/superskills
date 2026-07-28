@@ -1458,7 +1458,7 @@ def _existing_script_argv_context_for_skill_md(
             platform_input_fields=platform_context,
             prior_stdout_fields=declared_prior_stdout_by_path.get(script_path, []),
             function_execution_context=function_execution_context if isinstance(function_execution_context, dict) else {},
-            script_defaults=(run_analysis or {}).get("defaulted_keys") or (schema or {}).get("defaulted_keys") or [],
+            script_defaults=dict(getattr(entry, "default_values", {}) or {}),
             e2e_verified_bindings=(e2e_verified_bindings_by_script or {}).get(script_path, {}),
         )
 
@@ -2341,6 +2341,8 @@ def _build_generate_file_prompt(
             "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径。脚本路径后必须紧跟一个完整的输入 JSON object，并使用一对 ASCII 单引号包裹整个 JSON object，使其在 shell 中作为脚本路径后的第一个位置参数传入；JSON object 内部的字段名和字符串值必须继续使用标准 JSON 双引号。该输入 JSON 对应 Python 脚本中的 `sys.argv[1]`。\n"
             "6a. 每个 scripts/*.py command block 附近必须写普通 Markdown action schema 声明：role、inputs、outputs；这些是使用说明，不是运行时 hard schema。\n"
             "6b. 输入 JSON key 必须使用对应脚本真实 strict_json_argv_guard schema 中的字段；如果 guard 不完整，再以 run_args_analysis 和 function_execution_context/function_item_graph_context 为事实依据补足，不能自行编造业务字段或别名。\n"
+            "6b-1. actual_argv_schema 是 argv key identity 的唯一 authority；必须逐字复制 key，不得根据 role、purpose 或蓝图 prose 重命名。confirmed_bindings/exact incoming Graph provenance 与 frozen_defaults 只决定这些 key 的 value。\n"
+            "6b-2. frozen_defaults 中的值必须按原生 JSON 类型直接序列化；不得改为 fields/options placeholder。confirmed_bindings 必须使用该 target key 对应的精确 source，不得换用另一个可用字段。\n"
             "6c. 输入字段是脚本入口接口字段，不是平台字段白名单；输入值必须绑定到平台输入、责任图谱 incoming edge、已排序前序 stdout、reference/assets、literal_default、runtime_constant 或脚本默认值中的真实来源。\n"
             "6d. 不要为同一语义输入同时编造多个别名字段；选定一个输入字段后，command block、输入 JSON 说明和正文说明要一致。\n"
             "6e. 必填动态参数不能写成普通示例字符串、字段名字符串或只重复参数名的字符串；动态值必须使用 `{{...}}` placeholder，并且 placeholder 根节点必须存在于允许来源。\n"

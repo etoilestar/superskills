@@ -244,6 +244,7 @@ class FunctionItem(BaseModel):
     owner_step: Optional[str] = None
     purpose: str = ""
     inputs: list[str] = Field(default_factory=list)
+    default_values: dict[str, Any] = Field(default_factory=dict)
     outputs: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)
     required_tools: list[str] = Field(default_factory=list)
@@ -662,6 +663,7 @@ def build_default_responsibility_graph(
                 role=str(raw_item.get("role") or "").strip(),
                 purpose=purpose,
                 inputs=[str(value) for value in raw_item.get("inputs") or []],
+                default_values=dict(raw_item.get("default_values") or {}),
                 outputs=[str(value) for value in raw_item.get("outputs") or []],
                 required_tools=[str(value) for value in raw_item.get("required_capabilities") or []],
                 optional_tools=[],
@@ -833,6 +835,8 @@ def build_default_responsibility_graph(
                 ),
 
                 inputs=inputs,
+
+                default_values=dict(getattr(file_spec, "default_values", {}) or {}),
 
                 outputs=outputs,
 

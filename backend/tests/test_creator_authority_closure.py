@@ -169,6 +169,77 @@ def test_platform_input_binding_resolves_input():
     assert structured_responsibility_graph_input_provenance_gaps(items, edges) == []
 
 
+def test_frozen_default_resolves_input_without_platform_edge():
+    items = [_function("scripts/a.py", ["arg_A", "arg_B=3"], ["result"])]
+    edges = [_edge("platform_input_node", "user_request", "scripts/a.py", "arg_A")]
+    assert structured_responsibility_graph_input_provenance_gaps(items, edges) == []
+    context = api._build_responsibility_graph_construction_context(
+        frozen_blueprint_text="", allowed_function_item_targets=["scripts/a.py"],
+        function_items=items, responsibility_edges=edges,
+    )
+    assert context["node_contracts"][0]["frozen_defaults"] == {"arg_B": 3}
+    assert [domain["target_input"] for domain in context["input_source_domains"]] == ["arg_A"]
+
+
+def test_graph_rejects_external_provenance_for_frozen_default():
+    items = [_function("scripts/a.py", ["arg_B=3"], ["result"])]
+    edges = [_edge("platform_input_node", "user_request", "scripts/a.py", "arg_B")]
+    with pytest.raises(Exception, match="provenance_class_conflict"):
+        validate_structured_responsibility_edge_transport(edges, function_items=items)
+
+
+def test_blueprint_freeze_preserves_typed_structured_defaults():
+    blueprint = """## 📋 Skill 架构蓝图
+### 基本信息
+- **Skill 名称**: typed-defaults
+### I/O 契约
+- **输入**: user_request
+- **输出**: result
+### 目录结构
+- SKILL.md
+- scripts/: `scripts/a.py`
+- references/: 无需创建
+- assets/: 无需创建
+### 工作流逻辑
+1. Run the worker.
+### SkillPlan / 文件职责计划
+- path: `SKILL.md`
+  role: skill_overview
+  purpose: usage
+  inputs: []
+  outputs: []
+  dependencies: [scripts/a.py]
+  required_capabilities: []
+  business_forbidden_capabilities: []
+  references: []
+- path: `scripts/a.py`
+  role: worker
+  purpose: run
+  inputs: [arg_A, count, enabled, title]
+  outputs: [result]
+  default_values: [count=3, enabled=true, title="demo"]
+  dependencies: []
+  required_capabilities: []
+  business_forbidden_capabilities: []
+  references: []
+### 宿主执行方式
+- **直接回答**: no
+- **需要脚本/命令**: scripts/a.py
+- **禁止隐式执行**: yes
+- **执行后回答**: result
+### 资源清单
+- none
+"""
+    items = api._frozen_function_items_from_blueprint(
+        frozen_blueprint_text=blueprint,
+        allowed_function_item_targets=["scripts/a.py"],
+    )
+    assert items[0]["inputs"] == ["arg_A", "count", "enabled", "title"]
+    assert items[0]["default_values"] == {"count": 3, "enabled": True, "title": "demo"}
+    edges = [_edge("platform_input_node", "user_request", "scripts/a.py", "arg_A")]
+    assert structured_responsibility_graph_input_provenance_gaps(items, edges) == []
+
+
 def test_graph_construction_context_contains_only_frozen_structured_topology():
     item = _function("scripts/a.py", ["value"], ["result"])
     context = api._build_responsibility_graph_construction_context(
