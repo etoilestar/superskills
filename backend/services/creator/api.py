@@ -7364,6 +7364,10 @@ required_capabilities 只表达当前 scripts/*.py
 - 不得用 previous_blueprint_text、review_summary 或模型旧摘要覆盖 user_request / human_feedback 的用户原话；
 - 用户已经说清楚的内容不要重复追问；
 - 修订 Blueprint 时只能替换被最新反馈明确冲突覆盖的部分，其他已确认业务要求必须继续进入 workflow、FilePlan purpose、outputs、constraints 或 forbidden_capabilities。
+- 用户已经明确提供或已经确认的需求，后续 prepare 轮次必须保持不变，除非最新 human_feedback 明确修改该项；这是 user requirement → clarification answer → Blueprint 的单向继承关系；
+- 已确认的 runtime input、final output / artifact、required business actions 不得在重新生成 Blueprint 时重新解释或重新询问；已经问过并得到明确回答的问题不得再次询问；
+- 实现需要某个参数不代表用户必须提供该参数。用户没有明确要求运行时控制的普通实现参数，优先写入对应 script 的 default_values，不得自动提升为 runtime input；
+- 不得为了让 ResponsibilityGraph provenance 闭合，把内部默认参数改成 platform_input_node 输入。
 
 ## 业务动作方向必须保持
 

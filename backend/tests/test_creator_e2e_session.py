@@ -142,6 +142,11 @@ def test_e2e_seed_uses_frozen_platform_input_provenance_and_default(tmp_path):
         [command],
         skill_dir=skill_dir,
         requirements_by_file=requirements,
+        skill_plan_entries={
+            "scripts/x.py": SimpleNamespace(
+                inputs=[], outputs=[], artifact_contract={}, default_values={"arg_B": 5}
+            )
+        },
     )
 
     assert payload["root_A"]["arg_B"] == 7
@@ -205,6 +210,62 @@ def test_e2e_seed_uses_exact_command_path_for_unconstrained_frozen_edge(tmp_path
     )
     assert "root_A" not in mismatched_payload
     assert "root_B" not in mismatched_payload
+
+
+def _default_value_seed_case(tmp_path, *, external_context=None):
+    skill_dir = tmp_path / "skillplan-default-input"
+    skill_dir.mkdir()
+    edge = {
+        "from_node": "platform_input_node",
+        "from_output": "root_A",
+        "to_node": "scripts/x.py",
+        "to_input": "count",
+        "purpose": "provide runtime input",
+        "constraints": [],
+    }
+    (skill_dir / "SKILL.md").write_text(
+        "# Frozen input\nResponsibilityEdges: " + json.dumps([edge]),
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(
+        1,
+        "SKILL.md",
+        "scripts/x.py",
+        "python scripts/x.py '{}'",
+        "python",
+        {"count": "{{root_A.count}}"},
+    )
+    return e2e._seed_initial_e2e_payload(
+        [command],
+        external_context=external_context,
+        skill_dir=skill_dir,
+        requirements_by_file={
+            "scripts/x.py": [
+                e2e.RequirementItem(target_file="scripts/x.py", inputs=["count: int"])
+            ]
+        },
+        skill_plan_entries={
+            "scripts/x.py": SimpleNamespace(
+                inputs=[], outputs=[], artifact_contract={}, default_values={"count": 5}
+            )
+        },
+    )
+
+
+def test_e2e_seed_uses_skillplan_default_value_before_typed_sample(tmp_path):
+    payload = _default_value_seed_case(tmp_path)
+
+    assert payload["root_A"]["count"] == 5
+    assert isinstance(payload["root_A"]["count"], int)
+
+
+def test_e2e_seed_preserves_external_value_over_skillplan_default(tmp_path):
+    payload = _default_value_seed_case(
+        tmp_path,
+        external_context={"root_A": {"count": 8}},
+    )
+
+    assert payload["root_A"]["count"] == 8
 
 
 def test_checkpoint_saved_and_resume_from_changed_step(tmp_path, monkeypatch):

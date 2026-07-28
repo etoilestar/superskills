@@ -1732,6 +1732,13 @@ def _seed_initial_e2e_payload(
         (spec.target_file, spec.name): spec
         for spec in typed_specs
     }
+    defaults_by_target = {
+        (target_file, str(input_name)): default_value
+        for target_file, entry in (skill_plan_entries or {}).items()
+        for input_name, default_value in (
+            getattr(entry, "default_values", {}) or {}
+        ).items()
+    }
     responsibility_edges = parse_responsibility_edges(
         _read_e2e_skill_md_for_samples(skill_dir)
     )
@@ -1786,6 +1793,10 @@ def _seed_initial_e2e_payload(
             continue
         if binding is not None and "default" in binding and binding.get("default") is not None:
             container[key_parts[-1]] = binding["default"]
+            continue
+        target_default = (target_file, target_input)
+        if target_default in defaults_by_target:
+            container[key_parts[-1]] = defaults_by_target[target_default]
             continue
         if binding is not None and "sample" in binding and binding.get("sample") is not None:
             container[key_parts[-1]] = binding["sample"]

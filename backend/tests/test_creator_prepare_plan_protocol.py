@@ -1266,6 +1266,11 @@ async def test_blueprint_planner_prompt_preserves_confirmed_decision_contract(mo
     assert "clarification answer 不是参考意见" in prompt
     assert "Blueprint planning 输入契约" in prompt
     assert "不得通过修改 Blueprint 业务目标来规避工具缺失" in prompt
+    assert "已确认的 runtime input、final output / artifact、required business actions" in prompt
+    assert "已经问过并得到明确回答的问题不得再次询问" in prompt
+    assert "优先写入对应 script 的 default_values" in prompt
+    assert "不得自动提升为 runtime input" in prompt
+    assert "不得为了让 ResponsibilityGraph provenance 闭合" in prompt
 
 
 @pytest.mark.asyncio
