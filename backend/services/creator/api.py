@@ -5324,7 +5324,6 @@ async def _repair_prepare_blueprint_protocol(
     repaired = str(
         blueprint_text or ""
     )
-    original_non_resource_paths = _extract_prepare_non_resource_paths(repaired)
 
     seen = {
         repaired
@@ -5357,6 +5356,12 @@ async def _repair_prepare_blueprint_protocol(
         ]
         issue_codes = [str(item.get("code") or "") for item in current_errors if isinstance(item, dict)]
         issue_paths = [str(item.get("path") or item.get("field") or "") for item in current_errors if isinstance(item, dict)]
+        is_resource_authority_repair = "unjustified_resource_reference" in issue_codes
+        original_non_resource_paths = (
+            _extract_prepare_non_resource_paths(repaired)
+            if is_resource_authority_repair
+            else []
+        )
         logger.info(
             "[Creator][blueprint_repair] attempt=%d issue_codes=%s issue_paths=%s",
             repair_index + 1, issue_codes, issue_paths,
@@ -5472,9 +5477,14 @@ Creator 协议边界：
             else _normalize_prepare_blueprint_references(candidate)
         )
 
-        # Protocol/resource repair may edit resource declarations, but the
-        # executable FilePlan topology was already decided by the Planner.
-        if _extract_prepare_non_resource_paths(candidate) != original_non_resource_paths:
+        # Resource-authority repair may edit resource declarations only. Other
+        # protocol repairs can correct an invalid script path reported by their
+        # validator feedback.
+        if (
+            is_resource_authority_repair
+            and _extract_prepare_non_resource_paths(candidate)
+            != original_non_resource_paths
+        ):
             continue
 
         candidate_errors = (

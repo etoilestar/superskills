@@ -856,6 +856,31 @@ async def test_blueprint_resource_repair_rejects_script_topology_change(monkeypa
     ]
 
 
+@pytest.mark.asyncio
+async def test_blueprint_protocol_repair_can_correct_invalid_script_path(monkeypatch):
+    initial = _ready_blueprint(
+        _skill_plan_block("\n" + _script_plan_block("scripts/<name>.py"))
+    )
+    repaired_candidate = initial.replace("scripts/<name>.py", "scripts/a.py")
+
+    async def fake_complete(*_args, **_kwargs):
+        return json.dumps({"internal_blueprint_text": repaired_candidate})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+    repaired = await api._repair_prepare_blueprint_protocol(
+        request=_request(),
+        blueprint_text=initial,
+        protocol_errors=[
+            {"code": "invalid_dynamic_or_directory_path", "path": "scripts/<name>.py"},
+        ],
+        allowed_resource_paths=set(),
+    )
+
+    assert api._extract_prepare_non_resource_paths(repaired) == [
+        "SKILL.md", "scripts/a.py",
+    ]
+
+
 def test_prepare_rejects_semantic_function_item_target_gap_before_allocations():
     with pytest.raises(api.PreparePlanProtocolError, match="before requirement allocations"):
         api._validate_prepare_semantic_function_item_topology(
