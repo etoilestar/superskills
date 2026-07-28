@@ -4616,7 +4616,10 @@ def _prepare_protocol_issue(code: str, message: str, *, path: str = "", field: s
 
 def _extract_prepare_skill_plan_paths(blueprint_text: str) -> list[str]:
     paths: list[str] = []
-    for match in re.finditer(r"(?im)^\s*-\s*path\s*:\s*`?([^`\n]+?)`?\s*$", blueprint_text or ""):
+    for match in re.finditer(
+        r"(?im)^[ \t]*-[ \t]*path[ \t]*:[ \t]*`?([^`\n]+?)`?[ \t]*$",
+        blueprint_text or "",
+    ):
         path = _normalize_skill_path(match.group(1).strip().strip("'\""))
         if path and path not in paths:
             paths.append(path)
@@ -4679,8 +4682,10 @@ def _remove_unauthorized_prepare_resources(
 ) -> tuple[str, list[str]]:
     """Deterministically remove resource entries/references without authority."""
     rejected: set[str] = set()
+    before_non_resource_paths = _extract_prepare_non_resource_paths(blueprint_text)
     block_re = re.compile(
-        r"(?ims)^\s*-\s*path\s*:\s*`?([^`\n]+?)`?\s*$[\s\S]*?(?=^\s*-\s*path\s*:|^\s*#{1,6}\s+|\Z)"
+        r"(?ims)^[ \t]*-[ \t]*path[ \t]*:[ \t]*`?([^`\n]+?)`?[ \t]*$[\s\S]*?"
+        r"(?=^[ \t]*-[ \t]*path[ \t]*:|^[ \t]*#{1,6}[ \t]+|\Z)"
     )
 
     def clean_block(match: re.Match[str]) -> str:
@@ -4692,7 +4697,7 @@ def _remove_unauthorized_prepare_resources(
 
         def clean_field(field_match: re.Match[str]) -> str:
             values = []
-            for raw in re.split(r"[,，、]\s*", str(field_match.group(3) or "")):
+            for raw in re.split(r"[,，、][ \t]*", str(field_match.group(3) or "")):
                 value = _normalize_skill_path(raw.strip().strip("'\"`"))
                 if _is_prepare_resource_path(value) and value not in allowed_resource_paths:
                     rejected.add(value)
@@ -4702,13 +4707,24 @@ def _remove_unauthorized_prepare_resources(
             return f"{field_match.group(1)}{field_match.group(2)}: [{', '.join(values)}]"
 
         return re.sub(
-            r"(?im)^(\s*)(dependencies|references)\s*:\s*\[?([^\]\n]*)\]?\s*$",
+            r"(?im)^([ \t]*)(dependencies|references)[ \t]*:[ \t]*\[?([^\]\n]*)\]?[ \t]*$",
             clean_field,
             block,
         )
 
     cleaned = block_re.sub(clean_block, str(blueprint_text or ""))
+    if _extract_prepare_non_resource_paths(cleaned) != before_non_resource_paths:
+        return str(blueprint_text or "").strip(), []
     return cleaned.strip(), sorted(rejected)
+
+
+def _extract_prepare_non_resource_paths(blueprint_text: str) -> list[str]:
+    """Return the immutable, executable portion of prepare FilePlan topology."""
+    return [
+        path
+        for path in _extract_prepare_skill_plan_paths(blueprint_text)
+        if path == "SKILL.md" or path.startswith("scripts/")
+    ]
 
 
 def _enforce_prepare_plan_resource_authority(
@@ -4818,12 +4834,12 @@ def _preflight_prepare_blueprint_text(
         match = re.search(
             (
                 rf"(?ims)"
-                rf"^\s*-\s*path\s*:\s*"
-                rf"`?{re.escape(path)}`?\s*$"
+                rf"^[ \t]*-[ \t]*path[ \t]*:[ \t]*"
+                rf"`?{re.escape(path)}`?[ \t]*$"
                 rf"([\s\S]*?)"
                 rf"(?="
-                rf"^\s*-\s*path\s*:|"
-                rf"^\s*#{{1,6}}\s+|"
+                rf"^[ \t]*-[ \t]*path[ \t]*:|"
+                rf"^[ \t]*#{{1,6}}[ \t]+|"
                 rf"\Z"
                 rf")"
             ),
@@ -4843,10 +4859,10 @@ def _preflight_prepare_blueprint_text(
         match = re.search(
             (
                 rf"(?im)"
-                rf"^\s*{re.escape(field_name)}"
-                rf"\s*:\s*"
+                rf"^[ \t]*{re.escape(field_name)}"
+                rf"[ \t]*:[ \t]*"
                 rf"\[?([^\]\n]*)\]?"
-                rf"\s*$"
+                rf"[ \t]*$"
             ),
             block,
         )
@@ -4864,7 +4880,7 @@ def _preflight_prepare_blueprint_text(
         ] = []
 
         for item in re.split(
-            r"[,，、]\s*",
+            r"[,，、][ \t]*",
             raw,
         ):
             value = (
@@ -5181,20 +5197,20 @@ def _extract_prepare_reference_paths(blueprint_text: str) -> set[str]:
     text = str(blueprint_text or "")
     block_re = re.compile(
         (
-            r"(?ims)^\s*-\s*path\s*:\s*`?([^`\n]+?)`?\s*$"
+            r"(?ims)^[ \t]*-[ \t]*path[ \t]*:[ \t]*`?([^`\n]+?)`?[ \t]*$"
             r"(?P<block>[\s\S]*?)"
-            r"(?=^\s*-\s*path\s*:|^\s*#{1,6}\s+|\Z)"
+            r"(?=^[ \t]*-[ \t]*path[ \t]*:|^[ \t]*#{1,6}[ \t]+|\Z)"
         )
     )
     field_re = re.compile(
-        r"(?im)^\s*(dependencies|references)\s*:\s*\[?([^\]\n]*)\]?\s*$"
+        r"(?im)^[ \t]*(dependencies|references)[ \t]*:[ \t]*\[?([^\]\n]*)\]?[ \t]*$"
     )
 
     for block_match in block_re.finditer(text):
         block = block_match.group("block") or ""
         for field_match in field_re.finditer(block):
             raw = str(field_match.group(2) or "")
-            for item in re.split(r"[,，、]\s*", raw):
+            for item in re.split(r"[,，、][ \t]*", raw):
                 path = _normalize_skill_path(
                     str(item or "").strip().strip("'\"`")
                 )
@@ -5226,10 +5242,13 @@ def _insert_prepare_reference_plan_blocks(blueprint_text: str, blocks: list[str]
         return str(blueprint_text or "").strip()
     text = str(blueprint_text or "").rstrip()
     addition = "\n" + "\n".join(blocks) + "\n"
-    heading_match = re.search(r"(?im)^\s*#{1,6}\s*(?:SkillPlan|.*文件职责计划).*$", text)
+    heading_match = re.search(
+        r"(?im)^[ \t]*#{1,6}[ \t]*(?:SkillPlan|.*文件职责计划).*$",
+        text,
+    )
     if not heading_match:
         return (text + "\n\n## SkillPlan / 文件职责计划" + addition).strip()
-    next_heading = re.search(r"(?m)^\s*#{1,6}\s+", text[heading_match.end():])
+    next_heading = re.search(r"(?m)^[ \t]*#{1,6}[ \t]+", text[heading_match.end():])
     if not next_heading:
         return (text + addition).strip()
     insert_at = heading_match.end() + next_heading.start()
@@ -5337,6 +5356,12 @@ async def _repair_prepare_blueprint_protocol(
         ]
         issue_codes = [str(item.get("code") or "") for item in current_errors if isinstance(item, dict)]
         issue_paths = [str(item.get("path") or item.get("field") or "") for item in current_errors if isinstance(item, dict)]
+        is_resource_authority_repair = "unjustified_resource_reference" in issue_codes
+        original_non_resource_paths = (
+            _extract_prepare_non_resource_paths(repaired)
+            if is_resource_authority_repair
+            else []
+        )
         logger.info(
             "[Creator][blueprint_repair] attempt=%d issue_codes=%s issue_paths=%s",
             repair_index + 1, issue_codes, issue_paths,
@@ -5451,16 +5476,28 @@ Creator 协议边界：
             if allowed_resource_paths is not None
             else _normalize_prepare_blueprint_references(candidate)
         )
-        if allowed_resource_paths is not None:
-            candidate, rejected = _remove_unauthorized_prepare_resources(
-                candidate,
-                allowed_resource_paths,
-            )
-            if rejected:
-                logger.info(
-                    "[Creator][resource_authority] allowed_resources=%s rejected_resources=%s",
-                    sorted(allowed_resource_paths), rejected,
-                )
+
+        # Resource-authority repair may edit resource declarations only. Other
+        # protocol repairs can correct an invalid script path reported by their
+        # validator feedback.
+        if (
+            is_resource_authority_repair
+            and _extract_prepare_non_resource_paths(candidate)
+            != original_non_resource_paths
+        ):
+            continue
+
+        candidate_errors = (
+            _preflight_prepare_blueprint_text(candidate, allowed_resource_paths)
+            if allowed_resource_paths is not None
+            else _preflight_prepare_blueprint_text(candidate)
+        )
+        if any(
+            str(item.get("code") or "") == "unjustified_resource_reference"
+            for item in candidate_errors
+            if isinstance(item, dict)
+        ):
+            continue
 
         if not _prepare_repair_candidate_is_valid(
             candidate
@@ -5477,11 +5514,7 @@ Creator 协议边界：
         )
 
         previous_errors = current_errors
-        current_errors = (
-            _preflight_prepare_blueprint_text(repaired, allowed_resource_paths)
-            if allowed_resource_paths is not None
-            else _preflight_prepare_blueprint_text(repaired)
-        )
+        current_errors = candidate_errors
 
         if not current_errors:
             break
@@ -7027,6 +7060,25 @@ def _validate_function_item_targets_in_allowed_domain(
         )
 
 
+def _validate_prepare_semantic_function_item_topology(
+    authoritative_scripts: list[str],
+    function_items: list[dict[str, Any]],
+) -> None:
+    """Stop prepare before allocation when semantic targets lost FilePlan scripts."""
+    semantic_targets = [
+        str(item.get("target_file") or "").strip()
+        for item in function_items
+        if str(item.get("target_file") or "").strip()
+    ]
+    if set(semantic_targets) != set(authoritative_scripts):
+        raise PreparePlanProtocolError(
+            "Prepare pipeline inconsistency before requirement allocations: "
+            "authoritative script targets do not match semantic FunctionItem targets; "
+            f"authoritative_scripts={authoritative_scripts}; "
+            f"semantic_function_item_targets={semantic_targets}"
+        )
+
+
 async def _bind_executable_responsibility_plan(
     *,
     request: PreparePlanRequest,
@@ -8314,6 +8366,10 @@ Blueprint Planner 只规划业务责任。
             frozen_blueprint_text=frozen_blueprint_text,
             allowed_function_item_targets=allowed_function_item_targets,
         )
+        _validate_prepare_semantic_function_item_topology(
+            allowed_function_item_targets,
+            semantic_function_items,
+        )
         requirement_allocations = await _plan_requirement_allocations(
             request=request, blueprint_text=frozen_blueprint_text,
             function_items=semantic_function_items, planner_model=route.model,
@@ -8359,6 +8415,10 @@ Blueprint Planner 只规划业务责任。
             semantic_function_items = _frozen_function_items_from_blueprint(
                 frozen_blueprint_text=frozen_blueprint_text,
                 allowed_function_item_targets=allowed_function_item_targets,
+            )
+            _validate_prepare_semantic_function_item_topology(
+                allowed_function_item_targets,
+                semantic_function_items,
             )
             requirement_allocations = await _plan_requirement_allocations(
                 request=request, blueprint_text=frozen_blueprint_text,
