@@ -798,6 +798,72 @@ def test_resource_cleanup_preserves_blueprint_field_indentation_and_shape():
     api.validate_blueprint_shape_for_creator(cleaned)
 
 
+def test_resource_cleanup_preserves_adjacent_skill_plan_entries():
+    blueprint = _ready_blueprint(
+        "- path: `SKILL.md`\n  references: []\n"
+        "- path: `scripts/a.py`\n  dependencies: []\n  references: []\n"
+        "- path: `scripts/b.py`\n  dependencies: []\n  references: []"
+    )
+
+    cleaned, rejected = api._remove_unauthorized_prepare_resources(blueprint, set())
+
+    assert rejected == []
+    assert api._extract_prepare_skill_plan_paths(cleaned) == [
+        "SKILL.md", "scripts/a.py", "scripts/b.py",
+    ]
+
+
+def test_resource_cleanup_removes_hallucinated_links_without_deleting_scripts():
+    blueprint = _ready_blueprint(
+        "- path: `SKILL.md`\n  references: []\n"
+        "- path: `scripts/a.py`\n"
+        "  dependencies: [references/fake.md]\n"
+        "  references: [references/fake.md]\n"
+        "- path: `scripts/b.py`"
+    )
+
+    cleaned, rejected = api._remove_unauthorized_prepare_resources(blueprint, set())
+
+    assert rejected == ["references/fake.md"]
+    assert "references/fake.md" not in cleaned
+    assert api._extract_prepare_skill_plan_paths(cleaned) == [
+        "SKILL.md", "scripts/a.py", "scripts/b.py",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_blueprint_resource_repair_rejects_script_topology_change(monkeypatch):
+    initial = _ready_blueprint(
+        _skill_plan_block(
+            "\n" + "\n".join(_script_plan_block(f"scripts/{name}.py") for name in ("a", "b", "c"))
+        )
+    )
+    repaired_candidate = initial.replace(_script_plan_block("scripts/b.py") + "\n", "")
+
+    async def fake_complete(*_args, **_kwargs):
+        return json.dumps({"internal_blueprint_text": repaired_candidate})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+    repaired = await api._repair_prepare_blueprint_protocol(
+        request=_request(),
+        blueprint_text=initial,
+        protocol_errors=[{"code": "unjustified_resource_reference", "path": "references/fake.md"}],
+        allowed_resource_paths=set(),
+    )
+
+    assert api._extract_prepare_non_resource_paths(repaired) == [
+        "SKILL.md", "scripts/a.py", "scripts/b.py", "scripts/c.py",
+    ]
+
+
+def test_prepare_rejects_semantic_function_item_target_gap_before_allocations():
+    with pytest.raises(api.PreparePlanProtocolError, match="before requirement allocations"):
+        api._validate_prepare_semantic_function_item_topology(
+            ["scripts/a.py", "scripts/b.py", "scripts/c.py"],
+            [{"target_file": "scripts/a.py"}, {"target_file": "scripts/c.py"}],
+        )
+
+
 @pytest.mark.asyncio
 async def test_blueprint_repair_cannot_expand_frozen_resource_authority(monkeypatch):
     initial = _ready_blueprint(
@@ -823,6 +889,28 @@ async def test_blueprint_repair_cannot_expand_frozen_resource_authority(monkeypa
 
     assert "references/a.md" in repaired
     assert "references/b.md" not in repaired
+
+
+@pytest.mark.asyncio
+async def test_blueprint_repair_cannot_self_authorize_bundled_asset(monkeypatch):
+    initial = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py")))
+    repaired_candidate = initial.replace(
+        "### 宿主执行方式",
+        "- path: `assets/foo.docx`\n  role: asset\n  source: bundled\n### 宿主执行方式",
+    )
+
+    async def fake_complete(*_args, **_kwargs):
+        return json.dumps({"internal_blueprint_text": repaired_candidate})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+    repaired = await api._repair_prepare_blueprint_protocol(
+        request=_request(),
+        blueprint_text=initial,
+        protocol_errors=[{"code": "unjustified_resource_reference", "path": "assets/foo.docx"}],
+        allowed_resource_paths=set(),
+    )
+
+    assert "assets/foo.docx" not in repaired
 
 
 def _script_plan_block(path: str) -> str:
