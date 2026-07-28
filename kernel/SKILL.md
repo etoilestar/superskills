@@ -197,6 +197,14 @@ Creator prepare-plan 不能无限追问。
 - 是否确认进入下一阶段。
 - 是否要我现在开始创建。
 
+已经明确提供或已经确认的需求，在后续 prepare 轮次和 Blueprint 生成中必须保持不变，除非最新 `human_feedback` 明确修改该项。用户需求 → clarification answer → Blueprint 是单向继承关系。
+
+- 已确认的 runtime input、final output / artifact、required business actions 不得重新解释或重新询问。
+- 已经问过并得到明确回答的问题不得再次询问。
+- 实现需要某个参数不代表用户必须提供该参数。
+- 用户没有明确要求运行时控制的普通实现参数，优先写入对应 script 的 `default_values`，不要提升为 runtime input。
+- 不得为了让 ResponsibilityGraph provenance 闭合，把内部默认参数改成 `platform_input_node` 输入。
+
 **Phase 1 完成标志**：需求足以生成内部蓝图；或已返回 1 个真正必要的澄清问题。
 
 ---
