@@ -129,10 +129,37 @@ def test_preflight_rejects_asset_placeholder_and_directory_paths():
     assert any(i["code"] == "invalid_asset_directory_path" for i in api._preflight_prepare_blueprint_text(_ready_blueprint("- path: `assets/`\n  role: asset\n  source: user_upload")))
 
 
-def test_preflight_rejects_runtime_input_assets_and_missing_skillplan_path():
+def test_preflight_does_not_treat_prose_path_as_skillplan_path():
     text = _ready_blueprint("- path: `SKILL.md`\n  role: skill_overview") + "\n运行时每次上传的用户输入文件 assets/input.pdf\n"
     codes = {i["code"] for i in api._preflight_prepare_blueprint_text(text)}
-    assert "directory_or_text_path_missing_from_skill_plan" in codes
+    assert "directory_or_text_path_missing_from_skill_plan" not in codes
+
+
+def test_preflight_protocol_example_does_not_expand_strict_fileplan():
+    text = _ready_blueprint(
+        "- path: `SKILL.md`\n  role: skill_overview\n"
+        "- path: `scripts/x.py`\n  role: script"
+    ) + "\n宿主执行方式：reference 文件使用普通相对路径，例如 `references/example_reference.md`\n"
+
+    assert api._preflight_prepare_blueprint_text(text) == []
+
+
+def test_preflight_reference_field_still_requires_declared_skillplan_path():
+    text = _ready_blueprint(
+        "- path: `scripts/x.py`\n"
+        "  role: script\n"
+        "  dependencies: []\n"
+        "  references: [references/actual.md]"
+    )
+
+    codes = {issue["code"] for issue in api._preflight_prepare_blueprint_text(text)}
+    assert "reference_missing_from_skill_plan" in codes
+
+
+def test_preflight_directory_display_does_not_expand_strict_fileplan():
+    text = _ready_blueprint() + "\n目录示例：\n├── references/\n└── assets/\n具体示例 `references/example.md`\n"
+
+    assert api._preflight_prepare_blueprint_text(text) == []
 
 
 def test_preflight_resource_source_uses_structured_parser_for_both_field_names():
@@ -1229,6 +1256,11 @@ async def test_blueprint_planner_prompt_preserves_confirmed_decision_contract(mo
     assert "clarification answer 不是参考意见" in prompt
     assert "Blueprint planning 输入契约" in prompt
     assert "不得通过修改 Blueprint 业务目标来规避工具缺失" in prompt
+    assert "已确认的 runtime input、final output / artifact、required business actions" in prompt
+    assert "已经问过并得到明确回答的问题不得再次询问" in prompt
+    assert "优先写入对应 script 的 default_values" in prompt
+    assert "不得自动提升为 runtime input" in prompt
+    assert "不得为了让 ResponsibilityGraph provenance 闭合" in prompt
 
 
 @pytest.mark.asyncio
