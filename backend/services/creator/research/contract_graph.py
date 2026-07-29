@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
@@ -69,13 +70,13 @@ def add_function_item_nodes(graph: ContractGraph, skill_plan: SkillPlan) -> None
             node_type="function_item",
             artifact_path=path,
             symbol=path,
-            attributes={
+            attributes=deepcopy({
                 key: item.get(key, {} if key == "default_values" else [])
                 for key in (
                     "role", "purpose", "inputs", "outputs", "default_values",
                     "required_capabilities", "constraints",
                 )
-            },
+            }),
         ))
 
 
@@ -88,14 +89,14 @@ def add_script_interface_nodes(graph: ContractGraph, skill_plan: SkillPlan) -> N
             node_type="script_interface",
             artifact_path=entry.path,
             symbol=entry.entrypoint,
-            attributes={
+            attributes=deepcopy({
                 "inputs": entry.inputs,
                 "outputs": entry.outputs,
                 "runtime": entry.runtime,
                 "runtime_contract": entry.runtime_contract,
                 "artifact_contract": entry.artifact_contract,
                 "command_arg_bindings": entry.command_arg_bindings,
-            },
+            }),
         ))
 
 
@@ -122,10 +123,10 @@ def add_responsibility_edges(graph: ContractGraph, skill_plan: SkillPlan) -> Non
             owner="ResponsibilityGraph",
             source_port=from_output,
             target_port=to_input,
-            attributes={
+            attributes=deepcopy({
                 "purpose": edge.get("purpose", ""),
                 "constraints": edge.get("constraints", []),
-            },
+            }),
         ))
 
 
@@ -189,4 +190,3 @@ def build_contract_graph(*, skill_plan: SkillPlan, skill_md: str) -> ContractGra
     add_skill_command_nodes(graph, skill_md)
     validate_contract_graph(graph)
     return graph
-

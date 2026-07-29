@@ -65,6 +65,24 @@ def test_serialization_is_deterministic():
     assert json.dumps(first, sort_keys=True, ensure_ascii=False) == json.dumps(second, sort_keys=True, ensure_ascii=False)
 
 
+def test_contract_graph_is_snapshot_not_alias_of_skill_plan():
+    plan = _plan()
+    graph = build_contract_graph(skill_plan=plan, skill_md=SKILL_MD)
+    snapshot = graph.to_dict()
+
+    plan.files[0].inputs.append("later_input")
+    plan.files[0].outputs.append("later_output")
+    plan.files[0].runtime_contract["later"] = {"nested": [True]}
+    plan.files[0].artifact_contract["later"] = {"nested": [True]}
+    plan.files[0].command_arg_bindings[0]["arg"] = "changed"
+    plan.function_items[0]["inputs"].append("later_function_input")
+    plan.function_items[0]["outputs"].append("later_function_output")
+    plan.function_items[0]["constraints"].append({"nested": ["changed"]})
+    plan.responsibility_edges[1]["constraints"].append({"nested": ["changed"]})
+
+    assert graph.to_dict() == snapshot
+
+
 def test_equal_port_names_do_not_infer_dataflow():
     plan = _plan(first_output="text", second_input="text", edges=False)
     graph = build_contract_graph(skill_plan=plan, skill_md="")
