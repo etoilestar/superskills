@@ -151,103 +151,34 @@ async def _run_recovery(
 
 
 @pytest.mark.asyncio
-async def test_same_unresolved_input_runs_repair_regeneration_and_one_replan_then_rebuild(monkeypatch):
-    items = [
-        _item("scripts/a.py", inputs=(), outputs=("result",)),
-        _item("scripts/b.py", inputs=("required_value",), outputs=("final_result",)),
-    ]
-    unresolved = [_output_edge("scripts/b.py", "final_result")]
-    replanned = _blueprint(
-        _script_block("scripts/a.py", inputs=(), outputs=("result",)),
-        _script_block("scripts/b.py", inputs=("source_value",), outputs=("final_result",)),
-    )
-    rebuilt_items = [items[0], _item("scripts/b.py", inputs=("source_value",), outputs=("final_result",))]
-    rebuilt_edges = [_input_edge("scripts/b.py", "source_value"), _output_edge("scripts/b.py", "final_result")]
-    observations = []
+async def test_contract_gap_never_calls_whole_graph_or_blueprint_regeneration(monkeypatch):
+    from backend.services.creator.responsibility_graph import GraphDraft, compile_responsibility_graph
 
-    result, calls = await _run_recovery(
-        monkeypatch, initial_items=items, initial_edges=unresolved,
-        repair_edges=unresolved, regenerated_edges=unresolved,
-        replanned_blueprint=replanned, rebuilt_items=rebuilt_items, rebuilt_edges=rebuilt_edges,
-        observe=lambda phase, snapshot: observations.append((phase, snapshot["replan"])),
-    )
-
-    assert observations == [("after_repair", 0), ("after_regenerate", 0)]
-    assert calls["repair"] == calls["regenerate"] == calls["replan"] == 1
-    assert calls["bind"] == 2
-    assert calls["resolve_targets"] == 2  # initial freeze and post-replan re-freeze
-    assert calls["review"] == 1
-    assert result["function_items"] == rebuilt_items
-    assert result["responsibility_edges"] == rebuilt_edges
-    assert result["status"] == "ready" and result.get("clarifying_questions") == []
+    draft = GraphDraft.freeze([_item("scripts/b.py", inputs=("required_value",), outputs=("text",))])
+    await compile_responsibility_graph(draft)
+    assert draft.status == "validation_failed"
+    assert any(issue["issue_type"] == "node_contract_gap" for issue in draft.issues)
+    # The compiled path terminates with a structured contract gap; whole-graph
+    # regeneration and Blueprint rewriting are not recovery routes.
+    monkeypatch.setattr(api, "_regenerate_responsibility_graph", AsyncMock(side_effect=AssertionError("forbidden")))
+    monkeypatch.setattr(api, "_replan_blueprint_for_graph_closure", AsyncMock(side_effect=AssertionError("forbidden")))
+    assert api._regenerate_responsibility_graph.await_count == 0
+    assert api._replan_blueprint_for_graph_closure.await_count == 0
 
 
 @pytest.mark.asyncio
-async def test_replanned_graph_still_unresolved_cleanly_stops(monkeypatch):
-    items = [_item("scripts/b.py", inputs=("required_value",), outputs=("final_result",))]
-    unresolved = [_output_edge("scripts/b.py", "final_result")]
-    calls = Counter()
-    with pytest.raises(api.PreparePlanProtocolError, match="still lacks required input provenance"):
-        await _run_recovery(
-            monkeypatch, initial_items=items, initial_edges=unresolved,
-            repair_edges=unresolved, regenerated_edges=unresolved,
-            replanned_blueprint=_blueprint(_script_block("scripts/b.py", inputs=("required_value",), outputs=("final_result",))),
-            rebuilt_items=items, rebuilt_edges=unresolved,
-            calls=calls,
-        )
-    assert calls["repair"] == calls["regenerate"] == calls["replan"] == 1
-    assert calls["bind"] == 2 and calls["review"] == 0
+async def test_invalid_endpoint_candidate_is_rejected_without_mutating_nodes():
+    from backend.services.creator.responsibility_graph import GraphDraft, InputBinding, compile_responsibility_graph
 
-
-@pytest.mark.asyncio
-async def test_replanned_graph_semantic_failure_cleanly_stops(monkeypatch):
-    items = [_item("scripts/b.py", inputs=("invalid_required_value",), outputs=("final_result",))]
-    unresolved = [_output_edge("scripts/b.py", "final_result")]
-    rebuilt_items = [_item("scripts/b.py", inputs=("source_value",), outputs=("final_result",))]
-    calls = Counter()
-    with pytest.raises(api.PreparePlanProtocolError, match="failed full validation"):
-        await _run_recovery(
-            monkeypatch, initial_items=items, initial_edges=unresolved,
-            repair_edges=unresolved, regenerated_edges=unresolved,
-            replanned_blueprint=_blueprint(_script_block("scripts/b.py", inputs=("source_value",), outputs=("final_result",))),
-            rebuilt_items=rebuilt_items,
-            rebuilt_edges=[_input_edge("scripts/b.py", "source_value"), _output_edge("scripts/b.py", "final_result")],
-            rebuilt_review={"passed": False, "issues": [{"id": "alignment"}]},
-            calls=calls,
-        )
-    assert calls["repair"] == calls["regenerate"] == calls["replan"] == 1
-    assert calls["review"] == 1
-
-
-@pytest.mark.asyncio
-async def test_graph_local_endpoint_failure_never_replans_blueprint(monkeypatch):
-    item = _item("scripts/a.py", inputs=(), outputs=("result",))
-    invalid = [{**_output_edge("scripts/a.py"), "to_node": "unknown_node"}]
-    calls = Counter()
-    with pytest.raises(api.PreparePlanProtocolError):
-        await _run_recovery(
-            monkeypatch, initial_items=[item], initial_edges=invalid,
-            repair_edges=invalid, regenerated_edges=invalid,
-            calls=calls,
-        )
-    assert calls["repair"] == calls["regenerate"] == 1
-    assert calls["replan"] == 0
-
-
-@pytest.mark.asyncio
-async def test_changed_unresolved_fingerprint_is_progress_and_does_not_replan(monkeypatch):
-    item = _item("scripts/b.py", inputs=("x", "y"), outputs=("final_result",))
-    initial = [_input_edge("scripts/b.py", "y"), _output_edge("scripts/b.py", "final_result")]
-    later = [_input_edge("scripts/b.py", "x"), _output_edge("scripts/b.py", "final_result")]
-    calls = Counter()
-    with pytest.raises(api.PreparePlanProtocolError):
-        await _run_recovery(
-            monkeypatch, initial_items=[item], initial_edges=initial,
-            repair_edges=later, regenerated_edges=later,
-            calls=calls,
-        )
-    assert calls["repair"] == calls["regenerate"] == 1
-    assert calls["replan"] == 0
+    items = [_item("scripts/a.py", inputs=(), outputs=("text",)),
+             _item("scripts/b.py", inputs=("value",), outputs=("markdown",))]
+    draft = GraphDraft.freeze(items, input_bindings=[
+        InputBinding("scripts/b.py", "value", "script_output", "scripts/missing.py", "value")])
+    before = list(draft.function_items)
+    await compile_responsibility_graph(draft)
+    assert draft.status == "validation_failed"
+    assert draft.function_items == before
+    assert not draft.compiled_edges or all(edge["from_node"] != "scripts/missing.py" for edge in draft.compiled_edges)
 
 
 @pytest.mark.asyncio
