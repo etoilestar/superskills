@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     # Falls back to default_model when unset.
     planner_model: Optional[str] = Field("qwen3:30b-instruct", validation_alias=AliasChoices("PLANNER_MODEL", "planner_model"))
     creator_graph_binding_mode: str = Field(
-        "compiled_v2",
+        "shadow",
         validation_alias=AliasChoices("CREATOR_GRAPH_BINDING_MODE", "creator_graph_binding_mode"),
         pattern="^(legacy|compiled_v2|shadow)$",
     )

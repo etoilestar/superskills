@@ -1,4 +1,5 @@
 import copy
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -92,10 +93,8 @@ async def test_no_source_is_contract_gap_and_candidate_is_not_exportable():
     await compile_responsibility_graph(draft)
     assert draft.status == "validation_failed"
     assert draft.issues[0] == {
-        "issue_type": "node_contract_gap",
-        "target_node": "scripts/image.py",
-        "target_input": "scene_description",
-        "legal_sources": [],
+        "issue_type": "node_contract_gap", "target_node": "scripts/image.py",
+        "target_input": "scene_description", "legal_sources": [], "node_set_candidate": True,
     }
     assert draft.metrics["model_source_selection_count"] == 0
 
@@ -332,6 +331,27 @@ async def test_unauthorized_asset_and_failed_local_patch_rollback():
     assert draft.function_items == before
 
 
+def test_local_patch_supports_multiple_inputs_and_rejects_platform_pseudo_closure():
+    draft = GraphDraft.freeze([
+        item("scripts/source.py", [], ["left", "right"]),
+        item("scripts/target.py", ["bad_left", "bad_right"], ["text"]),
+    ], workflow_topology={"scripts/source.py": [], "scripts/target.py": ["scripts/source.py"]})
+    paths = {"/function_items/1/inputs/0", "/function_items/1/inputs/1"}
+    allowed = {paths.pop(): {"left", "right"}}
+    other_path = next(iter(paths))
+    allowed[other_path] = {"left", "right"}
+    all_paths = set(allowed)
+    patched = patch_graph_node_contract(draft, [
+        {"op": "replace", "path": "/function_items/1/inputs/0", "value": "left"},
+        {"op": "replace", "path": "/function_items/1/inputs/1", "value": "right"},
+    ], allowed_patch_paths=all_paths, allowed_replacement_values_by_path=allowed)
+    assert patched.function_items[1]["inputs"] == ["left", "right"]
+    with pytest.raises(ValueError, match="no legal structural producer"):
+        patch_graph_node_contract(draft, [
+            {"op": "replace", "path": "/function_items/1/inputs/0", "value": "user_request"},
+        ], allowed_patch_paths=all_paths, allowed_replacement_values_by_path=allowed)
+
+
 @pytest.mark.asyncio
 async def test_default_export_selector_retry_and_failed_exports():
     defaulted = GraphDraft.freeze([item("scripts/a.py", ["style"], ["text"], defaults={"style": "ink"})])
@@ -389,7 +409,10 @@ async def test_production_binding_uses_transaction_and_frozen_parameter_edges(mo
     monkeypatch.setattr(api, "complete_creator_role_once", forbidden_model)
     result = await api._bind_executable_responsibility_plan(
         request=api.PreparePlanRequest(user_request="demo"),
-        current_planner_result={"internal_blueprint_text": "frozen", "responsibility_edges": edges},
+        current_planner_result={"internal_blueprint_text": "frozen", "responsibility_edges": edges,
+            "input_bindings": [{"target_node": "scripts/a.py", "target_input": "theme",
+                "binding_kind": "platform_parameter", "source_root": "fields", "source_key": "topic"}],
+            "final_output_bindings": [{"platform_slot": "text", "source_node": "scripts/a.py", "source_output": "result"}]},
         planner_model="test", allowed_function_item_targets=["scripts/a.py"])
     assert commits == ["committed"]
     assert [(edge["from_node"], edge["from_output"], edge["to_node"], edge["to_input"])
@@ -400,7 +423,43 @@ async def test_production_binding_uses_transaction_and_frozen_parameter_edges(mo
 
 
 @pytest.mark.asyncio
-async def test_production_contract_gap_uses_one_local_patch_not_graph_regeneration(monkeypatch):
+async def test_compiled_v2_ignores_planner_authored_complete_edges(monkeypatch):
+    from backend.services.creator import api
+
+    items = [item("scripts/a.py", [], ["text"])]
+    monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
+    monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
+    result = await api._bind_executable_responsibility_plan(
+        request=api.PreparePlanRequest(user_request="demo"),
+        current_planner_result={"internal_blueprint_text": "frozen", "responsibility_edges": [{
+            "from_node": "scripts/attacker.py", "from_output": "invented", "to_node": "platform_output_node",
+            "to_input": "text", "purpose": "planner-authored complete graph", "constraints": []}]},
+        planner_model="test", allowed_function_item_targets=["scripts/a.py"])
+    assert result["responsibility_edges"][0]["from_node"] == "scripts/a.py"
+    assert all(edge["from_node"] != "scripts/attacker.py" for edge in result["responsibility_edges"])
+
+
+@pytest.mark.asyncio
+async def test_shadow_compiler_failure_cannot_replace_stable_graph(monkeypatch):
+    from backend.services.creator import api
+
+    items = [item("scripts/a.py", [], ["text"])]
+    stable = [{"from_node": "scripts/a.py", "from_output": "text", "to_node": "platform_output_node",
+               "to_input": "text", "purpose": "stable", "constraints": []}]
+    monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
+    monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "shadow")
+    async def explode(*_args, **_kwargs):
+        raise RuntimeError("shadow compiler unavailable")
+    monkeypatch.setattr(api, "compile_responsibility_graph", explode)
+    result = await api._bind_executable_responsibility_plan(
+        request=api.PreparePlanRequest(user_request="demo"),
+        current_planner_result={"internal_blueprint_text": "frozen", "responsibility_edges": stable},
+        planner_model="test", allowed_function_item_targets=["scripts/a.py"])
+    assert result["responsibility_edges"] == stable
+
+
+@pytest.mark.asyncio
+async def test_production_node_set_gap_replans_once_without_user_request_pseudo_closure(monkeypatch):
     from backend.services.creator import api
 
     items = [item("scripts/a.py", ["missing_runtime_input"], ["text"])]
@@ -409,7 +468,7 @@ async def test_production_contract_gap_uses_one_local_patch_not_graph_regenerati
     calls = []
     async def model(messages, *_args, **_kwargs):
         calls.append(messages[0]["content"])
-        return '{"operations":[{"op":"replace","path":"/function_items/0/inputs/0","value":"user_request"}]}'
+        return json.dumps({"function_items": [items[0], item("scripts/source.py", [], ["missing_runtime_input"])]})
     monkeypatch.setattr(api, "complete_creator_role_once", model)
     monkeypatch.setattr(api, "_regenerate_responsibility_graph", AsyncMock(side_effect=AssertionError("forbidden")))
     monkeypatch.setattr(api, "_replan_blueprint_for_graph_closure", AsyncMock(side_effect=AssertionError("forbidden")))
@@ -417,7 +476,8 @@ async def test_production_contract_gap_uses_one_local_patch_not_graph_regenerati
         request=api.PreparePlanRequest(user_request="demo"),
         current_planner_result={"internal_blueprint_text": "frozen"}, planner_model="test",
         allowed_function_item_targets=["scripts/a.py"])
-    assert result["function_items"][0]["inputs"] == ["user_request"]
-    assert len(calls) == 1 and "bounded JSON Patch" in calls[0]
+    assert result["function_items"][0]["inputs"] == ["missing_runtime_input"]
+    assert {entry["target_file"] for entry in result["function_items"]} == {"scripts/a.py", "scripts/source.py"}
+    assert len(calls) == 1 and "minimal FunctionItem node-set replan" in calls[0]
     assert api._regenerate_responsibility_graph.await_count == 0
     assert api._replan_blueprint_for_graph_closure.await_count == 0

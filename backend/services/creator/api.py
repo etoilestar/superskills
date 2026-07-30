@@ -7034,6 +7034,42 @@ def _validate_prepare_semantic_function_item_topology(
         )
 
 
+async def _bind_legacy_responsibility_edges(
+    *, request: PreparePlanRequest, frozen_blueprint_text: str,
+    function_items: list[dict[str, Any]], allowed_function_item_targets: list[str],
+    current_edges: list[dict[str, Any]], planner_model: str,
+) -> list[dict[str, Any]]:
+    """Produce the stable comparison graph only for legacy/shadow rollout modes."""
+    if current_edges:
+        return validate_structured_responsibility_edge_transport(
+            current_edges, function_items=function_items, source="frozen legacy graph"
+        )
+    context = _build_responsibility_graph_construction_context(
+        frozen_blueprint_text=frozen_blueprint_text,
+        allowed_function_item_targets=allowed_function_item_targets,
+        function_items=function_items,
+    )
+    prompt = """
+You are the legacy ResponsibilityGraph planner used only as the stable side of
+a shadow rollout. Return strict JSON {"responsibility_edges":[...]} using only
+the supplied frozen FunctionItems, legal endpoint domain, and platform slots.
+Do not add, remove, rename, or modify FunctionItems, scripts, ports, assets,
+references, or platform slots. Use canonical fields from_node, from_output,
+to_node, to_input, purpose, constraints.
+""".strip()
+    text = await complete_creator_role_once(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps({"graph_construction_context": context}, ensure_ascii=False)}],
+        "planner", fallback_model=planner_model,
+    )
+    data = _parse_prepare_plan_json(text)
+    if set(data) != {"responsibility_edges"} or not isinstance(data["responsibility_edges"], list):
+        raise PreparePlanProtocolError("Legacy shadow graph returned an invalid edge protocol")
+    return validate_structured_responsibility_edge_transport(
+        data["responsibility_edges"], function_items=function_items, source="legacy shadow graph"
+    )
+
+
 async def _bind_executable_responsibility_plan(
     *,
     request: PreparePlanRequest,
@@ -7049,19 +7085,28 @@ async def _bind_executable_responsibility_plan(
         frozen_blueprint_text=frozen_blueprint_text,
         allowed_function_item_targets=allowed_function_item_targets,
     )
-    frozen_edges = list(current_planner_result.get("responsibility_edges") or [])
+    planner_edges = list(current_planner_result.get("responsibility_edges") or [])
     mode = settings.creator_graph_binding_mode
+    stable_edges: list[dict[str, Any]] = []
+    if mode in {"legacy", "shadow"}:
+        stable_edges = await _bind_legacy_responsibility_edges(
+            request=request, frozen_blueprint_text=frozen_blueprint_text,
+            function_items=frozen_function_items,
+            allowed_function_item_targets=allowed_function_item_targets,
+            current_edges=planner_edges, planner_model=planner_model,
+        )
     if mode == "legacy":
         return {
             "function_items": frozen_function_items,
-            "responsibility_edges": validate_structured_responsibility_edge_transport(
-                frozen_edges, function_items=frozen_function_items, source="frozen legacy graph"
-            ),
+            "responsibility_edges": stable_edges,
+            "allowed_function_item_targets": list(allowed_function_item_targets),
         }
     transaction = GraphTransaction()
     draft = transaction.candidate(
         frozen_function_items,
-        frozen_edges=frozen_edges,
+        workflow_topology=current_planner_result.get("workflow_topology"),
+        input_bindings=current_planner_result.get("input_bindings"),
+        final_output_bindings=current_planner_result.get("final_output_bindings"),
     )
 
     async def select_source(payload: dict[str, Any]) -> dict[str, Any]:
@@ -7081,26 +7126,41 @@ The selected_candidate_id must be copied exactly from candidates.
         return _parse_prepare_plan_json(text)
 
     async def patch_node_contract(candidate: GraphDraft) -> GraphDraft:
-        issue = next(issue for issue in candidate.issues if issue.get("issue_type") == "node_contract_gap")
-        target = str(issue.get("target_node") or "")
-        target_input = str(issue.get("target_input") or "")
-        item_index = next(index for index, item in enumerate(candidate.function_items) if item["target_file"] == target)
-        input_index = list(candidate.function_items[item_index].get("inputs") or []).index(target_input)
-        allowed_path = f"/function_items/{item_index}/inputs/{input_index}"
-        neighbors = [item for item in candidate.function_items
-                     if item["target_file"] in candidate.allowed_predecessors.get(target, [])]
+        gaps = [issue for issue in candidate.issues if issue.get("issue_type") == "node_contract_gap"]
+        allowed_paths: set[str] = set()
+        allowed_values: dict[str, set[str]] = {}
+        affected_items: list[dict[str, Any]] = []
+        neighbors_by_target: dict[str, list[dict[str, Any]]] = {}
+        for issue in gaps:
+            target = str(issue.get("target_node") or "")
+            target_input = str(issue.get("target_input") or "")
+            item_index = next(index for index, item in enumerate(candidate.function_items) if item["target_file"] == target)
+            input_index = list(candidate.function_items[item_index].get("inputs") or []).index(target_input)
+            path = f"/function_items/{item_index}/inputs/{input_index}"
+            predecessors = set(candidate.allowed_predecessors.get(target, []))
+            legal_output_names = {
+                str(port["name"]) for port in candidate.ports
+                if port["direction"] == "output" and port["port_id"].split("::", 1)[0] in predecessors
+            }
+            if legal_output_names:
+                allowed_paths.add(path)
+                allowed_values[path] = legal_output_names
+            affected_items.append(candidate.function_items[item_index])
+            neighbors_by_target[target] = [item for item in candidate.function_items if item["target_file"] in predecessors]
+        if not allowed_paths:
+            return candidate
         prompt = """
-Repair one frozen FunctionItem input contract with one bounded JSON Patch.
-Return only {"operations":[{"op":"replace","path":"...","value":"..."}]}.
-Use only the supplied allowed_patch_path. Do not add/remove/rename a node, file,
+Repair only the supplied unresolved FunctionItem input contracts with bounded
+JSON Patch replacements. Return {"operations":[...]} and use only supplied
+allowed paths and allowed values. A platform input such as user_request is not
+a legal replacement unless it is explicitly listed. Do not add/remove a node,
 platform slot, asset, reference, intermediate file, or constraint. Do not return
 edges or rewrite the Blueprint. If no valid patch exists return {"operations":[]}.
 """.strip()
-        payload = {"issue": issue, "affected_function_item": candidate.function_items[item_index],
-                   "one_hop_predecessors": neighbors,
-                   "legal_source_domain": next((domain["candidates"] for domain in candidate.source_domains
-                       if domain["target_node"] == target and domain["target_input"] == target_input), []),
-                   "allowed_patch_path": allowed_path, "immutable_fields": ["target_file", "constraints"]}
+        payload = {"issues": gaps, "affected_function_items": affected_items,
+                   "one_hop_predecessors": neighbors_by_target,
+                   "allowed_replacements_by_path": {path: sorted(values) for path, values in allowed_values.items()},
+                   "immutable_fields": ["target_file", "constraints"]}
         text = await complete_creator_role_once(
             [{"role": "system", "content": prompt},
              {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
@@ -7109,24 +7169,83 @@ edges or rewrite the Blueprint. If no valid patch exists return {"operations":[]
         response = _parse_prepare_plan_json(text)
         if set(response) != {"operations"} or not isinstance(response["operations"], list) or not response["operations"]:
             return candidate
-        return patch_graph_node_contract(candidate, response["operations"], allowed_patch_paths={allowed_path})
+        return patch_graph_node_contract(candidate, response["operations"],
+            allowed_patch_paths=allowed_paths, allowed_replacement_values_by_path=allowed_values)
 
-    await compile_responsibility_graph(draft, source_selector=select_source)
-    if draft.status != "committed" and sum(issue.get("issue_type") == "node_contract_gap" for issue in draft.issues) == 1:
+    async def replan_minimal_node_set(candidate: GraphDraft) -> GraphDraft:
+        gaps = [issue for issue in candidate.issues
+                if issue.get("issue_type") == "node_contract_gap" and issue.get("node_set_candidate")]
+        if not gaps:
+            return candidate
+        prompt = """
+Perform one minimal FunctionItem node-set replan for the supplied node_set_gap.
+Return strict JSON {"function_items":[...]} containing every existing immutable
+FunctionItem plus at most one new scripts/**/*.py FunctionItem. Preserve every
+existing item byte-for-byte as structured JSON. The new item must include exactly
+target_file, role, purpose, inputs, outputs, required_capabilities, constraints,
+default_values. Do not add assets, references, platform slots, edges, or files of
+any other kind. Return the unchanged set when no legitimate producer node exists.
+""".strip()
+        payload = {"issue_type": "node_set_gap", "issues": gaps,
+                   "function_items": candidate.function_items,
+                   "user_requirement": request.user_request,
+                   "immutable_existing_targets": [item["target_file"] for item in candidate.function_items]}
+        text = await complete_creator_role_once(
+            [{"role": "system", "content": prompt},
+             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+            "planner", fallback_model=planner_model,
+        )
+        response = _parse_prepare_plan_json(text)
+        if set(response) != {"function_items"} or not isinstance(response["function_items"], list):
+            raise PreparePlanProtocolError("node_set_gap replan returned an invalid protocol")
+        replanned = normalize_structured_function_items(response["function_items"], source="node_set_gap replan")
+        before = {item["target_file"]: item for item in candidate.function_items}
+        after = {item["target_file"]: item for item in replanned}
+        if any(after.get(target) != item for target, item in before.items()) or not set(before) <= set(after) or len(after) > len(before) + 1:
+            raise PreparePlanProtocolError("node_set_gap replan modified existing nodes or exceeded one new node")
+        new_targets = set(after) - set(before)
+        if not new_targets:
+            return candidate
+        return GraphDraft.freeze(replanned)
+
+    try:
+        await compile_responsibility_graph(draft, source_selector=select_source)
+    except Exception as exc:
+        if mode != "shadow":
+            raise
+        logger.exception("[Creator][responsibility_graph_shadow] compiler_error=%s", exc)
+        return {"function_items": frozen_function_items, "responsibility_edges": stable_edges,
+                "allowed_function_item_targets": list(allowed_function_item_targets)}
+    if mode == "compiled_v2" and draft.status != "committed" and any(issue.get("issue_type") == "node_contract_gap" for issue in draft.issues):
         patched = await patch_node_contract(draft)
         if patched is not draft:
             draft = patched
             await compile_responsibility_graph(draft, source_selector=select_source)
             draft.metrics["node_contract_patch_count"] = 1
+    if mode == "compiled_v2" and draft.status != "committed" and any(
+        issue.get("issue_type") == "node_contract_gap" and issue.get("node_set_candidate") for issue in draft.issues
+    ):
+        replanned = await replan_minimal_node_set(draft)
+        if replanned is not draft:
+            draft = replanned
+            await compile_responsibility_graph(draft, source_selector=select_source)
+            draft.metrics["node_set_replan_count"] = 1
+        else:
+            draft.issues = [
+                {**issue, "issue_type": "node_set_gap"}
+                if issue.get("issue_type") == "node_contract_gap" and issue.get("node_set_candidate") else issue
+                for issue in draft.issues
+            ]
     logger.info("[Creator][responsibility_graph_compiler] %s", json.dumps(draft.metrics, ensure_ascii=False, default=str))
     if draft.status != "committed":
         if mode == "shadow":
             logger.warning("[Creator][responsibility_graph_shadow] %s", json.dumps({
                 "compiled_status": draft.status, "compiled_issues": draft.issues,
                 "compiled_edges": public_edges(draft) if draft.status == "committed" else [],
-                "legacy_edge_count": len(frozen_edges), "model_calls": draft.metrics.get("model_source_selection_count", 0),
+                "legacy_edge_count": len(stable_edges), "model_calls": draft.metrics.get("model_source_selection_count", 0),
             }, ensure_ascii=False, default=str))
-            return {"function_items": frozen_function_items, "responsibility_edges": frozen_edges}
+            return {"function_items": frozen_function_items, "responsibility_edges": stable_edges,
+                    "allowed_function_item_targets": list(allowed_function_item_targets)}
         issue_types = sorted({str(issue.get("issue_type") or "") for issue in draft.issues})
         raise PreparePlanProtocolError(json.dumps({
             "status": "graph_contract_gap", "stage": "responsibility_graph",
@@ -7134,7 +7253,7 @@ edges or rewrite the Blueprint. If no valid patch exists return {"operations":[]
         }, ensure_ascii=False))
     committed = transaction.commit(draft)
     if mode == "shadow":
-        legacy_pairs = {(edge.get("from_node"), edge.get("from_output"), edge.get("to_node"), edge.get("to_input")) for edge in frozen_edges}
+        legacy_pairs = {(edge.get("from_node"), edge.get("from_output"), edge.get("to_node"), edge.get("to_input")) for edge in stable_edges}
         compiled = public_edges(committed)
         compiled_pairs = {(edge.get("from_node"), edge.get("from_output"), edge.get("to_node"), edge.get("to_input")) for edge in compiled}
         logger.info("[Creator][responsibility_graph_shadow] %s", json.dumps({
@@ -7143,11 +7262,13 @@ edges or rewrite the Blueprint. If no valid patch exists return {"operations":[]
             "compiled_closure": True, "model_calls": committed.metrics.get("model_source_selection_count", 0),
             "graph_issues": [],
         }, ensure_ascii=False, default=str))
-        if frozen_edges:
-            return {"function_items": frozen_function_items, "responsibility_edges": frozen_edges}
+        if stable_edges:
+            return {"function_items": frozen_function_items, "responsibility_edges": stable_edges,
+                    "allowed_function_item_targets": list(allowed_function_item_targets)}
     return {
         "function_items": copy.deepcopy(committed.function_items),
         "responsibility_edges": public_edges(committed),
+        "allowed_function_item_targets": [item["target_file"] for item in committed.function_items],
     }
 
 
@@ -8950,6 +9071,9 @@ Blueprint Planner 只规划业务责任。
                 binding_data.get("function_items"),
                 source="planner",
             )
+            rebound_targets = binding_data.get("allowed_function_item_targets")
+            if isinstance(rebound_targets, list) and rebound_targets:
+                allowed_function_item_targets = [str(target) for target in rebound_targets]
             _validate_function_item_targets_in_allowed_domain(
                 candidate_function_items,
                 allowed_function_item_targets,
@@ -8973,6 +9097,7 @@ Blueprint Planner 只规划业务责任。
                     normalized_function_items,
                     normalized_edges,
                 )
+                frozen_blueprint_text = normalized_ready_draft["internal_blueprint_text"]
                 if event_emitter is not None:
                     await event_emitter({
                         "event": "planner_draft",

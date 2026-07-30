@@ -22,7 +22,7 @@ class _MissingDefault(Enum):
 
 
 _UNSET = _MissingDefault.TOKEN
-ISSUE_TYPES = frozenset({"protocol_shape_error", "illegal_node", "illegal_port", "node_contract_gap", "ambiguous_source", "wrong_source_selection", "duplicate_provenance", "type_mismatch", "topology_contract_issue", "cycle_detected", "missing_platform_input", "missing_platform_output", "final_output_contract_gap", "unreachable_final_output", "constraint_conflict", "unauthorized_static_resource"})
+ISSUE_TYPES = frozenset({"protocol_shape_error", "illegal_node", "illegal_port", "node_contract_gap", "node_set_gap", "ambiguous_source", "wrong_source_selection", "duplicate_provenance", "type_mismatch", "topology_contract_issue", "cycle_detected", "missing_platform_input", "missing_platform_output", "final_output_contract_gap", "unreachable_final_output", "constraint_conflict", "unauthorized_static_resource"})
 
 
 def port_id(node: str, direction: Literal["input", "output"], name: str) -> str:
@@ -464,7 +464,14 @@ async def compile_responsibility_graph(draft: GraphDraft, *, platform_contract: 
         candidates = [SourceCandidate(**{**item, "constraints": tuple(item.get("constraints") or [])}) for item in domains[key]["candidates"]]
         if not candidates:
             if not any(issue.get("target_node") == key[0] and issue.get("target_input") == key[1] for issue in draft.issues):
-                draft.issues.append({"issue_type": "node_contract_gap", "target_node": key[0], "target_input": key[1], "legal_sources": []})
+                has_executable_output = any(
+                    port["direction"] == "output"
+                    and port["port_id"].split("::", 1)[0] in draft.allowed_predecessors.get(key[0], [])
+                    for port in draft.ports
+                )
+                draft.issues.append({"issue_type": "node_contract_gap", "target_node": key[0],
+                    "target_input": key[1], "legal_sources": [],
+                    "node_set_candidate": not has_executable_output})
             continue
         if len(candidates) > 1: draft.ambiguous_targets.append({"target_node": key[0], "target_input": key[1], "candidates": [item.as_dict() for item in candidates]})
         target_item = next(item for item in draft.function_items if item["target_file"] == key[0])
@@ -494,7 +501,8 @@ async def compile_responsibility_graph(draft: GraphDraft, *, platform_contract: 
 
 
 def patch_graph_node_contract(draft: GraphDraft, operations: list[dict[str, Any]], *,
-                              allowed_patch_paths: set[str]) -> GraphDraft:
+                              allowed_patch_paths: set[str],
+                              allowed_replacement_values_by_path: dict[str, set[str]] | None = None) -> GraphDraft:
     """Apply a bounded local contract patch and return a fresh, uncompiled draft.
 
     Only replacement of an explicitly allowed scalar/list member is supported;
@@ -506,6 +514,9 @@ def patch_graph_node_contract(draft: GraphDraft, operations: list[dict[str, Any]
         path = str(operation.get("path") or "")
         if set(operation) != {"op", "path", "value"} or operation.get("op") != "replace" or path not in allowed_patch_paths:
             raise ValueError("graph contract patch is outside allowed paths")
+        allowed_values = (allowed_replacement_values_by_path or {}).get(path)
+        if allowed_values is not None and operation.get("value") not in allowed_values:
+            raise ValueError("graph contract patch value has no legal structural producer")
         parts = path.strip("/").split("/")
         if len(parts) not in {3, 4} or parts[0] != "function_items":
             raise ValueError("graph contract patch path must address one FunctionItem field")
