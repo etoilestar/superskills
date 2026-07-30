@@ -22,11 +22,18 @@ def _mapping(value: Any) -> dict[str, Any]:
 def snapshot_skill_plan(skill_plan: Any, *, system_commit: str) -> dict[str, Any]:
     """Adapt a SkillPlan/dataclass/dict without parsing, running, or mutating it."""
     plan = _mapping(skill_plan)
-    files = [_mapping(item) for item in plan.get("files", [])]
-    function_items = [_mapping(item) for item in plan.get("function_items", [])]
+    if not isinstance(plan.get("skill_name"), str) or not plan["skill_name"].strip():
+        raise ValueError("SkillPlan requires a non-empty skill_name")
+    for field in ("files", "function_items"):
+        if field not in plan:
+            raise ValueError(f"SkillPlan requires the {field} field")
+        if not isinstance(plan[field], list):
+            raise ValueError(f"SkillPlan.{field} must be a list")
+    files = [_mapping(item) for item in plan["files"]]
+    function_items = [_mapping(item) for item in plan["function_items"]]
     return build_authority_snapshot(
         system_commit=system_commit,
-        skill_name=plan.get("skill_name", ""),
+        skill_name=plan["skill_name"],
         file_plan=files,
         function_items=function_items,
     )

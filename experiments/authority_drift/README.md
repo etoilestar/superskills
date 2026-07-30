@@ -32,6 +32,16 @@ sorted keys, and compact separators. Extra state—including responsibility
 edges, Markdown/script content, commands, ToolPool data, traces, and runtime
 output—is ignored.
 
+“Deterministic” here means deterministic serialization of the same structured
+authority state; it is not semantic normalization. V1 conservatively preserves
+ordinary list order and does not infer that differently ordered or differently
+expressed structured values are equivalent.
+
+The hash is an **authority-state fingerprint**: it answers whether two
+canonical snapshots contain the same frozen authority representation. It is
+not a Skill identity and does not establish functional, runtime, or E2E
+equivalence.
+
 Run only this experiment's tests with:
 
 ```bash
