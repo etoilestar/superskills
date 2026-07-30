@@ -109,6 +109,76 @@ def test_empty_owner_is_allowed_during_allocation():
     assert allocations[0]["owners"] == []
 
 
+@pytest.mark.parametrize(
+    ("channels", "expected"),
+    [
+        ({"R1": "direct"}, (0, 0, 1)),
+        ({"R1": "resource"}, (0, 1, 0)),
+        ({"R1": "executable", "R2": "resource"}, (1, 1, 0)),
+        ({"R1": "executable", "R2": "resource", "R3": "direct"}, (1, 1, 1)),
+    ],
+)
+def test_requirement_channels_count_per_requirement(channels, expected):
+    summary = api._requirement_channel_summary(channels)
+    assert (
+        summary["executable_requirement_count"],
+        summary["resource_requirement_count"],
+        summary["direct_requirement_count"],
+    ) == expected
+
+
+def test_no_executable_allocations_do_not_create_ownerless_issue():
+    allocations = [_allocation("R1", []), _allocation("R2", [])]
+    review = api._normalize_semantic_review_against_allocations(
+        {"passed": True, "issues": []}, allocations,
+        {"R1": "resource", "R2": "direct"},
+    )
+    assert review == {"passed": True, "issues": []}
+
+
+@pytest.mark.parametrize("channels", [
+    {},
+    {"R1": "direct", "R2": "resource"},
+    {"R1": "unknown"},
+])
+def test_requirement_channel_protocol_rejects_missing_extra_or_invalid(channels):
+    with pytest.raises(api.PreparePlanProtocolError):
+        api._validate_requirement_channels(channels, [_allocation("R1", [])])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change_channel", [False, True])
+async def test_reconciliation_cannot_modify_owned_entry_or_channel(monkeypatch, change_channel):
+    allocations = [_allocation("R1", ["scripts/a.py"]), _allocation("R2", [])]
+    changed = [
+        {**allocations[0], "evidence": {
+            "responsibility": "changed", "outputs": [], "capabilities": []}},
+        allocations[1],
+    ]
+    channels = {"R1": "executable", "R2": "executable"}
+
+    async def complete(*_args, **_kwargs):
+        returned_channels = dict(channels)
+        if change_channel:
+            returned_channels["R2"] = "direct"
+        return json.dumps({
+            "requirement_allocations": changed,
+            "requirement_channels": returned_channels,
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    with pytest.raises(api.PreparePlanProtocolError):
+        await api._reconcile_requirement_allocations(
+            request=api.PreparePlanRequest(user_request="Complete capability A"),
+            blueprint_text="blueprint",
+            function_items=[{"target_file": "scripts/a.py"}],
+            requirement_allocations=allocations,
+            requirement_channels=channels,
+            semantic_review={"passed": False, "issues": []},
+            planner_model="test",
+        )
+
+
 @pytest.mark.asyncio
 async def test_requirement_planner_keeps_ownerless_core_requirement(monkeypatch):
     captured = []
@@ -119,7 +189,9 @@ async def test_requirement_planner_keeps_ownerless_core_requirement(monkeypatch)
             _allocation("R1", ["scripts/a.py"]),
             _allocation("R2", ["scripts/b.py"]),
             _allocation("R3", []),
-        ]})
+        ], "requirement_channels": {
+            "R1": "executable", "R2": "executable", "R3": "executable",
+        }})
 
     monkeypatch.setattr(api, "complete_creator_role_once", complete)
     allocations = await api._plan_requirement_allocations(
@@ -132,7 +204,8 @@ async def test_requirement_planner_keeps_ownerless_core_requirement(monkeypatch)
         planner_model="test",
     )
 
-    assert allocations[2]["owners"] == []
+    assert allocations["requirement_allocations"][2]["owners"] == []
+    assert allocations["requirement_channels"]["R3"] == "executable"
     planner_prompt = captured[0]
     assert "return owners=[]" in planner_prompt
     assert "do not omit" in planner_prompt
@@ -271,6 +344,36 @@ def test_normalization_does_not_mutate_inputs():
     api._normalize_semantic_review_against_allocations(review, allocations)
     assert review == original_review
     assert allocations == original_allocations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutator", [
+    lambda items: [*items, _allocation("R2", [])],
+    lambda items: [],
+    lambda items: [{**items[0], "requirement_id": "R2"}],
+    lambda items: [{**items[0], "requirement": "Changed capability"}],
+    lambda items: [items[1], items[0]],
+])
+async def test_reconciliation_cannot_change_requirement_set(monkeypatch, mutator):
+    allocations = [_allocation("R1", []), _allocation("R2", ["scripts/a.py"])]
+
+    async def complete(*_args, **_kwargs):
+        return json.dumps({
+            "requirement_allocations": mutator(allocations),
+            "requirement_channels": {"R1": "executable", "R2": "executable"},
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    with pytest.raises((ValueError, api.PreparePlanProtocolError)):
+        await api._reconcile_requirement_allocations(
+            request=api.PreparePlanRequest(user_request="Complete capability A"),
+            blueprint_text="blueprint",
+            function_items=[{"target_file": "scripts/a.py"}],
+            requirement_allocations=allocations,
+            requirement_channels={"R1": "executable", "R2": "executable"},
+            semantic_review={"passed": False, "issues": []},
+            planner_model="test",
+        )
 
 
 def test_semantic_review_rejects_unknown_target_exactly():
@@ -490,13 +593,37 @@ def test_ownerless_replan_rejects_unrelated_resource_change():
         )
 
 
-def test_ownerless_replan_rejects_undeclared_existing_target_change():
-    before = _blueprint([_entry("scripts/a.py"), _entry("scripts/c.py")])
-    after = _blueprint([
-        _entry("scripts/a.py", "Capability A responsibility"),
-        _entry("scripts/c.py", "Unrelated responsibility change"),
-    ])
-    with pytest.raises(api.PreparePlanProtocolError, match="patch manifest"):
+def test_replan_uses_actual_noop_instead_of_false_manifest():
+    before = _blueprint([_entry("scripts/a.py")])
+    actual = api._validate_blueprint_semantic_replan_scope(
+        before_blueprint_text=before,
+        after_blueprint_text=before,
+        blocking_issues=[{
+            "issue_type": "requirement_uncovered",
+            "requirement_id": "R1",
+            "affected_targets": [],
+        }],
+        patch_manifest={
+            "changed_targets": ["scripts/a.py"],
+            "added_targets": [],
+            "changed_resources": [],
+        },
+    )
+    assert actual["actual_changed_targets"] == []
+    assert actual["actual_added_targets"] == []
+    assert actual["actual_changed_resources"] == []
+
+
+@pytest.mark.parametrize("old,new", [
+    ("role: generic_script", "role: alternate_role"),
+    ("required_capabilities: []", "required_capabilities: [capability_a]"),
+    ("forbidden_capabilities: []", "forbidden_capabilities: [capability_b]"),
+    ("references: []", "references: [references/r.md]"),
+])
+def test_ownerless_replan_rejects_non_clarification_fields(old, new):
+    before = _blueprint([_entry("scripts/a.py")])
+    after = before.replace(old, new)
+    with pytest.raises(api.PreparePlanProtocolError, match="scope|FunctionItem domain"):
         api._validate_blueprint_semantic_replan_scope(
             before_blueprint_text=before,
             after_blueprint_text=after,
@@ -507,7 +634,6 @@ def test_ownerless_replan_rejects_undeclared_existing_target_change():
             }],
             patch_manifest={
                 "changed_targets": ["scripts/a.py"],
-                "added_targets": [],
-                "changed_resources": [],
+                "added_targets": [], "changed_resources": [],
             },
         )
