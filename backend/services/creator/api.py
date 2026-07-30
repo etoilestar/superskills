@@ -50,6 +50,7 @@ from .basic_format import check_patch_candidate_basic_format
 from .command_normalizer import _effective_command_lines
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
+from .responsibility_graph import GraphDraft, compile_responsibility_graph, public_edges
 
 
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
@@ -6306,7 +6307,7 @@ async def _converge_ready_executable_plan(
     draft_transport_error: str = "",
     frozen_blueprint_text: str = "",
 ) -> dict[str, Any]:
-    """Regenerate graph edges once without asking Planner to repeat FunctionItems."""
+    """Validate a backend-compiled candidate without regenerating its edge set."""
     if not frozen_blueprint_text:
         raise ValueError("Planner convergence requires frozen_blueprint_text")
 
@@ -6315,12 +6316,6 @@ async def _converge_ready_executable_plan(
         allowed_function_item_targets=allowed_function_item_targets,
     )
     draft_edges = list(current_planner_result.get("responsibility_edges") or [])
-    graph_context = _build_responsibility_graph_construction_context(
-        frozen_blueprint_text=frozen_blueprint_text,
-        allowed_function_item_targets=allowed_function_item_targets,
-        function_items=frozen_function_items,
-        responsibility_edges=draft_edges,
-    )
     logger.info(
         "[Creator][planner_convergence][draft] %s",
         json.dumps({
@@ -6333,53 +6328,12 @@ async def _converge_ready_executable_plan(
         }, ensure_ascii=False, default=str),
     )
 
-    prompt = """
-You are the same Blueprint Planner converging a ResponsibilityGraph over frozen
-FunctionItems. Blueprint defines responsibilities; Graph connects them.
-
-Return a complete responsibility_edges array only. Do not return or redesign
-FunctionItems, files, target_file, inputs, outputs, purpose, capabilities, or
-constraints. If frozen responsibility facts prevent closure, do not invent a
-new boundary; leave the facts unchanged so backend can request upstream replan.
-
-Use graph_construction_context as the only topology and endpoint authority. For
-each target input, choose the semantically correct provenance from its supplied
-legal_sources. Backend supplies only the structurally legal source domain and
-does not choose the semantic mapping. Use exact endpoint strings. Preserve the
-platform boundary contract and the canonical ResponsibilityEdge wire fields:
-from_node, from_output, to_node, to_input, purpose, constraints.
-
-Before returning, replay the complete graph and verify:
-0. Valid node identities are only platform_input_node,
-   platform_output_node, and exact authoritative script paths. Never use a
-   role, basename, capability, shorthand, or other alias.
-1. Every declared runtime input has exactly one legal provenance.
-2. Every from_output exists in the supplied legal source domain.
-3. Every to_input exists on the frozen target FunctionItem.
-4. Every required final output has a producer-to-platform_output path.
-5. No input, output, FunctionItem, file, or platform slot was invented.
-
-Return only strict JSON: {"responsibility_edges": [...]}
-""".strip()
-    payload = {
-        "task": "converge_responsibility_graph_edges",
-        "graph_construction_context": graph_context,
-        "validation_issues": ([{
-            "reason": draft_transport_error,
-        }] if draft_transport_error else []),
-    }
-    text = await complete_creator_role_once(
-        [{"role": "system", "content": prompt},
-         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
-        "planner", fallback_model=planner_model,
-    )
-    data = _parse_prepare_plan_json(text)
-    if set(data) != {"responsibility_edges"} or not isinstance(data.get("responsibility_edges"), list):
-        raise ValueError("Planner convergence must return only responsibility_edges")
+    if draft_transport_error:
+        raise ValueError(f"backend-compiled graph transport failed: {draft_transport_error}")
     normalized_edges = validate_structured_responsibility_edge_transport(
-        data["responsibility_edges"],
+        draft_edges,
         function_items=frozen_function_items,
-        source="planner convergence",
+        source="backend graph compiler",
     )
     result = dict(current_planner_result)
     result["function_items"] = frozen_function_items
@@ -7088,7 +7042,7 @@ async def _bind_executable_responsibility_plan(
     planner_model: str,
     allowed_function_item_targets: list[str],
 ) -> dict[str, Any]:
-    """Ask Planner for initial edges over Backend-materialized frozen FunctionItems."""
+    """Compile edges over frozen FunctionItems; ask the model only about ambiguity."""
     frozen_blueprint_text = str(
         current_planner_result.get("internal_blueprint_text") or ""
     )
@@ -7096,53 +7050,34 @@ async def _bind_executable_responsibility_plan(
         frozen_blueprint_text=frozen_blueprint_text,
         allowed_function_item_targets=allowed_function_item_targets,
     )
-    graph_context = _build_responsibility_graph_construction_context(
-        frozen_blueprint_text=frozen_blueprint_text,
-        allowed_function_item_targets=allowed_function_item_targets,
-        function_items=frozen_function_items,
-    )
-    prompt = """
-You are the Blueprint Planner binding the initial ResponsibilityGraph over frozen
-FunctionItems. Blueprint defines responsibilities; Graph connects them.
+    draft = GraphDraft.freeze(frozen_function_items)
 
-Return a complete responsibility_edges array only. Do not return or redesign
-FunctionItems, files, target_file, inputs, outputs, purpose, capabilities, or
-constraints. Use graph_construction_context as the only topology and endpoint
-authority. For each target input, choose the semantically correct provenance
-from its supplied legal_sources. Backend supplies only the structurally legal
-source domain; it does not choose the semantic mapping.
-
-Use exact canonical ResponsibilityEdge fields: from_node, from_output, to_node,
-to_input, purpose, constraints. Platform endpoints and slots must come from the
-supplied platform contracts. Do not infer aliases or invent endpoints.
-
-Before returning, replay the complete graph and verify:
-0. Valid node identities are only platform_input_node,
-   platform_output_node, and exact authoritative script paths. Never use a
-   role, basename, capability, shorthand, or other alias.
-1. Every declared runtime input has exactly one legal provenance.
-2. Every from_output exists in the supplied legal source domain.
-3. Every to_input exists on the frozen target FunctionItem.
-4. Every required final output has a producer-to-platform_output path.
-5. No input, output, FunctionItem, file, or platform slot was invented.
-
-Return only strict JSON: {"responsibility_edges": [...]}
+    async def select_source(payload: dict[str, Any]) -> dict[str, Any]:
+        prompt = """
+Select one semantically valid source from the supplied immutable candidates.
+Do not design an edge, node, port, file, asset, reference, platform slot, or
+implementation. Return strict JSON with no extra fields:
+{"decision":"selected","selected_candidate_id":"C1"}
+or {"decision":"no_semantically_valid_candidate"}.
+The selected_candidate_id must be copied exactly from candidates.
 """.strip()
-    payload = {
-        "task": "bind_responsibility_graph_edges",
-        "graph_construction_context": graph_context,
-    }
-    text = await complete_creator_role_once(
-        [{"role": "system", "content": prompt},
-         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
-        "planner", fallback_model=planner_model,
-    )
-    data = _parse_prepare_plan_json(text)
-    if set(data) != {"responsibility_edges"} or not isinstance(data.get("responsibility_edges"), list):
-        raise ValueError("Planner binding must return only responsibility_edges")
+        text = await complete_creator_role_once(
+            [{"role": "system", "content": prompt},
+             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            "planner", fallback_model=planner_model,
+        )
+        return _parse_prepare_plan_json(text)
+
+    await compile_responsibility_graph(draft, source_selector=select_source)
+    logger.info("[Creator][responsibility_graph_compiler] %s", json.dumps(draft.metrics, ensure_ascii=False, default=str))
+    if draft.status != "committed":
+        raise PreparePlanProtocolError(json.dumps({
+            "status": "internal_failure", "stage": "responsibility_graph",
+            "issues": draft.issues,
+        }, ensure_ascii=False))
     return {
         "function_items": frozen_function_items,
-        "responsibility_edges": data["responsibility_edges"],
+        "responsibility_edges": public_edges(draft),
     }
 
 
