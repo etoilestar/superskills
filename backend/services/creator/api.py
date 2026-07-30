@@ -7487,6 +7487,59 @@ def _requirement_channel_summary(
     }
 
 
+def _normalize_semantic_review_against_allocations(
+    review: dict[str, Any],
+    requirement_allocations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Make ownerless allocations blocking without inferring semantic ownership."""
+    normalized_review = copy.deepcopy(review)
+    allocations = copy.deepcopy(requirement_allocations)
+    issues = normalized_review.get("issues") or []
+
+    deduplicated_issues: list[dict[str, Any]] = []
+    seen_issues: set[str] = set()
+    for issue in issues:
+        identity = json.dumps(issue, ensure_ascii=False, sort_keys=True, default=str)
+        if identity not in seen_issues:
+            seen_issues.add(identity)
+            deduplicated_issues.append(issue)
+
+    coverage_issue_types = {
+        "requirement_uncovered", "requirement_partially_covered"
+    }
+    reported_ownerless_ids = {
+        str(issue.get("requirement_id") or "").strip()
+        for issue in deduplicated_issues
+        if issue.get("issue_type") in coverage_issue_types
+    }
+    ownerless_ids = [
+        str(allocation.get("requirement_id") or "").strip()
+        for allocation in allocations
+        if not (allocation.get("owners") or [])
+    ]
+    for requirement_id in ownerless_ids:
+        if requirement_id in reported_ownerless_ids:
+            continue
+        deduplicated_issues.append({
+            "issue_type": "requirement_uncovered",
+            "requirement_id": requirement_id,
+            "affected_targets": [],
+            "reason": (
+                "The current Blueprint has no legitimate FunctionItem owner "
+                "for this requirement."
+            ),
+            "repair_guidance": (
+                "Clarify the minimum existing FunctionItem responsibilities or add "
+                "only the minimum genuinely missing responsibility."
+            ),
+        })
+        reported_ownerless_ids.add(requirement_id)
+
+    normalized_review["issues"] = deduplicated_issues
+    normalized_review["passed"] = not deduplicated_issues
+    return normalized_review
+
+
 async def _review_blueprint_semantic_closure(
     *, request: PreparePlanRequest, blueprint_text: str,
     function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]],
