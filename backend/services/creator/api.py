@@ -7149,7 +7149,7 @@ Return only strict JSON: {"responsibility_edges": [...]}
 async def _plan_requirement_allocations(
     *, request: PreparePlanRequest, blueprint_text: str,
     function_items: list[dict[str, Any]], planner_model: str,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     """Ask the Planner for the semantic requirement-to-owner projection."""
     prompt = """
 You are the Blueprint Planner producing a requirement coverage projection before
@@ -7201,10 +7201,20 @@ FunctionItems may legitimately cooperate on one requirement. There is no
 one-requirement-to-one-file rule. Do not add, remove, rename, or modify FilePlan
 entries or FunctionItems during requirement allocation. The later semantic
 Reviewer and bounded Blueprint replan own repair.
+Static resource responsibilities and host direct-answer responsibilities are not
+script ownership requirements. Use the supplied structured FilePlan and
+FunctionItems to distinguish those channels; do not classify them with business
+keywords and do not create a script owner for either channel.
+
+Classify each requirement independently as executable, resource, or direct using
+only the original request and supplied structured planning facts. Only executable
+requirements require script owners. Resource and direct requirements use
+owners=[] and remain in their respective semantic-review channels.
 
 Return strict JSON only: {"requirement_allocations":[{"requirement_id":"R1",
 "requirement":"...","owners":["..."],"evidence":{"responsibility":"...",
-"outputs":[],"capabilities":[]}}]}. IDs must be unique and stable within this
+"outputs":[],"capabilities":[]}}],"requirement_channels":{"R1":"executable"}}.
+IDs must be unique and stable within this
 plan. Do not add files, FunctionItems, or requirements merely for closure.
 """.strip()
     payload = {
@@ -7225,15 +7235,256 @@ plan. Do not add files, FunctionItems, or requirements merely for closure.
         "planner", fallback_model=planner_model,
     )
     data = _parse_prepare_plan_json(text)
-    if set(data) != {"requirement_allocations"}:
+    if set(data) != {"requirement_allocations", "requirement_channels"}:
         raise PreparePlanProtocolError("Planner requirement allocation returned an invalid protocol shape")
-    return validate_requirement_allocations(
+    allocations = validate_requirement_allocations(
         data["requirement_allocations"],
         allowed_owner_targets=[
             str(item.get("target_file") or "").strip()
             for item in function_items
         ],
     )
+    channels = _validate_requirement_channels(
+        data["requirement_channels"], allocations
+    )
+    return {
+        "requirement_allocations": allocations,
+        "requirement_channels": channels,
+    }
+
+
+def _validate_requirement_channels(
+    channels: Any,
+    requirement_allocations: list[dict[str, Any]],
+) -> dict[str, str]:
+    if not isinstance(channels, dict):
+        raise PreparePlanProtocolError("requirement_channels must be an object")
+    requirement_ids = [item["requirement_id"] for item in requirement_allocations]
+    if set(channels) != set(requirement_ids):
+        raise PreparePlanProtocolError(
+            "requirement_channels IDs must exactly match requirement allocations"
+        )
+    allowed_channels = {"executable", "resource", "direct"}
+    normalized = {str(key): str(value).strip() for key, value in channels.items()}
+    invalid = {key: value for key, value in normalized.items() if value not in allowed_channels}
+    if invalid:
+        raise PreparePlanProtocolError(
+            f"requirement_channels contains invalid channel values: {invalid}"
+        )
+    invalid_non_executable_owners = [
+        item["requirement_id"] for item in requirement_allocations
+        if normalized[item["requirement_id"]] != "executable" and item.get("owners")
+    ]
+    if invalid_non_executable_owners:
+        raise PreparePlanProtocolError(
+            "Non-executable requirement channels cannot have script owners: "
+            f"{invalid_non_executable_owners}"
+        )
+    return {requirement_id: normalized[requirement_id] for requirement_id in requirement_ids}
+
+
+async def _plan_executable_requirement_allocations(
+    *, request: PreparePlanRequest, blueprint_text: str,
+    function_items: list[dict[str, Any]], planner_model: str,
+) -> dict[str, Any]:
+    """Plan the complete requirement projection and per-requirement channels."""
+    return await _plan_requirement_allocations(
+        request=request,
+        blueprint_text=blueprint_text,
+        function_items=function_items,
+        planner_model=planner_model,
+    )
+
+
+async def _reconcile_requirement_allocations(
+    *, request: PreparePlanRequest, blueprint_text: str,
+    function_items: list[dict[str, Any]],
+    requirement_allocations: list[dict[str, Any]],
+    requirement_channels: dict[str, str],
+    semantic_review: dict[str, Any], planner_model: str,
+) -> dict[str, Any]:
+    """Recheck ownership once without changing the authoritative requirement set."""
+    ownerless_ids = [
+        str(item.get("requirement_id") or "").strip()
+        for item in requirement_allocations
+        if not (item.get("owners") or [])
+        and requirement_channels.get(str(item.get("requirement_id") or "").strip())
+        == "executable"
+    ]
+    authoritative_targets = [
+        str(item.get("target_file") or "").strip()
+        for item in function_items if str(item.get("target_file") or "").strip()
+    ]
+    logger.info(
+        "[Creator][requirement_allocation_reconcile] attempt=1 ownerless_ids=%s",
+        ownerless_ids,
+    )
+    prompt = """
+You are the Blueprint Planner reconciling a requirement allocation exactly once.
+The Blueprint and FunctionItems are frozen. Re-evaluate only whether currently
+ownerless executable requirements are already carried by one or more supplied
+FunctionItems. You may modify only owners and evidence. Preserve every
+requirement_id, requirement text, and array position exactly. Owners must be
+copied verbatim from authoritative_targets. Do not choose the first target by
+default, assign every target, infer from names, paths, roles, capabilities,
+suffixes, or business keywords, or create any owner identity. Leave owners=[]
+when the frozen Blueprint does not establish legitimate ownership. Static
+resource and host direct-answer responsibilities are not script ownership.
+Preserve requirement_channels exactly. Return strict JSON only:
+{"requirement_allocations":[...],"requirement_channels":{...}}.
+""".strip()
+    payload = {
+        "original_user_requirement": request.user_request,
+        "current_blueprint": blueprint_text,
+        "current_function_items": function_items,
+        "requirement_allocations": requirement_allocations,
+        "ownerless_requirement_ids": ownerless_ids,
+        "authoritative_targets": authoritative_targets,
+        "semantic_review": semantic_review,
+        "requirement_channels": requirement_channels,
+    }
+    text = await complete_creator_role_once(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+        "planner", fallback_model=planner_model,
+    )
+    data = _parse_prepare_plan_json(text)
+    if set(data) != {"requirement_allocations", "requirement_channels"}:
+        raise PreparePlanProtocolError(
+            "Requirement allocation reconciliation returned an invalid protocol shape"
+        )
+    reconciled = validate_requirement_allocations(
+        data["requirement_allocations"],
+        allowed_owner_targets=authoritative_targets,
+    )
+    reconciled_channels = _validate_requirement_channels(
+        data["requirement_channels"], reconciled
+    )
+    if reconciled_channels != requirement_channels:
+        raise PreparePlanProtocolError(
+            "Requirement allocation reconciliation changed requirement channels"
+        )
+    before_identity = [
+        (item.get("requirement_id"), item.get("requirement"))
+        for item in requirement_allocations
+    ]
+    after_identity = [
+        (item.get("requirement_id"), item.get("requirement"))
+        for item in reconciled
+    ]
+    if before_identity != after_identity:
+        raise PreparePlanProtocolError(
+            "Requirement allocation reconciliation changed requirement identity, text, or order"
+        )
+    initial_ownerless = set(ownerless_ids)
+    before_by_id = {item["requirement_id"]: item for item in requirement_allocations}
+    after_by_id = {item["requirement_id"]: item for item in reconciled}
+    modified_non_ownerless = [
+        requirement_id for requirement_id in before_by_id
+        if requirement_id not in initial_ownerless
+        and before_by_id[requirement_id] != after_by_id[requirement_id]
+    ]
+    if modified_non_ownerless:
+        raise PreparePlanProtocolError(
+            "Requirement allocation reconciliation modified non-ownerless entries: "
+            f"{modified_non_ownerless}"
+        )
+    resolved_ids = [
+        requirement_id for requirement_id in ownerless_ids
+        if next(
+            (item.get("owners") for item in reconciled
+             if item.get("requirement_id") == requirement_id),
+            [],
+        )
+    ]
+    remaining_ownerless_ids = [
+        str(item.get("requirement_id") or "").strip()
+        for item in reconciled if not (item.get("owners") or [])
+        and reconciled_channels.get(str(item.get("requirement_id") or "").strip())
+        == "executable"
+    ]
+    logger.info(
+        "[Creator][requirement_allocation_reconcile] resolved_ids=%s remaining_ownerless_ids=%s",
+        resolved_ids, remaining_ownerless_ids,
+    )
+    return {
+        "requirement_allocations": reconciled,
+        "requirement_channels": reconciled_channels,
+    }
+
+
+def _normalize_semantic_review_against_allocations(
+    review: dict[str, Any],
+    requirement_allocations: list[dict[str, Any]],
+    requirement_channels: dict[str, str],
+) -> dict[str, Any]:
+    """Make ownerless allocations blocking without inferring semantic ownership."""
+    normalized_review = copy.deepcopy(review)
+    allocations = copy.deepcopy(requirement_allocations)
+    issues = normalized_review.get("issues") or []
+
+    deduplicated_issues: list[dict[str, Any]] = []
+    seen_issues: set[str] = set()
+    for issue in issues:
+        identity = json.dumps(issue, ensure_ascii=False, sort_keys=True, default=str)
+        if identity not in seen_issues:
+            seen_issues.add(identity)
+            deduplicated_issues.append(issue)
+
+    coverage_issue_types = {
+        "requirement_uncovered", "requirement_partially_covered"
+    }
+    reported_ownerless_ids = {
+        str(issue.get("requirement_id") or "").strip()
+        for issue in deduplicated_issues
+        if issue.get("issue_type") in coverage_issue_types
+    }
+    ownerless_ids = [
+        str(allocation.get("requirement_id") or "").strip()
+        for allocation in allocations
+        if not (allocation.get("owners") or [])
+        and requirement_channels.get(
+            str(allocation.get("requirement_id") or "").strip()
+        ) == "executable"
+    ]
+    for requirement_id in ownerless_ids:
+        if requirement_id in reported_ownerless_ids:
+            continue
+        deduplicated_issues.append({
+            "issue_type": "requirement_uncovered",
+            "requirement_id": requirement_id,
+            "affected_targets": [],
+            "reason": (
+                "The current Blueprint has no legitimate FunctionItem owner "
+                "for this requirement."
+            ),
+            "repair_guidance": (
+                "Clarify the minimum existing FunctionItem responsibilities or add "
+                "only the minimum genuinely missing responsibility."
+            ),
+        })
+        reported_ownerless_ids.add(requirement_id)
+
+    normalized_review["issues"] = deduplicated_issues
+    normalized_review["passed"] = not deduplicated_issues
+    return normalized_review
+
+
+def _requirement_channel_summary(
+    requirement_channels: dict[str, str],
+) -> dict[str, int]:
+    """Report actual per-requirement channel counts."""
+    return {
+        "executable_requirement_count": sum(
+            value == "executable" for value in requirement_channels.values()
+        ),
+        "resource_requirement_count": sum(
+            value == "resource" for value in requirement_channels.values()
+        ),
+        "direct_requirement_count": sum(
+            value == "direct" for value in requirement_channels.values()
+        ),
+    }
 
 
 def _normalize_semantic_review_against_allocations(
@@ -7292,7 +7543,7 @@ def _normalize_semantic_review_against_allocations(
 async def _review_blueprint_semantic_closure(
     *, request: PreparePlanRequest, blueprint_text: str,
     function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]],
-    planner_model: str,
+    requirement_channels: dict[str, str], planner_model: str,
 ) -> dict[str, Any]:
     """Review requirement coverage and resource meaning; Backend checks shape only."""
     prompt = """
@@ -7301,10 +7552,29 @@ original user requirement, current Blueprint/FilePlan, FunctionItems, and
 requirement_allocations. Decide whether an explicit core requirement is omitted,
 has a real owner, the owner's responsibility is sufficient, capabilities/outputs
 basically match, or a responsibility was invented merely to close structure.
-An ownerless requirement allocation is a legitimate diagnostic state indicating
-that the current Blueprint may have failed to cover a core user requirement. Do
-not treat owners=[] as malformed. Semantic closure must not pass while a genuine
-core requirement remains ownerless.
+Interpret every supplied requirement according to requirement_channels.
+channel=executable requires one or more runtime FunctionItems. owners=[] is a
+blocking executable coverage gap. Check that each owner genuinely carries the
+requirement through its purpose, inputs, outputs, and constraints; allow genuine
+joint ownership, and reject an owner invented merely for structural closure.
+
+channel=resource is carried by static reference/asset responsibility, resource
+source, or resource dependency. owners=[] is valid and must not require a script
+owner. Check the declared resource path, source, dependency, and purpose, whether
+real provenance is missing, and whether a runtime-produced result was incorrectly
+represented as static responsibility.
+
+channel=direct is carried by host direct-answer or result-presentation
+responsibility. owners=[] is valid and is not uncovered merely because no script
+owner exists. Check that the Blueprint expresses the host responsibility and that
+runtime execution responsibility was not incorrectly assigned to this channel.
+
+Also review whether each channel is semantically consistent with the original
+request, structured FilePlan, FunctionItems, resource authority, host execution
+mode, and input/output responsibility. Do not infer a channel from business
+keywords, filenames, suffixes, roles, or capability labels. Report an incorrect
+channel as responsibility_mismatch, referencing its existing requirement_id,
+and direct the minimum Blueprint replan to regenerate the complete projection.
 
 You may review only the supplied requirements. requirement_uncovered and
 requirement_partially_covered MUST reference an existing supplied requirement_id.
@@ -7345,6 +7615,7 @@ conflict may additionally include resource.
         "current_blueprint": blueprint_text,
         "function_items": function_items,
         "requirement_allocations": requirement_allocations,
+        "requirement_channels": requirement_channels,
     }
     text = await complete_creator_role_once(
         [{"role": "system", "content": prompt},
@@ -7377,7 +7648,7 @@ conflict may additionally include resource.
             f"requirement allocation domain: requirement_ids={invalid_requirement_ids}"
         )
     review = _normalize_semantic_review_against_allocations(
-        review, requirement_allocations
+        review, requirement_allocations, requirement_channels
     )
     uncovered = [str(i.get("requirement_id") or "") for i in review["issues"] if i["issue_type"] == "requirement_uncovered"]
     partial = [str(i.get("requirement_id") or "") for i in review["issues"] if i["issue_type"] == "requirement_partially_covered"]
@@ -7447,24 +7718,71 @@ existing supplied requirement; then make only the minimum required change.
     issues = _preflight_prepare_blueprint_text(replanned)
     if issues:
         raise PreparePlanProtocolError(f"Blueprint semantic replan failed FilePlan validation: {issues}")
-    _validate_blueprint_semantic_replan_scope(
+    actual_diff = _validate_blueprint_semantic_replan_scope(
         before_blueprint_text=blueprint_text,
         after_blueprint_text=replanned,
         blocking_issues=blocking_issues,
         patch_manifest=data,
     )
+    logger.info(
+        "[Creator][blueprint_semantic_replan] actual_noop=%s",
+        not any(actual_diff[key] for key in (
+            "actual_changed_targets", "actual_added_targets",
+            "actual_changed_resources", "actual_removed_paths",
+        )),
+    )
     return replanned
+
+
+def _strict_blueprint_compatibility_fields(
+    blueprint_text: str,
+    paths_needing_compatibility: set[str],
+) -> dict[str, dict[str, str]]:
+    """Supplement only legacy blocks the canonical parser retained as raw purpose."""
+    supplemental: dict[str, dict[str, str]] = {}
+    field_names = (
+        "role", "purpose", "inputs", "outputs", "constraints",
+        "required_capabilities", "forbidden_capabilities", "references", "source",
+    )
+    matches = list(re.finditer(
+        r"(?im)^[ \t]*-[ \t]*path[ \t]*:[ \t]*`?([^`\n]+?)`?[ \t]*$",
+        blueprint_text or "",
+    ))
+    for index, match in enumerate(matches):
+        path = _normalize_skill_path(match.group(1).strip().strip("'\""))
+        if path not in paths_needing_compatibility:
+            continue
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(blueprint_text)
+        block = blueprint_text[match.end():end]
+        for field in field_names:
+            field_match = re.search(
+                rf"(?im)^[ \t]*{re.escape(field)}[ \t]*:[ \t]*(.*)$",
+                block,
+            )
+            if field_match:
+                supplemental.setdefault(path, {})[field] = field_match.group(1).strip()
+    return supplemental
 
 
 def _blueprint_semantic_structural_facts(blueprint_text: str) -> tuple[str, dict[str, dict[str, Any]]]:
     plan = parse_blueprint([{"role": "assistant", "content": blueprint_text}], strict=True)
-    return plan.skill_name, {entry.path: asdict(entry) for entry in plan.files}
+    facts = {entry.path: asdict(entry) for entry in plan.files}
+    paths_needing_compatibility = {
+        path for path, item in facts.items()
+        if str(item.get("purpose") or "").lstrip().startswith("- path:")
+    }
+    supplemental = _strict_blueprint_compatibility_fields(
+        blueprint_text, paths_needing_compatibility
+    )
+    for path, fields in supplemental.items():
+        facts[path].update(fields)
+    return plan.skill_name, facts
 
 
 def _validate_blueprint_semantic_replan_scope(
     *, before_blueprint_text: str, after_blueprint_text: str,
     blocking_issues: list[dict[str, Any]], patch_manifest: dict[str, Any],
-) -> None:
+) -> dict[str, Any]:
     """Match the declared patch to structural diff and reject unrelated drift."""
     before_name, before = _blueprint_semantic_structural_facts(before_blueprint_text)
     after_name, after = _blueprint_semantic_structural_facts(after_blueprint_text)
@@ -7485,12 +7803,22 @@ def _validate_blueprint_semantic_replan_scope(
     declared_changed = {str(value).strip() for value in patch_manifest["changed_targets"]}
     declared_added = {str(value).strip() for value in patch_manifest["added_targets"]}
     declared_resources = {str(value).strip() for value in patch_manifest["changed_resources"]}
-    if (declared_changed, declared_added, declared_resources) != (
-        actual_changed_targets, actual_added_targets, actual_changed_resources
-    ):
-        raise PreparePlanProtocolError("Blueprint semantic replan patch manifest does not match structural diff")
+    logger.info(
+        "[Creator][blueprint_semantic_replan_diff] "
+        "declared_changed_targets=%s actual_changed_targets=%s "
+        "declared_added_targets=%s actual_added_targets=%s "
+        "declared_changed_resources=%s actual_changed_resources=%s",
+        sorted(declared_changed), sorted(actual_changed_targets),
+        sorted(declared_added), sorted(actual_added_targets),
+        sorted(declared_resources), sorted(actual_changed_resources),
+    )
     if removed & before_targets or removed - before_targets:
         raise PreparePlanProtocolError("Blueprint semantic replan introduced unrelated structural drift by removing paths")
+    if before_targets - after_targets:
+        raise PreparePlanProtocolError(
+            "Blueprint semantic replan changed an existing target outside the "
+            f"authoritative FunctionItem domain: {sorted(before_targets - after_targets)}"
+        )
 
     affected = {
         str(target).strip()
@@ -7534,6 +7862,19 @@ def _validate_blueprint_semantic_replan_scope(
                 "Blueprint semantic replan changed resources outside an ownerless "
                 "requirement repair scope"
             )
+    return {
+        "actual_changed_targets": sorted(actual_changed_targets),
+        "actual_added_targets": sorted(actual_added_targets),
+        "actual_changed_resources": sorted(actual_changed_resources),
+        "actual_removed_paths": sorted(removed),
+        "actual_changed_fields": {
+            path: sorted(
+                key for key in set(before[path]) | set(after[path])
+                if before[path].get(key) != after[path].get(key)
+            )
+            for path in sorted(actual_changed_targets)
+        },
+    }
 
 
 def _planner_convergence_review_event_from_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -8455,15 +8796,60 @@ Blueprint Planner 只规划业务责任。
             allowed_function_item_targets,
             semantic_function_items,
         )
-        requirement_allocations = await _plan_requirement_allocations(
+        requirement_projection = await _plan_executable_requirement_allocations(
             request=request, blueprint_text=frozen_blueprint_text,
             function_items=semantic_function_items, planner_model=route.model,
+        )
+        requirement_allocations = requirement_projection["requirement_allocations"]
+        requirement_channels = requirement_projection["requirement_channels"]
+        channel_counts = _requirement_channel_summary(requirement_channels)
+        logger.info(
+            "[Creator][requirement_channel] executable_requirement_count=%d "
+            "resource_requirement_count=%d direct_requirement_count=%d",
+            channel_counts["executable_requirement_count"],
+            channel_counts["resource_requirement_count"],
+            channel_counts["direct_requirement_count"],
         )
         semantic_review = await _review_blueprint_semantic_closure(
             request=request, blueprint_text=frozen_blueprint_text,
             function_items=semantic_function_items,
-            requirement_allocations=requirement_allocations, planner_model=route.model,
+            requirement_allocations=requirement_allocations,
+            requirement_channels=requirement_channels, planner_model=route.model,
         )
+        ownerless_ids = [
+            str(item.get("requirement_id") or "").strip()
+            for item in requirement_allocations if not (item.get("owners") or [])
+            and requirement_channels.get(str(item.get("requirement_id") or "").strip())
+            == "executable"
+        ]
+        coverage_issue_types = {
+            "requirement_uncovered", "requirement_partially_covered"
+        }
+        ownerless_id_set = set(ownerless_ids)
+        coverage_only = bool(semantic_review["issues"]) and all(
+            issue.get("issue_type") in coverage_issue_types
+            and str(issue.get("requirement_id") or "").strip() in ownerless_id_set
+            for issue in semantic_review["issues"]
+        )
+        if ownerless_ids and coverage_only:
+            requirement_projection = await _reconcile_requirement_allocations(
+                request=request,
+                blueprint_text=frozen_blueprint_text,
+                function_items=semantic_function_items,
+                requirement_allocations=requirement_allocations,
+                requirement_channels=requirement_channels,
+                semantic_review=semantic_review,
+                planner_model=route.model,
+            )
+            requirement_allocations = requirement_projection["requirement_allocations"]
+            requirement_channels = requirement_projection["requirement_channels"]
+            semantic_review = await _review_blueprint_semantic_closure(
+                request=request, blueprint_text=frozen_blueprint_text,
+                function_items=semantic_function_items,
+                requirement_allocations=requirement_allocations,
+                requirement_channels=requirement_channels,
+                planner_model=route.model,
+            )
         if not semantic_review["passed"]:
             frozen_blueprint_text = await _replan_blueprint_for_semantic_closure(
                 request=request, blueprint_text=frozen_blueprint_text,
@@ -8505,16 +8891,34 @@ Blueprint Planner 只规划业务责任。
                 allowed_function_item_targets,
                 semantic_function_items,
             )
-            requirement_allocations = await _plan_requirement_allocations(
+            requirement_projection = await _plan_executable_requirement_allocations(
                 request=request, blueprint_text=frozen_blueprint_text,
                 function_items=semantic_function_items, planner_model=route.model,
             )
+            requirement_allocations = requirement_projection["requirement_allocations"]
+            requirement_channels = requirement_projection["requirement_channels"]
             semantic_review = await _review_blueprint_semantic_closure(
                 request=request, blueprint_text=frozen_blueprint_text,
                 function_items=semantic_function_items,
-                requirement_allocations=requirement_allocations, planner_model=route.model,
+                requirement_allocations=requirement_allocations,
+                requirement_channels=requirement_channels, planner_model=route.model,
             )
             if not semantic_review["passed"]:
+                remaining_ownerless_ids = [
+                    str(item.get("requirement_id") or "").strip()
+                    for item in requirement_allocations
+                    if not (item.get("owners") or [])
+                    and requirement_channels.get(str(item.get("requirement_id") or "").strip())
+                    == "executable"
+                ]
+                logger.error(
+                    "[Creator][semantic_closure_failure] stage=post_blueprint_replan "
+                    "issue_ids=%s remaining_ownerless_ids=%s failure_reason=%s",
+                    [str(issue.get("requirement_id") or "").strip()
+                     for issue in semantic_review["issues"]],
+                    remaining_ownerless_ids,
+                    "blocking semantic issues remain after exactly one replan",
+                )
                 raise PreparePlanProtocolError(
                     "Blueprint semantic closure failed after exactly one localized replan; "
                     f"issues={semantic_review['issues']}"
@@ -8523,14 +8927,19 @@ Blueprint Planner 只规划业务责任。
             **first_planner_result,
             "internal_blueprint_text": frozen_blueprint_text,
             "requirement_allocations": requirement_allocations,
+            "requirement_channels": requirement_channels,
         }
 
         try:
-            binding_data = await _bind_executable_responsibility_plan(
-                request=request,
-                current_planner_result=first_planner_result,
-                planner_model=route.model,
-                allowed_function_item_targets=allowed_function_item_targets,
+            binding_data = (
+                await _bind_executable_responsibility_plan(
+                    request=request,
+                    current_planner_result=first_planner_result,
+                    planner_model=route.model,
+                    allowed_function_item_targets=allowed_function_item_targets,
+                )
+                if allowed_function_item_targets
+                else {"function_items": [], "responsibility_edges": []}
             )
             candidate_function_items = normalize_structured_function_items(
                 binding_data.get("function_items"),
@@ -8615,6 +9024,7 @@ Blueprint Planner 只规划业务责任。
             data["function_items"] = normalized_converged_function_items
             data["responsibility_edges"] = normalized_converged_edges
             data["requirement_allocations"] = requirement_allocations
+            data["requirement_channels"] = requirement_channels
             data["internal_blueprint_text"] = _render_structured_responsibility_view(
                 frozen_blueprint_text,
                 normalized_converged_function_items,

@@ -1,3 +1,4 @@
+import copy
 import json
 import re
 
@@ -1053,7 +1054,7 @@ def _semantic_closure_response(messages):
             "requirement_id": "R1", "requirement": "完成核心责任",
             "owners": owners,
             "evidence": {"responsibility": "完成责任", "outputs": [], "capabilities": []},
-        }]}
+        }], "requirement_channels": {"R1": "executable"}}
     if "semantic coverage Reviewer" in system:
         return {"passed": True, "issues": []}
     return None
@@ -1078,7 +1079,7 @@ def _with_script_purpose(blueprint, target, purpose):
 
 async def _run_semantic_closure_until_graph(
     monkeypatch, *, reviews, replanned_blueprint=None, initial_blueprint=None,
-    allocation_responses=None,
+    allocation_responses=None, reconciliation_responses=None,
 ):
     import json
 
@@ -1086,6 +1087,7 @@ async def _run_semantic_closure_until_graph(
         _skill_plan_block("\n" + _script_plan_block("scripts/a.py"))
     )
     allocations = 0
+    reconciliations = 0
     review_calls = 0
     replan_calls = 0
     graph_calls = 0
@@ -1096,17 +1098,36 @@ async def _run_semantic_closure_until_graph(
         return json.dumps(_ready_payload(initial))
 
     async def semantic_models(messages, role, fallback_model):
-        nonlocal allocations, review_calls, replan_calls, blueprint_calls
+        nonlocal allocations, reconciliations, review_calls, replan_calls, blueprint_calls
         system = str(messages[0].get("content") or "")
+        if "reconciling a requirement allocation exactly once" in system:
+            reconciliations += 1
+            if reconciliation_responses is None:
+                payload = json.loads(messages[1]["content"])
+                return json.dumps({
+                    "requirement_allocations": payload["requirement_allocations"],
+                    "requirement_channels": payload["requirement_channels"],
+                })
+            result = dict(reconciliation_responses[reconciliations - 1])
+            result.setdefault("requirement_channels", {
+                item["requirement_id"]: "executable"
+                for item in result["requirement_allocations"]
+            })
+            return json.dumps(result)
         if "requirement coverage projection" in system:
             allocations += 1
             if allocation_responses is not None:
-                return json.dumps(allocation_responses[allocations - 1])
+                result = dict(allocation_responses[allocations - 1])
+                result.setdefault("requirement_channels", {
+                    item["requirement_id"]: "executable"
+                    for item in result["requirement_allocations"]
+                })
+                return json.dumps(result)
             return json.dumps({"requirement_allocations": [{
                 "requirement_id": "R1", "requirement": "完成核心责任",
                 "owners": ["scripts/a.py"],
                 "evidence": {"responsibility": "完成责任", "outputs": [], "capabilities": []},
-            }]})
+            }], "requirement_channels": {"R1": "executable"}})
         if "semantic coverage Reviewer" in system:
             result = reviews[review_calls]
             review_calls += 1
@@ -1136,7 +1157,8 @@ async def _run_semantic_closure_until_graph(
         pass
     return {
         "initial": initial, "allocations": allocations, "reviews": review_calls,
-        "replans": replan_calls, "graphs": graph_calls, "graph_blueprint": graph_blueprint,
+        "reconciliations": reconciliations, "replans": replan_calls,
+        "graphs": graph_calls, "graph_blueprint": graph_blueprint,
     }
 
 
@@ -1145,7 +1167,8 @@ async def test_semantic_closure_pass_calls_graph_once_without_replan(monkeypatch
     result = await _run_semantic_closure_until_graph(
         monkeypatch, reviews=[{"passed": True, "issues": []}],
     )
-    assert result == {**result, "allocations": 1, "reviews": 1, "replans": 0, "graphs": 1}
+    assert result == {**result, "allocations": 1, "reviews": 1,
+                      "reconciliations": 0, "replans": 0, "graphs": 1}
 
 
 @pytest.mark.asyncio
@@ -1180,8 +1203,10 @@ async def test_ownerless_reviewer_pass_enters_exactly_one_replan(monkeypatch):
     }]}
     result = await _run_semantic_closure_until_graph(
         monkeypatch,
-        reviews=[{"passed": True, "issues": []}, {"passed": True, "issues": []}],
+        reviews=[{"passed": True, "issues": []}, {"passed": True, "issues": []},
+                 {"passed": True, "issues": []}],
         allocation_responses=[allocation([]), allocation(["scripts/a.py"])],
+        reconciliation_responses=[allocation([])],
         replanned_blueprint={
             "internal_blueprint_text": revised,
             "changed_targets": ["scripts/a.py"],
@@ -1189,7 +1214,131 @@ async def test_ownerless_reviewer_pass_enters_exactly_one_replan(monkeypatch):
             "changed_resources": [],
         },
     )
-    assert (result["allocations"], result["reviews"], result["replans"], result["graphs"]) == (2, 2, 1, 1)
+    assert (result["allocations"], result["reviews"], result["reconciliations"],
+            result["replans"], result["graphs"]) == (2, 3, 1, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_ownerless_reconciliation_closes_without_blueprint_replan(monkeypatch):
+    initial = _ready_blueprint(_skill_plan_block(
+        "\n" + _script_plan_block("scripts/a.py")
+        + "\n" + _script_plan_block("scripts/b.py")
+    ))
+    allocation = lambda owners: {"requirement_allocations": [{
+        "requirement_id": "R1", "requirement": "Complete capability A",
+        "owners": owners,
+        "evidence": {"responsibility": "Capability A", "outputs": [], "capabilities": []},
+    }]}
+    result = await _run_semantic_closure_until_graph(
+        monkeypatch,
+        initial_blueprint=initial,
+        allocation_responses=[allocation([])],
+        reconciliation_responses=[allocation(["scripts/a.py", "scripts/b.py"])],
+        reviews=[{"passed": True, "issues": []}, {"passed": True, "issues": []}],
+    )
+    assert (result["allocations"], result["reviews"], result["reconciliations"],
+            result["replans"], result["graphs"]) == (1, 2, 1, 0, 1)
+
+
+@pytest.mark.asyncio
+async def test_three_channel_mix_only_executable_requires_owner(monkeypatch):
+    allocations = {"requirement_allocations": [
+        {"requirement_id": "R1", "requirement": "Complete capability A",
+         "owners": ["scripts/a.py"], "evidence": {"responsibility": "A", "outputs": [], "capabilities": []}},
+        {"requirement_id": "R2", "requirement": "Provide resource responsibility",
+         "owners": [], "evidence": {"responsibility": "resource", "outputs": [], "capabilities": []}},
+        {"requirement_id": "R3", "requirement": "Provide direct responsibility",
+         "owners": [], "evidence": {"responsibility": "direct", "outputs": [], "capabilities": []}},
+    ], "requirement_channels": {
+        "R1": "executable", "R2": "resource", "R3": "direct",
+    }}
+    result = await _run_semantic_closure_until_graph(
+        monkeypatch, allocation_responses=[allocations],
+        reviews=[{"passed": True, "issues": []}],
+    )
+    assert (result["reconciliations"], result["replans"], result["graphs"]) == (0, 0, 1)
+
+
+@pytest.mark.asyncio
+async def test_three_channel_mix_reconciles_only_ownerless_executable(monkeypatch):
+    initial = {"requirement_allocations": [
+        {"requirement_id": "R1", "requirement": "Complete capability A",
+         "owners": [], "evidence": {"responsibility": "A", "outputs": [], "capabilities": []}},
+        {"requirement_id": "R2", "requirement": "Provide resource responsibility",
+         "owners": [], "evidence": {"responsibility": "resource", "outputs": [], "capabilities": []}},
+        {"requirement_id": "R3", "requirement": "Provide direct responsibility",
+         "owners": [], "evidence": {"responsibility": "direct", "outputs": [], "capabilities": []}},
+    ], "requirement_channels": {
+        "R1": "executable", "R2": "resource", "R3": "direct",
+    }}
+    reconciled = copy.deepcopy(initial)
+    reconciled["requirement_allocations"][0]["owners"] = ["scripts/a.py"]
+    result = await _run_semantic_closure_until_graph(
+        monkeypatch, allocation_responses=[initial],
+        reconciliation_responses=[reconciled],
+        reviews=[{"passed": True, "issues": []}, {"passed": True, "issues": []}],
+    )
+    assert (result["reconciliations"], result["replans"], result["graphs"]) == (1, 0, 1)
+
+
+@pytest.mark.asyncio
+async def test_noncoverage_issue_skips_reconciliation_and_replans_once(monkeypatch):
+    initial = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py")))
+    revised = _with_script_purpose(initial, "scripts/a.py", "Capability A responsibility")
+    allocation = lambda owners: {"requirement_allocations": [{
+        "requirement_id": "R1", "requirement": "Complete capability A",
+        "owners": owners,
+        "evidence": {"responsibility": "Capability A", "outputs": [], "capabilities": []},
+    }]}
+    result = await _run_semantic_closure_until_graph(
+        monkeypatch,
+        allocation_responses=[allocation([]), allocation(["scripts/a.py"])],
+        reviews=[
+            {"passed": False, "issues": [{
+                "issue_type": "responsibility_mismatch", "requirement_id": "R1",
+                "affected_targets": ["scripts/a.py"], "reason": "mismatch",
+                "repair_guidance": "clarify",
+            }]},
+            {"passed": True, "issues": []},
+        ],
+        replanned_blueprint={
+            "internal_blueprint_text": revised,
+            "changed_targets": ["scripts/a.py"],
+            "added_targets": [], "changed_resources": [],
+        },
+    )
+    assert (result["reconciliations"], result["replans"], result["graphs"]) == (0, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_coverage_issue_outside_ownerless_domain_skips_reconciliation(monkeypatch):
+    initial = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py")))
+    revised = _with_script_purpose(initial, "scripts/a.py", "Capability A responsibility")
+    evidence = {"responsibility": "Capability A", "outputs": [], "capabilities": []}
+    first = {"requirement_allocations": [
+        {"requirement_id": "R1", "requirement": "Capability A", "owners": [], "evidence": evidence},
+        {"requirement_id": "R2", "requirement": "Capability B", "owners": ["scripts/a.py"], "evidence": evidence},
+    ], "requirement_channels": {"R1": "executable", "R2": "executable"}}
+    second = copy.deepcopy(first)
+    second["requirement_allocations"][0]["owners"] = ["scripts/a.py"]
+    result = await _run_semantic_closure_until_graph(
+        monkeypatch,
+        allocation_responses=[first, second],
+        reviews=[
+            {"passed": False, "issues": [{
+                "issue_type": "requirement_partially_covered", "requirement_id": "R2",
+                "affected_targets": ["scripts/a.py"], "reason": "partial",
+                "repair_guidance": "clarify",
+            }]},
+            {"passed": True, "issues": []},
+        ],
+        replanned_blueprint={
+            "internal_blueprint_text": revised,
+            "changed_targets": ["scripts/a.py"], "added_targets": [],
+            "changed_resources": [],
+        },
+    )
+    assert (result["reconciliations"], result["replans"], result["graphs"]) == (0, 1, 1)
 
 
 @pytest.mark.asyncio
@@ -1200,21 +1349,19 @@ async def test_ownerless_after_replan_uses_existing_failure_exit(monkeypatch):
         "owners": [],
         "evidence": {"responsibility": "Capability A", "outputs": [], "capabilities": []},
     }]}
-    replan_calls = 0
-
-    async def replan_once(**_kwargs):
-        nonlocal replan_calls
-        replan_calls += 1
-        return initial
-
-    monkeypatch.setattr(api, "_replan_blueprint_for_semantic_closure", replan_once)
     with pytest.raises(api.PreparePlanProtocolError, match="exactly one localized replan"):
         await _run_semantic_closure_until_graph(
             monkeypatch,
-            reviews=[{"passed": True, "issues": []}, {"passed": True, "issues": []}],
+            reviews=[{"passed": True, "issues": []}, {"passed": True, "issues": []},
+                     {"passed": True, "issues": []}],
             allocation_responses=[allocation, allocation],
+            replanned_blueprint={
+                "internal_blueprint_text": initial,
+                "changed_targets": ["scripts/a.py"],
+                "added_targets": [],
+                "changed_resources": [],
+            },
         )
-    assert replan_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1322,6 +1469,10 @@ async def test_ownerless_allocation_drives_replan_then_graph(monkeypatch):
                 "issue_type": "requirement_uncovered", "requirement_id": "R3",
                 "affected_targets": [], "reason": "no owner", "repair_guidance": "add responsibility",
             }]},
+            {"passed": False, "issues": [{
+                "issue_type": "requirement_uncovered", "requirement_id": "R3",
+                "affected_targets": [], "reason": "no owner", "repair_guidance": "add responsibility",
+            }]},
             {"passed": True, "issues": []},
         ],
         replanned_blueprint={
@@ -1329,7 +1480,8 @@ async def test_ownerless_allocation_drives_replan_then_graph(monkeypatch):
             "changed_targets": [], "added_targets": ["scripts/c.py"], "changed_resources": [],
         },
     )
-    assert (result["allocations"], result["reviews"], result["replans"], result["graphs"]) == (2, 2, 1, 1)
+    assert (result["allocations"], result["reviews"], result["reconciliations"],
+            result["replans"], result["graphs"]) == (2, 3, 1, 1, 1)
 
 
 @pytest.mark.asyncio
@@ -3386,13 +3538,17 @@ async def test_requirement_coverage_blocks_only_supplied_ids(
             await api._review_blueprint_semantic_closure(
                 request=_request(), blueprint_text="blueprint",
                 function_items=[_function_item("scripts/a.py")],
-                requirement_allocations=allocations, planner_model="test",
+                requirement_allocations=allocations,
+                requirement_channels={"R1": "executable", "R2": "executable"},
+                planner_model="test",
             )
     else:
         review = await api._review_blueprint_semantic_closure(
             request=_request(), blueprint_text="blueprint",
             function_items=[_function_item("scripts/a.py")],
-            requirement_allocations=allocations, planner_model="test",
+            requirement_allocations=allocations,
+            requirement_channels={"R1": "executable", "R2": "executable"},
+            planner_model="test",
         )
         assert review["passed"] is False
         assert [item["requirement_id"] for item in review["issues"]] == ["R2"]
@@ -3431,10 +3587,15 @@ async def test_semantic_review_prompt_preserves_planning_phase_boundaries(monkey
         requirement_allocations=[{
             "requirement_id": "R1", "requirement": "illustrated output",
             "owners": ["scripts/a.py"], "evidence": {},
-        }], planner_model="test",
+        }], requirement_channels={"R1": "executable"}, planner_model="test",
     )
 
     prompt = " ".join(captured["prompt"].split())
     assert "file does not exist" in prompt
     assert "Actual resource content quality is reviewed after file generation" in prompt
     assert "text_generation Tool producing image-prompt text is still text_generation" in prompt
+    assert "channel=executable" in prompt
+    assert "channel=resource" in prompt
+    assert "channel=direct" in prompt
+    assert "responsibility_mismatch" in prompt
+    assert "owners=[] is valid" in prompt
