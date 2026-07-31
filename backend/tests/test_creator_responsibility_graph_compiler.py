@@ -64,7 +64,7 @@ async def test_ambiguous_source_selector_can_only_choose_candidate_id():
     draft = GraphDraft.freeze([
         item("scripts/a.py", [], ["text"]),
         item("scripts/b.py", ["text"], ["markdown"]),
-    ])
+    ], workflow_topology={"scripts/a.py": [], "scripts/b.py": ["scripts/a.py"]})
     prompts = []
 
     async def selector(payload):
@@ -77,7 +77,8 @@ async def test_ambiguous_source_selector_can_only_choose_candidate_id():
     assert len(prompts) == 1
     assert {"candidate_id", "source_node", "source_output", "source_type", "target_type"} <= set(prompts[0]["candidates"][0])
 
-    invalid = GraphDraft.freeze(copy.deepcopy(draft.function_items))
+    invalid = GraphDraft.freeze(copy.deepcopy(draft.function_items),
+        workflow_topology={"scripts/a.py": [], "scripts/b.py": ["scripts/a.py"]})
     await compile_responsibility_graph(
         invalid, source_selector=lambda _payload: {"decision": "selected", "selected_candidate_id": "outside"}
     )
@@ -85,6 +86,14 @@ async def test_ambiguous_source_selector_can_only_choose_candidate_id():
     assert any(issue["issue_type"] == "wrong_source_selection" for issue in invalid.issues)
     with pytest.raises(ValueError, match="committed"):
         public_edges(invalid)
+
+    mutated = GraphDraft.freeze(copy.deepcopy(draft.function_items),
+        workflow_topology={"scripts/a.py": [], "scripts/b.py": ["scripts/a.py"]})
+    def mutate_target(payload):
+        payload["target_input"] = "changed"
+        return {"decision": "selected", "selected_candidate_id": payload["candidates"][0]["candidate_id"]}
+    await compile_responsibility_graph(mutated, source_selector=mutate_target)
+    assert any(issue["issue_type"] == "protocol_shape_error" for issue in mutated.issues)
 
 
 @pytest.mark.asyncio
@@ -146,6 +155,42 @@ def typed(name, value_type, *, semantic_id=""):
     return {"name": name, "value_type": value_type, "semantic_id": semantic_id}
 
 
+def blueprint_with_resources(*paths):
+    blocks = [
+        "- path: `SKILL.md`\n  role: skill_overview\n  purpose: Guide\n  inputs: []\n  outputs: []\n"
+        "  default_values: {}\n  dependencies: []\n  required_capabilities: []\n"
+        "  forbidden_capabilities: []\n  references: []\n  constraints: []",
+        "- path: `scripts/a.py`\n  role: generic_script\n  purpose: Run\n  inputs: []\n  outputs: [text]\n"
+        "  default_values: {}\n  dependencies: []\n  required_capabilities: []\n"
+        "  forbidden_capabilities: []\n  references: []\n  constraints: []",
+    ]
+    for path in paths:
+        role = "reference" if path.startswith("references/") else "asset"
+        source = "\n  source: bundled" if path.startswith("assets/") else ""
+        blocks.append(
+            f"- path: `{path}`\n  role: {role}\n  purpose: Declared resource\n  inputs: []\n  outputs: []\n"
+            "  default_values: {}\n  dependencies: []\n  required_capabilities: []\n"
+            f"  forbidden_capabilities: []\n  references: []\n  constraints: []{source}"
+        )
+    return """## 📋 Skill 架构蓝图
+### 基本信息
+- **Skill Name**: graph-test
+### I/O Contract
+- **Input**: value
+- **Output**: result
+### 目录结构
+- SKILL.md
+### Workflow Logic
+1. Run.
+### SkillPlan / 文件职责计划
+""" + "\n".join(blocks) + """
+### 宿主执行方式
+- 需要脚本/命令: execute scripts
+### Resource List
+- declared only
+"""
+
+
 @pytest.mark.parametrize("order", [
     ["scripts/a.py", "scripts/b.py", "scripts/c.py"],
     ["scripts/c.py", "scripts/a.py", "scripts/b.py"],
@@ -167,14 +212,26 @@ async def test_explicit_topology_is_independent_of_function_item_order(order):
     assert any(issue["issue_type"] == "type_mismatch" for issue in draft.issues)
 
 
-def test_open_topology_contains_every_other_script_and_rejects_bad_explicit_nodes():
+def test_missing_topology_does_not_connect_scripts_and_rejects_bad_explicit_nodes():
     items = [item("scripts/a.py", [], ["x"]), item("scripts/b.py", ["x"], ["text"])]
     open_draft = GraphDraft.freeze(items)
-    assert open_draft.allowed_predecessors == {"scripts/a.py": ["scripts/b.py"], "scripts/b.py": ["scripts/a.py"]}
+    assert open_draft.allowed_predecessors == {"scripts/a.py": [], "scripts/b.py": []}
     invalid = GraphDraft.freeze(items, workflow_topology={
         "scripts/a.py": ["scripts/a.py", "references/a.md"], "scripts/missing.py": ["scripts/a.py"]
     })
     assert len([issue for issue in invalid.issues if issue["issue_type"] == "topology_contract_issue"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_unique_semantic_identity_can_authorize_source_without_topology():
+    draft = GraphDraft.freeze([
+        item("scripts/q10.py", [], [typed("v10", "string", semantic_id="S1")]),
+        item("scripts/q11.py", [typed("v11", "string", semantic_id="S1")], ["text"]),
+    ])
+    await compile_responsibility_graph(draft)
+    assert draft.status == "committed"
+    assert any(edge["from_node"] == "scripts/q10.py" and edge["to_node"] == "scripts/q11.py"
+               for edge in public_edges(draft))
 
 
 @pytest.mark.parametrize(("source_output", "target_input"), [
@@ -294,7 +351,8 @@ async def test_cycle_and_duplicate_provenance_are_rejected():
                         InputBinding("scripts/b.py", "a", "script_output", "scripts/a.py", "a")])
     await compile_responsibility_graph(cycle)
     assert any(issue["issue_type"] == "cycle_detected" for issue in cycle.issues)
-    duplicate = GraphDraft.freeze([item("scripts/a.py", [], ["x"]), item("scripts/b.py", ["x"], ["text"])])
+    duplicate = GraphDraft.freeze([item("scripts/a.py", [], ["x"]), item("scripts/b.py", ["x"], ["text"])],
+        workflow_topology={"scripts/a.py": [], "scripts/b.py": ["scripts/a.py"]})
     duplicate.compiled_edges = [{"from_node": "scripts/a.py", "from_output": "x", "to_node": "scripts/b.py", "to_input": "x"}]
     # Compilation starts from a clean candidate, so stale/partial edges cannot create duplicate provenance.
     await compile_responsibility_graph(duplicate)
@@ -358,7 +416,8 @@ async def test_default_export_selector_retry_and_failed_exports():
     await compile_responsibility_graph(defaulted)
     exported = export_script_generation_contracts(defaulted)[0]["runtime_inputs"][0]
     assert exported == {"name": "style", "resolution_kind": "local_default", "resolver_kind": "local_default", "default": "ink"}
-    failed = GraphDraft.freeze([item("scripts/a.py", [], ["text"]), item("scripts/b.py", ["text"], ["markdown"])])
+    failed = GraphDraft.freeze([item("scripts/a.py", [], ["text"]), item("scripts/b.py", ["text"], ["markdown"])],
+        workflow_topology={"scripts/a.py": [], "scripts/b.py": ["scripts/a.py"]})
     await compile_responsibility_graph(failed, source_selector=lambda _payload: {"edge": "forbidden"})
     assert failed.metrics["model_source_selection_count"] == 2
     with pytest.raises(ValueError): public_edges(failed)
@@ -403,6 +462,7 @@ async def test_production_binding_uses_transaction_and_frozen_parameter_edges(mo
 
     monkeypatch.setattr(api, "GraphTransaction", ObservedTransaction)
     monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
+    monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
     monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
     async def forbidden_model(*_args, **_kwargs):
         raise AssertionError("frozen unique bindings must not invoke a model")
@@ -428,6 +488,7 @@ async def test_compiled_v2_ignores_planner_authored_complete_edges(monkeypatch):
 
     items = [item("scripts/a.py", [], ["text"])]
     monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
+    monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
     monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
     result = await api._bind_executable_responsibility_plan(
         request=api.PreparePlanRequest(user_request="demo"),
@@ -447,7 +508,11 @@ async def test_shadow_compiler_failure_cannot_replace_stable_graph(monkeypatch):
     stable = [{"from_node": "scripts/a.py", "from_output": "text", "to_node": "platform_output_node",
                "to_input": "text", "purpose": "stable", "constraints": []}]
     monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
+    monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
     monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "shadow")
+    monkeypatch.setattr(api, "complete_creator_role_once", AsyncMock(return_value=json.dumps({
+        "responsibility_edges": stable,
+    })))
     async def explode(*_args, **_kwargs):
         raise RuntimeError("shadow compiler unavailable")
     monkeypatch.setattr(api, "compile_responsibility_graph", explode)
@@ -464,6 +529,7 @@ async def test_production_node_set_gap_replans_once_without_user_request_pseudo_
 
     items = [item("scripts/a.py", ["missing_runtime_input"], ["text"])]
     monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
+    monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
     monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
     calls = []
     async def model(messages, *_args, **_kwargs):
@@ -481,3 +547,269 @@ async def test_production_node_set_gap_replans_once_without_user_request_pseudo_
     assert len(calls) == 1 and "minimal FunctionItem node-set replan" in calls[0]
     assert api._regenerate_responsibility_graph.await_count == 0
     assert api._replan_blueprint_for_graph_closure.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_mode_never_constructs_compiler_state(monkeypatch):
+    from backend.services.creator import api
+
+    items = [item("scripts/a.py", ["value"], ["text"])]
+    edges = [
+        {"from_node": "platform_input_node", "from_output": "fields", "to_node": "scripts/a.py",
+         "to_input": "value", "purpose": "stable", "constraints": [
+             {"type": "platform_parameter_binding", "source_key": "value", "required": True}]},
+        {"from_node": "scripts/a.py", "from_output": "text", "to_node": "platform_output_node",
+         "to_input": "text", "purpose": "stable", "constraints": []},
+    ]
+    monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "legacy")
+    monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
+    monkeypatch.setattr(api, "complete_creator_role_once", AsyncMock(return_value=json.dumps({
+        "responsibility_edges": edges,
+    })))
+    monkeypatch.setattr(api, "GraphTransaction", lambda: (_ for _ in ()).throw(AssertionError("compiler constructed")))
+    monkeypatch.setattr(api, "compile_responsibility_graph", AsyncMock(side_effect=AssertionError("compiler called")))
+    result = await api._bind_executable_responsibility_plan(
+        request=api.PreparePlanRequest(user_request="demo"),
+        current_planner_result={"internal_blueprint_text": "frozen", "responsibility_edges": edges},
+        planner_model="test", allowed_function_item_targets=["scripts/a.py"])
+    assert result["function_items"] == items
+    assert result["responsibility_edges"] == edges
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", [
+    "resource_authority", "transaction", "candidate", "freeze", "port", "topology",
+    "input_binding", "final_binding", "compile", "public_edges", "diff", "logging",
+])
+async def test_shadow_fail_open_boundary_returns_immutable_legacy_result(monkeypatch, stage):
+    from backend.services.creator import api
+    from backend.services.creator import responsibility_graph as graph_module
+
+    items = [item("scripts/a.py", ["value"], ["text"])]
+    edges = [
+        {"from_node": "platform_input_node", "from_output": "fields", "to_node": "scripts/a.py",
+         "to_input": "value", "purpose": "stable", "constraints": [
+             {"type": "platform_parameter_binding", "source_key": "value", "required": True}]},
+        {"from_node": "scripts/a.py", "from_output": "text", "to_node": "platform_output_node",
+         "to_input": "text", "purpose": "stable", "constraints": []},
+    ]
+    legacy = {"function_items": items, "responsibility_edges": edges,
+              "internal_blueprint_text": blueprint_with_resources(),
+              "allowed_function_item_targets": ["scripts/a.py"]}
+    if stage == "resource_authority":
+        monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError(stage)))
+    else:
+        monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
+    if stage == "transaction":
+        monkeypatch.setattr(api, "GraphTransaction", lambda: (_ for _ in ()).throw(RuntimeError(stage)))
+    elif stage == "candidate":
+        class BrokenTransaction:
+            def candidate(self, *_args, **_kwargs): raise RuntimeError(stage)
+        monkeypatch.setattr(api, "GraphTransaction", BrokenTransaction)
+    elif stage == "freeze":
+        monkeypatch.setattr(graph_module.GraphDraft, "freeze", classmethod(
+            lambda _cls, *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(stage))))
+    elif stage == "port":
+        monkeypatch.setattr(graph_module, "_port", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(stage)))
+    elif stage == "topology":
+        monkeypatch.setattr(graph_module, "_compile_topology", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(stage)))
+    elif stage == "input_binding":
+        monkeypatch.setattr(graph_module, "_binding_from_edge", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(stage)))
+    elif stage == "final_binding":
+        monkeypatch.setattr(graph_module, "FinalOutputBinding", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(stage)))
+    elif stage == "compile":
+        monkeypatch.setattr(api, "compile_responsibility_graph", AsyncMock(side_effect=RuntimeError(stage)))
+    elif stage == "public_edges":
+        monkeypatch.setattr(api, "public_edges", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(stage)))
+    elif stage == "diff":
+        monkeypatch.setattr(api, "public_edges", lambda *_args, **_kwargs: [{
+            "from_node": [], "from_output": "x", "to_node": "y", "to_input": "z",
+        }])
+    elif stage == "logging":
+        monkeypatch.setattr(api.logger, "info", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(stage)))
+        monkeypatch.setattr(api.logger, "exception", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(stage)))
+    result = await api._run_shadow_after_legacy(
+        request=api.PreparePlanRequest(user_request="demo"),
+        legacy_result=legacy, planner_model="test")
+    assert result == legacy
+    assert result is not legacy
+    assert result["function_items"] is not legacy["function_items"]
+    assert result["responsibility_edges"] is not legacy["responsibility_edges"]
+
+
+@pytest.mark.asyncio
+async def test_shadow_model_selection_defaults_off_and_never_repairs(monkeypatch):
+    from backend.services.creator import api
+
+    items = [item("scripts/a.py", ["missing"], ["text"])]
+    legacy = {"function_items": items, "responsibility_edges": [],
+              "internal_blueprint_text": blueprint_with_resources(),
+              "allowed_function_item_targets": ["scripts/a.py"]}
+    monkeypatch.setattr(api.settings, "creator_graph_shadow_model_selection", False)
+    monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
+    monkeypatch.setattr(api, "complete_creator_role_once", AsyncMock(side_effect=AssertionError("selector called")))
+    monkeypatch.setattr(api, "patch_graph_node_contract", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("patch called")))
+    monkeypatch.setattr(api, "_replan_blueprint_for_graph_closure", AsyncMock(side_effect=AssertionError("replan called")))
+    monkeypatch.setattr(api, "_regenerate_responsibility_graph", AsyncMock(side_effect=AssertionError("regenerate called")))
+    result = await api._run_shadow_after_legacy(
+        request=api.PreparePlanRequest(user_request="demo"), legacy_result=legacy,
+        planner_model="test")
+    assert result == legacy
+    assert api.complete_creator_role_once.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_shadow_model_selection_opt_in_is_bounded_to_one_retry(monkeypatch):
+    from backend.services.creator import api
+
+    items = [item("scripts/q12.py", [], ["v12"]), item("scripts/q13.py", [], ["v13"]),
+             item("scripts/q14.py", ["v14"], ["text"])]
+    legacy = {"function_items": items, "responsibility_edges": [],
+              "internal_blueprint_text": blueprint_with_resources(),
+              "workflow_topology": {"scripts/q12.py": [], "scripts/q13.py": [],
+                                    "scripts/q14.py": ["scripts/q12.py", "scripts/q13.py"]}}
+    monkeypatch.setattr(api.settings, "creator_graph_shadow_model_selection", True)
+    model = AsyncMock(return_value=json.dumps({
+        "decision": "selected", "selected_candidate_id": "outside",
+    }))
+    monkeypatch.setattr(api, "complete_creator_role_once", model)
+    await api._run_shadow_after_legacy(
+        request=api.PreparePlanRequest(user_request="demo"), legacy_result=legacy,
+        planner_model="test")
+    assert model.await_count == 2
+
+
+def test_refreeze_preserves_bindings_resource_authority_and_existing_nodes():
+    original = [item("scripts/a.py", ["theme", "template"], ["result"])]
+    draft = GraphDraft.freeze(original,
+        input_bindings=[
+            InputBinding("scripts/a.py", "theme", "platform_parameter", source_root="fields", source_key="topic"),
+            InputBinding("scripts/a.py", "template", "static_value",
+                         resolver={"kind": "static_reference", "path": "references/template.md"}),
+        ],
+        final_output_bindings=[FinalOutputBinding("text", "scripts/a.py", "result")],
+        authorized_references={"references/template.md"}, authorized_assets={"assets/item.bin"})
+    replanned_items = [copy.deepcopy(original[0]), item("scripts/new.py", [], ["theme"])]
+    refrozen = draft.refreeze(replanned_items, topology_updates={"scripts/a.py": ["scripts/new.py"]})
+    assert refrozen.function_items[0] == original[0]
+    assert refrozen.input_bindings == draft.input_bindings
+    assert refrozen.final_output_bindings == draft.final_output_bindings
+    assert refrozen.resolver_registry.authorized_references == {"references/template.md"}
+    assert refrozen.resolver_registry.authorized_assets == {"assets/item.bin"}
+    assert refrozen.allowed_predecessors["scripts/a.py"] == ["scripts/new.py"]
+
+
+def test_api_resource_authority_uses_only_declared_and_uploaded_paths():
+    from backend.services.creator import api
+
+    references, assets = api._graph_resource_authority(
+        blueprint_text=blueprint_with_resources("references/template.md", "assets/declared.bin"),
+        uploaded_files=[{"target_path": "assets/uploaded.bin"}, {"path": "outside.bin"}],
+    )
+    assert references == {"references/template.md"}
+    assert assets == {"assets/declared.bin", "assets/uploaded.bin"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("resolver", "declared_path"), [
+    ({"kind": "static_reference", "path": "references/template.md"}, "references/template.md"),
+    ({"kind": "uploaded_asset", "path": "assets/declared.bin"}, "assets/declared.bin"),
+])
+async def test_compiled_api_accepts_only_authorized_static_resources(monkeypatch, resolver, declared_path):
+    from backend.services.creator import api
+
+    items = [item("scripts/a.py", ["template"], ["text"])]
+    monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
+    monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
+    result = await api._bind_executable_responsibility_plan(
+        request=api.PreparePlanRequest(user_request="demo"),
+        current_planner_result={
+            "internal_blueprint_text": blueprint_with_resources(declared_path),
+            "input_bindings": [{"target_node": "scripts/a.py", "target_input": "template",
+                                "binding_kind": "static_value", "resolver": resolver}],
+        }, planner_model="test", allowed_function_item_targets=["scripts/a.py"])
+    assert result["function_items"] == items
+    assert not any(edge["to_input"] == "template" for edge in result["responsibility_edges"])
+
+
+@pytest.mark.asyncio
+async def test_compiled_api_rejects_undeclared_static_resource(monkeypatch):
+    from backend.services.creator import api
+
+    items = [item("scripts/a.py", ["template"], ["text"])]
+    monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
+    monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
+    with pytest.raises(api.PreparePlanProtocolError, match="unauthorized_static_resource"):
+        await api._bind_executable_responsibility_plan(
+            request=api.PreparePlanRequest(user_request="demo"),
+            current_planner_result={
+                "internal_blueprint_text": blueprint_with_resources(),
+                "input_bindings": [{"target_node": "scripts/a.py", "target_input": "template",
+                                    "binding_kind": "static_value",
+                                    "resolver": {"kind": "static_reference", "path": "references/missing.md"}}],
+            }, planner_model="test", allowed_function_item_targets=["scripts/a.py"])
+
+
+@pytest.mark.asyncio
+async def test_shadow_resource_rejection_does_not_change_legacy_result(monkeypatch):
+    from backend.services.creator import api
+
+    items = [item("scripts/a.py", ["template"], ["text"])]
+    edges = [{"from_node": "platform_input_node", "from_output": "fields", "to_node": "scripts/a.py",
+              "to_input": "template", "purpose": "stable", "constraints": [
+                  {"type": "platform_parameter_binding", "source_key": "template", "required": True}]},
+             {"from_node": "scripts/a.py", "from_output": "text", "to_node": "platform_output_node",
+              "to_input": "text", "purpose": "stable", "constraints": []}]
+    legacy = {"function_items": items, "responsibility_edges": edges,
+              "internal_blueprint_text": blueprint_with_resources(),
+              "input_bindings": [{"target_node": "scripts/a.py", "target_input": "template",
+                                  "binding_kind": "static_value",
+                                  "resolver": {"kind": "uploaded_asset", "path": "assets/missing.bin"}}]}
+    monkeypatch.setattr(api.settings, "creator_graph_shadow_model_selection", False)
+    result = await api._run_shadow_after_legacy(
+        request=api.PreparePlanRequest(user_request="demo"), legacy_result=legacy,
+        planner_model="test")
+    assert result == legacy
+
+
+@pytest.mark.asyncio
+async def test_historical_graph_failure_matrix_is_stable_across_three_runs():
+    async def run_once():
+        snapshots = []
+        missing = GraphDraft.freeze([item("scripts/q1.py", ["v1"], ["text"])])
+        await compile_responsibility_graph(missing)
+        snapshots.append((missing.status, tuple(sorted(issue["issue_type"] for issue in missing.issues))))
+
+        renamed = GraphDraft.freeze([item("scripts/q2.py", ["v2"], ["o2"])],
+            input_bindings=[InputBinding("scripts/q2.py", "v2", "platform_parameter",
+                                        source_root="fields", source_key="k2")],
+            final_output_bindings=[FinalOutputBinding("text", "scripts/q2.py", "o2")])
+        await compile_responsibility_graph(renamed)
+        snapshots.append((renamed.status, tuple((edge["from_node"], edge["from_output"], edge["to_node"], edge["to_input"])
+                                                for edge in public_edges(renamed))))
+
+        fan = GraphDraft.freeze([
+            item("scripts/q3.py", [], ["v3"]), item("scripts/q4.py", ["v3"], ["v4"]),
+            item("scripts/q5.py", ["v3"], ["v5"]), item("scripts/q6.py", ["v4", "v5"], ["text"]),
+        ], workflow_topology={"scripts/q3.py": [], "scripts/q4.py": ["scripts/q3.py"],
+            "scripts/q5.py": ["scripts/q3.py"], "scripts/q6.py": ["scripts/q4.py", "scripts/q5.py"]},
+            input_bindings=[InputBinding("scripts/q6.py", "v4", "script_output", "scripts/q4.py", "v4"),
+                            InputBinding("scripts/q6.py", "v5", "script_output", "scripts/q5.py", "v5")])
+        await compile_responsibility_graph(fan)
+        snapshots.append((fan.status, len(public_edges(fan))))
+
+        invalid_selector = GraphDraft.freeze([
+            item("scripts/q7.py", [], ["v7"]), item("scripts/q8.py", [], ["v8"]),
+            item("scripts/q9.py", [typed("v9", "string")], ["markdown"]),
+        ], workflow_topology={"scripts/q7.py": [], "scripts/q8.py": [],
+                              "scripts/q9.py": ["scripts/q7.py", "scripts/q8.py"]})
+        await compile_responsibility_graph(invalid_selector,
+            source_selector=lambda _payload: {"decision": "selected", "selected_candidate_id": "invalid"})
+        snapshots.append((invalid_selector.status,
+                          invalid_selector.metrics["model_source_selection_count"],
+                          tuple(sorted(issue["issue_type"] for issue in invalid_selector.issues))))
+        return snapshots
+
+    first = await run_once()
+    assert await run_once() == first
+    assert await run_once() == first

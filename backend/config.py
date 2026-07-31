@@ -27,9 +27,16 @@ class Settings(BaseSettings):
     # Falls back to default_model when unset.
     planner_model: Optional[str] = Field("qwen3:30b-instruct", validation_alias=AliasChoices("PLANNER_MODEL", "planner_model"))
     creator_graph_binding_mode: str = Field(
-        "shadow",
+        "legacy",
         validation_alias=AliasChoices("CREATOR_GRAPH_BINDING_MODE", "creator_graph_binding_mode"),
         pattern="^(legacy|compiled_v2|shadow)$",
+    )
+    creator_graph_shadow_model_selection: bool = Field(
+        False,
+        validation_alias=AliasChoices(
+            "CREATOR_GRAPH_SHADOW_MODEL_SELECTION",
+            "creator_graph_shadow_model_selection",
+        ),
     )
 
     # Optional separate model used exclusively for output-format validation rounds

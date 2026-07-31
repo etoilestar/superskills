@@ -155,6 +155,13 @@ class GraphDraft:
             elif edge.get("to_node") in targets:
                 bindings.append(_binding_from_edge(edge))
         topology, evidence, topology_issues = _compile_topology(items, workflow_topology or allowed_predecessors, bindings)
+        binding_targets: set[tuple[str, str]] = set()
+        for binding in bindings:
+            key = (binding.target_node, binding.target_input)
+            if binding.binding_kind in {"platform_parameter", "script_output"} and key in binding_targets:
+                topology_issues.append({"issue_type": "duplicate_provenance",
+                                        "target_node": key[0], "target_input": key[1]})
+            binding_targets.add(key)
         ports = []
         for item in items:
             for direction, raw_ports in (("input", item.get("inputs") or []), ("output", item.get("outputs") or [])):
@@ -167,6 +174,26 @@ class GraphDraft:
                    allowed_predecessors=topology, topology_evidence=evidence, ports=ports,
                    issues=topology_issues, resolver_registry=InputResolverRegistry(
                        authorized_references=authorized_references or set(), authorized_assets=authorized_assets or set()))
+
+    def refreeze(
+        self,
+        function_items: list[dict[str, Any]], *,
+        topology_updates: dict[str, list[str]] | None = None,
+    ) -> "GraphDraft":
+        """Refreeze after bounded node planning without dropping authority facts."""
+        topology = copy.deepcopy(self.allowed_predecessors)
+        for item in function_items:
+            topology.setdefault(str(item["target_file"]), [])
+        for target, predecessors in (topology_updates or {}).items():
+            topology[target] = sorted(set(topology.get(target, [])) | set(predecessors))
+        return GraphDraft.freeze(
+            function_items,
+            workflow_topology=topology,
+            input_bindings=copy.deepcopy(self.input_bindings),
+            final_output_bindings=copy.deepcopy(self.final_output_bindings),
+            authorized_references=set(self.resolver_registry.authorized_references),
+            authorized_assets=set(self.resolver_registry.authorized_assets),
+        )
 
 
 @dataclass
@@ -235,10 +262,9 @@ def _compile_topology(items: list[dict[str, Any]], explicit: dict[str, list[str]
             if binding.binding_kind == "script_output" and binding.source_node:
                 if binding.target_node in targets and binding.source_node in targets and binding.source_node != binding.target_node:
                     topology[binding.target_node].add(binding.source_node); evidence[f"{binding.source_node}->{binding.target_node}"] = "frozen source binding"; bound = True
-        if not dependency_found and not bound:
-            for target in targets:
-                topology[target] = targets - {target}
-                for source in topology[target]: evidence[f"{source}->{target}"] = "open executable domain"
+        # Absence of topology is not evidence that every executable node may
+        # precede every other node.  Such inputs remain unresolved unless an
+        # explicit binding or unique semantic port identity supplies authority.
     return ({target: sorted(values) for target, values in topology.items()}, evidence, issues)
 
 
@@ -291,9 +317,23 @@ def compute_legal_source_domain(target_node: str, target_input: str, function_it
                 target_node, target_input, target_port["port_id"], "platform_parameter", "unknown", target_port["value_type"], (),
                 {"name_match": "exact", "type_match": "unknown", "topology_allowed": True, "explicit_binding": False,
                  "topology_evidence": "platform slot exact match"}))
+        if not topology_constraints.get(target_node) and target_port.get("semantic_id"):
+            semantic_sources = [
+                (item["port_id"].split("::", 1)[0], item["name"], False)
+                for item in all_ports
+                if item["direction"] == "output"
+                and item.get("semantic_id") == target_port.get("semantic_id")
+                and not item["port_id"].startswith(f"{target_node}::")
+                and type_compatibility(item["value_type"], target_port["value_type"]) != "incompatible"
+            ]
+            if len(semantic_sources) == 1:
+                sources = semantic_sources
     for node, output, explicit_binding in sources:
         source_port = next((item for item in all_ports if item["port_id"] == port_id(str(node), "output", str(output))), None)
-        if not source_port or node not in topology_constraints.get(target_node, []):
+        semantic_authority = bool(source_port and source_port.get("semantic_id")
+                                  and source_port.get("semantic_id") == target_port.get("semantic_id")
+                                  and len(sources) == 1)
+        if not source_port or (node not in topology_constraints.get(target_node, []) and not semantic_authority):
             continue
         compatibility = type_compatibility(source_port["value_type"], target_port["value_type"])
         semantic_match = bool(source_port.get("semantic_id") and source_port.get("semantic_id") == target_port.get("semantic_id"))
@@ -393,10 +433,26 @@ async def _choose(candidates: list[SourceCandidate], payload: dict[str, Any], se
         issues.append({"issue_type": "ambiguous_source", **issue_context}); return None, 0
     calls = 0
     last_issue = "protocol_shape_error"
+    candidate_snapshot = tuple(
+        (item.candidate_id, item.source_port_id, item.target_port_id)
+        for item in candidates
+    )
+    target_snapshot = (payload.get("target_node"), payload.get("target_input"))
     for _attempt in range(2):
         response = selector(payload); response = await response if inspect.isawaitable(response) else response; calls += 1
+        if candidate_snapshot != tuple(
+            (item.candidate_id, item.source_port_id, item.target_port_id)
+            for item in candidates
+        ) or target_snapshot != (payload.get("target_node"), payload.get("target_input")):
+            issues.append({"issue_type": "protocol_shape_error", **issue_context})
+            return None, calls
         allowed = {item.candidate_id: item for item in candidates}
-        if isinstance(response, dict) and not (set(response) - {"decision", "selected_candidate_id"}) and response.get("decision") in {"selected", "no_semantically_valid_candidate"}:
+        expected_fields = (
+            {"decision", "selected_candidate_id"}
+            if isinstance(response, dict) and response.get("decision") == "selected"
+            else {"decision"}
+        )
+        if isinstance(response, dict) and set(response) == expected_fields and response.get("decision") in {"selected", "no_semantically_valid_candidate"}:
             selected = response.get("selected_candidate_id")
             if response["decision"] == "selected" and selected in allowed: return allowed[selected], calls
             if response["decision"] == "no_semantically_valid_candidate":
