@@ -14,7 +14,8 @@ from typing import Any, Awaitable, Callable, Literal
 
 from ..platform_io_contract import build_platform_io_contract
 
-VALUE_TYPES = frozenset({"unknown", "string", "number", "integer", "boolean", "object", "array", "path", "array[path]", "array[string]"})
+STANDARD_VALUE_TYPES = frozenset({"string", "number", "integer", "boolean", "object", "array", "path"})
+TYPE_ALIASES = {"int": "integer", "float": "number", "str": "string", "list": "array", "dict": "object", "filepath": "path"}
 ResolutionKind = Literal["platform_runtime", "upstream_runtime", "ambiguous_runtime", "local_default", "static_resolved", "unresolved"]
 BindingKind = Literal["platform_parameter", "script_output", "local_default", "static_value", "unbound"]
 class _MissingDefault(Enum):
@@ -29,27 +30,35 @@ def port_id(node: str, direction: Literal["input", "output"], name: str) -> str:
     return f"{node}::{direction}::{name}"
 
 
+def normalize_type_descriptor(value: Any) -> str:
+    """Normalize a deliberately open port type descriptor."""
+    descriptor = str(value or "").strip().lower()
+    return TYPE_ALIASES.get(descriptor, descriptor or "unknown")
+
+
 def _port(raw: Any) -> dict[str, Any]:
     if isinstance(raw, str):
         return {"name": raw, "value_type": "unknown", "description": "", "semantic_id": ""}
     if not isinstance(raw, dict) or not str(raw.get("name") or "").strip():
         raise ValueError("ports must be strings or objects with a name")
-    value_type = str(raw.get("value_type") or raw.get("type") or "unknown")
-    if value_type not in VALUE_TYPES:
-        raise ValueError(f"unsupported port value_type: {value_type}")
+    value_type = normalize_type_descriptor(raw.get("value_type") or raw.get("type"))
     return {"name": str(raw["name"]), "value_type": value_type,
             "description": str(raw.get("description") or ""),
             "semantic_id": str(raw.get("semantic_id") or "")}
 
 
 def type_compatibility(source_type: str, target_type: str) -> Literal["compatible", "unknown", "incompatible"]:
+    source_type = normalize_type_descriptor(source_type)
+    target_type = normalize_type_descriptor(target_type)
     if source_type == target_type:
         return "compatible"
     if "unknown" in {source_type, target_type}:
         return "unknown"
     if source_type == "integer" and target_type == "number":
         return "compatible"
-    return "incompatible"
+    if source_type in STANDARD_VALUE_TYPES and target_type in STANDARD_VALUE_TYPES:
+        return "incompatible"
+    return "unknown"
 
 
 @dataclass(frozen=True)
@@ -133,6 +142,7 @@ class GraphDraft:
     ports: list[dict[str, str]] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
     resolver_registry: InputResolverRegistry = field(default_factory=InputResolverRegistry)
+    allowed_node_targets: set[str] = field(default_factory=set)
 
     @classmethod
     def freeze(cls, function_items: list[dict[str, Any]], *,
@@ -141,12 +151,17 @@ class GraphDraft:
                input_bindings: list[InputBinding | dict[str, Any]] | None = None,
                final_output_bindings: list[FinalOutputBinding | dict[str, Any]] | None = None,
                frozen_edges: list[dict[str, Any]] | None = None,
+               allowed_node_targets: set[str] | list[str] | None = None,
                authorized_references: set[str] | None = None,
                authorized_assets: set[str] | None = None) -> "GraphDraft":
         items = copy.deepcopy(function_items)
         targets = [str(item.get("target_file") or "") for item in items]
-        if len(set(targets)) != len(targets) or any(not target.startswith("scripts/") or not target.endswith(".py") for target in targets):
-            raise ValueError("FunctionItem node domain must contain unique scripts/**/*.py targets")
+        allowed_targets = set(targets if allowed_node_targets is None else allowed_node_targets)
+        if any(not target for target in targets) or len(set(targets)) != len(targets):
+            raise ValueError("FunctionItem node targets must be non-empty and unique")
+        unauthorized = sorted(set(targets) - allowed_targets)
+        if unauthorized:
+            raise ValueError(f"FunctionItem nodes are outside the frozen target domain: {unauthorized}")
         bindings = [_coerce_input_binding(value) for value in (input_bindings or [])]
         finals = [_coerce_final_binding(value) for value in (final_output_bindings or [])]
         for edge in frozen_edges or []:
@@ -172,6 +187,7 @@ class GraphDraft:
                                   "semantic_id": parsed["semantic_id"]})
         return cls(function_items=items, input_bindings=bindings, final_output_bindings=finals,
                    allowed_predecessors=topology, topology_evidence=evidence, ports=ports,
+                   allowed_node_targets=allowed_targets,
                    issues=topology_issues, resolver_registry=InputResolverRegistry(
                        authorized_references=authorized_references or set(), authorized_assets=authorized_assets or set()))
 
@@ -188,6 +204,7 @@ class GraphDraft:
             topology[target] = sorted(set(topology.get(target, [])) | set(predecessors))
         return GraphDraft.freeze(
             function_items,
+            allowed_node_targets=self.allowed_node_targets,
             workflow_topology=topology,
             input_bindings=copy.deepcopy(self.input_bindings),
             final_output_bindings=copy.deepcopy(self.final_output_bindings),
