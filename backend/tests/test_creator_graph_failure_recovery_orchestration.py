@@ -89,6 +89,7 @@ async def _run_recovery(
     replanned_blueprint=None, rebuilt_items=None, rebuilt_edges=None,
     rebuilt_review=None, observe=None, calls=None,
 ):
+    monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "legacy")
     initial_blueprint = _blueprint(*[
         _script_block(item["target_file"], inputs=item["inputs"], outputs=item["outputs"])
         for item in initial_items
@@ -135,6 +136,12 @@ async def _run_recovery(
         return real_resolve_targets(blueprint_text)
 
     monkeypatch.setattr(api, "complete_creator_role_once", planner_once)
+    monkeypatch.setattr(api, "_plan_executable_requirement_allocations", AsyncMock(return_value={
+        "requirement_allocations": [], "requirement_channels": {},
+    }))
+    monkeypatch.setattr(api, "_review_blueprint_semantic_closure", AsyncMock(return_value={
+        "passed": True, "issues": [],
+    }))
     monkeypatch.setattr(api, "_bind_executable_responsibility_plan", bind)
     monkeypatch.setattr(api, "_converge_ready_executable_plan", converge)
     monkeypatch.setattr(api, "_repair_responsibility_graph_alignment", repair)
@@ -177,9 +184,18 @@ async def test_same_unresolved_input_runs_repair_regeneration_and_one_replan_the
     assert calls["bind"] == 2
     assert calls["resolve_targets"] == 2  # initial freeze and post-replan re-freeze
     assert calls["review"] == 1
-    assert result["function_items"] == rebuilt_items
+    assert result["function_items"] == api.normalize_structured_function_items(
+        rebuilt_items, source="test"
+    )
     assert result["responsibility_edges"] == rebuilt_edges
     assert result["status"] == "ready" and result.get("clarifying_questions") == []
+    assert result["metrics"] == {
+        "legacy_graph_status": "committed",
+        "legacy_repair_count": 1,
+        "legacy_regeneration_count": 1,
+        "legacy_blueprint_replan_count": 1,
+        "legacy_edge_count": len(rebuilt_edges),
+    }
 
 
 @pytest.mark.asyncio
