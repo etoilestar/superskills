@@ -13,7 +13,9 @@ from backend.services.creator.responsibility_graph import (
     compute_legal_source_domain,
     export_script_generation_contracts,
     port_id,
+    normalize_type_descriptor,
     patch_graph_node_contract,
+    type_compatibility,
     public_edges,
 )
 
@@ -524,29 +526,23 @@ async def test_shadow_compiler_failure_cannot_replace_stable_graph(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_production_node_set_gap_replans_once_without_user_request_pseudo_closure(monkeypatch):
+async def test_compiler_does_not_replan_or_mutate_node_set(monkeypatch):
     from backend.services.creator import api
 
     items = [item("scripts/a.py", ["missing_runtime_input"], ["text"])]
+    original = copy.deepcopy(items)
     monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
     monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
     monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
-    calls = []
-    async def model(messages, *_args, **_kwargs):
-        calls.append(messages[0]["content"])
-        return json.dumps({"function_items": [items[0], item("scripts/source.py", [], ["missing_runtime_input"])]})
+    model = AsyncMock(side_effect=AssertionError("selector must not invent a candidate"))
     monkeypatch.setattr(api, "complete_creator_role_once", model)
-    monkeypatch.setattr(api, "_regenerate_responsibility_graph", AsyncMock(side_effect=AssertionError("forbidden")))
-    monkeypatch.setattr(api, "_replan_blueprint_for_graph_closure", AsyncMock(side_effect=AssertionError("forbidden")))
-    result = await api._bind_executable_responsibility_plan(
-        request=api.PreparePlanRequest(user_request="demo"),
-        current_planner_result={"internal_blueprint_text": "frozen"}, planner_model="test",
-        allowed_function_item_targets=["scripts/a.py"])
-    assert result["function_items"][0]["inputs"] == ["missing_runtime_input"]
-    assert {entry["target_file"] for entry in result["function_items"]} == {"scripts/a.py", "scripts/source.py"}
-    assert len(calls) == 1 and "minimal FunctionItem node-set replan" in calls[0]
-    assert api._regenerate_responsibility_graph.await_count == 0
-    assert api._replan_blueprint_for_graph_closure.await_count == 0
+    with pytest.raises(api.PreparePlanProtocolError, match="node_contract_gap"):
+        await api._bind_executable_responsibility_plan(
+            request=api.PreparePlanRequest(user_request="demo"),
+            current_planner_result={"internal_blueprint_text": "frozen"}, planner_model="test",
+            allowed_function_item_targets=["scripts/a.py"])
+    assert items == original
+    assert model.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -648,7 +644,6 @@ async def test_shadow_model_selection_defaults_off_and_never_repairs(monkeypatch
     monkeypatch.setattr(api.settings, "creator_graph_shadow_model_selection", False)
     monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
     monkeypatch.setattr(api, "complete_creator_role_once", AsyncMock(side_effect=AssertionError("selector called")))
-    monkeypatch.setattr(api, "patch_graph_node_contract", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("patch called")))
     monkeypatch.setattr(api, "_replan_blueprint_for_graph_closure", AsyncMock(side_effect=AssertionError("replan called")))
     monkeypatch.setattr(api, "_regenerate_responsibility_graph", AsyncMock(side_effect=AssertionError("regenerate called")))
     result = await api._run_shadow_after_legacy(
@@ -679,24 +674,11 @@ async def test_shadow_model_selection_opt_in_is_bounded_to_one_retry(monkeypatch
     assert model.await_count == 2
 
 
-def test_refreeze_preserves_bindings_resource_authority_and_existing_nodes():
-    original = [item("scripts/a.py", ["theme", "template"], ["result"])]
-    draft = GraphDraft.freeze(original,
-        input_bindings=[
-            InputBinding("scripts/a.py", "theme", "platform_parameter", source_root="fields", source_key="topic"),
-            InputBinding("scripts/a.py", "template", "static_value",
-                         resolver={"kind": "static_reference", "path": "references/template.md"}),
-        ],
-        final_output_bindings=[FinalOutputBinding("text", "scripts/a.py", "result")],
-        authorized_references={"references/template.md"}, authorized_assets={"assets/item.bin"})
-    replanned_items = [copy.deepcopy(original[0]), item("scripts/new.py", [], ["theme"])]
-    refrozen = draft.refreeze(replanned_items, topology_updates={"scripts/a.py": ["scripts/new.py"]})
-    assert refrozen.function_items[0] == original[0]
-    assert refrozen.input_bindings == draft.input_bindings
-    assert refrozen.final_output_bindings == draft.final_output_bindings
-    assert refrozen.resolver_registry.authorized_references == {"references/template.md"}
-    assert refrozen.resolver_registry.authorized_assets == {"assets/item.bin"}
-    assert refrozen.allowed_predecessors["scripts/a.py"] == ["scripts/new.py"]
+def test_refreeze_cannot_add_node_outside_frozen_domain():
+    original = [item("scripts/a.py", ["theme"], ["result"])]
+    draft = GraphDraft.freeze(original, allowed_node_targets={"scripts/a.py"})
+    with pytest.raises(ValueError, match="outside the frozen target domain"):
+        draft.refreeze([*original, item("scripts/new.py", [], ["theme"])])
 
 
 def test_api_resource_authority_uses_only_declared_and_uploaded_paths():
@@ -813,3 +795,34 @@ async def test_historical_graph_failure_matrix_is_stable_across_three_runs():
     first = await run_once()
     assert await run_once() == first
     assert await run_once() == first
+
+
+def test_node_authority_is_frozen_set_not_file_suffix():
+    targets = {"scripts/process.py", "scripts/process.sh", "scripts/render.js", "scripts/query.sql"}
+    draft = GraphDraft.freeze([item(target, [], ["text"]) for target in sorted(targets)], allowed_node_targets=targets)
+    assert {entry["target_file"] for entry in draft.function_items} == targets
+    for unauthorized in ("scripts/unplanned.py", "references/info.md", "assets/logo.png", "SKILL.md"):
+        with pytest.raises(ValueError, match="outside the frozen target domain"):
+            GraphDraft.freeze([item(unauthorized, [], ["text"])], allowed_node_targets=targets)
+
+
+def test_open_type_descriptors_and_simple_compatibility():
+    custom = ["image", "audio", "video", "bytes", "stream", "dataframe", "tensor", "document", "custom_record"]
+    GraphDraft.freeze([item("scripts/types.any", [{"name": value, "value_type": value} for value in custom], ["text"])])
+    assert normalize_type_descriptor(" INT ") == "integer"
+    assert type_compatibility("custom_record", "custom_record") == "compatible"
+    assert type_compatibility("image", "image") == "compatible"
+    assert type_compatibility("integer", "number") == "compatible"
+    assert type_compatibility("unknown", "image") == "unknown"
+    assert type_compatibility("image", "dataframe") == "unknown"
+
+
+def test_graph_binding_mode_default_and_environment_overrides(monkeypatch):
+    from backend.config import Settings
+    monkeypatch.delenv("CREATOR_GRAPH_BINDING_MODE", raising=False)
+    monkeypatch.delenv("creator_graph_binding_mode", raising=False)
+    assert Settings(_env_file=None).creator_graph_binding_mode == "compiled_v2"
+    monkeypatch.setenv("CREATOR_GRAPH_BINDING_MODE", "legacy")
+    assert Settings(_env_file=None).creator_graph_binding_mode == "legacy"
+    monkeypatch.setenv("CREATOR_GRAPH_BINDING_MODE", "shadow")
+    assert Settings(_env_file=None).creator_graph_binding_mode == "shadow"

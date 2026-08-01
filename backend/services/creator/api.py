@@ -50,7 +50,7 @@ from .basic_format import check_patch_candidate_basic_format
 from .command_normalizer import _effective_command_lines
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
-from .responsibility_graph import GraphDraft, GraphTransaction, compile_responsibility_graph, patch_graph_node_contract, public_edges
+from .responsibility_graph import GraphDraft, GraphTransaction, compile_responsibility_graph, public_edges
 
 
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
@@ -7233,6 +7233,7 @@ async def _bind_executable_responsibility_plan(
     transaction = GraphTransaction()
     draft = transaction.candidate(
         frozen_function_items,
+        allowed_node_targets=allowed_function_item_targets,
         workflow_topology=current_planner_result.get("workflow_topology"),
         input_bindings=current_planner_result.get("input_bindings"),
         final_output_bindings=current_planner_result.get("final_output_bindings"),
@@ -7256,121 +7257,7 @@ The selected_candidate_id must be copied exactly from candidates.
         )
         return _parse_prepare_plan_json(text)
 
-    async def patch_node_contract(candidate: GraphDraft) -> GraphDraft:
-        gaps = [issue for issue in candidate.issues if issue.get("issue_type") == "node_contract_gap"]
-        allowed_paths: set[str] = set()
-        allowed_values: dict[str, set[str]] = {}
-        affected_items: list[dict[str, Any]] = []
-        neighbors_by_target: dict[str, list[dict[str, Any]]] = {}
-        for issue in gaps:
-            target = str(issue.get("target_node") or "")
-            target_input = str(issue.get("target_input") or "")
-            item_index = next(index for index, item in enumerate(candidate.function_items) if item["target_file"] == target)
-            input_index = list(candidate.function_items[item_index].get("inputs") or []).index(target_input)
-            path = f"/function_items/{item_index}/inputs/{input_index}"
-            predecessors = set(candidate.allowed_predecessors.get(target, []))
-            legal_output_names = {
-                str(port["name"]) for port in candidate.ports
-                if port["direction"] == "output" and port["port_id"].split("::", 1)[0] in predecessors
-            }
-            if legal_output_names:
-                allowed_paths.add(path)
-                allowed_values[path] = legal_output_names
-            affected_items.append(candidate.function_items[item_index])
-            neighbors_by_target[target] = [item for item in candidate.function_items if item["target_file"] in predecessors]
-        if not allowed_paths:
-            return candidate
-        prompt = """
-Repair only the supplied unresolved FunctionItem input contracts with bounded
-JSON Patch replacements. Return {"operations":[...]} and use only supplied
-allowed paths and allowed values. A platform input such as user_request is not
-a legal replacement unless it is explicitly listed. Do not add/remove a node,
-platform slot, asset, reference, intermediate file, or constraint. Do not return
-edges or rewrite the Blueprint. If no valid patch exists return {"operations":[]}.
-""".strip()
-        payload = {"issues": gaps, "affected_function_items": affected_items,
-                   "one_hop_predecessors": neighbors_by_target,
-                   "allowed_replacements_by_path": {path: sorted(values) for path, values in allowed_values.items()},
-                   "immutable_fields": ["target_file", "constraints"]}
-        text = await complete_creator_role_once(
-            [{"role": "system", "content": prompt},
-             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
-            "planner", fallback_model=planner_model,
-        )
-        response = _parse_prepare_plan_json(text)
-        if set(response) != {"operations"} or not isinstance(response["operations"], list) or not response["operations"]:
-            return candidate
-        return patch_graph_node_contract(candidate, response["operations"],
-            allowed_patch_paths=allowed_paths, allowed_replacement_values_by_path=allowed_values)
-
-    async def replan_minimal_node_set(candidate: GraphDraft) -> GraphDraft:
-        gaps = [issue for issue in candidate.issues
-                if issue.get("issue_type") == "node_contract_gap" and issue.get("node_set_candidate")]
-        if not gaps:
-            return candidate
-        prompt = """
-Perform one minimal FunctionItem node-set replan for the supplied node_set_gap.
-Return strict JSON {"function_items":[...]} containing every existing immutable
-FunctionItem plus at most one new scripts/**/*.py FunctionItem. Preserve every
-existing item byte-for-byte as structured JSON. The new item must include exactly
-target_file, role, purpose, inputs, outputs, required_capabilities, constraints,
-default_values. Do not add assets, references, platform slots, edges, or files of
-any other kind. Return the unchanged set when no legitimate producer node exists.
-""".strip()
-        payload = {"issue_type": "node_set_gap", "issues": gaps,
-                   "function_items": candidate.function_items,
-                   "user_requirement": request.user_request,
-                   "immutable_existing_targets": [item["target_file"] for item in candidate.function_items]}
-        text = await complete_creator_role_once(
-            [{"role": "system", "content": prompt},
-             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
-            "planner", fallback_model=planner_model,
-        )
-        response = _parse_prepare_plan_json(text)
-        if set(response) != {"function_items"} or not isinstance(response["function_items"], list):
-            raise PreparePlanProtocolError("node_set_gap replan returned an invalid protocol")
-        replanned = normalize_structured_function_items(response["function_items"], source="node_set_gap replan")
-        before = {item["target_file"]: item for item in candidate.function_items}
-        after = {item["target_file"]: item for item in replanned}
-        if any(after.get(target) != item for target, item in before.items()) or not set(before) <= set(after) or len(after) > len(before) + 1:
-            raise PreparePlanProtocolError("node_set_gap replan modified existing nodes or exceeded one new node")
-        new_targets = set(after) - set(before)
-        if not new_targets:
-            return candidate
-        # At most one added node is a recovery budget, not an architectural
-        # requirement that a Skill contain a fixed number of scripts.
-        new_target = next(iter(new_targets))
-        topology_updates = {
-            str(issue["target_node"]): [new_target]
-            for issue in gaps
-            if str(issue.get("target_node") or "") in before
-        }
-        return candidate.refreeze(
-            replanned,
-            topology_updates=topology_updates,
-        )
-
     await compile_responsibility_graph(draft, source_selector=select_source)
-    if draft.status != "committed" and any(issue.get("issue_type") == "node_contract_gap" for issue in draft.issues):
-        patched = await patch_node_contract(draft)
-        if patched is not draft:
-            draft = patched
-            await compile_responsibility_graph(draft, source_selector=select_source)
-            draft.metrics["node_contract_patch_count"] = 1
-    if draft.status != "committed" and any(
-        issue.get("issue_type") == "node_contract_gap" and issue.get("node_set_candidate") for issue in draft.issues
-    ):
-        replanned = await replan_minimal_node_set(draft)
-        if replanned is not draft:
-            draft = replanned
-            await compile_responsibility_graph(draft, source_selector=select_source)
-            draft.metrics["node_set_replan_count"] = 1
-        else:
-            draft.issues = [
-                {**issue, "issue_type": "node_set_gap"}
-                if issue.get("issue_type") == "node_contract_gap" and issue.get("node_set_candidate") else issue
-                for issue in draft.issues
-            ]
     draft.metrics.update({
         "compiler_status": draft.status,
         "compiler_issue_types": sorted({str(issue.get("issue_type") or "") for issue in draft.issues}),

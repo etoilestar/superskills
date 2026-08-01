@@ -89,6 +89,7 @@ async def _run_recovery(
     replanned_blueprint=None, rebuilt_items=None, rebuilt_edges=None,
     rebuilt_review=None, observe=None, calls=None,
 ):
+    monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "legacy")
     initial_blueprint = _blueprint(*[
         _script_block(item["target_file"], inputs=item["inputs"], outputs=item["outputs"])
         for item in initial_items
