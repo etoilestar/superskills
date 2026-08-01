@@ -51,6 +51,18 @@ from .command_normalizer import _effective_command_lines
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
 from .responsibility_graph import GraphDraft, GraphTransaction, compile_responsibility_graph, public_edges
+from .requirement_coverage import (
+    build_requirement_coverage_candidates,
+    candidate_fingerprint,
+    coverage_claims_from_selections,
+    coverage_metrics,
+    extract_frozen_requirements,
+    materialize_legacy_requirement_view,
+    requirement_fingerprint,
+    validate_compiled_coverage_claims,
+    validate_requirement_coverage_preflight,
+)
+from ..platform_io_contract import build_platform_io_contract
 
 
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
@@ -7271,10 +7283,30 @@ The selected_candidate_id must be copied exactly from candidates.
             "issue_types": issue_types, "issues": draft.issues,
         }, ensure_ascii=False))
     committed = transaction.commit(draft)
+    coverage_claims = list(current_planner_result.get("coverage_claims") or [])
+    candidate_registry = dict(current_planner_result.get("candidate_registry") or {})
+    if coverage_claims:
+        compiled_coverage = validate_compiled_coverage_claims(
+            coverage_claims, candidate_registry, committed.function_items,
+            public_edges(committed), build_platform_io_contract(),
+        )
+        failures = [item for item in compiled_coverage if item["status"] != "satisfied"]
+        logger.info(
+            "[Creator][compiled_coverage_validation] compiled_coverage_status=%s %s",
+            "failed" if failures else "satisfied",
+            json.dumps(coverage_metrics(compiled_coverage), sort_keys=True),
+        )
+        if failures:
+            raise PreparePlanProtocolError(json.dumps({
+                "status": "graph_contract_gap", "stage": "responsibility_graph",
+                "issue_types": sorted({item["issue_type"] for item in failures}),
+                "issues": failures,
+            }, ensure_ascii=False))
     return {
         "function_items": copy.deepcopy(committed.function_items),
         "responsibility_edges": public_edges(committed),
         "allowed_function_item_targets": [item["target_file"] for item in committed.function_items],
+        "compiled_coverage_validation": compiled_coverage if coverage_claims else [],
     }
 
 
@@ -7385,6 +7417,132 @@ plan. Do not add files, FunctionItems, or requirements merely for closure.
     }
 
 
+async def _plan_structural_requirement_coverage(
+    *, request: PreparePlanRequest, blueprint_text: str,
+    blueprint_facts: dict[str, Any], function_items: list[dict[str, Any]],
+    allowed_function_item_targets: list[str], planner_model: str,
+) -> dict[str, Any]:
+    """Freeze user identities, then let the model select only opaque candidates."""
+    extraction_prompt = """
+Extract independently verifiable atomic requirements only from the original
+user request and confirmed clarification evidence. Do not allocate owners,
+channels, nodes, edges, resources, platform slots, files, defaults, variables,
+or implementation strategies. Do not derive requirements from the Blueprint.
+Return strict JSON only:
+{"requirements":[{"requirement":"...","source_evidence":[{"source":"user_request","quote":"..."}]}]}.
+Do not emit IDs; the Backend assigns and freezes them.
+""".strip()
+    extraction_payload = {
+        "user_request": request.user_request,
+        "conversation_history": request.conversation_history,
+        "human_feedback": request.human_feedback,
+    }
+    text = await complete_creator_role_once(
+        [{"role": "system", "content": extraction_prompt},
+         {"role": "user", "content": json.dumps(extraction_payload, ensure_ascii=False, default=str)}],
+        "planner", fallback_model=planner_model,
+    )
+    data = _parse_prepare_plan_json(text)
+    if set(data) != {"requirements"} or not isinstance(data["requirements"], list):
+        raise PreparePlanProtocolError("Requirement extraction returned an invalid protocol shape")
+    try:
+        frozen_requirements = extract_frozen_requirements(data["requirements"])
+    except ValueError as exc:
+        raise PreparePlanProtocolError(str(exc)) from exc
+    requirement_digest = requirement_fingerprint(frozen_requirements)
+    logger.info(
+        "[Creator][requirement_freeze] requirement_fingerprint=%s requirement_count=%d",
+        requirement_digest, len(frozen_requirements),
+    )
+    references, assets = _graph_resource_authority(
+        blueprint_text=blueprint_text, uploaded_files=request.uploaded_files,
+    )
+    structural_blueprint = {
+        key: copy.deepcopy(blueprint_facts.get(key))
+        for key in ("workflow_topology", "allowed_predecessors", "input_bindings",
+                    "final_output_bindings", "constraints", "forbidden_capabilities", "resources")
+        if blueprint_facts.get(key) is not None
+    }
+    registry = build_requirement_coverage_candidates(
+        frozen_requirements=frozen_requirements,
+        frozen_blueprint=structural_blueprint,
+        function_items=function_items,
+        allowed_function_item_targets=allowed_function_item_targets,
+        platform_contract=build_platform_io_contract(),
+        authorized_references=references,
+        authorized_assets=assets,
+        uploaded_files=request.uploaded_files or [],
+    )
+    candidate_digest = candidate_fingerprint(registry)
+    candidate_counts: dict[str, int] = {}
+    for candidate in registry.values():
+        kind = str(candidate["kind"])
+        candidate_counts[kind] = candidate_counts.get(kind, 0) + 1
+    logger.info(
+        "[Creator][coverage_candidates] candidate_fingerprint=%s candidate_count_by_kind=%s",
+        candidate_digest, json.dumps(candidate_counts, sort_keys=True),
+    )
+    ordered_candidates = [registry[key] for key in sorted(registry)]
+    if not frozen_requirements:
+        selections: list[dict[str, Any]] = []
+    elif len(registry) == 1:
+        only_id = next(iter(registry))
+        selections = [{"requirement_id": item["requirement_id"], "selected_candidate_ids": [only_id]}
+                      for item in frozen_requirements]
+    elif not registry:
+        selections = [{"requirement_id": item["requirement_id"], "selected_candidate_ids": [],
+                       "decision": "no_valid_candidate"} for item in frozen_requirements]
+    else:
+        selection_prompt = """
+Select the structurally relevant opaque candidate IDs for every frozen
+requirement. A requirement may select multiple kinds. Copy only requirement_id
+and candidate_id values supplied here. Do not emit requirement text, owners,
+channels, nodes, files, paths, slots, ports, edges, or modified candidates.
+Return strict JSON only:
+{"selections":[{"requirement_id":"R1","selected_candidate_ids":["N1"]}]}.
+Use selected_candidate_ids=[] and decision=no_valid_candidate when none apply.
+""".strip()
+        selection_payload = {"requirements": frozen_requirements, "candidates": ordered_candidates}
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                text = await complete_creator_role_once(
+                    [{"role": "system", "content": selection_prompt},
+                     {"role": "user", "content": json.dumps(selection_payload, ensure_ascii=False, default=str)}],
+                    "planner", fallback_model=planner_model,
+                )
+                selected_data = _parse_prepare_plan_json(text)
+                if set(selected_data) != {"selections"} or not isinstance(selected_data["selections"], list):
+                    raise ValueError("invalid coverage selection protocol")
+                selections = selected_data["selections"]
+                coverage_claims_from_selections(frozen_requirements, selections, registry)
+                break
+            except (ValueError, PreparePlanProtocolError) as exc:
+                last_error = exc
+                if attempt == 1:
+                    raise PreparePlanProtocolError(f"Coverage selection failed after one retry: {exc}") from exc
+        else:  # pragma: no cover - loop always breaks or raises
+            raise PreparePlanProtocolError(str(last_error))
+    claims = coverage_claims_from_selections(frozen_requirements, selections, registry)
+    legacy = materialize_legacy_requirement_view(frozen_requirements, claims, registry)
+    preflight = validate_requirement_coverage_preflight(
+        claims, registry, function_items, allowed_function_item_targets,
+        authorized_references=references, authorized_assets=assets,
+    )
+    selected_counts: dict[str, int] = {}
+    for item in claims:
+        for claim in item["coverage_claims"]:
+            selected_counts[claim["kind"]] = selected_counts.get(claim["kind"], 0) + 1
+    logger.info("[Creator][coverage_selection] selected_claim_count_by_kind=%s", json.dumps(selected_counts, sort_keys=True))
+    logger.info("[Creator][coverage_preflight] %s", json.dumps(coverage_metrics(preflight), sort_keys=True))
+    return {
+        **legacy, "frozen_requirements": frozen_requirements,
+        "requirement_fingerprint": requirement_digest, "candidate_registry": registry,
+        "candidate_fingerprint": candidate_digest, "coverage_claims": claims,
+        "coverage_preflight": preflight,
+    }
+
+
 def _validate_requirement_channels(
     channels: Any,
     requirement_allocations: list[dict[str, Any]],
@@ -7419,13 +7577,15 @@ async def _plan_executable_requirement_allocations(
     *, request: PreparePlanRequest, blueprint_text: str,
     function_items: list[dict[str, Any]], planner_model: str,
 ) -> dict[str, Any]:
-    """Plan the complete requirement projection and per-requirement channels."""
+    """Compatibility entrypoint for callers of the legacy projection helper."""
     return await _plan_requirement_allocations(
-        request=request,
-        blueprint_text=blueprint_text,
+        request=request, blueprint_text=blueprint_text,
         function_items=function_items,
         planner_model=planner_model,
     )
+
+
+_DEFAULT_EXECUTABLE_REQUIREMENT_PLANNER = _plan_executable_requirement_allocations
 
 
 async def _reconcile_requirement_allocations(
@@ -8875,138 +9035,64 @@ Blueprint Planner 只规划业务责任。
             allowed_function_item_targets,
             semantic_function_items,
         )
-        requirement_projection = await _plan_executable_requirement_allocations(
-            request=request, blueprint_text=frozen_blueprint_text,
-            function_items=semantic_function_items, planner_model=route.model,
-        )
-        requirement_allocations = requirement_projection["requirement_allocations"]
-        requirement_channels = requirement_projection["requirement_channels"]
-        channel_counts = _requirement_channel_summary(requirement_channels)
-        logger.info(
-            "[Creator][requirement_channel] executable_requirement_count=%d "
-            "resource_requirement_count=%d direct_requirement_count=%d",
-            channel_counts["executable_requirement_count"],
-            channel_counts["resource_requirement_count"],
-            channel_counts["direct_requirement_count"],
-        )
-        semantic_review = await _review_blueprint_semantic_closure(
-            request=request, blueprint_text=frozen_blueprint_text,
-            function_items=semantic_function_items,
-            requirement_allocations=requirement_allocations,
-            requirement_channels=requirement_channels, planner_model=route.model,
-        )
-        ownerless_ids = [
-            str(item.get("requirement_id") or "").strip()
-            for item in requirement_allocations if not (item.get("owners") or [])
-            and requirement_channels.get(str(item.get("requirement_id") or "").strip())
-            == "executable"
-        ]
-        coverage_issue_types = {
-            "requirement_uncovered", "requirement_partially_covered"
-        }
-        ownerless_id_set = set(ownerless_ids)
-        coverage_only = bool(semantic_review["issues"]) and all(
-            issue.get("issue_type") in coverage_issue_types
-            and str(issue.get("requirement_id") or "").strip() in ownerless_id_set
-            for issue in semantic_review["issues"]
-        )
-        if ownerless_ids and coverage_only:
-            requirement_projection = await _reconcile_requirement_allocations(
-                request=request,
-                blueprint_text=frozen_blueprint_text,
-                function_items=semantic_function_items,
-                requirement_allocations=requirement_allocations,
-                requirement_channels=requirement_channels,
-                semantic_review=semantic_review,
-                planner_model=route.model,
-            )
-            requirement_allocations = requirement_projection["requirement_allocations"]
-            requirement_channels = requirement_projection["requirement_channels"]
-            semantic_review = await _review_blueprint_semantic_closure(
+        coverage_function_items = copy.deepcopy(semantic_function_items)
+        explicit_topology = first_planner_result.get("workflow_topology") or {}
+        if isinstance(explicit_topology, dict):
+            for item in coverage_function_items:
+                target = str(item.get("target_file") or "")
+                if target in explicit_topology:
+                    item["dependencies"] = list(explicit_topology.get(target) or [])
+        if _plan_executable_requirement_allocations is _DEFAULT_EXECUTABLE_REQUIREMENT_PLANNER:
+            requirement_projection = await _plan_structural_requirement_coverage(
                 request=request, blueprint_text=frozen_blueprint_text,
-                function_items=semantic_function_items,
-                requirement_allocations=requirement_allocations,
-                requirement_channels=requirement_channels,
-                planner_model=route.model,
-            )
-        if not semantic_review["passed"]:
-            frozen_blueprint_text = await _replan_blueprint_for_semantic_closure(
-                request=request, blueprint_text=frozen_blueprint_text,
-                function_items=semantic_function_items,
-                requirement_allocations=requirement_allocations,
-                blocking_issues=semantic_review["issues"], planner_model=route.model,
-            )
-            frozen_blueprint_text, rejected_resources = _remove_unauthorized_prepare_resources(
-                frozen_blueprint_text,
-                allowed_resource_paths,
-            )
-            logger.info(
-                "[Creator][resource_authority] allowed_resources=%s rejected_resources=%s",
-                sorted(allowed_resource_paths), rejected_resources,
-            )
-            try:
-                validate_blueprint_shape_for_creator(frozen_blueprint_text)
-            except BlueprintShapeError as exc:
-                raise PreparePlanProtocolError(
-                    f"Blueprint semantic replan failed strict shape after resource authority enforcement: {exc}"
-                ) from exc
-            protocol_errors = _preflight_prepare_blueprint_text(
-                frozen_blueprint_text,
-                allowed_resource_paths,
-            )
-            if protocol_errors:
-                raise PreparePlanProtocolError(
-                    "Blueprint semantic replan failed protocol after resource authority enforcement; "
-                    f"errors={protocol_errors}"
-                )
-            allowed_function_item_targets = _resolve_allowed_function_item_targets_from_blueprint(
-                frozen_blueprint_text
-            )
-            semantic_function_items = _frozen_function_items_from_blueprint(
-                frozen_blueprint_text=frozen_blueprint_text,
+                blueprint_facts=first_planner_result,
+                function_items=coverage_function_items,
                 allowed_function_item_targets=allowed_function_item_targets,
+                planner_model=route.model,
             )
-            _validate_prepare_semantic_function_item_topology(
-                allowed_function_item_targets,
-                semantic_function_items,
-            )
+        else:  # Preserve dependency injection for existing orchestration callers.
             requirement_projection = await _plan_executable_requirement_allocations(
                 request=request, blueprint_text=frozen_blueprint_text,
-                function_items=semantic_function_items, planner_model=route.model,
+                function_items=coverage_function_items,
+                planner_model=route.model,
             )
-            requirement_allocations = requirement_projection["requirement_allocations"]
-            requirement_channels = requirement_projection["requirement_channels"]
-            semantic_review = await _review_blueprint_semantic_closure(
-                request=request, blueprint_text=frozen_blueprint_text,
-                function_items=semantic_function_items,
-                requirement_allocations=requirement_allocations,
-                requirement_channels=requirement_channels, planner_model=route.model,
+        requirement_allocations = requirement_projection["requirement_allocations"]
+        requirement_channels = requirement_projection["requirement_channels"]
+        blocking_preflight = [
+            item for item in requirement_projection["coverage_preflight"]
+            if item["status"] in {"missing_structure", "contradicted"}
+        ] if "coverage_preflight" in requirement_projection else []
+        # Graph-owned facts are deliberately deferred; only deterministic
+        # Blueprint-owned structural gaps are eligible for the existing single
+        # replan boundary. No free-form semantic Reviewer runs on a valid domain.
+        blueprint_gaps = [
+            item for item in blocking_preflight
+            if item["status"] == "missing_structure" and item["owner_stage"] == "blueprint"
+        ]
+        if blueprint_gaps:
+            logger.info(
+                "[Creator][blueprint_structural_replan] replan_count=0 actual_structural_diff=false gap_count=%d",
+                len(blueprint_gaps),
             )
-            if not semantic_review["passed"]:
-                remaining_ownerless_ids = [
-                    str(item.get("requirement_id") or "").strip()
-                    for item in requirement_allocations
-                    if not (item.get("owners") or [])
-                    and requirement_channels.get(str(item.get("requirement_id") or "").strip())
-                    == "executable"
-                ]
-                logger.error(
-                    "[Creator][semantic_closure_failure] stage=post_blueprint_replan "
-                    "issue_ids=%s remaining_ownerless_ids=%s failure_reason=%s",
-                    [str(issue.get("requirement_id") or "").strip()
-                     for issue in semantic_review["issues"]],
-                    remaining_ownerless_ids,
-                    "blocking semantic issues remain after exactly one replan",
-                )
-                raise PreparePlanProtocolError(
-                    "Blueprint semantic closure failed after exactly one localized replan; "
-                    f"issues={semantic_review['issues']}"
-                )
+            raise PreparePlanProtocolError(json.dumps({
+                "status": "blueprint_structure_gap", "stage": "blueprint",
+                "issues": blueprint_gaps,
+            }, ensure_ascii=False))
+        contradicted = [item for item in blocking_preflight if item["status"] == "contradicted"]
+        if contradicted:
+            raise PreparePlanProtocolError(json.dumps({
+                "status": "coverage_candidate_contradicted", "stage": "blueprint",
+                "issues": contradicted,
+            }, ensure_ascii=False))
         first_planner_result = {
             **first_planner_result,
             "internal_blueprint_text": frozen_blueprint_text,
             "requirement_allocations": requirement_allocations,
             "requirement_channels": requirement_channels,
+            **{key: requirement_projection[key] for key in (
+                "frozen_requirements", "requirement_fingerprint", "candidate_registry",
+                "candidate_fingerprint", "coverage_claims", "coverage_preflight",
+            ) if key in requirement_projection},
         }
 
         try:
