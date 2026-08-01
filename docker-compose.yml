@@ -42,6 +42,7 @@ services:
       - LOG_DIR=/app/logs
       - TEMPERATURE=${TEMPERATURE:-0.7}
       - MAX_TOKENS=${MAX_TOKENS:-4096}
+      - CREATOR_GRAPH_BINDING_MODE=${CREATOR_GRAPH_BINDING_MODE:-compiled_v2}
 # Makes host.docker.internal resolve to the host on Linux as well
     extra_hosts:
       - "host.docker.internal:host-gateway"

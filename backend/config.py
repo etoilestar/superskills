@@ -13,6 +13,15 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434")
 
 
 class Settings(BaseSettings):
+    # ResponsibilityGraph binding strategy. ``legacy`` is intentionally kept as
+    # a deployment-level escape hatch; requests never fall back to it locally.
+    creator_graph_binding_mode: str = Field(
+        "compiled_v2",
+        validation_alias=AliasChoices(
+            "CREATOR_GRAPH_BINDING_MODE", "creator_graph_binding_mode"
+        ),
+        pattern="^(legacy|shadow|compiled_v2)$",
+    )
     # LLM backend
     llm_base_url: str = Field(LLM_BASE_URL, validation_alias=AliasChoices("LLM_BASE_URL", "llm_base_url"))
     default_model: str = Field(default_model, validation_alias=AliasChoices("DEFAULT_MODEL", "default_model"))
