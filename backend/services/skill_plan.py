@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+import copy
 import json
 import re
 from typing import Literal
@@ -344,6 +345,11 @@ _ALLOWED_FUNCTION_ITEM_FIELDS = {
     "required_capabilities",
     "constraints",
     "default_values",
+    "dependencies",
+    "forbidden_capabilities",
+    "references",
+    "assets",
+    "uploads",
 }
 
 
@@ -366,17 +372,15 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
     normalized: list[dict[str, object]] = []
     seen_targets: set[str] = set()
     invalid: list[dict[str, object]] = []
-    required = set(_ALLOWED_FUNCTION_ITEM_FIELDS) - {"default_values"}
+    required = {"target_file", "role", "purpose", "inputs", "outputs",
+                "required_capabilities", "constraints"}
     for index, item in enumerate(raw_items):
         if not isinstance(item, dict):
             invalid.append({"index": index, "type": type(item).__name__})
             continue
-        unknown = sorted(str(key) for key in item.keys() if key not in _ALLOWED_FUNCTION_ITEM_FIELDS)
         missing = sorted(required - set(item.keys()))
-        if unknown or missing:
+        if missing:
             issue: dict[str, object] = {"index": index}
-            if unknown:
-                issue["unknown_fields"] = unknown
             if missing:
                 issue["missing_fields"] = missing
             invalid.append(issue)
@@ -401,8 +405,12 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             invalid.append({"index": index, "field": "purpose"})
             continue
         try:
-            inputs = _normalize_string_array(item.get("inputs"), source=source, index=index, field="inputs")
-            outputs = _normalize_string_array(item.get("outputs"), source=source, index=index, field="outputs")
+            inputs = copy.deepcopy(item.get("inputs"))
+            outputs = copy.deepcopy(item.get("outputs"))
+            if not isinstance(inputs, list) or not all(isinstance(value, (str, dict)) for value in inputs):
+                raise ValueError(f"{source}.function_items[{index}].inputs must be a port array")
+            if not isinstance(outputs, list) or not all(isinstance(value, (str, dict)) for value in outputs):
+                raise ValueError(f"{source}.function_items[{index}].outputs must be a port array")
             required_capabilities = _normalize_string_array(item.get("required_capabilities"), source=source, index=index, field="required_capabilities")
         except ValueError as exc:
             invalid.append({"index": index, "error": str(exc)})
@@ -410,6 +418,9 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
         normalized_inputs: list[str] = []
         inline_defaults: dict[str, object] = {}
         for raw_input in inputs:
+            if isinstance(raw_input, dict):
+                normalized_inputs.append(raw_input)
+                continue
             input_name, inline_default = parse_schema_input_item(raw_input)
             has_inline_default = "=" in raw_input or bool(re.search(r"(?:default|默认|缺省)", raw_input, re.I))
             normalized_inputs.append(input_name or raw_input)
@@ -421,7 +432,7 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             invalid.append({"index": index, "field": "default_values"})
             continue
         default_values = {**inline_defaults, **default_values}
-        input_names = set(inputs)
+        input_names = {value if isinstance(value, str) else value.get("name") for value in inputs}
         if any(not isinstance(key, str) or key not in input_names for key in default_values):
             invalid.append({"index": index, "field": "default_values", "reason": "keys_must_be_declared_inputs"})
             continue
@@ -430,7 +441,8 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             invalid.append({"index": index, "field": "constraints"})
             continue
         seen_targets.add(target)
-        normalized.append({
+        normalized_item = copy.deepcopy(item)
+        normalized_item.update({
             "target_file": target,
             "role": role,
             "purpose": purpose.strip(),
@@ -440,6 +452,9 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             "constraints": [dict(constraint) for constraint in constraints],
             "default_values": dict(default_values),
         })
+        # Blueprint is the structure authority.  Preserve extension metadata
+        # verbatim rather than silently narrowing it to today's known schema.
+        normalized.append(normalized_item)
     if invalid:
         raise ValueError(f"{source}.function_items contains invalid function items: {invalid}")
     return normalized

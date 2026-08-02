@@ -20,6 +20,39 @@ from backend.services.creator.responsibility_graph import (
 )
 
 
+@pytest.mark.asyncio
+async def test_compiled_api_batches_and_applies_graph_ambiguities_once(monkeypatch):
+    from backend.services.creator import api
+
+    items = [
+        item("scripts/a.py", [], ["value"]),
+        item("scripts/b.py", [], ["value"]),
+        item("scripts/c.py", ["value"], ["text"]),
+    ]
+    calls = []
+
+    async def choose(messages, role, fallback_model):
+        calls.append(messages)
+        return '{"selections":[{"ambiguity_id":"A1","selected_candidate_id":"A1-C2"}]}'
+
+    monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
+    monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
+    monkeypatch.setattr(api, "complete_creator_role_once", choose)
+    monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
+    result = await api._bind_executable_responsibility_plan(
+        request=api.PreparePlanRequest(user_request="demo"),
+        current_planner_result={"internal_blueprint_text": "frozen"},
+        planner_model="test", allowed_function_item_targets=[value["target_file"] for value in items],
+    )
+    assert len(calls) == 1
+    payload = json.loads(calls[0][1]["content"])
+    assert payload["ambiguities"][0]["target"]["purpose"] == "Process scripts/c.py"
+    assert payload["ambiguities"][0]["candidates"][0]["source_purpose"]
+    assert payload["ambiguities"][0]["candidates"][0]["match_confidence"] == "weak_name"
+    edge = next(value for value in result["responsibility_edges"] if value["to_node"] == "scripts/c.py")
+    assert edge["from_node"] == "scripts/b.py"
+
+
 def item(target, inputs, outputs, *, defaults=None):
     return {
         "target_file": target,
@@ -191,6 +224,18 @@ def blueprint_with_resources(*paths):
 ### Resource List
 - declared only
 """
+
+
+def test_complete_blueprint_graph_fact_parser_preserves_resources_and_topology():
+    from backend.services.creator import api
+
+    facts = api.parse_blueprint_graph_facts(
+        blueprint_with_resources("references/rules.md"),
+        allowed_function_item_targets=["scripts/a.py"],
+    )
+    assert facts["workflow_topology"] == {"scripts/a.py": []}
+    assert facts["resources"] == ["references/rules.md"]
+    assert facts["function_items"][0]["target_file"] == "scripts/a.py"
 
 
 @pytest.mark.parametrize("order", [
@@ -512,6 +557,7 @@ async def test_shadow_compiler_failure_cannot_replace_stable_graph(monkeypatch):
     monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
     monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
     monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "shadow")
+    monkeypatch.setattr(api, "_plan_executable_requirement_allocations", AsyncMock())
     monkeypatch.setattr(api, "complete_creator_role_once", AsyncMock(return_value=json.dumps({
         "responsibility_edges": stable,
     })))
@@ -531,18 +577,15 @@ async def test_compiler_does_not_replan_or_mutate_node_set(monkeypatch):
 
     items = [item("scripts/a.py", ["missing_runtime_input"], ["text"])]
     original = copy.deepcopy(items)
-    monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
-    monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
-    monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
-    model = AsyncMock(side_effect=AssertionError("selector must not invent a candidate"))
-    monkeypatch.setattr(api, "complete_creator_role_once", model)
-    with pytest.raises(api.PreparePlanProtocolError, match="node_contract_gap"):
-        await api._bind_executable_responsibility_plan(
-            request=api.PreparePlanRequest(user_request="demo"),
-            current_planner_result={"internal_blueprint_text": "frozen"}, planner_model="test",
-            allowed_function_item_targets=["scripts/a.py"])
+    facts = api.normalize_blueprint_graph_facts(
+        function_items=items,
+        platform_contract={"platform_skill_boundary": {"final_output_fields": ["text"]}},
+    )
+    assert facts["structural_issues"] == [{
+        "issue_type": "unbound_required_input", "target_node": "scripts/a.py",
+        "target_input": "missing_runtime_input",
+    }]
     assert items == original
-    assert model.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -558,6 +601,7 @@ async def test_legacy_mode_never_constructs_compiler_state(monkeypatch):
          "to_input": "text", "purpose": "stable", "constraints": []},
     ]
     monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "legacy")
+    monkeypatch.setattr(api, "_plan_executable_requirement_allocations", AsyncMock())
     monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: items)
     monkeypatch.setattr(api, "complete_creator_role_once", AsyncMock(return_value=json.dumps({
         "responsibility_edges": edges,

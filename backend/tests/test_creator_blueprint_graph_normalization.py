@@ -1,0 +1,144 @@
+import json
+
+import pytest
+
+from backend.services.creator.blueprint_graph import (
+    apply_ambiguity_selections,
+    blueprint_graph_fingerprint,
+    match_port_evidence,
+    normalize_blueprint_graph_facts,
+    parse_ambiguity_selections,
+)
+from backend.services.creator.requirement_coverage import (
+    audit_committed_requirement_coverage,
+    freeze_requirements,
+)
+
+
+def item(path, inputs, outputs, dependencies=()):
+    return {"target_file": path, "role": "processor", "purpose": path,
+            "inputs": inputs, "outputs": outputs, "dependencies": list(dependencies),
+            "required_capabilities": [], "forbidden_capabilities": ["network"],
+            "constraints": [{"kind": "offline"}], "default_values": {},
+            "references": ["references/r.md"], "extension_fact": {"kept": True}}
+
+
+def test_unique_chain_is_inferred_without_ambiguity_and_preserves_metadata():
+    facts = normalize_blueprint_graph_facts(
+        function_items=[
+            item("scripts/a.py", [], [{"name": "document", "semantic_id": "doc"}]),
+            item("scripts/b.py", [{"name": "source", "semantic_id": "doc"}], ["text"], ["scripts/a.py"]),
+        ], platform_contract={"platform_skill_boundary": {"final_output_fields": ["text"]}},
+    )
+    assert facts["ambiguities"] == []
+    assert facts["metrics"]["model_selection_call_count"] == 0
+    assert facts["input_bindings"][0]["source_node"] == "scripts/a.py"
+    assert facts["function_items"][0]["extension_fact"] == {"kept": True}
+    assert facts["function_items"][0]["forbidden_capabilities"] == ["network"]
+
+
+def test_multiple_producers_create_one_finite_ambiguity():
+    facts = normalize_blueprint_graph_facts(function_items=[
+        item("scripts/a.py", [], ["value"]), item("scripts/b.py", [], ["value"]),
+        item("scripts/c.py", ["value"], ["text"], ["scripts/a.py", "scripts/b.py"]),
+    ], platform_contract={"platform_skill_boundary": {"final_output_fields": ["text"]}})
+    ambiguity = facts["ambiguities"][0]
+    assert ambiguity["target_node"] == "scripts/c.py"
+    assert len(ambiguity["candidate_sources"]) == 2
+    selected = apply_ambiguity_selections(
+        facts, {ambiguity["ambiguity_id"]: ambiguity["candidate_sources"][1]["candidate_id"]}
+    )
+    assert selected["ambiguities"] == []
+    assert selected["input_bindings"][-1]["source_node"] == "scripts/b.py"
+    assert selected["metrics"]["model_selection_call_count"] == 1
+
+
+def test_unique_port_match_without_dependency_is_inferred_acyclically():
+    facts = normalize_blueprint_graph_facts(function_items=[
+        item("scripts/a.py", [], [{"name": "payload", "value_type": "object"}]),
+        item("scripts/b.py", [{"name": "payload", "value_type": "object"}], ["text"]),
+    ], platform_contract={"platform_skill_boundary": {"final_output_fields": ["text"]}})
+    assert facts["ambiguities"] == []
+    assert facts["workflow_topology"]["scripts/b.py"] == ["scripts/a.py"]
+    assert facts["input_bindings"][0]["source_node"] == "scripts/a.py"
+
+
+def test_weak_name_is_not_silently_connected():
+    facts = normalize_blueprint_graph_facts(function_items=[
+        item("scripts/a.py", [], ["content"]), item("scripts/b.py", ["content"], []),
+    ], platform_contract={})
+    assert facts["input_bindings"] == []
+    assert any(value["issue_type"] == "unbound_required_input" for value in facts["structural_issues"])
+    assert match_port_evidence({"name": "content", "semantic_id": "", "value_type": "unknown"},
+                               {"name": "content", "semantic_id": "", "value_type": "unknown"})["confidence"] == "weak_name"
+
+
+def test_typed_name_is_deterministic_and_platform_peer_competes_when_equally_weak():
+    typed = normalize_blueprint_graph_facts(function_items=[
+        item("scripts/a.py", [], [{"name": "data", "value_type": "object"}]),
+        item("scripts/b.py", [{"name": "data", "value_type": "object"}], []),
+    ], platform_contract={})
+    assert typed["input_bindings"][0]["source_node"] == "scripts/a.py"
+    competing = normalize_blueprint_graph_facts(function_items=[
+        item("scripts/a.py", [], ["payload"]), item("scripts/b.py", ["payload"], []),
+    ], platform_contract={"platform_skill_boundary": {"input_envelope_fields": ["payload"]}})
+    assert competing["input_bindings"] == []
+    assert len(competing["ambiguities"]) == 1
+    assert {value["source_node"] for value in competing["ambiguities"][0]["candidate_sources"]} == {
+        "scripts/a.py", "platform_input_node"
+    }
+
+
+def test_normalization_is_order_independent_and_batch_cycle_safe():
+    values = [
+        item("scripts/a.py", [], [{"name": "document", "semantic_id": "doc"}]),
+        item("scripts/b.py", [{"name": "source", "semantic_id": "doc"}], ["text"]),
+        item("scripts/c.py", [], ["other"]),
+    ]
+    variants = [values, [values[2], values[0], values[1]], [values[1], values[2], values[0]]]
+    normalized = [normalize_blueprint_graph_facts(function_items=value, platform_contract={}) for value in variants]
+    assert normalized[0] == normalized[1] == normalized[2]
+    cyclic = normalize_blueprint_graph_facts(function_items=[
+        item("scripts/a.py", [{"name": "from_b", "semantic_id": "ba"}],
+             [{"name": "to_b", "semantic_id": "ab"}]),
+        item("scripts/b.py", [{"name": "from_a", "semantic_id": "ab"}],
+             [{"name": "to_a", "semantic_id": "ba"}]),
+    ], platform_contract={})
+    assert cyclic["input_bindings"] == []
+    assert {value["issue_type"] for value in cyclic["structural_issues"]} == {"cycle_detected"}
+
+
+def test_selection_protocol_accepts_identical_duplicate_and_rejects_unknown():
+    ambiguities = [{"ambiguity_id": "A1", "candidate_sources": [{"candidate_id": "A1-C1"}]}]
+    payload = json.dumps({"selections": [{"ambiguity_id": "A1", "selected_candidate_id": "A1-C1"}]})
+    assert parse_ambiguity_selections(payload + payload, ambiguities) == {"A1": "A1-C1"}
+    with pytest.raises(ValueError, match="invalid_candidate"):
+        parse_ambiguity_selections('{"selections":[{"ambiguity_id":"A1","selected_candidate_id":"A1-C9"}]}', ambiguities)
+
+
+def test_requirement_freeze_and_post_commit_audit_are_read_only():
+    requirements = freeze_requirements("Create the requested output")
+    committed_items = [item("scripts/a.py", [], ["text"])]
+    committed_edges = [{"from_node": "scripts/a.py", "from_output": "text",
+                        "to_node": "platform_output_node", "to_input": "text"}]
+    original = json.dumps([committed_items, committed_edges], sort_keys=True)
+    audit = audit_committed_requirement_coverage(
+        requirements, normalized_blueprint={}, function_items=committed_items,
+        responsibility_edges=committed_edges,
+    )
+    assert audit[0]["status"] == "unverifiable"
+    assert audit[0]["owner_stage"] == "runtime"
+    assert json.dumps([committed_items, committed_edges], sort_keys=True) == original
+
+
+def test_graph_fingerprint_covers_topology_boundaries_constraints_and_resources():
+    base = {"function_items": [], "workflow_topology": {}, "input_bindings": [],
+            "final_output_bindings": [], "constraints": [], "resources": []}
+    fingerprints = {blueprint_graph_fingerprint({**base, key: value}) for key, value in (
+        ("workflow_topology", {"scripts/a.py": []}),
+        ("input_bindings", [{"target_node": "scripts/a.py"}]),
+        ("final_output_bindings", [{"platform_slot": "text"}]),
+        ("constraints", [{"kind": "offline"}]),
+        ("resources", ["references/a.md"]),
+    )}
+    assert len(fingerprints) == 5
