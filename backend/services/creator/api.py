@@ -54,6 +54,7 @@ from .responsibility_graph import GraphDraft, GraphTransaction, compile_responsi
 from .requirement_coverage import (
     CoverageProjectionConflict,
     build_requirement_coverage_candidates,
+    blueprint_structural_fingerprint,
     candidate_fingerprint,
     coverage_claims_from_selections,
     coverage_metrics,
@@ -7436,11 +7437,11 @@ async def _plan_structural_requirement_coverage(
     *, request: PreparePlanRequest, blueprint_text: str,
     blueprint_facts: dict[str, Any], function_items: list[dict[str, Any]],
     allowed_function_item_targets: list[str], planner_model: str,
+    frozen_requirements_override: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Freeze user identities, then let the model select only opaque candidates."""
     extraction_prompt = """
-Produce the requirement coverage projection extraction phase by extracting
-independently verifiable atomic requirements only from the original
+Extract independently verifiable atomic requirements only from the original
 user request and confirmed clarification evidence. Do not allocate owners,
 channels, nodes, edges, resources, platform slots, files, defaults, variables,
 or implementation strategies. Do not derive requirements from the Blueprint.
@@ -7452,36 +7453,37 @@ Do not emit IDs; the Backend assigns and freezes them.
         "user_request": request.user_request,
         "conversation_history": request.conversation_history,
         "human_feedback": request.human_feedback,
-        # Supplied for transport compatibility; the extraction contract above
-        # explicitly forbids deriving identities or ownership from these facts.
-        "function_items": function_items,
     }
-    text = await complete_creator_role_once(
-        [{"role": "system", "content": extraction_prompt},
-         {"role": "user", "content": json.dumps(extraction_payload, ensure_ascii=False, default=str)}],
-        "planner", fallback_model=planner_model,
-    )
-    data = _parse_prepare_plan_json(text)
-    if set(data) == {"requirement_allocations", "requirement_channels"}:
-        allocations = validate_requirement_allocations(
-            data["requirement_allocations"],
-            allowed_owner_targets=allowed_function_item_targets,
-        )
-        return {
-            "requirement_allocations": allocations,
-            "requirement_channels": _validate_requirement_channels(
-                data["requirement_channels"], allocations,
-            ),
-            "_legacy_protocol": True,
-        }
-    if set(data) != {"requirements"} or not isinstance(data["requirements"], list):
-        raise PreparePlanProtocolError(json.dumps({
-            "status": "requirement_extraction_gap", "stage": "requirement_extraction",
-        }))
-    try:
-        frozen_requirements = extract_frozen_requirements(data["requirements"])
-    except ValueError as exc:
-        raise PreparePlanProtocolError(str(exc)) from exc
+    if frozen_requirements_override is None:
+        data: dict[str, Any] | None = None
+        last_extraction_error = ""
+        for attempt in range(2):
+            try:
+                text = await complete_creator_role_once(
+                    [{"role": "system", "content": extraction_prompt},
+                     {"role": "user", "content": json.dumps(extraction_payload, ensure_ascii=False, default=str)}],
+                    "planner", fallback_model=planner_model,
+                )
+                candidate_data = _parse_prepare_plan_json(text)
+                if set(candidate_data) != {"requirements"} or not isinstance(candidate_data["requirements"], list):
+                    raise ValueError("requirements must be the only top-level field")
+                data = candidate_data
+                break
+            except (ValueError, PreparePlanProtocolError) as exc:
+                last_extraction_error = str(exc)
+                if attempt == 1:
+                    raise PreparePlanProtocolError(json.dumps({
+                        "status": "requirement_extraction_gap", "stage": "requirement_extraction",
+                        "detail": last_extraction_error,
+                    })) from exc
+        if data is None:  # pragma: no cover - loop either assigns or raises
+            raise PreparePlanProtocolError(last_extraction_error)
+        try:
+            frozen_requirements = extract_frozen_requirements(data["requirements"])
+        except ValueError as exc:
+            raise PreparePlanProtocolError(str(exc)) from exc
+    else:
+        frozen_requirements = copy.deepcopy(frozen_requirements_override)
     requirement_digest = requirement_fingerprint(frozen_requirements)
     logger.info(
         "[Creator][requirement_freeze] requirement_fingerprint=%s requirement_count=%d",
@@ -8003,6 +8005,43 @@ existing supplied requirement; then make only the minimum required change.
         )),
     )
     return replanned
+
+
+async def _replan_blueprint_for_structural_coverage(
+    *, request: PreparePlanRequest, blueprint_text: str,
+    frozen_requirements: list[dict[str, Any]], missing_claims: list[dict[str, Any]],
+    function_items: list[dict[str, Any]], allowed_targets: list[str], planner_model: str,
+) -> str:
+    """Perform exactly one Blueprint-only structural replan without re-extraction."""
+    prompt = """
+Perform one localized Blueprint structural replan. Return a complete replacement
+internal_blueprint_text while preserving all frozen user requirements verbatim.
+Modify only the minimum FunctionItem inputs, outputs, dependencies, topology,
+resource, or constraint facts needed for the supplied missing structural claims.
+Do not generate owners, channels, coverage selections, ResponsibilityEdges, or
+runtime implementation advice. Return strict JSON only:
+{"internal_blueprint_text":"..."}.
+""".strip()
+    payload = {
+        "frozen_requirements": frozen_requirements,
+        "current_blueprint": blueprint_text,
+        "missing_requirement_ids": sorted({item["requirement_id"] for item in missing_claims}),
+        "missing_structure_kinds": sorted({str(item.get("kind") or "") for item in missing_claims}),
+        "current_function_items": function_items,
+        "allowed_targets": allowed_targets,
+    }
+    text = await complete_creator_role_once(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+        "planner", fallback_model=planner_model,
+    )
+    data = _parse_prepare_plan_json(text)
+    if set(data) != {"internal_blueprint_text"} or not str(data.get("internal_blueprint_text") or "").strip():
+        raise PreparePlanProtocolError(json.dumps({
+            "status": "blueprint_structure_gap", "stage": "blueprint",
+            "detail": "structural replan returned an invalid protocol",
+        }))
+    return str(data["internal_blueprint_text"])
 
 
 def _strict_blueprint_compatibility_fields(
@@ -9090,8 +9129,7 @@ Blueprint Planner 只规划业务责任。
             )
         requirement_allocations = requirement_projection["requirement_allocations"]
         requirement_channels = requirement_projection["requirement_channels"]
-        if (_plan_executable_requirement_allocations is not _DEFAULT_EXECUTABLE_REQUIREMENT_PLANNER
-                or requirement_projection.get("_legacy_protocol")):
+        if _plan_executable_requirement_allocations is not _DEFAULT_EXECUTABLE_REQUIREMENT_PLANNER:
             channel_counts = _requirement_channel_summary(requirement_channels)
             logger.info(
                 "[Creator][requirement_channel] executable_requirement_count=%d "
@@ -9235,14 +9273,71 @@ Blueprint Planner 只规划业务责任。
                 if item["status"] == "missing_structure" and item["owner_stage"] == "blueprint"
             ]
             if blueprint_gaps:
+                before_fingerprint = blueprint_structural_fingerprint(
+                    semantic_function_items, first_planner_result,
+                )
                 logger.info(
-                    "[Creator][blueprint_structural_replan] replan_count=0 actual_structural_diff=false gap_count=%d",
+                    "[Creator][blueprint_structural_replan] replan_count=1 gap_count=%d",
                     len(blueprint_gaps),
                 )
-                raise PreparePlanProtocolError(json.dumps({
-                    "status": "blueprint_structure_gap", "stage": "blueprint",
-                    "issues": blueprint_gaps,
-                }, ensure_ascii=False))
+                replanned_text = await _replan_blueprint_for_structural_coverage(
+                    request=request, blueprint_text=frozen_blueprint_text,
+                    frozen_requirements=requirement_projection["frozen_requirements"],
+                    missing_claims=blueprint_gaps,
+                    function_items=semantic_function_items,
+                    allowed_targets=allowed_function_item_targets,
+                    planner_model=route.model,
+                )
+                replanned_text, rejected_resources = _remove_unauthorized_prepare_resources(
+                    replanned_text, allowed_resource_paths,
+                )
+                validate_blueprint_shape_for_creator(replanned_text)
+                protocol_errors = _preflight_prepare_blueprint_text(
+                    replanned_text, allowed_resource_paths,
+                )
+                if protocol_errors:
+                    raise PreparePlanProtocolError(json.dumps({
+                        "status": "blueprint_structure_gap", "stage": "blueprint",
+                        "issues": protocol_errors,
+                    }, ensure_ascii=False))
+                replanned_targets = _resolve_allowed_function_item_targets_from_blueprint(replanned_text)
+                replanned_items = _frozen_function_items_from_blueprint(
+                    frozen_blueprint_text=replanned_text,
+                    allowed_function_item_targets=replanned_targets,
+                )
+                after_fingerprint = blueprint_structural_fingerprint(
+                    replanned_items, first_planner_result,
+                )
+                actual_diff = before_fingerprint != after_fingerprint
+                logger.info(
+                    "[Creator][blueprint_structural_replan] replan_count=1 actual_structural_diff=%s",
+                    str(actual_diff).lower(),
+                )
+                if not actual_diff:
+                    raise PreparePlanProtocolError(json.dumps({
+                        "status": "blueprint_replan_noop", "stage": "blueprint",
+                        "issues": blueprint_gaps,
+                    }, ensure_ascii=False))
+                frozen_blueprint_text = replanned_text
+                allowed_function_item_targets = replanned_targets
+                semantic_function_items = replanned_items
+                requirement_projection = await _plan_structural_requirement_coverage(
+                    request=request, blueprint_text=frozen_blueprint_text,
+                    blueprint_facts=first_planner_result,
+                    function_items=semantic_function_items,
+                    allowed_function_item_targets=allowed_function_item_targets,
+                    planner_model=route.model,
+                    frozen_requirements_override=requirement_projection["frozen_requirements"],
+                )
+                requirement_allocations = requirement_projection["requirement_allocations"]
+                requirement_channels = requirement_projection["requirement_channels"]
+                remaining = [item for item in requirement_projection["coverage_preflight"]
+                             if item["status"] in {"missing_structure", "contradicted"}]
+                if remaining:
+                    raise PreparePlanProtocolError(json.dumps({
+                        "status": "blueprint_structure_gap", "stage": "blueprint",
+                        "issues": remaining,
+                    }, ensure_ascii=False))
             contradicted = [item for item in blocking_preflight if item["status"] == "contradicted"]
             if contradicted:
                 raise PreparePlanProtocolError(json.dumps({
