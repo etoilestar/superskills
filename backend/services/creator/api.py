@@ -6334,10 +6334,11 @@ async def _legacy_converge_ready_executable_plan(
     if not frozen_blueprint_text:
         raise ValueError("Planner convergence requires frozen_blueprint_text")
 
-    frozen_function_items = _frozen_function_items_from_blueprint(
-        frozen_blueprint_text=frozen_blueprint_text,
-        allowed_function_item_targets=allowed_function_item_targets,
+    canonical_facts = parse_blueprint_graph_facts(
+        frozen_blueprint_text, allowed_function_item_targets=allowed_function_item_targets,
+        structured_facts=current_planner_result,
     )
+    frozen_function_items = canonical_facts["function_items"]
     draft_edges = list(current_planner_result.get("responsibility_edges") or [])
     graph_context = _build_responsibility_graph_construction_context(
         frozen_blueprint_text=frozen_blueprint_text,
@@ -6908,15 +6909,22 @@ def _frozen_function_items_from_blueprint(
 
 def parse_blueprint_graph_facts(
     blueprint_text: str, *, allowed_function_item_targets: list[str] | None = None,
+    structured_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Parse all graph-relevant facts from one complete strict Blueprint."""
     parsed = parse_blueprint([{"role": "assistant", "content": blueprint_text}], strict=True)
     entries = list(parsed.skill_plan.files if parsed.skill_plan else [])
     targets = allowed_function_item_targets or [entry.path for entry in entries if entry.path.startswith("scripts/")]
-    function_items = _frozen_function_items_from_blueprint(
-        frozen_blueprint_text=blueprint_text, allowed_function_item_targets=targets,
-    )
     target_set = set(targets)
+    function_items = normalize_structured_function_items([{
+        "target_file": entry.path, "role": str(entry.role), "purpose": entry.purpose,
+        "inputs": list(entry.inputs), "outputs": list(entry.outputs), "dependencies": list(entry.dependencies),
+        "required_capabilities": list(entry.required_capabilities),
+        "forbidden_capabilities": list(entry.forbidden_capabilities), "constraints": list(entry.constraints),
+        "default_values": dict(entry.default_values), "references": list(dict.fromkeys(
+            list(entry.reference_files) + list(entry.skill_local_references) + list(entry.creator_internal_references))),
+    } for entry in entries if entry.path in target_set], source="frozen_blueprint")
+    _validate_function_item_targets_in_allowed_domain(function_items, targets)
     topology = {entry.path: sorted(set(entry.dependencies))
                 for entry in entries if entry.path in target_set}
     input_bindings: list[dict[str, Any]] = []
@@ -6942,12 +6950,17 @@ def parse_blueprint_graph_facts(
                     "target_input": value.get("to_input"),
                 })
     resources = [entry.path for entry in entries if entry.path not in target_set and entry.path != "SKILL.md"]
-    return {
+    embedded = {
         "function_items": function_items, "workflow_topology": topology,
         "input_bindings": input_bindings, "final_output_bindings": final_bindings,
         "constraints": [copy.deepcopy(value) for item in function_items for value in item.get("constraints") or []],
         "resources": sorted(resources),
     }
+    supplied = structured_facts or {}
+    for key in ("workflow_topology", "input_bindings", "final_output_bindings", "constraints", "resources"):
+        if key in supplied and supplied[key] is not None:
+            embedded[key] = copy.deepcopy(supplied[key])
+    return embedded
 
 
 async def _regenerate_responsibility_graph(
@@ -7267,10 +7280,11 @@ async def _bind_executable_responsibility_plan(
     frozen_blueprint_text = str(
         current_planner_result.get("internal_blueprint_text") or ""
     )
-    frozen_function_items = _frozen_function_items_from_blueprint(
-        frozen_blueprint_text=frozen_blueprint_text,
-        allowed_function_item_targets=allowed_function_item_targets,
+    canonical_facts = parse_blueprint_graph_facts(
+        frozen_blueprint_text, allowed_function_item_targets=allowed_function_item_targets,
+        structured_facts=current_planner_result,
     )
+    frozen_function_items = canonical_facts["function_items"]
     planner_edges = list(current_planner_result.get("responsibility_edges") or [])
     mode = settings.creator_graph_binding_mode
     stable_edges: list[dict[str, Any]] = []
@@ -7293,11 +7307,11 @@ async def _bind_executable_responsibility_plan(
     )
     normalized_facts = normalize_blueprint_graph_facts(
         function_items=frozen_function_items,
-        workflow_topology=current_planner_result.get("workflow_topology"),
-        input_bindings=current_planner_result.get("input_bindings"),
-        final_output_bindings=current_planner_result.get("final_output_bindings"),
+        workflow_topology=canonical_facts["workflow_topology"],
+        input_bindings=canonical_facts["input_bindings"],
+        final_output_bindings=canonical_facts["final_output_bindings"],
         platform_contract=build_platform_io_contract(),
-        resources=current_planner_result.get("resources") or [],
+        resources=canonical_facts["resources"],
         authorized_resources=set(authorized_references) | set(authorized_assets),
     )
     logger.info("[Creator][graph_normalization] %s", json.dumps(normalized_facts["metrics"], sort_keys=True))
@@ -7305,10 +7319,10 @@ async def _bind_executable_responsibility_plan(
                 str(normalized_facts["validation"]["valid"]).lower(), len(normalized_facts["validation"]["issues"]))
     logger.info("[Creator][graph_ambiguities] ambiguity_count=%d", len(normalized_facts["ambiguities"]))
     if normalized_facts["structural_issues"]:
-        if any(issue.get("issue_type") in {"resource_authority_gap", "unauthorized_resource"}
-               for issue in normalized_facts["structural_issues"]):
+        issue_types = {str(issue.get("issue_type") or "") for issue in normalized_facts["structural_issues"]}
+        if not issue_types <= {"unresolved_input", "missing_output"}:
             raise PreparePlanProtocolError(json.dumps({
-                "status": "resource_authority_gap", "stage": "blueprint_normalization",
+                "status": "blueprint_graph_invalid", "stage": "blueprint_normalization",
                 "issues": normalized_facts["structural_issues"],
             }, ensure_ascii=False))
         before_facts = {**normalized_facts,
@@ -7359,12 +7373,8 @@ async def _bind_executable_responsibility_plan(
         allowed_function_item_targets = replanned_targets
         logger.info("[Creator][blueprint_structural_replan] replan_count=1 actual_structural_diff=true")
         if normalized_facts["structural_issues"]:
-            issue_types = {str(item.get("issue_type") or "") for item in normalized_facts["structural_issues"]}
-            status = ("blueprint_cycle_detected" if "cycle_detected" in issue_types
-                      else "blueprint_unbound_required_input" if "unbound_required_input" in issue_types
-                      else "blueprint_missing_required_output")
             raise PreparePlanProtocolError(json.dumps({
-                "status": status, "stage": "blueprint_normalization",
+                "status": "blueprint_structure_unresolved", "stage": "blueprint_normalization",
                 "issues": normalized_facts["structural_issues"],
             }, ensure_ascii=False))
     if normalized_facts["ambiguities"]:
@@ -7425,12 +7435,8 @@ one JSON object, without markdown or explanation:
                     len(selections))
         logger.info("[Creator][graph_validation] stage=post_ambiguity valid=true issues=0")
     if normalized_facts["structural_issues"]:
-        issue_types = {str(item.get("issue_type") or "") for item in normalized_facts["structural_issues"]}
-        status = ("blueprint_cycle_detected" if "cycle_detected" in issue_types
-                  else "blueprint_unbound_required_input" if "unbound_required_input" in issue_types
-                  else "blueprint_missing_required_output")
         raise PreparePlanProtocolError(json.dumps({
-            "status": status, "stage": "blueprint_normalization",
+            "status": "blueprint_structure_unresolved", "stage": "blueprint_normalization",
             "issues": normalized_facts["structural_issues"],
         }, ensure_ascii=False))
     transaction = GraphTransaction()

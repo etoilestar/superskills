@@ -63,6 +63,22 @@ _CONFIDENCE = {"none": 0, "weak_name": 1, "typed_name": 2, "semantic": 3,
                "dependency_typed_name": 4, "dependency_semantic": 5, "explicit_binding": 6}
 _BINDING_KEYS = frozenset({"binding_kind", "source_node", "source_output", "source_root", "source_key",
                            "target_node", "target_input", "required", "default", "resolver", "platform_slot"})
+_ISSUE_KIND = {
+    "unknown_node": "unknown_reference", "unknown_port": "unknown_reference",
+    "blueprint_unknown_dependency": "unknown_reference", "blueprint_binding_unknown_node": "unknown_reference",
+    "blueprint_binding_unknown_port": "unknown_reference", "invalid_platform_boundary": "unknown_reference",
+    "type_mismatch": "incompatible_type", "blueprint_binding_type_mismatch": "incompatible_type",
+    "blueprint_binding_duplicate_source": "duplicate_binding", "unbound_required_input": "unresolved_input",
+    "missing_required_output": "missing_output", "cycle_detected": "cycle",
+    "blueprint_binding_cycle": "cycle", "blueprint_explicit_cycle": "cycle",
+    "resource_authority_gap": "unauthorized_resource",
+}
+
+
+def _general_issue(issue: dict[str, Any]) -> dict[str, Any]:
+    value = copy.deepcopy(issue)
+    value["issue_type"] = _ISSUE_KIND.get(str(value.get("issue_type") or ""), str(value.get("issue_type") or "unknown_reference"))
+    return value
 
 
 def _cycles(topology: dict[str, list[str]]) -> list[set[str]]:
@@ -306,7 +322,7 @@ def normalize_blueprint_graph_facts(
                         "final_output_boundary_count": len(finals), "constraint_count": sum(len(x.get("constraints") or []) for x in items)}}
     validation = validate_blueprint_graph_facts(result, allowed_node_targets=by_node, platform_contract=platform_contract or {})
     combined = {json.dumps(value, ensure_ascii=False, sort_keys=True): value
-                for value in [*result["structural_issues"], *validation["issues"]]}
+                for value in map(_general_issue, [*result["structural_issues"], *validation["issues"]])}
     result["structural_issues"] = [combined[key] for key in sorted(combined)]
     result["validation"] = {"valid": not result["structural_issues"], "issues": copy.deepcopy(result["structural_issues"])}
     return result
@@ -388,7 +404,8 @@ def validate_blueprint_graph_facts(
         for value in facts.get("resources") or []:
             path = str(value.get("path") if isinstance(value, dict) else value)
             if path not in authorized: issues.append({"issue_type": "unauthorized_resource", "path": path})
-    return {"valid": not issues, "issues": sorted(issues, key=lambda value: json.dumps(value, sort_keys=True))}
+    generalized = [_general_issue(value) for value in issues]
+    return {"valid": not generalized, "issues": sorted(generalized, key=lambda value: json.dumps(value, sort_keys=True))}
 
 
 def validate_resolved_blueprint_graph_facts(facts: dict[str, Any]) -> dict[str, Any]:

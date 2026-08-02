@@ -68,7 +68,7 @@ def test_weak_name_is_not_silently_connected():
         item("scripts/a.py", [], ["content"]), item("scripts/b.py", ["content"], []),
     ], platform_contract={})
     assert facts["input_bindings"] == []
-    assert any(value["issue_type"] == "unbound_required_input" for value in facts["structural_issues"])
+    assert any(value["issue_type"] == "unresolved_input" for value in facts["structural_issues"])
     assert match_port_evidence({"name": "content", "semantic_id": "", "value_type": "unknown"},
                                {"name": "content", "semantic_id": "", "value_type": "unknown"})["confidence"] == "weak_name"
 
@@ -122,9 +122,9 @@ def test_invalid_explicit_binding_and_weak_final_output_are_structural_issues():
     ], input_bindings=[{"binding_kind": "script_output", "source_node": "scripts/a.py",
                        "source_output": "value", "target_node": "scripts/b.py", "target_input": "value"}],
        platform_contract={"platform_skill_boundary": {"final_output_fields": ["text"]}})
-    assert "blueprint_binding_type_mismatch" in {value["issue_type"] for value in facts["structural_issues"]}
+    assert "incompatible_type" in {value["issue_type"] for value in facts["structural_issues"]}
     assert facts["final_output_bindings"] == []
-    assert any(value["issue_type"] == "missing_required_output" for value in facts["structural_issues"])
+    assert any(value["issue_type"] == "missing_output" for value in facts["structural_issues"])
 
 
 def test_unknown_dependency_is_preserved_and_reported():
@@ -132,7 +132,7 @@ def test_unknown_dependency_is_preserved_and_reported():
         item("scripts/a.py", [], ["text"], ["scripts/missing.py"]),
     ], platform_contract={})
     issue = next(value for value in facts["structural_issues"]
-                 if value["issue_type"] == "blueprint_unknown_dependency")
+                 if value["issue_type"] == "unknown_reference")
     assert issue["dependencies"] == ["scripts/missing.py"]
 
 
@@ -166,7 +166,7 @@ def test_normalization_is_order_independent_and_batch_cycle_safe():
              [{"name": "to_a", "semantic_id": "ba"}]),
     ], platform_contract={})
     assert cyclic["input_bindings"] == []
-    assert "cycle_detected" in {value["issue_type"] for value in cyclic["structural_issues"]}
+    assert "cycle" in {value["issue_type"] for value in cyclic["structural_issues"]}
 
 
 def test_selection_protocol_accepts_identical_duplicate_and_rejects_unknown():
