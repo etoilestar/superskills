@@ -51,6 +51,12 @@ from .command_normalizer import _effective_command_lines
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
 from .responsibility_graph import GraphDraft, GraphTransaction, compile_responsibility_graph, public_edges
+from .blueprint_graph import (
+    apply_ambiguity_selections,
+    blueprint_graph_fingerprint,
+    normalize_blueprint_graph_facts,
+    parse_ambiguity_selections,
+)
 from .requirement_coverage import (
     CoverageProjectionConflict,
     build_requirement_coverage_candidates,
@@ -59,11 +65,13 @@ from .requirement_coverage import (
     coverage_claims_from_selections,
     coverage_metrics,
     extract_frozen_requirements,
+    freeze_requirements,
     materialize_legacy_requirement_view,
     project_coverage_claims_to_graph_hints,
     requirement_fingerprint,
     validate_compiled_coverage_claims,
     validate_requirement_coverage_preflight,
+    audit_committed_requirement_coverage,
 )
 from ..platform_io_contract import build_platform_io_contract
 
@@ -6422,7 +6430,8 @@ async def _converge_ready_executable_plan(
     frozen_blueprint_text: str = "",
 ) -> dict[str, Any]:
     """Validate a backend-compiled candidate without regenerating its edge set."""
-    if settings.creator_graph_binding_mode in {"legacy", "shadow"}:
+    if (settings.creator_graph_binding_mode in {"legacy", "shadow"}
+            and _plan_executable_requirement_allocations is not _DEFAULT_EXECUTABLE_REQUIREMENT_PLANNER):
         return await _legacy_converge_ready_executable_plan(
             request=request,
             current_planner_result=current_planner_result,
@@ -6875,9 +6884,15 @@ def _frozen_function_items_from_blueprint(
             "purpose": entry.purpose,
             "inputs": list(entry.inputs),
             "outputs": list(entry.outputs),
+            "dependencies": list(entry.dependencies),
             "required_capabilities": list(entry.required_capabilities),
+            "forbidden_capabilities": list(entry.forbidden_capabilities),
             "constraints": list(entry.constraints),
             "default_values": dict(entry.default_values),
+            "references": list(dict.fromkeys(
+                list(entry.reference_files) + list(entry.skill_local_references)
+                + list(entry.creator_internal_references)
+            )),
         }
         for entry in (parsed.skill_plan.files if parsed.skill_plan else [])
         if entry.path in allowed
@@ -6889,6 +6904,50 @@ def _frozen_function_items_from_blueprint(
         normalized, allowed_function_item_targets
     )
     return normalized
+
+
+def parse_blueprint_graph_facts(
+    blueprint_text: str, *, allowed_function_item_targets: list[str] | None = None,
+) -> dict[str, Any]:
+    """Parse all graph-relevant facts from one complete strict Blueprint."""
+    parsed = parse_blueprint([{"role": "assistant", "content": blueprint_text}], strict=True)
+    entries = list(parsed.skill_plan.files if parsed.skill_plan else [])
+    targets = allowed_function_item_targets or [entry.path for entry in entries if entry.path.startswith("scripts/")]
+    function_items = _frozen_function_items_from_blueprint(
+        frozen_blueprint_text=blueprint_text, allowed_function_item_targets=targets,
+    )
+    target_set = set(targets)
+    topology = {entry.path: sorted(set(entry.dependencies))
+                for entry in entries if entry.path in target_set}
+    input_bindings: list[dict[str, Any]] = []
+    final_bindings: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry.path not in target_set:
+            continue
+        for raw in entry.input_binding or []:
+            value = copy.deepcopy(raw)
+            value.setdefault("target_node", entry.path)
+            input_bindings.append(value)
+        for edge in entry.logical_edges or []:
+            value = copy.deepcopy(edge)
+            if value.get("to_node") == "platform_output_node":
+                final_bindings.append({
+                    "platform_slot": value.get("to_input"), "source_node": value.get("from_node") or entry.path,
+                    "source_output": value.get("from_output"),
+                })
+            else:
+                input_bindings.append({
+                    "binding_kind": "script_output", "source_node": value.get("from_node") or entry.path,
+                    "source_output": value.get("from_output"), "target_node": value.get("to_node"),
+                    "target_input": value.get("to_input"),
+                })
+    resources = [entry.path for entry in entries if entry.path not in target_set and entry.path != "SKILL.md"]
+    return {
+        "function_items": function_items, "workflow_topology": topology,
+        "input_bindings": input_bindings, "final_output_bindings": final_bindings,
+        "constraints": [copy.deepcopy(value) for item in function_items for value in item.get("constraints") or []],
+        "resources": sorted(resources),
+    }
 
 
 async def _regenerate_responsibility_graph(
@@ -6949,42 +7008,37 @@ async def _replan_blueprint_for_graph_closure(
     *,
     request: PreparePlanRequest,
     frozen_blueprint_text: str,
-    blocking_issue: dict[str, Any],
+    blocking_issue: dict[str, Any] | None = None,
+    blocking_issues: list[dict[str, Any]] | None = None,
     graph_construction_context: dict[str, Any],
     planner_model: str,
 ) -> str:
     """Perform the single, narrowly scoped Blueprint-owned recovery attempt."""
-    target_file = str(blocking_issue.get("target_file") or "")
-    affected_item = next(
-        (
-            item for item in graph_construction_context.get("node_contracts", [])
-            if item.get("node") == target_file
-        ),
-        {},
-    )
-    feedback = {
-        "failure_category": blocking_issue.get("category"),
-        "target_file": target_file,
-        "target_input": blocking_issue.get("target_input"),
-        "reason": (
-            "No legal provenance exists under the current frozen FunctionItems "
-            "after local repair and full graph regeneration."
-        ),
-    }
+    issues = copy.deepcopy(blocking_issues or ([blocking_issue] if blocking_issue else []))
+    affected_target_set: set[str] = set()
+    for value in issues:
+        affected_target_set.update(str(target) for target in (
+            value.get("target_file"), value.get("target_node"), value.get("source_node")
+        ) if target)
+        affected_target_set.update(str(target) for target in value.get("candidate_targets") or [] if target)
+        affected_target_set.update(str(target) for target in value.get("nodes") or [] if target)
+    affected_targets = sorted(affected_target_set)
+    affected_items = [item for item in graph_construction_context.get("node_contracts", [])
+                      if item.get("node") in affected_targets]
     prompt = """
 You are the Blueprint Planner performing one narrowly scoped replan because the
 frozen runtime contract cannot close as a legal ResponsibilityGraph. Return one
 complete replacement internal_blueprint_text and nothing else.
 
-Re-evaluate whether the affected input is genuine runtime data, upstream-produced
+Re-evaluate whether each affected input is genuine runtime data, upstream-produced
 data, literal/default configuration, or a static reference/asset dependency. The
 Backend does not make that choice. Do not invent a platform input or upstream
 output only to satisfy graph closure. If the current FunctionItem boundary is
 wrong, revise the Blueprint contract.
 
-Preserve all unrelated files, target_file values, inputs, outputs, capabilities,
-resource declarations, workflow facts, and constraints. Only modify the minimum
-Blueprint facts responsible for the supplied blocking issue. Do not redesign the
+Preserve all unrelated files, target_file values, capabilities, requirements,
+resource declarations, workflow facts, and constraints. Fix all supplied issues
+in this one response, modifying only their minimum structural facts. Do not redesign the
 Skill, rename scripts, change capability ownership, or add unrelated files.
 ResponsibilityEdges do not belong in this response.
 
@@ -6993,16 +7047,10 @@ Return strict JSON: {"internal_blueprint_text": "..."}
     payload = {
         "task": "replan_blueprint_for_graph_closure",
         "frozen_blueprint": frozen_blueprint_text,
-        "blocking_structural_issue": feedback,
-        "affected_function_item": affected_item,
-        "legal_source_domain": next(
-            (
-                domain for domain in graph_construction_context.get("input_source_domains", [])
-                if domain.get("target_file") == target_file
-                and domain.get("target_input") == blocking_issue.get("target_input")
-            ),
-            {},
-        ),
+        "structural_issues": issues,
+        "affected_function_items": affected_items,
+        "allowed_targets": graph_construction_context.get("allowed_function_targets") or [],
+        "legal_source_domains": graph_construction_context.get("input_source_domains") or [],
     }
     text = await complete_creator_role_once(
         [{"role": "system", "content": prompt},
@@ -7032,30 +7080,27 @@ Return strict JSON: {"internal_blueprint_text": "..."}
     if set(old_files) != set(new_files):
         raise PreparePlanProtocolError("Blueprint graph-closure replan changed the frozen FilePlan path domain")
     for path in old_files:
-        if path != target_file and old_files[path] != new_files[path]:
+        if path not in affected_targets and old_files[path] != new_files[path]:
             raise PreparePlanProtocolError(
                 f"Blueprint graph-closure replan modified unrelated FilePlan entry: {path}"
             )
-    old_target = old_files.get(target_file)
-    new_target = new_files.get(target_file)
-    if old_target is None or new_target is None:
-        raise PreparePlanProtocolError("Blueprint graph-closure replan lost the affected FunctionItem")
     permitted_target_fields = {
-        "inputs", "dependencies", "constraints", "default_values",
+        "inputs", "outputs", "dependencies", "input_binding", "logical_edges", "constraints", "default_values",
         "reference_files", "skill_local_references", "creator_internal_references",
     }
-    old_target_data = vars(old_target)
-    new_target_data = vars(new_target)
-    changed_target_fields = {
-        field for field in set(old_target_data) | set(new_target_data)
-        if old_target_data.get(field) != new_target_data.get(field)
-    }
-    forbidden_changes = sorted(changed_target_fields - permitted_target_fields)
-    if forbidden_changes:
-        raise PreparePlanProtocolError(
-            "Blueprint graph-closure replan exceeded the affected contract scope; "
-            f"changed_fields={forbidden_changes}"
-        )
+    for target_file in affected_targets:
+        old_target, new_target = old_files.get(target_file), new_files.get(target_file)
+        if old_target is None or new_target is None:
+            raise PreparePlanProtocolError("Blueprint graph-closure replan lost an affected FunctionItem")
+        old_target_data, new_target_data = vars(old_target), vars(new_target)
+        changed_target_fields = {field for field in set(old_target_data) | set(new_target_data)
+                                 if old_target_data.get(field) != new_target_data.get(field)}
+        forbidden_changes = sorted(changed_target_fields - permitted_target_fields)
+        if forbidden_changes:
+            raise PreparePlanProtocolError(
+                "Blueprint graph-closure replan exceeded the affected contract scope; "
+                f"target={target_file}; changed_fields={forbidden_changes}"
+            )
     return replanned
 
 
@@ -7216,6 +7261,7 @@ async def _bind_executable_responsibility_plan(
     current_planner_result: dict[str, Any],
     planner_model: str,
     allowed_function_item_targets: list[str],
+    legacy_adapter: bool = False,
 ) -> dict[str, Any]:
     """Compile edges over frozen FunctionItems; ask the model only about ambiguity."""
     frozen_blueprint_text = str(
@@ -7228,14 +7274,14 @@ async def _bind_executable_responsibility_plan(
     planner_edges = list(current_planner_result.get("responsibility_edges") or [])
     mode = settings.creator_graph_binding_mode
     stable_edges: list[dict[str, Any]] = []
-    if mode in {"legacy", "shadow"}:
+    if mode in {"legacy", "shadow"} and legacy_adapter:
         stable_edges = await _bind_legacy_responsibility_edges(
             request=request, frozen_blueprint_text=frozen_blueprint_text,
             function_items=frozen_function_items,
             allowed_function_item_targets=allowed_function_item_targets,
             current_edges=planner_edges, planner_model=planner_model,
         )
-    if mode in {"legacy", "shadow"}:
+    if mode in {"legacy", "shadow"} and legacy_adapter:
         return {
             "function_items": frozen_function_items,
             "responsibility_edges": stable_edges,
@@ -7245,49 +7291,160 @@ async def _bind_executable_responsibility_plan(
         blueprint_text=frozen_blueprint_text,
         uploaded_files=request.uploaded_files,
     )
-    coverage_claims = list(current_planner_result.get("coverage_claims") or [])
-    candidate_registry = dict(current_planner_result.get("candidate_registry") or {})
-    try:
-        projected_hints = project_coverage_claims_to_graph_hints(
-            coverage_claims=coverage_claims,
-            candidate_registry=candidate_registry,
-            workflow_topology=current_planner_result.get("workflow_topology"),
-            input_bindings=current_planner_result.get("input_bindings"),
-            final_output_bindings=current_planner_result.get("final_output_bindings"),
+    normalized_facts = normalize_blueprint_graph_facts(
+        function_items=frozen_function_items,
+        workflow_topology=current_planner_result.get("workflow_topology"),
+        input_bindings=current_planner_result.get("input_bindings"),
+        final_output_bindings=current_planner_result.get("final_output_bindings"),
+        platform_contract=build_platform_io_contract(),
+        resources=current_planner_result.get("resources") or [],
+        authorized_resources=set(authorized_references) | set(authorized_assets),
+    )
+    logger.info("[Creator][graph_normalization] %s", json.dumps(normalized_facts["metrics"], sort_keys=True))
+    logger.info("[Creator][graph_validation] stage=initial valid=%s issues=%d",
+                str(normalized_facts["validation"]["valid"]).lower(), len(normalized_facts["validation"]["issues"]))
+    logger.info("[Creator][graph_ambiguities] ambiguity_count=%d", len(normalized_facts["ambiguities"]))
+    if normalized_facts["structural_issues"]:
+        if any(issue.get("issue_type") in {"resource_authority_gap", "unauthorized_resource"}
+               for issue in normalized_facts["structural_issues"]):
+            raise PreparePlanProtocolError(json.dumps({
+                "status": "resource_authority_gap", "stage": "blueprint_normalization",
+                "issues": normalized_facts["structural_issues"],
+            }, ensure_ascii=False))
+        before_facts = {**normalized_facts,
+                        "constraints": copy.deepcopy(current_planner_result.get("constraints") or []),
+                        "resources": copy.deepcopy(current_planner_result.get("resources") or [])}
+        before_fingerprint = blueprint_graph_fingerprint(before_facts)
+        logger.info("[Creator][blueprint_structural_replan] replan_count=1 issues=%s",
+                    json.dumps(normalized_facts["structural_issues"], ensure_ascii=False))
+        construction_context = _build_responsibility_graph_construction_context(
+            frozen_blueprint_text=frozen_blueprint_text,
+            allowed_function_item_targets=allowed_function_item_targets,
+            function_items=frozen_function_items,
+            responsibility_edges=[],
         )
-    except CoverageProjectionConflict as exc:
+        replanned_text = await _replan_blueprint_for_graph_closure(
+            request=request, frozen_blueprint_text=frozen_blueprint_text,
+            blocking_issues=[{
+                **issue, "category": issue.get("issue_type"),
+            } for issue in normalized_facts["structural_issues"]],
+            graph_construction_context=construction_context,
+            planner_model=planner_model,
+        )
+        replanned_targets = _resolve_allowed_function_item_targets_from_blueprint(replanned_text)
+        replanned_facts = parse_blueprint_graph_facts(
+            replanned_text, allowed_function_item_targets=replanned_targets,
+        )
+        replanned_items = replanned_facts["function_items"]
+        normalized_facts = normalize_blueprint_graph_facts(
+            function_items=replanned_items,
+            workflow_topology=replanned_facts["workflow_topology"],
+            input_bindings=replanned_facts["input_bindings"],
+            final_output_bindings=replanned_facts["final_output_bindings"],
+            platform_contract=build_platform_io_contract(),
+            resources=replanned_facts["resources"],
+            authorized_resources=set(authorized_references) | set(authorized_assets),
+        )
+        logger.info("[Creator][graph_validation] stage=post_replan valid=%s issues=%d",
+                    str(normalized_facts["validation"]["valid"]).lower(), len(normalized_facts["validation"]["issues"]))
+        after_fingerprint = blueprint_graph_fingerprint({**normalized_facts,
+            "constraints": replanned_facts["constraints"], "resources": replanned_facts["resources"]})
+        if before_fingerprint == after_fingerprint:
+            raise PreparePlanProtocolError(json.dumps({
+                "status": "blueprint_replan_noop", "stage": "blueprint_normalization",
+                "issues": normalized_facts["structural_issues"],
+            }, ensure_ascii=False))
+        frozen_blueprint_text = replanned_text
+        frozen_function_items = replanned_items
+        allowed_function_item_targets = replanned_targets
+        logger.info("[Creator][blueprint_structural_replan] replan_count=1 actual_structural_diff=true")
+        if normalized_facts["structural_issues"]:
+            issue_types = {str(item.get("issue_type") or "") for item in normalized_facts["structural_issues"]}
+            status = ("blueprint_cycle_detected" if "cycle_detected" in issue_types
+                      else "blueprint_unbound_required_input" if "unbound_required_input" in issue_types
+                      else "blueprint_missing_required_output")
+            raise PreparePlanProtocolError(json.dumps({
+                "status": status, "stage": "blueprint_normalization",
+                "issues": normalized_facts["structural_issues"],
+            }, ensure_ascii=False))
+    if normalized_facts["ambiguities"]:
+        ambiguity_payload = {
+            "ambiguities": [
+                {
+                    "ambiguity_id": item["ambiguity_id"],
+                    "kind": item["kind"],
+                    "target": item.get("target"),
+                    "explicit_dependencies": item.get("explicit_dependencies") or [],
+                    "candidates": [{
+                        "candidate_id": value["candidate_id"],
+                        "source_node": value["source_node"],
+                        "source_purpose": value.get("source_purpose", ""),
+                        "source_output": value.get("source_port") or {"name": value.get("source_output")},
+                        "match_confidence": value.get("match_confidence"),
+                        "match_reason": value.get("match_reason"),
+                    } for value in item["candidate_sources"]],
+                }
+                for item in normalized_facts["ambiguities"]
+            ]
+        }
+        selection_prompt = """
+Resolve only the supplied finite graph ambiguities. Copy every ambiguity_id and
+one candidate_id belonging to it. Do not create nodes, ports, files, edges,
+Blueprint facts, owners, channels, resources, or implementation. Return exactly
+one JSON object, without markdown or explanation:
+{"selections":[{"ambiguity_id":"A1","selected_candidate_id":"A1-C1"}]}
+""".strip()
+        protocol_error = ""
+        selections: dict[str, str] | None = None
+        for attempt in range(2):
+            repair = (f"\nPrevious response errors:\n- {protocol_error}\n"
+                      "Fix only these protocol errors." if protocol_error else "")
+            response_text = await complete_creator_role_once(
+                [{"role": "system", "content": selection_prompt + repair},
+                 {"role": "user", "content": json.dumps(ambiguity_payload, ensure_ascii=False)}],
+                "planner", fallback_model=planner_model,
+            )
+            try:
+                selections = parse_ambiguity_selections(response_text, normalized_facts["ambiguities"])
+                break
+            except (ValueError, json.JSONDecodeError) as exc:
+                protocol_error = str(exc)
+        if selections is None:
+            raise PreparePlanProtocolError(json.dumps({
+                "status": "ambiguity_selection_protocol_gap", "stage": "ambiguity_selection",
+                "detail": protocol_error,
+            }, ensure_ascii=False))
+        try:
+            normalized_facts = apply_ambiguity_selections(normalized_facts, selections)
+        except ValueError as exc:
+            raise PreparePlanProtocolError(json.dumps({
+                "status": "ambiguity_selection_structural_conflict", "stage": "post_ambiguity",
+                "detail": str(exc),
+            }, ensure_ascii=False)) from exc
+        logger.info("[Creator][ambiguity_selection] ambiguity_count=%d model_selection_call_count=1",
+                    len(selections))
+        logger.info("[Creator][graph_validation] stage=post_ambiguity valid=true issues=0")
+    if normalized_facts["structural_issues"]:
+        issue_types = {str(item.get("issue_type") or "") for item in normalized_facts["structural_issues"]}
+        status = ("blueprint_cycle_detected" if "cycle_detected" in issue_types
+                  else "blueprint_unbound_required_input" if "unbound_required_input" in issue_types
+                  else "blueprint_missing_required_output")
         raise PreparePlanProtocolError(json.dumps({
-            "status": "coverage_projection_conflict", "stage": "blueprint",
-            "detail": str(exc),
-        }, ensure_ascii=False)) from exc
+            "status": status, "stage": "blueprint_normalization",
+            "issues": normalized_facts["structural_issues"],
+        }, ensure_ascii=False))
     transaction = GraphTransaction()
     draft = transaction.candidate(
-        frozen_function_items,
+        normalized_facts["function_items"],
         allowed_node_targets=allowed_function_item_targets,
-        workflow_topology=projected_hints["workflow_topology"],
-        input_bindings=projected_hints["input_bindings"],
-        final_output_bindings=projected_hints["final_output_bindings"],
+        workflow_topology=normalized_facts["workflow_topology"],
+        input_bindings=normalized_facts["input_bindings"],
+        final_output_bindings=normalized_facts["final_output_bindings"],
         authorized_references=authorized_references,
         authorized_assets=authorized_assets,
     )
 
-    async def select_source(payload: dict[str, Any]) -> dict[str, Any]:
-        prompt = """
-Select one semantically valid source from the supplied immutable candidates.
-Do not design an edge, node, port, file, asset, reference, platform slot, or
-implementation. Return strict JSON with no extra fields:
-{"decision":"selected","selected_candidate_id":"C1"}
-or {"decision":"no_semantically_valid_candidate"}.
-The selected_candidate_id must be copied exactly from candidates.
-""".strip()
-        text = await complete_creator_role_once(
-            [{"role": "system", "content": prompt},
-             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            "planner", fallback_model=planner_model,
-        )
-        return _parse_prepare_plan_json(text)
-
-    await compile_responsibility_graph(draft, source_selector=select_source)
+    await compile_responsibility_graph(draft)
     draft.metrics.update({
         "compiler_status": draft.status,
         "compiler_issue_types": sorted({str(issue.get("issue_type") or "") for issue in draft.issues}),
@@ -7301,28 +7458,24 @@ The selected_candidate_id must be copied exactly from candidates.
             "issue_types": issue_types, "issues": draft.issues,
         }, ensure_ascii=False))
     committed = transaction.commit(draft)
-    if coverage_claims:
-        compiled_coverage = validate_compiled_coverage_claims(
-            coverage_claims, candidate_registry, committed.function_items,
-            public_edges(committed), build_platform_io_contract(),
-        )
-        failures = [item for item in compiled_coverage if item["status"] != "satisfied"]
-        logger.info(
-            "[Creator][compiled_coverage_validation] compiled_coverage_status=%s %s",
-            "failed" if failures else "satisfied",
-            json.dumps(coverage_metrics(compiled_coverage), sort_keys=True),
-        )
-        if failures:
-            raise PreparePlanProtocolError(json.dumps({
-                "status": "graph_contract_gap", "stage": "responsibility_graph",
-                "issue_types": sorted({item["issue_type"] for item in failures}),
-                "issues": failures,
-            }, ensure_ascii=False))
+    requirement_audit = audit_committed_requirement_coverage(
+        current_planner_result.get("frozen_requirements") or [],
+        normalized_blueprint=normalized_facts,
+        function_items=committed.function_items,
+        responsibility_edges=public_edges(committed),
+        platform_bindings=[*normalized_facts["input_bindings"], *normalized_facts["final_output_bindings"]],
+        constraints=current_planner_result.get("constraints") or [],
+        resources=current_planner_result.get("resources") or [],
+    )
+    audit_counts: dict[str, int] = {}
+    for audit_item in requirement_audit:
+        audit_counts[audit_item["status"]] = audit_counts.get(audit_item["status"], 0) + 1
+    logger.info("[Creator][request_trace_audit] status_counts=%s", json.dumps(audit_counts, sort_keys=True))
     return {
         "function_items": copy.deepcopy(committed.function_items),
         "responsibility_edges": public_edges(committed),
         "allowed_function_item_targets": [item["target_file"] for item in committed.function_items],
-        "compiled_coverage_validation": compiled_coverage if coverage_claims else [],
+        "requirement_audit": requirement_audit,
     }
 
 
@@ -8278,6 +8431,17 @@ Do not emit FunctionItems in this first pass.
 Do not emit ResponsibilityEdges in this first pass.
 Do not plan the ResponsibilityGraph in this first pass.
 
+Machine-readable Blueprint structure is mandatory when status=ready. Populate
+workflow_topology, input_bindings, final_output_bindings, constraints, and
+resources alongside internal_blueprint_text. Every script entry in SkillPlan
+must explicitly populate inputs, outputs, dependencies, constraints, and
+default_values (empty arrays/objects are allowed when genuinely unknown).
+Natural-language workflow prose never substitutes for these machine fields.
+Bindings may only reference exact declared script targets and port names.
+When a concrete port source is uncertain, omit that binding and use an empty
+input_bindings/final_output_bindings array rather than guessing. The Backend
+will deterministically complete strong port facts or expose a finite ambiguity.
+
 internal_blueprint_text is the human-readable Blueprint view and must contain the complete SkillPlan file responsibility information: path, role, purpose, inputs, outputs, default_values, dependencies, required_capabilities, forbidden_capabilities, references, constraints, and existing file-local metadata. Any input decided as internal_default, constant, or creation-time fixed must be recorded in that script entry's structured default_values with its native JSON type; prose-only defaults are invalid.
 
 The first pass only follows the FilePlan protocol. It may plan SKILL.md, scripts/**, references/**, assets/**, and config files.
@@ -9114,12 +9278,22 @@ Blueprint Planner 只规划业务责任。
                 if target in explicit_topology:
                     item["dependencies"] = list(explicit_topology.get(target) or [])
         if _plan_executable_requirement_allocations is _DEFAULT_EXECUTABLE_REQUIREMENT_PLANNER:
-            requirement_projection = await _plan_structural_requirement_coverage(
-                request=request, blueprint_text=frozen_blueprint_text,
-                blueprint_facts=first_planner_result,
-                function_items=coverage_function_items,
-                allowed_function_item_targets=allowed_function_item_targets,
-                planner_model=route.model,
+            # Production freezes identity for the post-commit audit only.  It
+            # does not classify every requirement into graph candidates.
+            frozen_requirements = freeze_requirements(
+                request.user_request,
+            )
+            requirement_projection = {
+                "frozen_requirements": frozen_requirements,
+                "requirement_fingerprint": requirement_fingerprint(frozen_requirements),
+                # Compatibility transport remains empty in production. Frozen
+                # requirements are not owners/channels or graph planning facts.
+                "requirement_allocations": [],
+                "requirement_channels": {},
+            }
+            logger.info(
+                "[Creator][requirement_freeze] requirement_fingerprint=%s requirement_count=%d",
+                requirement_projection["requirement_fingerprint"], len(frozen_requirements),
             )
         else:  # Preserve dependency injection for existing orchestration callers.
             requirement_projection = await _plan_executable_requirement_allocations(
@@ -9251,99 +9425,7 @@ Blueprint Planner 只规划业务责任。
                         "Blueprint semantic closure failed after exactly one localized replan; "
                         f"issues={semantic_review['issues']}"
                     )
-        else:
-            blocking_preflight = [
-                item for item in requirement_projection["coverage_preflight"]
-                if item["status"] in {"missing_structure", "contradicted"}
-            ] if "coverage_preflight" in requirement_projection else []
-            mapping_gaps = [
-                item for item in blocking_preflight
-                if item["status"] == "missing_structure" and item["owner_stage"] == "coverage_mapping"
-            ]
-            if mapping_gaps:
-                raise PreparePlanProtocolError(json.dumps({
-                    "status": "requirement_coverage_unmapped", "stage": "coverage_mapping",
-                    "issues": mapping_gaps,
-                }, ensure_ascii=False))
-            # Graph-owned facts are deliberately deferred; only deterministic
-            # Blueprint-owned structural gaps are eligible for the existing single
-            # replan boundary. No free-form semantic Reviewer runs on a valid domain.
-            blueprint_gaps = [
-                item for item in blocking_preflight
-                if item["status"] == "missing_structure" and item["owner_stage"] == "blueprint"
-            ]
-            if blueprint_gaps:
-                before_fingerprint = blueprint_structural_fingerprint(
-                    semantic_function_items, first_planner_result,
-                )
-                logger.info(
-                    "[Creator][blueprint_structural_replan] replan_count=1 gap_count=%d",
-                    len(blueprint_gaps),
-                )
-                replanned_text = await _replan_blueprint_for_structural_coverage(
-                    request=request, blueprint_text=frozen_blueprint_text,
-                    frozen_requirements=requirement_projection["frozen_requirements"],
-                    missing_claims=blueprint_gaps,
-                    function_items=semantic_function_items,
-                    allowed_targets=allowed_function_item_targets,
-                    planner_model=route.model,
-                )
-                replanned_text, rejected_resources = _remove_unauthorized_prepare_resources(
-                    replanned_text, allowed_resource_paths,
-                )
-                validate_blueprint_shape_for_creator(replanned_text)
-                protocol_errors = _preflight_prepare_blueprint_text(
-                    replanned_text, allowed_resource_paths,
-                )
-                if protocol_errors:
-                    raise PreparePlanProtocolError(json.dumps({
-                        "status": "blueprint_structure_gap", "stage": "blueprint",
-                        "issues": protocol_errors,
-                    }, ensure_ascii=False))
-                replanned_targets = _resolve_allowed_function_item_targets_from_blueprint(replanned_text)
-                replanned_items = _frozen_function_items_from_blueprint(
-                    frozen_blueprint_text=replanned_text,
-                    allowed_function_item_targets=replanned_targets,
-                )
-                after_fingerprint = blueprint_structural_fingerprint(
-                    replanned_items, first_planner_result,
-                )
-                actual_diff = before_fingerprint != after_fingerprint
-                logger.info(
-                    "[Creator][blueprint_structural_replan] replan_count=1 actual_structural_diff=%s",
-                    str(actual_diff).lower(),
-                )
-                if not actual_diff:
-                    raise PreparePlanProtocolError(json.dumps({
-                        "status": "blueprint_replan_noop", "stage": "blueprint",
-                        "issues": blueprint_gaps,
-                    }, ensure_ascii=False))
-                frozen_blueprint_text = replanned_text
-                allowed_function_item_targets = replanned_targets
-                semantic_function_items = replanned_items
-                requirement_projection = await _plan_structural_requirement_coverage(
-                    request=request, blueprint_text=frozen_blueprint_text,
-                    blueprint_facts=first_planner_result,
-                    function_items=semantic_function_items,
-                    allowed_function_item_targets=allowed_function_item_targets,
-                    planner_model=route.model,
-                    frozen_requirements_override=requirement_projection["frozen_requirements"],
-                )
-                requirement_allocations = requirement_projection["requirement_allocations"]
-                requirement_channels = requirement_projection["requirement_channels"]
-                remaining = [item for item in requirement_projection["coverage_preflight"]
-                             if item["status"] in {"missing_structure", "contradicted"}]
-                if remaining:
-                    raise PreparePlanProtocolError(json.dumps({
-                        "status": "blueprint_structure_gap", "stage": "blueprint",
-                        "issues": remaining,
-                    }, ensure_ascii=False))
-            contradicted = [item for item in blocking_preflight if item["status"] == "contradicted"]
-            if contradicted:
-                raise PreparePlanProtocolError(json.dumps({
-                    "status": "coverage_candidate_contradicted", "stage": "blueprint",
-                    "issues": contradicted,
-                }, ensure_ascii=False))
+        # The production branch has no pre-compile requirement coverage gate.
         first_planner_result = {
             **first_planner_result,
             "internal_blueprint_text": frozen_blueprint_text,
@@ -9484,7 +9566,8 @@ Blueprint Planner 只规划业务责任。
                 ) from exc
 
         mode = settings.creator_graph_binding_mode
-        if mode in {"legacy", "shadow"}:
+        if (mode in {"legacy", "shadow"}
+                and _plan_executable_requirement_allocations is not _DEFAULT_EXECUTABLE_REQUIREMENT_PLANNER):
             data = await _run_legacy_responsibility_graph_closure(
                 request=request, data=data, first_planner_result=first_planner_result,
                 frozen_blueprint_text=frozen_blueprint_text,
