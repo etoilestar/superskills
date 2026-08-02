@@ -42,6 +42,20 @@ def _matches(source: dict[str, Any], target: dict[str, Any]) -> bool:
     return bool((semantic or named) and type_compatibility(source["value_type"], target["value_type"]) != "incompatible")
 
 
+def _would_cycle(topology: dict[str, list[str]], source: str, target: str) -> bool:
+    """Return whether adding ``source -> target`` closes a predecessor cycle."""
+    pending = [source]
+    visited: set[str] = set()
+    while pending:
+        node = pending.pop()
+        if node == target:
+            return True
+        if node not in visited:
+            visited.add(node)
+            pending.extend(topology.get(node) or [])
+    return False
+
+
 def normalize_blueprint_graph_facts(
     *, function_items: list[dict[str, Any]], workflow_topology: dict[str, list[str]] | None = None,
     input_bindings: list[dict[str, Any]] | None = None,
@@ -77,7 +91,14 @@ def normalize_blueprint_graph_facts(
             key = (target_node, target["name"])
             if key in bound or target["name"] in defaults:
                 continue
-            predecessors = [node for node in topology[target_node] if node in by_node and node != target_node]
+            explicit_predecessors = [node for node in topology[target_node] if node in by_node and node != target_node]
+            # An explicit predecessor set is authoritative.  Without one, the
+            # allowed node domain may be searched, but only compatible and
+            # acyclic producers survive; this is not an all-pairs candidate set.
+            predecessors = explicit_predecessors or [
+                node for node in sorted(by_node)
+                if node != target_node and not _would_cycle(topology, node, target_node)
+            ]
             candidates = []
             for source_node in predecessors:
                 for raw_output in by_node[source_node].get("outputs") or []:
@@ -88,6 +109,8 @@ def normalize_blueprint_graph_facts(
                                            "target_input": target["name"]})
             if len(candidates) == 1:
                 bindings.append(candidates[0]); bound.add(key)
+                source_node = str(candidates[0]["source_node"])
+                topology[target_node] = sorted(set(topology[target_node]) | {source_node})
             elif len(candidates) > 1:
                 ambiguity("input_source", target_node, target["name"], candidates)
             else:
@@ -120,7 +143,9 @@ def normalize_blueprint_graph_facts(
             # fields every skill must emit.  A gap exists only when no terminal
             # output matches any accepted field (checked after this loop).
         if output_slots and not finals and not any(item["kind"] == "final_output" for item in ambiguities):
-            issues.append({"issue_type": "missing_required_output"})
+            issues.append({"issue_type": "missing_required_output",
+                           "target_node": terminals[0] if len(terminals) == 1 else None,
+                           "candidate_targets": terminals})
     return {"function_items": items, "workflow_topology": topology, "input_bindings": bindings,
             "final_output_bindings": finals, "ambiguities": ambiguities, "structural_issues": issues,
             "metrics": {"function_item_count": len(items), "explicit_edge_count": len(input_bindings or []),
@@ -159,3 +184,38 @@ def parse_ambiguity_selections(text: str, ambiguities: Iterable[dict[str, Any]])
     if set(selected) != set(registry):
         raise ValueError("ambiguity_selection_protocol_gap: missing ambiguity")
     return selected
+
+
+def apply_ambiguity_selections(
+    normalized_facts: dict[str, Any], selections: dict[str, str],
+) -> dict[str, Any]:
+    """Apply validated opaque choices without creating or rewriting facts."""
+    result = copy.deepcopy(normalized_facts)
+    ambiguities = result.get("ambiguities") or []
+    expected = {str(item.get("ambiguity_id")) for item in ambiguities}
+    if set(selections) != expected:
+        raise ValueError("ambiguity_selection_protocol_gap: selections must cover every ambiguity")
+    for ambiguity in ambiguities:
+        ambiguity_id = str(ambiguity["ambiguity_id"])
+        candidates = {str(value["candidate_id"]): value for value in ambiguity.get("candidate_sources") or []}
+        candidate_id = selections[ambiguity_id]
+        if candidate_id not in candidates:
+            raise ValueError("ambiguity_selection_invalid_candidate")
+        selected = {key: copy.deepcopy(value) for key, value in candidates[candidate_id].items()
+                    if key != "candidate_id"}
+        if ambiguity.get("kind") == "final_output":
+            result["final_output_bindings"].append(selected)
+        else:
+            result["input_bindings"].append(selected)
+            if selected.get("binding_kind") == "script_output":
+                target = str(selected["target_node"]); source = str(selected["source_node"])
+                result["workflow_topology"][target] = sorted(
+                    set(result["workflow_topology"].get(target) or []) | {source}
+                )
+    result["ambiguities"] = []
+    result["metrics"]["model_selection_call_count"] = 1 if ambiguities else 0
+    result["metrics"]["inferred_edge_count"] = (
+        len(result["input_bindings"]) - int(result["metrics"].get("explicit_edge_count") or 0)
+    )
+    result["metrics"]["final_output_boundary_count"] = len(result["final_output_bindings"])
+    return result

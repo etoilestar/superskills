@@ -51,7 +51,11 @@ from .command_normalizer import _effective_command_lines
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
 from .responsibility_graph import GraphDraft, GraphTransaction, compile_responsibility_graph, public_edges
-from .blueprint_graph import normalize_blueprint_graph_facts
+from .blueprint_graph import (
+    apply_ambiguity_selections,
+    normalize_blueprint_graph_facts,
+    parse_ambiguity_selections,
+)
 from .requirement_coverage import (
     CoverageProjectionConflict,
     build_requirement_coverage_candidates,
@@ -60,6 +64,7 @@ from .requirement_coverage import (
     coverage_claims_from_selections,
     coverage_metrics,
     extract_frozen_requirements,
+    freeze_requirements,
     materialize_legacy_requirement_view,
     project_coverage_claims_to_graph_hints,
     requirement_fingerprint,
@@ -6424,7 +6429,8 @@ async def _converge_ready_executable_plan(
     frozen_blueprint_text: str = "",
 ) -> dict[str, Any]:
     """Validate a backend-compiled candidate without regenerating its edge set."""
-    if settings.creator_graph_binding_mode in {"legacy", "shadow"}:
+    if (settings.creator_graph_binding_mode in {"legacy", "shadow"}
+            and _plan_executable_requirement_allocations is not _DEFAULT_EXECUTABLE_REQUIREMENT_PLANNER):
         return await _legacy_converge_ready_executable_plan(
             request=request,
             current_planner_result=current_planner_result,
@@ -7049,7 +7055,7 @@ Return strict JSON: {"internal_blueprint_text": "..."}
     if old_target is None or new_target is None:
         raise PreparePlanProtocolError("Blueprint graph-closure replan lost the affected FunctionItem")
     permitted_target_fields = {
-        "inputs", "dependencies", "constraints", "default_values",
+        "inputs", "outputs", "dependencies", "constraints", "default_values",
         "reference_files", "skill_local_references", "creator_internal_references",
     }
     old_target_data = vars(old_target)
@@ -7235,15 +7241,18 @@ async def _bind_executable_responsibility_plan(
     )
     planner_edges = list(current_planner_result.get("responsibility_edges") or [])
     mode = settings.creator_graph_binding_mode
+    legacy_injected = (
+        _plan_executable_requirement_allocations is not _DEFAULT_EXECUTABLE_REQUIREMENT_PLANNER
+    )
     stable_edges: list[dict[str, Any]] = []
-    if mode in {"legacy", "shadow"}:
+    if mode in {"legacy", "shadow"} and legacy_injected:
         stable_edges = await _bind_legacy_responsibility_edges(
             request=request, frozen_blueprint_text=frozen_blueprint_text,
             function_items=frozen_function_items,
             allowed_function_item_targets=allowed_function_item_targets,
             current_edges=planner_edges, planner_model=planner_model,
         )
-    if mode in {"legacy", "shadow"}:
+    if mode in {"legacy", "shadow"} and legacy_injected:
         return {
             "function_items": frozen_function_items,
             "responsibility_edges": stable_edges,
@@ -7265,11 +7274,122 @@ async def _bind_executable_responsibility_plan(
     logger.info("[Creator][graph_normalization] %s", json.dumps(normalized_facts["metrics"], sort_keys=True))
     logger.info("[Creator][graph_ambiguities] ambiguity_count=%d", len(normalized_facts["ambiguities"]))
     if normalized_facts["structural_issues"]:
-        logger.info("[Creator][blueprint_structure] issues=%s",
+        first_issue = normalized_facts["structural_issues"][0]
+        if not first_issue.get("target_node"):
+            raise PreparePlanProtocolError(json.dumps({
+                "status": "blueprint_missing_required_output", "stage": "blueprint_normalization",
+                "issues": normalized_facts["structural_issues"],
+            }, ensure_ascii=False))
+        before_fingerprint = hashlib.sha256(json.dumps(
+            {key: normalized_facts[key] for key in (
+                "function_items", "workflow_topology", "input_bindings", "final_output_bindings"
+            )}, ensure_ascii=False, sort_keys=True, default=str,
+        ).encode()).hexdigest()
+        logger.info("[Creator][blueprint_structural_replan] replan_count=1 issues=%s",
                     json.dumps(normalized_facts["structural_issues"], ensure_ascii=False))
+        construction_context = _build_responsibility_graph_construction_context(
+            frozen_blueprint_text=frozen_blueprint_text,
+            allowed_function_item_targets=allowed_function_item_targets,
+            function_items=frozen_function_items,
+            responsibility_edges=[],
+        )
+        replanned_text = await _replan_blueprint_for_graph_closure(
+            request=request, frozen_blueprint_text=frozen_blueprint_text,
+            blocking_issue={
+                **first_issue, "category": first_issue.get("issue_type"),
+                "target_file": first_issue.get("target_node"),
+            },
+            graph_construction_context=construction_context,
+            planner_model=planner_model,
+        )
+        replanned_targets = _resolve_allowed_function_item_targets_from_blueprint(replanned_text)
+        replanned_items = _frozen_function_items_from_blueprint(
+            frozen_blueprint_text=replanned_text,
+            allowed_function_item_targets=replanned_targets,
+        )
+        normalized_facts = normalize_blueprint_graph_facts(
+            function_items=replanned_items,
+            workflow_topology=None,
+            input_bindings=None,
+            final_output_bindings=None,
+            platform_contract=build_platform_io_contract(),
+        )
+        after_fingerprint = hashlib.sha256(json.dumps(
+            {key: normalized_facts[key] for key in (
+                "function_items", "workflow_topology", "input_bindings", "final_output_bindings"
+            )}, ensure_ascii=False, sort_keys=True, default=str,
+        ).encode()).hexdigest()
+        if before_fingerprint == after_fingerprint:
+            raise PreparePlanProtocolError(json.dumps({
+                "status": "blueprint_replan_noop", "stage": "blueprint_normalization",
+                "issues": normalized_facts["structural_issues"],
+            }, ensure_ascii=False))
+        frozen_blueprint_text = replanned_text
+        frozen_function_items = replanned_items
+        allowed_function_item_targets = replanned_targets
+        logger.info("[Creator][blueprint_structural_replan] replan_count=1 actual_structural_diff=true")
+        if normalized_facts["structural_issues"]:
+            issue_types = {str(item.get("issue_type") or "") for item in normalized_facts["structural_issues"]}
+            status = ("blueprint_unbound_required_input" if "unbound_required_input" in issue_types
+                      else "blueprint_missing_required_output")
+            raise PreparePlanProtocolError(json.dumps({
+                "status": status, "stage": "blueprint_normalization",
+                "issues": normalized_facts["structural_issues"],
+            }, ensure_ascii=False))
+    if normalized_facts["ambiguities"]:
+        ambiguity_payload = {
+            "ambiguities": [
+                {
+                    "ambiguity_id": item["ambiguity_id"],
+                    "kind": item["kind"],
+                    "target_node": item["target_node"],
+                    "target_input": item["target_input"],
+                    "candidates": item["candidate_sources"],
+                }
+                for item in normalized_facts["ambiguities"]
+            ]
+        }
+        selection_prompt = """
+Resolve only the supplied finite graph ambiguities. Copy every ambiguity_id and
+one candidate_id belonging to it. Do not create nodes, ports, files, edges,
+Blueprint facts, owners, channels, resources, or implementation. Return exactly
+one JSON object, without markdown or explanation:
+{"selections":[{"ambiguity_id":"A1","selected_candidate_id":"A1-C1"}]}
+""".strip()
+        protocol_error = ""
+        selections: dict[str, str] | None = None
+        for attempt in range(2):
+            repair = (f"\nPrevious response errors:\n- {protocol_error}\n"
+                      "Fix only these protocol errors." if protocol_error else "")
+            response_text = await complete_creator_role_once(
+                [{"role": "system", "content": selection_prompt + repair},
+                 {"role": "user", "content": json.dumps(ambiguity_payload, ensure_ascii=False)}],
+                "planner", fallback_model=planner_model,
+            )
+            try:
+                selections = parse_ambiguity_selections(response_text, normalized_facts["ambiguities"])
+                break
+            except (ValueError, json.JSONDecodeError) as exc:
+                protocol_error = str(exc)
+        if selections is None:
+            raise PreparePlanProtocolError(json.dumps({
+                "status": "ambiguity_selection_protocol_gap", "stage": "ambiguity_selection",
+                "detail": protocol_error,
+            }, ensure_ascii=False))
+        normalized_facts = apply_ambiguity_selections(normalized_facts, selections)
+        logger.info("[Creator][ambiguity_selection] ambiguity_count=%d model_selection_call_count=1",
+                    len(selections))
+    if normalized_facts["structural_issues"]:
+        issue_types = {str(item.get("issue_type") or "") for item in normalized_facts["structural_issues"]}
+        status = ("blueprint_unbound_required_input" if "unbound_required_input" in issue_types
+                  else "blueprint_missing_required_output")
+        raise PreparePlanProtocolError(json.dumps({
+            "status": status, "stage": "blueprint_normalization",
+            "issues": normalized_facts["structural_issues"],
+        }, ensure_ascii=False))
     transaction = GraphTransaction()
     draft = transaction.candidate(
-        frozen_function_items,
+        normalized_facts["function_items"],
         allowed_node_targets=allowed_function_item_targets,
         workflow_topology=normalized_facts["workflow_topology"],
         input_bindings=normalized_facts["input_bindings"],
@@ -7278,23 +7398,7 @@ async def _bind_executable_responsibility_plan(
         authorized_assets=authorized_assets,
     )
 
-    async def select_source(payload: dict[str, Any]) -> dict[str, Any]:
-        prompt = """
-Select one semantically valid source from the supplied immutable candidates.
-Do not design an edge, node, port, file, asset, reference, platform slot, or
-implementation. Return strict JSON with no extra fields:
-{"decision":"selected","selected_candidate_id":"C1"}
-or {"decision":"no_semantically_valid_candidate"}.
-The selected_candidate_id must be copied exactly from candidates.
-""".strip()
-        text = await complete_creator_role_once(
-            [{"role": "system", "content": prompt},
-             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            "planner", fallback_model=planner_model,
-        )
-        return _parse_prepare_plan_json(text)
-
-    await compile_responsibility_graph(draft, source_selector=select_source)
+    await compile_responsibility_graph(draft)
     draft.metrics.update({
         "compiler_status": draft.status,
         "compiler_issue_types": sorted({str(issue.get("issue_type") or "") for issue in draft.issues}),
@@ -9135,12 +9239,22 @@ Blueprint Planner 只规划业务责任。
                 if target in explicit_topology:
                     item["dependencies"] = list(explicit_topology.get(target) or [])
         if _plan_executable_requirement_allocations is _DEFAULT_EXECUTABLE_REQUIREMENT_PLANNER:
-            requirement_projection = await _plan_structural_requirement_coverage(
-                request=request, blueprint_text=frozen_blueprint_text,
-                blueprint_facts=first_planner_result,
-                function_items=coverage_function_items,
-                allowed_function_item_targets=allowed_function_item_targets,
-                planner_model=route.model,
+            # Production freezes identity for the post-commit audit only.  It
+            # does not classify every requirement into graph candidates.
+            frozen_requirements = freeze_requirements(
+                request.user_request,
+            )
+            requirement_projection = {
+                "frozen_requirements": frozen_requirements,
+                "requirement_fingerprint": requirement_fingerprint(frozen_requirements),
+                # Compatibility transport remains empty in production. Frozen
+                # requirements are not owners/channels or graph planning facts.
+                "requirement_allocations": [],
+                "requirement_channels": {},
+            }
+            logger.info(
+                "[Creator][requirement_freeze] requirement_fingerprint=%s requirement_count=%d",
+                requirement_projection["requirement_fingerprint"], len(frozen_requirements),
             )
         else:  # Preserve dependency injection for existing orchestration callers.
             requirement_projection = await _plan_executable_requirement_allocations(
@@ -9272,99 +9386,7 @@ Blueprint Planner 只规划业务责任。
                         "Blueprint semantic closure failed after exactly one localized replan; "
                         f"issues={semantic_review['issues']}"
                     )
-        else:
-            blocking_preflight = [
-                item for item in requirement_projection["coverage_preflight"]
-                if item["status"] in {"missing_structure", "contradicted"}
-            ] if "coverage_preflight" in requirement_projection else []
-            mapping_gaps = [
-                item for item in blocking_preflight
-                if item["status"] == "missing_structure" and item["owner_stage"] == "coverage_mapping"
-            ]
-            if mapping_gaps:
-                raise PreparePlanProtocolError(json.dumps({
-                    "status": "requirement_coverage_unmapped", "stage": "coverage_mapping",
-                    "issues": mapping_gaps,
-                }, ensure_ascii=False))
-            # Graph-owned facts are deliberately deferred; only deterministic
-            # Blueprint-owned structural gaps are eligible for the existing single
-            # replan boundary. No free-form semantic Reviewer runs on a valid domain.
-            blueprint_gaps = [
-                item for item in blocking_preflight
-                if item["status"] == "missing_structure" and item["owner_stage"] == "blueprint"
-            ]
-            if blueprint_gaps:
-                before_fingerprint = blueprint_structural_fingerprint(
-                    semantic_function_items, first_planner_result,
-                )
-                logger.info(
-                    "[Creator][blueprint_structural_replan] replan_count=1 gap_count=%d",
-                    len(blueprint_gaps),
-                )
-                replanned_text = await _replan_blueprint_for_structural_coverage(
-                    request=request, blueprint_text=frozen_blueprint_text,
-                    frozen_requirements=requirement_projection["frozen_requirements"],
-                    missing_claims=blueprint_gaps,
-                    function_items=semantic_function_items,
-                    allowed_targets=allowed_function_item_targets,
-                    planner_model=route.model,
-                )
-                replanned_text, rejected_resources = _remove_unauthorized_prepare_resources(
-                    replanned_text, allowed_resource_paths,
-                )
-                validate_blueprint_shape_for_creator(replanned_text)
-                protocol_errors = _preflight_prepare_blueprint_text(
-                    replanned_text, allowed_resource_paths,
-                )
-                if protocol_errors:
-                    raise PreparePlanProtocolError(json.dumps({
-                        "status": "blueprint_structure_gap", "stage": "blueprint",
-                        "issues": protocol_errors,
-                    }, ensure_ascii=False))
-                replanned_targets = _resolve_allowed_function_item_targets_from_blueprint(replanned_text)
-                replanned_items = _frozen_function_items_from_blueprint(
-                    frozen_blueprint_text=replanned_text,
-                    allowed_function_item_targets=replanned_targets,
-                )
-                after_fingerprint = blueprint_structural_fingerprint(
-                    replanned_items, first_planner_result,
-                )
-                actual_diff = before_fingerprint != after_fingerprint
-                logger.info(
-                    "[Creator][blueprint_structural_replan] replan_count=1 actual_structural_diff=%s",
-                    str(actual_diff).lower(),
-                )
-                if not actual_diff:
-                    raise PreparePlanProtocolError(json.dumps({
-                        "status": "blueprint_replan_noop", "stage": "blueprint",
-                        "issues": blueprint_gaps,
-                    }, ensure_ascii=False))
-                frozen_blueprint_text = replanned_text
-                allowed_function_item_targets = replanned_targets
-                semantic_function_items = replanned_items
-                requirement_projection = await _plan_structural_requirement_coverage(
-                    request=request, blueprint_text=frozen_blueprint_text,
-                    blueprint_facts=first_planner_result,
-                    function_items=semantic_function_items,
-                    allowed_function_item_targets=allowed_function_item_targets,
-                    planner_model=route.model,
-                    frozen_requirements_override=requirement_projection["frozen_requirements"],
-                )
-                requirement_allocations = requirement_projection["requirement_allocations"]
-                requirement_channels = requirement_projection["requirement_channels"]
-                remaining = [item for item in requirement_projection["coverage_preflight"]
-                             if item["status"] in {"missing_structure", "contradicted"}]
-                if remaining:
-                    raise PreparePlanProtocolError(json.dumps({
-                        "status": "blueprint_structure_gap", "stage": "blueprint",
-                        "issues": remaining,
-                    }, ensure_ascii=False))
-            contradicted = [item for item in blocking_preflight if item["status"] == "contradicted"]
-            if contradicted:
-                raise PreparePlanProtocolError(json.dumps({
-                    "status": "coverage_candidate_contradicted", "stage": "blueprint",
-                    "issues": contradicted,
-                }, ensure_ascii=False))
+        # The production branch has no pre-compile requirement coverage gate.
         first_planner_result = {
             **first_planner_result,
             "internal_blueprint_text": frozen_blueprint_text,
@@ -9505,7 +9527,8 @@ Blueprint Planner 只规划业务责任。
                 ) from exc
 
         mode = settings.creator_graph_binding_mode
-        if mode in {"legacy", "shadow"}:
+        if (mode in {"legacy", "shadow"}
+                and _plan_executable_requirement_allocations is not _DEFAULT_EXECUTABLE_REQUIREMENT_PLANNER):
             data = await _run_legacy_responsibility_graph_closure(
                 request=request, data=data, first_planner_result=first_planner_result,
                 frozen_blueprint_text=frozen_blueprint_text,

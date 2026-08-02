@@ -454,9 +454,6 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
         })
         # Blueprint is the structure authority.  Preserve extension metadata
         # verbatim rather than silently narrowing it to today's known schema.
-        normalized_item.setdefault("dependencies", [])
-        normalized_item.setdefault("forbidden_capabilities", [])
-        normalized_item.setdefault("references", [])
         normalized.append(normalized_item)
     if invalid:
         raise ValueError(f"{source}.function_items contains invalid function items: {invalid}")

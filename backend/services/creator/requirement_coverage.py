@@ -50,6 +50,30 @@ def extract_frozen_requirements(items: Iterable[dict[str, Any]]) -> list[dict[st
     return frozen
 
 
+def freeze_requirements(
+    user_request: str, *, confirmed_evidence: Iterable[str] = (),
+) -> list[dict[str, Any]]:
+    """Freeze original user evidence without a second semantic planner pass.
+
+    The Blueprint model already interpreted the request.  This boundary keeps
+    stable audit identities only; it deliberately does not classify or map the
+    text to graph structure.
+    """
+    raw = []
+    if str(user_request or "").strip():
+        text = str(user_request).strip()
+        raw.append({"requirement": text, "source_evidence": [
+            {"source": "user_request", "quote": text}
+        ]})
+    for value in confirmed_evidence:
+        text = str(value or "").strip()
+        if text:
+            raw.append({"requirement": text, "source_evidence": [
+                {"source": "confirmed_evidence", "quote": text}
+            ]})
+    return extract_frozen_requirements(raw)
+
+
 def requirement_fingerprint(requirements: Iterable[dict[str, Any]]) -> str:
     identity = [{
         "requirement_id": item.get("requirement_id"),
