@@ -16,6 +16,10 @@ COVERAGE_KINDS = ("node", "dataflow", "boundary", "resource", "constraint")
 VALID_STATUSES = frozenset({"satisfied", "deferred", "missing_structure", "contradicted"})
 
 
+class CoverageProjectionConflict(ValueError):
+    """A selected immutable candidate contradicts an explicit graph fact."""
+
+
 def _stable(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -105,7 +109,12 @@ def build_requirement_coverage_candidates(
     raw: dict[str, list[dict[str, Any]]] = {kind: [] for kind in COVERAGE_KINDS}
     by_target = {str(item["target_file"]): item for item in items}
     for item in items:
-        raw["node"].append({"kind": "node", **{key: copy.deepcopy(item.get(key) or ([] if key != "purpose" else "")) for key in ("target_file", "purpose", "inputs", "outputs", "required_capabilities", "constraints")}})
+        raw["node"].append({"kind": "node", **{
+            key: copy.deepcopy(item.get(key) if item.get(key) is not None else ([] if key != "purpose" else ""))
+            for key in ("target_file", "purpose", "inputs", "outputs", "dependencies",
+                        "required_capabilities", "forbidden_capabilities", "constraints",
+                        "default_values", "references")
+        }})
 
     flow_evidence: dict[tuple[str, str], set[str]] = {}
     def add_flow(source: Any, target: Any, evidence: str) -> None:
@@ -132,7 +141,19 @@ def build_requirement_coverage_candidates(
                for a in source_ports for b in target_ports):
             flow_evidence[(source, target)].add("compatible_ports")
     for (source, target), evidence in flow_evidence.items():
-        raw["dataflow"].append({"kind": "dataflow", "source_target": source, "target_target": target, "evidence": sorted(evidence)})
+        matching_bindings = [binding for binding in bindings if isinstance(binding, dict)
+                             and str(binding.get("source_node") or "") == source
+                             and str(binding.get("target_node") or "") == target]
+        if matching_bindings:
+            for binding in matching_bindings:
+                raw["dataflow"].append({
+                    "kind": "dataflow", "source_target": source, "target_target": target,
+                    "source_output": str(binding.get("source_output") or ""),
+                    "target_input": str(binding.get("target_input") or ""),
+                    "evidence": sorted(evidence),
+                })
+        else:
+            raw["dataflow"].append({"kind": "dataflow", "source_target": source, "target_target": target, "evidence": sorted(evidence)})
 
     input_slots = _contract_slots(platform_contract, "input_envelope_fields")
     for binding in bindings:
@@ -193,25 +214,38 @@ def coverage_claims_from_selections(
 ) -> list[dict[str, Any]]:
     """Validate opaque selections and group them into stable per-kind claims."""
     requirement_ids = [str(item["requirement_id"]) for item in frozen_requirements]
-    selection_by_id: dict[str, list[str]] = {}
+    selection_by_id: dict[str, dict[str, Any]] = {}
     for selection in selections:
         requirement_id = str(selection.get("requirement_id") or "")
         if requirement_id not in requirement_ids or requirement_id in selection_by_id:
             raise ValueError("selection requirement IDs must be unique members of the frozen set")
-        candidate_ids = selection.get("selected_candidate_ids") or []
+        if set(selection) != {"requirement_id", "decision", "selected_candidate_ids"}:
+            raise ValueError("selection must contain only requirement_id, decision, and selected_candidate_ids")
+        decision = selection.get("decision")
+        candidate_ids = selection.get("selected_candidate_ids")
         if not isinstance(candidate_ids, list) or any(value not in candidate_registry for value in candidate_ids):
             raise ValueError("selection contains an unknown candidate ID")
-        selection_by_id[requirement_id] = sorted(set(candidate_ids), key=_candidate_sort_key)
+        if decision == "selected" and not candidate_ids:
+            raise ValueError("selected requires at least one candidate ID")
+        if decision == "no_valid_candidate" and candidate_ids:
+            raise ValueError("no_valid_candidate requires an empty candidate list")
+        if decision not in {"selected", "no_valid_candidate"}:
+            raise ValueError("selection contains an invalid decision")
+        selection_by_id[requirement_id] = {
+            "decision": decision,
+            "selected_candidate_ids": sorted(set(candidate_ids), key=_candidate_sort_key),
+        }
     if set(selection_by_id) != set(requirement_ids):
         raise ValueError("selections must cover the complete frozen requirement set")
     result = []
     for requirement_id in requirement_ids:
         grouped: dict[str, list[str]] = {}
-        for candidate_id in selection_by_id[requirement_id]:
+        selection = selection_by_id[requirement_id]
+        for candidate_id in selection["selected_candidate_ids"]:
             grouped.setdefault(candidate_registry[candidate_id]["kind"], []).append(candidate_id)
         claims = [{"claim_id": f"{requirement_id}-C{index}", "kind": kind, "selected_candidate_ids": grouped[kind]}
                   for index, kind in enumerate((kind for kind in COVERAGE_KINDS if kind in grouped), 1)]
-        result.append({"requirement_id": requirement_id, "coverage_claims": claims})
+        result.append({"requirement_id": requirement_id, "decision": selection["decision"], "coverage_claims": claims})
     return result
 
 
@@ -243,7 +277,16 @@ def validate_requirement_coverage_preflight(
     authorized = {str(value) for value in authorized_references} | {str(value) for value in authorized_assets}
     results = []
     for entry in coverage_claims:
-        for claim in entry.get("coverage_claims") or []:
+        claims = entry.get("coverage_claims") or []
+        if not claims:
+            results.append({
+                "requirement_id": entry["requirement_id"], "claim_id": None,
+                "kind": None, "status": "missing_structure",
+                "owner_stage": "coverage_mapping",
+                "issue_type": "requirement_coverage_unmapped", "evidence": {},
+            })
+            continue
+        for claim in claims:
             ids = claim.get("selected_candidate_ids") or []
             candidates = [candidate_registry.get(value) for value in ids]
             kind = claim.get("kind")
@@ -264,12 +307,87 @@ def validate_requirement_coverage_preflight(
             elif kind == "resource" and any(candidate["source"] == "authorized" and candidate["path"] not in authorized for candidate in candidates):
                 status = "contradicted"
             results.append({"requirement_id": entry["requirement_id"], "claim_id": claim.get("claim_id"), "kind": kind,
-                            "status": status, "owner_stage": stage, "evidence": {"selected_candidate_ids": list(ids)}})
+                            "status": status, "owner_stage": stage, "issue_type": "",
+                            "evidence": {"selected_candidate_ids": list(ids)}})
     return results
 
 
 def should_replan_blueprint(results: Iterable[dict[str, Any]], *, replan_count: int) -> bool:
     return replan_count == 0 and any(item.get("status") == "missing_structure" and item.get("owner_stage") == "blueprint" for item in results)
+
+
+def blueprint_structural_fingerprint(
+    function_items: list[dict[str, Any]], blueprint_facts: dict[str, Any],
+) -> str:
+    """Fingerprint only Blueprint-owned structure, never user requirement text."""
+    item_keys = ("target_file", "inputs", "outputs", "dependencies", "constraints",
+                 "forbidden_capabilities", "default_values", "references")
+    payload = {
+        "function_items": sorted(
+            ({key: copy.deepcopy(item.get(key)) for key in item_keys} for item in function_items),
+            key=_stable,
+        ),
+        **{key: copy.deepcopy(blueprint_facts.get(key)) for key in (
+            "workflow_topology", "allowed_predecessors", "input_bindings",
+            "final_output_bindings", "constraints", "resources",
+        )},
+    }
+    return _fingerprint(payload)
+
+
+def project_coverage_claims_to_graph_hints(
+    *, coverage_claims: list[dict[str, Any]], candidate_registry: dict[str, dict[str, Any]],
+    workflow_topology: dict[str, list[str]] | None = None,
+    input_bindings: list[dict[str, Any]] | None = None,
+    final_output_bindings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Merge selected frozen graph facts without overwriting explicit facts."""
+    topology = {str(target): sorted({str(source) for source in sources or []})
+                for target, sources in (copy.deepcopy(workflow_topology) or {}).items()}
+    inputs = copy.deepcopy(input_bindings or [])
+    finals = copy.deepcopy(final_output_bindings or [])
+
+    def selected_candidates() -> Iterable[dict[str, Any]]:
+        for entry in coverage_claims:
+            for claim in entry.get("coverage_claims") or []:
+                for candidate_id in claim.get("selected_candidate_ids") or []:
+                    candidate = candidate_registry.get(candidate_id)
+                    if candidate is None or candidate.get("kind") != claim.get("kind"):
+                        raise CoverageProjectionConflict("coverage_projection_conflict: invalid candidate domain")
+                    yield candidate
+
+    for candidate in selected_candidates():
+        kind = candidate["kind"]
+        if kind == "dataflow":
+            source, target = candidate["source_target"], candidate["target_target"]
+            topology[target] = sorted(set(topology.get(target, [])) | {source})
+        elif kind == "boundary" and candidate["direction"] == "input":
+            projected = {
+                "target_node": candidate["node_target"], "target_input": candidate["node_port"],
+                "binding_kind": "platform_parameter", "source_node": "platform_input_node",
+                "source_output": candidate["platform_slot"], "source_root": candidate["platform_slot"],
+            }
+            same_target = [item for item in inputs if item.get("target_node") == projected["target_node"]
+                           and item.get("target_input") == projected["target_input"]]
+            if same_target and not any(all(item.get(key) == value for key, value in projected.items()) for item in same_target):
+                raise CoverageProjectionConflict("coverage_projection_conflict: input binding")
+            if not same_target:
+                inputs.append(projected)
+        elif kind == "boundary" and candidate["direction"] == "output":
+            projected = {
+                "platform_slot": candidate["platform_slot"], "source_node": candidate["node_target"],
+                "source_output": candidate["node_port"],
+            }
+            same_slot = [item for item in finals if item.get("platform_slot") == projected["platform_slot"]]
+            if same_slot and not any(all(item.get(key) == value for key, value in projected.items()) for item in same_slot):
+                raise CoverageProjectionConflict("coverage_projection_conflict: final output binding")
+            if not same_slot:
+                finals.append(projected)
+    return {
+        "workflow_topology": {key: topology[key] for key in sorted(topology)},
+        "input_bindings": sorted(inputs, key=_stable),
+        "final_output_bindings": sorted(finals, key=_stable),
+    }
 
 
 def validate_compiled_coverage_claims(
@@ -278,7 +396,9 @@ def validate_compiled_coverage_claims(
     platform_contract: dict[str, Any],
 ) -> list[dict[str, Any]]:
     targets = {str(item.get("target_file") or "") for item in committed_function_items}
-    edges = {(str(edge.get("from_node") or ""), str(edge.get("to_node") or ""), str(edge.get("to_input") or "")) for edge in committed_edges}
+    edges = {(str(edge.get("from_node") or ""), str(edge.get("from_output") or ""),
+              str(edge.get("to_node") or ""), str(edge.get("to_input") or ""))
+             for edge in committed_edges}
     input_slots = set(_contract_slots(platform_contract, "input_envelope_fields"))
     output_slots = set(_contract_slots(platform_contract, "final_output_fields"))
     results = []
@@ -288,13 +408,26 @@ def validate_compiled_coverage_claims(
             kind, status, issue = claim.get("kind"), "satisfied", ""
             if any(candidate is None for candidate in candidates):
                 status, issue = "contradicted", "candidate_domain_gap"
-            elif kind == "dataflow" and any((candidate["source_target"], candidate["target_target"]) not in {(a, b) for a, b, _ in edges} for candidate in candidates):
-                status, issue = "contradicted", "dataflow_contract_gap"
+            elif kind == "dataflow":
+                for candidate in candidates:
+                    matching = [edge for edge in edges if edge[0] == candidate["source_target"] and edge[2] == candidate["target_target"]]
+                    if candidate.get("source_output"):
+                        matching = [edge for edge in matching if edge[1] == candidate["source_output"]]
+                    if candidate.get("target_input"):
+                        matching = [edge for edge in matching if edge[3] == candidate["target_input"]]
+                    if not matching:
+                        status, issue = "contradicted", "dataflow_contract_gap"
             elif kind == "boundary":
                 for candidate in candidates:
-                    if candidate["direction"] == "output" and (candidate["node_target"], "platform_output_node", candidate["platform_slot"]) not in edges:
+                    if candidate["direction"] == "output" and (
+                        candidate["node_target"], candidate["node_port"],
+                        "platform_output_node", candidate["platform_slot"],
+                    ) not in edges:
                         status, issue = "contradicted", "final_output_contract_gap"
-                    elif candidate["direction"] == "input" and not any(a == "platform_input_node" and b == candidate["node_target"] for a, b, _ in edges):
+                    elif candidate["direction"] == "input" and (
+                        "platform_input_node", candidate["platform_slot"],
+                        candidate["node_target"], candidate["node_port"],
+                    ) not in edges:
                         status, issue = "contradicted", "input_boundary_contract_gap"
                     elif candidate["platform_slot"] not in (output_slots if candidate["direction"] == "output" else input_slots):
                         status, issue = "contradicted", "platform_slot_gap"
