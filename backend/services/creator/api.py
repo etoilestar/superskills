@@ -51,6 +51,7 @@ from .command_normalizer import _effective_command_lines
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
 from .responsibility_graph import GraphDraft, GraphTransaction, compile_responsibility_graph, public_edges
+from .blueprint_graph import normalize_blueprint_graph_facts
 from .requirement_coverage import (
     CoverageProjectionConflict,
     build_requirement_coverage_candidates,
@@ -64,6 +65,7 @@ from .requirement_coverage import (
     requirement_fingerprint,
     validate_compiled_coverage_claims,
     validate_requirement_coverage_preflight,
+    audit_committed_requirement_coverage,
 )
 from ..platform_io_contract import build_platform_io_contract
 
@@ -6875,9 +6877,15 @@ def _frozen_function_items_from_blueprint(
             "purpose": entry.purpose,
             "inputs": list(entry.inputs),
             "outputs": list(entry.outputs),
+            "dependencies": list(entry.dependencies),
             "required_capabilities": list(entry.required_capabilities),
+            "forbidden_capabilities": list(entry.forbidden_capabilities),
             "constraints": list(entry.constraints),
             "default_values": dict(entry.default_values),
+            "references": list(dict.fromkeys(
+                list(entry.reference_files) + list(entry.skill_local_references)
+                + list(entry.creator_internal_references)
+            )),
         }
         for entry in (parsed.skill_plan.files if parsed.skill_plan else [])
         if entry.path in allowed
@@ -7247,26 +7255,25 @@ async def _bind_executable_responsibility_plan(
     )
     coverage_claims = list(current_planner_result.get("coverage_claims") or [])
     candidate_registry = dict(current_planner_result.get("candidate_registry") or {})
-    try:
-        projected_hints = project_coverage_claims_to_graph_hints(
-            coverage_claims=coverage_claims,
-            candidate_registry=candidate_registry,
-            workflow_topology=current_planner_result.get("workflow_topology"),
-            input_bindings=current_planner_result.get("input_bindings"),
-            final_output_bindings=current_planner_result.get("final_output_bindings"),
-        )
-    except CoverageProjectionConflict as exc:
-        raise PreparePlanProtocolError(json.dumps({
-            "status": "coverage_projection_conflict", "stage": "blueprint",
-            "detail": str(exc),
-        }, ensure_ascii=False)) from exc
+    normalized_facts = normalize_blueprint_graph_facts(
+        function_items=frozen_function_items,
+        workflow_topology=current_planner_result.get("workflow_topology"),
+        input_bindings=current_planner_result.get("input_bindings"),
+        final_output_bindings=current_planner_result.get("final_output_bindings"),
+        platform_contract=build_platform_io_contract(),
+    )
+    logger.info("[Creator][graph_normalization] %s", json.dumps(normalized_facts["metrics"], sort_keys=True))
+    logger.info("[Creator][graph_ambiguities] ambiguity_count=%d", len(normalized_facts["ambiguities"]))
+    if normalized_facts["structural_issues"]:
+        logger.info("[Creator][blueprint_structure] issues=%s",
+                    json.dumps(normalized_facts["structural_issues"], ensure_ascii=False))
     transaction = GraphTransaction()
     draft = transaction.candidate(
         frozen_function_items,
         allowed_node_targets=allowed_function_item_targets,
-        workflow_topology=projected_hints["workflow_topology"],
-        input_bindings=projected_hints["input_bindings"],
-        final_output_bindings=projected_hints["final_output_bindings"],
+        workflow_topology=normalized_facts["workflow_topology"],
+        input_bindings=normalized_facts["input_bindings"],
+        final_output_bindings=normalized_facts["final_output_bindings"],
         authorized_references=authorized_references,
         authorized_assets=authorized_assets,
     )
@@ -7301,6 +7308,19 @@ The selected_candidate_id must be copied exactly from candidates.
             "issue_types": issue_types, "issues": draft.issues,
         }, ensure_ascii=False))
     committed = transaction.commit(draft)
+    requirement_audit = audit_committed_requirement_coverage(
+        current_planner_result.get("frozen_requirements") or [],
+        normalized_blueprint=normalized_facts,
+        function_items=committed.function_items,
+        responsibility_edges=public_edges(committed),
+        platform_bindings=[*normalized_facts["input_bindings"], *normalized_facts["final_output_bindings"]],
+        constraints=current_planner_result.get("constraints") or [],
+        resources=current_planner_result.get("resources") or [],
+    )
+    audit_counts: dict[str, int] = {}
+    for audit_item in requirement_audit:
+        audit_counts[audit_item["status"]] = audit_counts.get(audit_item["status"], 0) + 1
+    logger.info("[Creator][requirement_audit] coverage_status_counts=%s", json.dumps(audit_counts, sort_keys=True))
     if coverage_claims:
         compiled_coverage = validate_compiled_coverage_claims(
             coverage_claims, candidate_registry, committed.function_items,
@@ -7323,6 +7343,7 @@ The selected_candidate_id must be copied exactly from candidates.
         "responsibility_edges": public_edges(committed),
         "allowed_function_item_targets": [item["target_file"] for item in committed.function_items],
         "compiled_coverage_validation": compiled_coverage if coverage_claims else [],
+        "requirement_audit": requirement_audit,
     }
 
 

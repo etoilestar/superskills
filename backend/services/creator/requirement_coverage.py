@@ -59,6 +59,42 @@ def requirement_fingerprint(requirements: Iterable[dict[str, Any]]) -> str:
     return _fingerprint(identity)
 
 
+def audit_committed_requirement_coverage(
+    frozen_requirements: Iterable[dict[str, Any]], *, normalized_blueprint: dict[str, Any],
+    function_items: Iterable[dict[str, Any]], responsibility_edges: Iterable[dict[str, Any]],
+    platform_bindings: Iterable[dict[str, Any]] = (), constraints: Iterable[Any] = (),
+    resources: Iterable[Any] = (),
+) -> list[dict[str, Any]]:
+    """Audit immutable committed facts without repairing or blocking the graph.
+
+    Evidence is deliberately identity based: Blueprint facts may explicitly
+    carry requirement IDs.  Free-form text similarity is not graph authority;
+    requirements without such structural evidence remain runtime-verifiable.
+    """
+    facts = [*copy.deepcopy(list(function_items)), *copy.deepcopy(list(responsibility_edges)),
+             *copy.deepcopy(list(platform_bindings)), *copy.deepcopy(list(constraints)),
+             *copy.deepcopy(list(resources))]
+    facts.append(copy.deepcopy(normalized_blueprint))
+    result = []
+    for requirement in frozen_requirements:
+        requirement_id = str(requirement.get("requirement_id") or "")
+        evidence = []
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            ids = fact.get("requirement_ids") or []
+            if requirement_id in ids:
+                evidence.append({"requirement_id": requirement_id, "fact": copy.deepcopy(fact)})
+        result.append({
+            "requirement_id": requirement_id,
+            "status": "satisfied" if evidence else "unverifiable",
+            "evidence": evidence,
+            "owner_stage": "graph" if evidence else "runtime",
+            "issue_type": None if evidence else "requirement_runtime_unverifiable",
+        })
+    return result
+
+
 def candidate_fingerprint(registry: dict[str, dict[str, Any]]) -> str:
     return _fingerprint([{**registry[key]} for key in sorted(registry, key=_candidate_sort_key)])
 
