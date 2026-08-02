@@ -50,6 +50,30 @@ def extract_frozen_requirements(items: Iterable[dict[str, Any]]) -> list[dict[st
     return frozen
 
 
+def freeze_requirements(
+    user_request: str, *, confirmed_evidence: Iterable[str] = (),
+) -> list[dict[str, Any]]:
+    """Freeze original user evidence without a second semantic planner pass.
+
+    The Blueprint model already interpreted the request.  This boundary keeps
+    stable audit identities only; it deliberately does not classify or map the
+    text to graph structure.
+    """
+    raw = []
+    if str(user_request or "").strip():
+        text = str(user_request).strip()
+        raw.append({"requirement": text, "source_evidence": [
+            {"source": "user_request", "quote": text}
+        ]})
+    for value in confirmed_evidence:
+        text = str(value or "").strip()
+        if text:
+            raw.append({"requirement": text, "source_evidence": [
+                {"source": "confirmed_evidence", "quote": text}
+            ]})
+    return extract_frozen_requirements(raw)
+
+
 def requirement_fingerprint(requirements: Iterable[dict[str, Any]]) -> str:
     identity = [{
         "requirement_id": item.get("requirement_id"),
@@ -57,6 +81,42 @@ def requirement_fingerprint(requirements: Iterable[dict[str, Any]]) -> str:
         "source_evidence": item.get("source_evidence"),
     } for item in requirements]
     return _fingerprint(identity)
+
+
+def audit_committed_requirement_coverage(
+    frozen_requirements: Iterable[dict[str, Any]], *, normalized_blueprint: dict[str, Any],
+    function_items: Iterable[dict[str, Any]], responsibility_edges: Iterable[dict[str, Any]],
+    platform_bindings: Iterable[dict[str, Any]] = (), constraints: Iterable[Any] = (),
+    resources: Iterable[Any] = (),
+) -> list[dict[str, Any]]:
+    """Audit immutable committed facts without repairing or blocking the graph.
+
+    Evidence is deliberately identity based: Blueprint facts may explicitly
+    carry requirement IDs.  Free-form text similarity is not graph authority;
+    requirements without such structural evidence remain runtime-verifiable.
+    """
+    facts = [*copy.deepcopy(list(function_items)), *copy.deepcopy(list(responsibility_edges)),
+             *copy.deepcopy(list(platform_bindings)), *copy.deepcopy(list(constraints)),
+             *copy.deepcopy(list(resources))]
+    facts.append(copy.deepcopy(normalized_blueprint))
+    result = []
+    for requirement in frozen_requirements:
+        requirement_id = str(requirement.get("requirement_id") or "")
+        evidence = []
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            ids = fact.get("requirement_ids") or []
+            if requirement_id in ids:
+                evidence.append({"requirement_id": requirement_id, "fact": copy.deepcopy(fact)})
+        result.append({
+            "requirement_id": requirement_id,
+            "status": "satisfied" if evidence else "unverifiable",
+            "evidence": evidence,
+            "owner_stage": "graph" if evidence else "runtime",
+            "issue_type": None if evidence else "requirement_runtime_unverifiable",
+        })
+    return result
 
 
 def candidate_fingerprint(registry: dict[str, dict[str, Any]]) -> str:
