@@ -1148,8 +1148,25 @@ async def _run_semantic_closure_until_graph(
         )
         raise _SemanticClosureGraphCalled()
 
+    async def injected_legacy_planner(**kwargs):
+        nonlocal allocations
+        allocations += 1
+        if allocation_responses is not None:
+            result = dict(allocation_responses[allocations - 1])
+        else:
+            result = {"requirement_allocations": [{
+                "requirement_id": "R1", "requirement": "完成核心责任",
+                "owners": [item["target_file"] for item in kwargs["function_items"]],
+                "evidence": {"responsibility": "完成责任", "outputs": [], "capabilities": []},
+            }]}
+        result.setdefault("requirement_channels", {
+            item["requirement_id"]: "executable" for item in result["requirement_allocations"]
+        })
+        return result
+
     monkeypatch.setattr(api, "complete_chat_once", initial_planner)
     monkeypatch.setattr(api, "complete_creator_role_once", semantic_models)
+    monkeypatch.setattr(api, "_plan_executable_requirement_allocations", injected_legacy_planner)
     monkeypatch.setattr(api, "_bind_executable_responsibility_plan", graph)
     try:
         await api._generate_internal_blueprint_or_questions(_request())
@@ -2899,6 +2916,13 @@ async def _run_ready_graph_alignment_flow(monkeypatch, review, repair=None, init
     async def converge(**kwargs):
         return {**_ready_payload("converged"), "function_items": [item], "responsibility_edges": edges}
 
+    async def injected_legacy_planner(**kwargs):
+        return {"requirement_allocations": [{
+            "requirement_id": "R1", "requirement": "完成核心责任",
+            "owners": [entry["target_file"] for entry in kwargs["function_items"]],
+            "evidence": {"responsibility": "完成责任", "outputs": [], "capabilities": []},
+        }], "requirement_channels": {"R1": "executable"}}
+
     async def fake_complete_creator_role_once(messages, role, fallback_model):
         semantic = _semantic_closure_response(messages)
         if semantic is not None:
@@ -2907,6 +2931,7 @@ async def _run_ready_graph_alignment_flow(monkeypatch, review, repair=None, init
 
     _mock_creator_completion(monkeypatch, fake_complete)
     monkeypatch.setattr(api, "complete_creator_role_once", fake_complete_creator_role_once)
+    monkeypatch.setattr(api, "_plan_executable_requirement_allocations", injected_legacy_planner)
     monkeypatch.setattr(api, "_bind_executable_responsibility_plan", bind)
     monkeypatch.setattr(api, "_converge_ready_executable_plan", converge)
     monkeypatch.setattr(api, "_review_responsibility_graph_alignment", review)
