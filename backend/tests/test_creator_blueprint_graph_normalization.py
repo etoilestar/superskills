@@ -133,7 +133,7 @@ def test_unknown_dependency_is_preserved_and_reported():
     ], platform_contract={})
     issue = next(value for value in facts["structural_issues"]
                  if value["issue_type"] == "unknown_reference")
-    assert issue["dependencies"] == ["scripts/missing.py"]
+    assert issue["nodes"] == ["scripts/missing.py"]
 
 
 def test_ambiguity_selection_that_combines_into_cycle_is_rejected():

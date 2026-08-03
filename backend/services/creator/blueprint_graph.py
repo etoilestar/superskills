@@ -47,20 +47,20 @@ def match_port_evidence(
     if relation.get("has_explicit_binding"):
         return {"matched": True, "confidence": "explicit_binding", "reason": "complete explicit port binding"}
     if source["semantic_id"] and target["semantic_id"] and source["semantic_id"] == target["semantic_id"]:
-        confidence = "dependency_semantic" if relation.get("has_dependency") else "semantic"
+        confidence = "dependency" if relation.get("has_dependency") else "semantic"
         return {"matched": True, "confidence": confidence, "reason": "equal semantic_id with compatible value_type"}
     if source["name"] != target["name"]:
         reason = ("dependency does not establish a compatible port binding"
                   if relation.get("has_dependency") else "port names and semantic_id do not match")
         return {"matched": False, "confidence": "none", "reason": reason}
     if "unknown" not in {source["value_type"], target["value_type"]}:
-        confidence = "dependency_typed_name" if relation.get("has_dependency") else "typed_name"
+        confidence = "dependency" if relation.get("has_dependency") else "typed_name"
         return {"matched": True, "confidence": confidence, "reason": "equal port name with declared compatible value_type"}
     return {"matched": True, "confidence": "weak_name", "reason": "equal port name with unknown value_type"}
 
 
 _CONFIDENCE = {"none": 0, "weak_name": 1, "typed_name": 2, "semantic": 3,
-               "dependency_typed_name": 4, "dependency_semantic": 5, "explicit_binding": 6}
+               "dependency": 4, "explicit_binding": 5}
 _BINDING_KEYS = frozenset({"binding_kind", "source_node", "source_output", "source_root", "source_key",
                            "target_node", "target_input", "required", "default", "resolver", "platform_slot"})
 _ISSUE_KIND = {
@@ -120,66 +120,19 @@ def normalize_blueprint_graph_facts(
                          for node, item in by_node.items()}
     issues: list[dict[str, Any]] = []
     resource_values = copy.deepcopy(resources or [])
-    if authorized_resources is not None:
-        allowed_resources = {str(value) for value in authorized_resources}
-        for value in resource_values:
-            path = str(value.get("path") if isinstance(value, dict) else value)
-            if path and path not in allowed_resources:
-                issues.append({"issue_type": "resource_authority_gap", "path": path})
-    for node, item in by_node.items():
-        for direction in ("inputs", "outputs"):
-            if any(not _port(value)["name"] for value in item.get(direction) or []):
-                issues.append({"issue_type": "unknown_port", "target_node": node, "direction": direction})
-        unknown_dependencies = sorted(set(original_topology[node]) - set(by_node))
-        if unknown_dependencies or node in original_topology[node]:
-            issues.append({"issue_type": "blueprint_unknown_dependency", "target_node": node,
-                           "dependencies": unknown_dependencies, "self_dependency": node in original_topology[node]})
     bindings = sorted(copy.deepcopy(input_bindings or []), key=lambda value: (
         str(value.get("target_node")), str(value.get("target_input")), str(value.get("source_node")), str(value.get("source_output"))))
     finals = sorted(copy.deepcopy(final_output_bindings or []), key=lambda value: (
         str(value.get("platform_slot")), str(value.get("source_node")), str(value.get("source_output"))))
-    input_names = {node: {_port(value)["name"] for value in item.get("inputs") or []} for node, item in by_node.items()}
-    output_names = {node: {_port(value)["name"] for value in item.get("outputs") or []} for node, item in by_node.items()}
     for value in bindings:
         if value.get("binding_kind") == "platform_parameter":
             value.setdefault("source_node", "platform_input_node")
             value.setdefault("source_output", value.get("source_root"))
-        target, target_input = str(value.get("target_node") or ""), str(value.get("target_input") or "")
-        source, source_output = str(value.get("source_node") or ""), str(value.get("source_output") or "")
-        if target not in by_node or target_input not in input_names.get(target, set()):
-            issues.append({"issue_type": "blueprint_binding_unknown_port", "target_node": target, "target_input": target_input})
-            continue
-        if value.get("binding_kind") == "script_output" and (source not in by_node or source_output not in output_names.get(source, set())):
-            issue_type = "blueprint_binding_unknown_node" if source not in by_node else "blueprint_binding_unknown_port"
-            issues.append({"issue_type": issue_type, "source_node": source, "source_output": source_output})
-            continue
-        if value.get("binding_kind") == "script_output":
-            source_port = next(_port(raw) for raw in by_node[source].get("outputs") or [] if _port(raw)["name"] == source_output)
-            target_port = next(_port(raw) for raw in by_node[target].get("inputs") or [] if _port(raw)["name"] == target_input)
-            if source == target:
-                issues.append({"issue_type": "blueprint_binding_cycle", "source_node": source, "target_node": target})
-            if type_compatibility(source_port["value_type"], target_port["value_type"]) == "incompatible":
-                issues.append({"issue_type": "blueprint_binding_type_mismatch", "source_node": source,
-                               "source_output": source_output, "target_node": target, "target_input": target_input})
-    for value in finals:
-        source, source_output = str(value.get("source_node") or ""), str(value.get("source_output") or "")
-        if source not in by_node or source_output not in output_names.get(source, set()):
-            issue_type = "blueprint_binding_unknown_node" if source not in by_node else "blueprint_binding_unknown_port"
-            issues.append({"issue_type": issue_type, "source_node": source, "source_output": source_output})
-    explicit_counts: dict[tuple[str, str], int] = {}
-    for value in bindings:
-        key = (str(value.get("target_node") or ""), str(value.get("target_input") or ""))
-        explicit_counts[key] = explicit_counts.get(key, 0) + 1
-    for key, count in explicit_counts.items():
-        if count > 1:
-            issues.append({"issue_type": "blueprint_binding_duplicate_source", "target_node": key[0], "target_input": key[1]})
     binding_topology = copy.deepcopy(original_topology)
     for value in bindings:
         if value.get("binding_kind") == "script_output" and value.get("source_node") in by_node and value.get("target_node") in by_node:
             target = str(value["target_node"]); source = str(value["source_node"])
             binding_topology[target] = sorted(set(binding_topology[target]) | {source})
-    for component in _cycles(binding_topology):
-        issues.append({"issue_type": "blueprint_binding_cycle", "nodes": sorted(component)})
     bound = {(str(value.get("target_node")), str(value.get("target_input"))) for value in bindings}
     platform_inputs = _slots(platform_contract or {}, "input_envelope_fields", "input_fields")
     registry: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -315,6 +268,7 @@ def normalize_blueprint_graph_facts(
             "allowed_node_targets": sorted(by_node), "platform_contract": copy.deepcopy(platform_contract or {}),
             "resources": resource_values,
             "authorized_resources": sorted(str(value) for value in (authorized_resources or [])),
+            "resource_authority_enforced": authorized_resources is not None,
             "ambiguities": ambiguities, "structural_issues": sorted(issues, key=lambda value: json.dumps(value, sort_keys=True)),
             "metrics": {"function_item_count": len(items), "explicit_edge_count": len(input_bindings or []),
                         "inferred_edge_count": len(bindings) - len(input_bindings or []), "ambiguity_count": len(ambiguities),
@@ -349,6 +303,10 @@ def validate_blueprint_graph_facts(
               for node, item in by_node.items()}
     outputs = {node: {_port(value)["name"]: _port(value) for value in item.get("outputs") or []}
                for node, item in by_node.items()}
+    for node, item in by_node.items():
+        for direction in ("inputs", "outputs"):
+            if any(not _port(value)["name"] for value in item.get(direction) or []):
+                issues.append({"issue_type": "unknown_reference", "target_node": node, "direction": direction})
     topology = {node: list((facts.get("workflow_topology") or {}).get(node) or []) for node in by_node}
     for node, predecessors in topology.items():
         unknown = sorted(set(predecessors) - allowed)
@@ -400,7 +358,7 @@ def validate_blueprint_graph_facts(
         if output not in outputs[source]: issues.append({"issue_type": "unknown_port", "source_node": source, "source_output": output})
         if slot not in final_slots: issues.append({"issue_type": "invalid_platform_boundary", "platform_slot": slot})
     authorized = set(facts.get("authorized_resources") or [])
-    if authorized:
+    if facts.get("resource_authority_enforced"):
         for value in facts.get("resources") or []:
             path = str(value.get("path") if isinstance(value, dict) else value)
             if path not in authorized: issues.append({"issue_type": "unauthorized_resource", "path": path})

@@ -6873,38 +6873,11 @@ def _frozen_function_items_from_blueprint(
     frozen_blueprint_text: str,
     allowed_function_item_targets: list[str],
 ) -> list[dict[str, Any]]:
-    """Materialize FunctionItems directly from frozen structured SkillPlan facts."""
-    allowed = set(allowed_function_item_targets)
-    parsed = parse_blueprint(
-        [{"role": "assistant", "content": frozen_blueprint_text}], strict=True
-    )
-    items = [
-        {
-            "target_file": entry.path,
-            "role": str(entry.role),
-            "purpose": entry.purpose,
-            "inputs": list(entry.inputs),
-            "outputs": list(entry.outputs),
-            "dependencies": list(entry.dependencies),
-            "required_capabilities": list(entry.required_capabilities),
-            "forbidden_capabilities": list(entry.forbidden_capabilities),
-            "constraints": list(entry.constraints),
-            "default_values": dict(entry.default_values),
-            "references": list(dict.fromkeys(
-                list(entry.reference_files) + list(entry.skill_local_references)
-                + list(entry.creator_internal_references)
-            )),
-        }
-        for entry in (parsed.skill_plan.files if parsed.skill_plan else [])
-        if entry.path in allowed
-    ]
-    normalized = normalize_structured_function_items(
-        items, source="frozen_blueprint"
-    )
-    _validate_function_item_targets_in_allowed_domain(
-        normalized, allowed_function_item_targets
-    )
-    return normalized
+    """Compatibility view over the canonical Blueprint graph-facts parser."""
+    return parse_blueprint_graph_facts(
+        frozen_blueprint_text,
+        allowed_function_item_targets=allowed_function_item_targets,
+    )["function_items"]
 
 
 def parse_blueprint_graph_facts(
