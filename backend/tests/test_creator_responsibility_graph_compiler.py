@@ -35,7 +35,11 @@ async def test_compiled_api_batches_and_applies_graph_ambiguities_once(monkeypat
         calls.append(messages)
         return '{"selections":[{"ambiguity_id":"A1","selected_candidate_id":"A1-C2"}]}'
 
-    monkeypatch.setattr(api, "parse_blueprint_graph_facts", lambda _text, **kwargs: parsed_facts(items, kwargs))
+    monkeypatch.setattr(api, "parse_blueprint_graph_facts", lambda _text, **kwargs: parsed_facts(items, kwargs, {
+        "final_output_bindings": [
+            {"platform_slot": "text", "source_node": "scripts/c.py", "source_output": "text"},
+        ],
+    }))
     monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
     monkeypatch.setattr(api, "complete_creator_role_once", choose)
     monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
@@ -68,7 +72,12 @@ async def test_compiled_api_resolves_multiple_ambiguities_in_one_model_call(monk
             {"ambiguity_id": "A1", "selected_candidate_id": "A1-C2"},
             {"ambiguity_id": "A2", "selected_candidate_id": "A2-C2"},
         ]})
-    monkeypatch.setattr(api, "parse_blueprint_graph_facts", lambda _text, **kwargs: parsed_facts(items, kwargs))
+    monkeypatch.setattr(api, "parse_blueprint_graph_facts", lambda _text, **kwargs: parsed_facts(items, kwargs, {
+        "final_output_bindings": [
+            {"platform_slot": "text", "source_node": "scripts/c.py", "source_output": "text"},
+            {"platform_slot": "markdown", "source_node": "scripts/d.py", "source_output": "markdown"},
+        ],
+    }))
     monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
     monkeypatch.setattr(api, "complete_creator_role_once", choose)
     monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
@@ -86,8 +95,9 @@ async def test_compiled_api_resolves_multiple_ambiguities_in_one_model_call(monk
     assert sum(value["to_node"] in {"scripts/c.py", "scripts/d.py"} for value in result["responsibility_edges"]) == 2
 
 
-def parsed_facts(items, kwargs):
-    supplied = kwargs.get("structured_facts") or {}
+def parsed_facts(items, kwargs, canonical=None):
+    assert "structured_facts" not in kwargs
+    supplied = canonical or {}
     return {"function_items": items, "workflow_topology": copy.deepcopy(supplied.get("workflow_topology") or {}),
             "input_bindings": copy.deepcopy(supplied.get("input_bindings") or []),
             "final_output_bindings": copy.deepcopy(supplied.get("final_output_bindings") or []),
@@ -554,7 +564,13 @@ async def test_production_binding_uses_transaction_and_frozen_parameter_edges(mo
             return super().commit(candidate)
 
     monkeypatch.setattr(api, "GraphTransaction", ObservedTransaction)
-    monkeypatch.setattr(api, "parse_blueprint_graph_facts", lambda _text, **kwargs: parsed_facts(items, kwargs))
+    monkeypatch.setattr(api, "parse_blueprint_graph_facts", lambda _text, **kwargs: parsed_facts(items, kwargs, {
+        "input_bindings": [{"target_node": "scripts/a.py", "target_input": "theme",
+            "binding_kind": "platform_parameter", "source_root": "fields", "source_key": "topic"}],
+        "final_output_bindings": [
+            {"platform_slot": "text", "source_node": "scripts/a.py", "source_output": "result"},
+        ],
+    }))
     monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
     monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
     async def forbidden_model(*_args, **_kwargs):
@@ -580,7 +596,11 @@ async def test_compiled_v2_ignores_planner_authored_complete_edges(monkeypatch):
     from backend.services.creator import api
 
     items = [item("scripts/a.py", [], ["text"])]
-    monkeypatch.setattr(api, "parse_blueprint_graph_facts", lambda _text, **kwargs: parsed_facts(items, kwargs))
+    monkeypatch.setattr(api, "parse_blueprint_graph_facts", lambda _text, **kwargs: parsed_facts(items, kwargs, {
+        "final_output_bindings": [
+            {"platform_slot": "text", "source_node": "scripts/a.py", "source_output": "text"},
+        ],
+    }))
     monkeypatch.setattr(api, "_graph_resource_authority", lambda **_kwargs: (set(), set()))
     monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
     result = await api._bind_executable_responsibility_plan(
@@ -793,7 +813,13 @@ async def test_compiled_api_accepts_only_authorized_static_resources(monkeypatch
 
     items = [item("scripts/a.py", ["template"], ["text"])]
     monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
-    monkeypatch.setattr(api, "parse_blueprint_graph_facts", lambda _text, **kwargs: parsed_facts(items, kwargs))
+    monkeypatch.setattr(api, "parse_blueprint_graph_facts", lambda _text, **kwargs: parsed_facts(items, kwargs, {
+        "input_bindings": [{"target_node": "scripts/a.py", "target_input": "template",
+            "binding_kind": "static_value", "resolver": resolver}],
+        "final_output_bindings": [
+            {"platform_slot": "text", "source_node": "scripts/a.py", "source_output": "text"},
+        ],
+    }))
     result = await api._bind_executable_responsibility_plan(
         request=api.PreparePlanRequest(user_request="demo"),
             current_planner_result={
@@ -812,7 +838,14 @@ async def test_compiled_api_rejects_undeclared_static_resource(monkeypatch):
 
     items = [item("scripts/a.py", ["template"], ["text"])]
     monkeypatch.setattr(api.settings, "creator_graph_binding_mode", "compiled_v2")
-    monkeypatch.setattr(api, "parse_blueprint_graph_facts", lambda _text, **kwargs: parsed_facts(items, kwargs))
+    monkeypatch.setattr(api, "parse_blueprint_graph_facts", lambda _text, **kwargs: parsed_facts(items, kwargs, {
+        "input_bindings": [{"target_node": "scripts/a.py", "target_input": "template",
+            "binding_kind": "static_value",
+            "resolver": {"kind": "static_reference", "path": "references/missing.md"}}],
+        "final_output_bindings": [
+            {"platform_slot": "text", "source_node": "scripts/a.py", "source_output": "text"},
+        ],
+    }))
     with pytest.raises(api.PreparePlanProtocolError, match="unauthorized_static_resource"):
         await api._bind_executable_responsibility_plan(
             request=api.PreparePlanRequest(user_request="demo"),

@@ -6336,7 +6336,6 @@ async def _legacy_converge_ready_executable_plan(
 
     canonical_facts = parse_blueprint_graph_facts(
         frozen_blueprint_text, allowed_function_item_targets=allowed_function_item_targets,
-        structured_facts=current_planner_result,
     )
     frozen_function_items = canonical_facts["function_items"]
     draft_edges = list(current_planner_result.get("responsibility_edges") or [])
@@ -7255,7 +7254,6 @@ async def _bind_executable_responsibility_plan(
     )
     canonical_facts = parse_blueprint_graph_facts(
         frozen_blueprint_text, allowed_function_item_targets=allowed_function_item_targets,
-        structured_facts=current_planner_result,
     )
     frozen_function_items = canonical_facts["function_items"]
     planner_edges = list(current_planner_result.get("responsibility_edges") or [])
