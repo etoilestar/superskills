@@ -7391,56 +7391,20 @@ def _normalize_semantic_review_against_allocations(
     requirement_allocations: list[dict[str, Any]],
     requirement_channels: dict[str, str],
 ) -> dict[str, Any]:
-    """Make ownerless allocations blocking without inferring semantic ownership."""
-    normalized_review = copy.deepcopy(review)
-    allocations = copy.deepcopy(requirement_allocations)
-    issues = normalized_review.get("issues") or []
-
-    deduplicated_issues: list[dict[str, Any]] = []
-    seen_issues: set[str] = set()
-    for issue in issues:
-        identity = json.dumps(issue, ensure_ascii=False, sort_keys=True, default=str)
-        if identity not in seen_issues:
-            seen_issues.add(identity)
-            deduplicated_issues.append(issue)
-
-    coverage_issue_types = {
-        "requirement_uncovered", "requirement_partially_covered"
-    }
-    reported_ownerless_ids = {
-        str(issue.get("requirement_id") or "").strip()
-        for issue in deduplicated_issues
-        if issue.get("issue_type") in coverage_issue_types
-    }
-    ownerless_ids = [
-        str(allocation.get("requirement_id") or "").strip()
-        for allocation in allocations
-        if not (allocation.get("owners") or [])
-        and requirement_channels.get(
-            str(allocation.get("requirement_id") or "").strip()
-        ) == "executable"
-    ]
-    for requirement_id in ownerless_ids:
-        if requirement_id in reported_ownerless_ids:
-            continue
-        deduplicated_issues.append({
-            "issue_type": "requirement_uncovered",
-            "requirement_id": requirement_id,
-            "affected_targets": [],
-            "reason": (
-                "The current Blueprint has no legitimate FunctionItem owner "
-                "for this requirement."
-            ),
-            "repair_guidance": (
-                "Clarify the minimum existing FunctionItem responsibilities or add "
-                "only the minimum genuinely missing responsibility."
-            ),
-        })
-        reported_ownerless_ids.add(requirement_id)
-
-    normalized_review["issues"] = deduplicated_issues
-    normalized_review["passed"] = not deduplicated_issues
-    return normalized_review
+    """Deduplicate validated review output without adding semantic conclusions."""
+    normalized = copy.deepcopy(review)
+    normalized.setdefault("deferred_checks", [])
+    for field in ("issues", "deferred_checks"):
+        deduplicated: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for issue in normalized.get(field) or []:
+            identity = json.dumps(issue, ensure_ascii=False, sort_keys=True, default=str)
+            if identity not in seen:
+                seen.add(identity)
+                deduplicated.append(issue)
+        normalized[field] = deduplicated
+    normalized["passed"] = not normalized["issues"]
+    return normalized
 
 
 def _requirement_channel_summary(
@@ -7460,125 +7424,137 @@ def _requirement_channel_summary(
     }
 
 
-
 async def _review_blueprint_semantic_closure(
     *, request: PreparePlanRequest, blueprint_text: str,
     function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]],
     requirement_channels: dict[str, str], planner_model: str,
 ) -> dict[str, Any]:
-    """Review requirement coverage and resource meaning; Backend checks shape only."""
+    """Review only semantic facts observable before ResponsibilityGraph creation."""
     prompt = """
-You are the Blueprint semantic coverage Reviewer. Review only meaning, using the
-original user requirement, current Blueprint/FilePlan, FunctionItems, and
-requirement_allocations. Decide whether an explicit core requirement is omitted,
-has a real owner, the owner's responsibility is sufficient, capabilities/outputs
-basically match, or a responsibility was invented merely to close structure.
-Interpret every supplied requirement according to requirement_channels.
-channel=executable requires one or more runtime FunctionItems. owners=[] is a
-blocking executable coverage gap. Check that each owner genuinely carries the
-requirement through its purpose, inputs, outputs, and constraints; allow genuine
-joint ownership, and reject an owner invented merely for structural closure.
+You are the pre-graph Blueprint semantic coverage Reviewer.
 
-channel=resource is carried by static reference/asset responsibility, resource
-source, or resource dependency. owners=[] is valid and must not require a script
-owner. Check the declared resource path, source, dependency, and purpose, whether
-real provenance is missing, and whether a runtime-produced result was incorrectly
-represented as static responsibility.
+Review only facts observable in the supplied pre-graph payload: the original
+user requirement, current Blueprint/FilePlan, frozen FunctionItems, requirement
+allocations, requirement channels, and authoritative FunctionItem target domain.
+Do not require every requirement to have a FunctionItem owner. FunctionItem
+ownership applies only where the supplied allocation legitimately assigns
+runtime FunctionItems. Only requirements whose current allocation uses
+FunctionItem ownership require FunctionItem owners. Do not convert other
+responsibilities into synthetic owners.
 
-channel=direct is carried by host direct-answer or result-presentation
-responsibility. owners=[] is valid and is not uncovered merely because no script
-owner exists. Check that the Blueprint expresses the host responsibility and that
-runtime execution responsibility was not incorrectly assigned to this channel.
+You must not make a blocking conclusion whose proof requires facts that do not
+yet exist: ResponsibilityGraph edges, runtime execution order, upstream data
+transport, platform terminal bindings, generated source, runtime observations,
+sandbox enforcement, or host result delivery. Absence of later-stage evidence
+is not a violation. When evidence belongs to a later Creator stage, return a
+deferred_verification in deferred_checks with blocking_now=false,
+repair_scope=none, and the appropriate lifecycle evidence_stage.
 
-Also review whether each channel is semantically consistent with the original
-request, structured FilePlan, FunctionItems, resource authority, host execution
-mode, and input/output responsibility. Do not infer a channel from business
-keywords, filenames, suffixes, roles, or capability labels. Report an incorrect
-channel as responsibility_mismatch, referencing its existing requirement_id,
-and direct the minimum Blueprint replan to regenerate the complete projection.
+Distinguish satisfied, deferred, violated, and uncovered. A violation directly
+contradicts supplied evidence. Uncovered means a fact required to exist in this
+pre-graph payload is absent. Insufficient evidence is deferred, not uncovered.
+Relationships between FunctionItems may require graph evidence: inspect current
+nodes and declared ports, but do not claim a relationship is missing merely
+because edges have not been constructed.
 
-You may review only the supplied requirements. requirement_uncovered and
-requirement_partially_covered MUST reference an existing supplied requirement_id.
-Do not create requirements from implementation preferences, quality
-improvements, style preferences, richer designs, inferred hidden requirements,
-or Blueprint implementation details. An observation that does not map to an
-existing supplied requirement_id is advisory only and must not be blocking.
+The complete valid FunctionItem owner domain is
+`authoritative_function_item_targets`. There are no implicit owners. Every owner
+or affected FunctionItem target must be copied exactly from that list. Never
+create or recommend another component identity. If no supplied FunctionItem
+legitimately owns a requirement, decide whether it is represented outside
+FunctionItem ownership or requires later evidence.
 
-Capability is determined by the actual operation and actual Tool capability used
-by the current file, never by how its output is used downstream. A
-text_generation Tool producing image-prompt text is still text_generation;
-generating SQL text is not database execution; generating a search query is not
-web retrieval; and generating an outline is not document generation. Only actual
-image generation behavior or image-generation Tool usage is image_generation.
+Treat requirement_channels as authoritative for this review call. Do not
+silently reinterpret or replace a channel. Report a channel mismatch only when
+an exact supplied pre-graph field directly contradicts it, not merely because
+another channel seems plausible.
 
-Also review declared dependencies/resources: whether each is actually required
-static content, whether it is Creator-generated guidance or pre-existing static
-material, and whether a static dependency lacks a real source/provenance.
-The current phase is Blueprint planning, so references/assets may not have been
-generated yet. Do not reject a planned resource because its file does not exist,
-is empty, has no generated body yet, or is not yet detailed. At this stage review
-only its planned responsibility, dependency relationship, declared source,
-SkillPlan consistency, and semantic justification. Actual resource content
-quality is reviewed after file generation.
-Do not infer from filenames, suffixes, keywords, or a business taxonomy.
+A blocking issue requires concrete evidence from the supplied payload. Identify
+the supplied object, exact field, observed value, and expected_fact directly
+contradicted or absent. Do not block on imagined architecture, implementation
+preference, unsupplied components, hypothetical owners, or later-stage evidence.
 
-Return strict JSON only: {"passed":true,"issues":[]} or a failed result whose
-issue_type is exactly one of requirement_uncovered,
+Before returning, adversarially self-check every candidate blocking issue:
+1. requirement_id exists in supplied allocations;
+2. evidence is observable now;
+3. the missing fact must exist now;
+4. a concrete supplied field supports the conclusion;
+5. affected_targets are exact authoritative targets;
+6. repair invents no entity;
+7. repair_scope can modify the identified object;
+8. the issue remains valid without a ResponsibilityGraph.
+If any answer is no, defer it when later evidence is required; otherwise omit it.
+
+Return strict JSON with exactly passed, issues, and deferred_checks. `issues`
+contains only blocking_now=true issues. `deferred_checks` contains only
+non-blocking deferred_verification entries. passed is true exactly when issues is
+empty. Allowed issue_type values: requirement_uncovered,
 requirement_partially_covered, responsibility_mismatch,
-resource_semantic_conflict. Every issue includes requirement_id (empty when not
-applicable), affected_targets array, reason, and repair_guidance. A resource
-conflict may additionally include resource.
+resource_semantic_conflict, deferred_verification. Allowed evidence_stage:
+blueprint, graph, generation, runtime, boundary, resource. Allowed repair_scope:
+blueprint, allocation, graph, resource, none.
+
+Every entry contains issue_type, requirement_id, blocking_now, evidence_stage,
+repair_scope, affected_targets, evidence, expected_fact, reason, and
+repair_guidance. Evidence is an array of objects with exactly source, target,
+field, and observed. Blocking entries require non-empty evidence and
+expected_fact. A deferred entry uses evidence=[], expected_fact="",
+affected_targets=[], repair_scope=none, and empty repair_guidance. Do not return
+FunctionItems, allocations, channels, owners, edges, or explanations outside the
+JSON envelope.
 """.strip()
+    authoritative_targets = [
+        str(item.get("target_file") or "").strip()
+        for item in function_items
+        if str(item.get("target_file") or "").strip()
+    ]
+    valid_requirement_ids = [
+        str(item.get("requirement_id") or "").strip()
+        for item in requirement_allocations
+        if str(item.get("requirement_id") or "").strip()
+    ]
     payload = {
+        "original_user_requirement": request.user_request,
         "user_requirement": request.user_request,
         "conversation_history": request.conversation_history,
         "human_feedback": request.human_feedback,
         "current_blueprint": blueprint_text,
-        "function_items": function_items,
+        "frozen_function_items": function_items,
         "requirement_allocations": requirement_allocations,
         "requirement_channels": requirement_channels,
+        "authoritative_function_item_targets": authoritative_targets,
     }
     text = await complete_creator_role_once(
         [{"role": "system", "content": prompt},
          {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
         "reviewer", fallback_model=planner_model,
     )
-    review = validate_blueprint_semantic_review(
-        _parse_prepare_plan_json(text),
-        allowed_function_item_targets=[
-            str(item.get("target_file") or "").strip()
-            for item in function_items
-        ],
-    )
-    valid_requirement_ids = {
-        str(allocation.get("requirement_id") or "").strip()
-        for allocation in requirement_allocations
-        if str(allocation.get("requirement_id") or "").strip()
-    }
-    invalid_requirement_ids = [
-        str(issue.get("requirement_id") or "").strip()
-        for issue in review["issues"]
-        if issue["issue_type"] in {
-            "requirement_uncovered", "requirement_partially_covered"
-        }
-        and str(issue.get("requirement_id") or "").strip() not in valid_requirement_ids
-    ]
-    if invalid_requirement_ids:
-        raise PreparePlanProtocolError(
-            "Blueprint semantic review referenced requirement_id outside the "
-            f"requirement allocation domain: requirement_ids={invalid_requirement_ids}"
+    try:
+        review = validate_blueprint_semantic_review(
+            _parse_prepare_plan_json(text),
+            allowed_function_item_targets=authoritative_targets,
+            supplied_requirement_ids=valid_requirement_ids,
         )
+    except ValueError as exc:
+        logger.error("[Creator][semantic_review_protocol_violation] error=%s", exc)
+        raise PreparePlanProtocolError(
+            f"Pre-graph semantic Reviewer returned an invalid protocol: {exc}"
+        ) from exc
     review = _normalize_semantic_review_against_allocations(
         review, requirement_allocations, requirement_channels
     )
-    uncovered = [str(i.get("requirement_id") or "") for i in review["issues"] if i["issue_type"] == "requirement_uncovered"]
-    partial = [str(i.get("requirement_id") or "") for i in review["issues"] if i["issue_type"] == "requirement_partially_covered"]
-    covered_count = max(0, len(requirement_allocations) - len(set(uncovered + partial)))
-    logger.info("[Creator][requirement_coverage] requirement_count=%d covered_count=%d uncovered_ids=%s partially_covered_ids=%s",
-                len(requirement_allocations), covered_count, uncovered, partial)
-    resource_issues = [i for i in review["issues"] if i["issue_type"] == "resource_semantic_conflict"]
-    logger.info("[Creator][resource_semantic_review] issue_count=%d affected_resources=%s",
-                len(resource_issues), [str(i.get("resource") or "") for i in resource_issues if i.get("resource")])
+    deferred = review["deferred_checks"]
+    advisory_count = sum(not issue.get("blocking_now") for issue in review["issues"])
+    logger.info(
+        "[Creator][semantic_review] blocking_issue_count=%d deferred_check_count=%d advisory_issue_count=%d",
+        len(review["issues"]), len(deferred), advisory_count,
+    )
+    for issue in deferred:
+        logger.info(
+            "[Creator][semantic_review_deferred] requirement_id=%s evidence_stage=%s reason=%s",
+            issue.get("requirement_id", ""), issue.get("evidence_stage", ""),
+            issue.get("reason", ""),
+        )
     return review
 
 
@@ -7653,6 +7629,32 @@ existing supplied requirement; then make only the minimum required change.
         )),
     )
     return replanned
+
+
+def _semantic_projection_facts(blueprint_text: str) -> dict[str, Any]:
+    """Project parsed facts whose real changes permit requirement reprojection."""
+    parsed = parse_blueprint(
+        [{"role": "assistant", "content": blueprint_text}], strict=True
+    )
+    entries = list(parsed.skill_plan.files if parsed.skill_plan else [])
+    function_items = [
+        {
+            "target_file": entry.path,
+            "purpose": entry.purpose,
+            "inputs": list(entry.inputs),
+            "outputs": list(entry.outputs),
+            "constraints": copy.deepcopy(entry.constraints),
+        }
+        for entry in entries
+        if str(entry.path).startswith("scripts/")
+    ]
+    resources = [
+        copy.deepcopy(vars(entry))
+        for entry in entries
+        if not str(entry.path).startswith("scripts/")
+        and str(entry.path) != "SKILL.md"
+    ]
+    return {"function_items": function_items, "resources": resources}
 
 
 def _strict_blueprint_compatibility_fields(
@@ -8737,84 +8739,24 @@ Blueprint Planner 只规划业务责任。
             requirement_allocations=requirement_allocations,
             requirement_channels=requirement_channels, planner_model=route.model,
         )
-        ownerless_ids = [
-            str(item.get("requirement_id") or "").strip()
-            for item in requirement_allocations if not (item.get("owners") or [])
-            and requirement_channels.get(str(item.get("requirement_id") or "").strip())
-            == "executable"
+        blocking_issues = list(semantic_review["issues"])
+        allocation_issues = [
+            issue for issue in blocking_issues
+            if issue.get("repair_scope") == "allocation"
         ]
-        coverage_issue_types = {
-            "requirement_uncovered", "requirement_partially_covered"
-        }
-        ownerless_id_set = set(ownerless_ids)
-        coverage_only = bool(semantic_review["issues"]) and all(
-            issue.get("issue_type") in coverage_issue_types
-            and str(issue.get("requirement_id") or "").strip() in ownerless_id_set
-            for issue in semantic_review["issues"]
-        )
-        if ownerless_ids and coverage_only:
+        if allocation_issues:
+            logger.info(
+                "[Creator][semantic_repair_route] scope=allocation issue_count=%d",
+                len(allocation_issues),
+            )
             requirement_projection = await _reconcile_requirement_allocations(
                 request=request,
                 blueprint_text=frozen_blueprint_text,
                 function_items=semantic_function_items,
                 requirement_allocations=requirement_allocations,
                 requirement_channels=requirement_channels,
-                semantic_review=semantic_review,
+                semantic_review={**semantic_review, "issues": allocation_issues},
                 planner_model=route.model,
-            )
-            requirement_allocations = requirement_projection["requirement_allocations"]
-            requirement_channels = requirement_projection["requirement_channels"]
-            semantic_review = await _review_blueprint_semantic_closure(
-                request=request, blueprint_text=frozen_blueprint_text,
-                function_items=semantic_function_items,
-                requirement_allocations=requirement_allocations,
-                requirement_channels=requirement_channels,
-                planner_model=route.model,
-            )
-        if not semantic_review["passed"]:
-            frozen_blueprint_text = await _replan_blueprint_for_semantic_closure(
-                request=request, blueprint_text=frozen_blueprint_text,
-                function_items=semantic_function_items,
-                requirement_allocations=requirement_allocations,
-                blocking_issues=semantic_review["issues"], planner_model=route.model,
-            )
-            frozen_blueprint_text, rejected_resources = _remove_unauthorized_prepare_resources(
-                frozen_blueprint_text,
-                allowed_resource_paths,
-            )
-            logger.info(
-                "[Creator][resource_authority] allowed_resources=%s rejected_resources=%s",
-                sorted(allowed_resource_paths), rejected_resources,
-            )
-            try:
-                validate_blueprint_shape_for_creator(frozen_blueprint_text)
-            except BlueprintShapeError as exc:
-                raise PreparePlanProtocolError(
-                    f"Blueprint semantic replan failed strict shape after resource authority enforcement: {exc}"
-                ) from exc
-            protocol_errors = _preflight_prepare_blueprint_text(
-                frozen_blueprint_text,
-                allowed_resource_paths,
-            )
-            if protocol_errors:
-                raise PreparePlanProtocolError(
-                    "Blueprint semantic replan failed protocol after resource authority enforcement; "
-                    f"errors={protocol_errors}"
-                )
-            allowed_function_item_targets = _resolve_allowed_function_item_targets_from_blueprint(
-                frozen_blueprint_text
-            )
-            semantic_function_items = _frozen_function_items_from_blueprint(
-                frozen_blueprint_text=frozen_blueprint_text,
-                allowed_function_item_targets=allowed_function_item_targets,
-            )
-            _validate_prepare_semantic_function_item_topology(
-                allowed_function_item_targets,
-                semantic_function_items,
-            )
-            requirement_projection = await _plan_executable_requirement_allocations(
-                request=request, blueprint_text=frozen_blueprint_text,
-                function_items=semantic_function_items, planner_model=route.model,
             )
             requirement_allocations = requirement_projection["requirement_allocations"]
             requirement_channels = requirement_projection["requirement_channels"]
@@ -8824,26 +8766,90 @@ Blueprint Planner 只规划业务责任。
                 requirement_allocations=requirement_allocations,
                 requirement_channels=requirement_channels, planner_model=route.model,
             )
-            if not semantic_review["passed"]:
-                remaining_ownerless_ids = [
-                    str(item.get("requirement_id") or "").strip()
-                    for item in requirement_allocations
-                    if not (item.get("owners") or [])
-                    and requirement_channels.get(str(item.get("requirement_id") or "").strip())
-                    == "executable"
-                ]
-                logger.error(
-                    "[Creator][semantic_closure_failure] stage=post_blueprint_replan "
-                    "issue_ids=%s remaining_ownerless_ids=%s failure_reason=%s",
-                    [str(issue.get("requirement_id") or "").strip()
-                     for issue in semantic_review["issues"]],
-                    remaining_ownerless_ids,
-                    "blocking semantic issues remain after exactly one replan",
-                )
+            blocking_issues = list(semantic_review["issues"])
+
+        blueprint_issues = [
+            issue for issue in blocking_issues
+            if issue.get("repair_scope") == "blueprint"
+        ]
+        non_blueprint_issues = [
+            issue for issue in blocking_issues
+            if issue.get("repair_scope") != "blueprint"
+        ]
+        if blueprint_issues and not non_blueprint_issues:
+            logger.info(
+                "[Creator][semantic_repair_route] scope=blueprint issue_count=%d",
+                len(blueprint_issues),
+            )
+            before_projection_facts = _semantic_projection_facts(
+                frozen_blueprint_text
+            )
+            replanned_blueprint = await _replan_blueprint_for_semantic_closure(
+                request=request, blueprint_text=frozen_blueprint_text,
+                function_items=semantic_function_items,
+                requirement_allocations=requirement_allocations,
+                blocking_issues=blueprint_issues, planner_model=route.model,
+            )
+            replanned_blueprint, rejected_resources = _remove_unauthorized_prepare_resources(
+                replanned_blueprint, allowed_resource_paths,
+            )
+            logger.info(
+                "[Creator][resource_authority] allowed_resources=%s rejected_resources=%s",
+                sorted(allowed_resource_paths), rejected_resources,
+            )
+            validate_blueprint_shape_for_creator(replanned_blueprint)
+            protocol_errors = _preflight_prepare_blueprint_text(
+                replanned_blueprint, allowed_resource_paths,
+            )
+            if protocol_errors:
                 raise PreparePlanProtocolError(
-                    "Blueprint semantic closure failed after exactly one localized replan; "
-                    f"issues={semantic_review['issues']}"
+                    "Blueprint semantic replan failed protocol after resource authority enforcement; "
+                    f"errors={protocol_errors}"
                 )
+            after_projection_facts = _semantic_projection_facts(replanned_blueprint)
+            actual_noop = before_projection_facts == after_projection_facts
+            frozen_blueprint_text = replanned_blueprint
+            logger.info(
+                "[Creator][semantic_replan] actual_noop=%s preserved_requirement_projection=%s",
+                str(actual_noop).lower(), str(actual_noop).lower(),
+            )
+            allowed_function_item_targets = _resolve_allowed_function_item_targets_from_blueprint(
+                frozen_blueprint_text
+            )
+            semantic_function_items = _frozen_function_items_from_blueprint(
+                frozen_blueprint_text=frozen_blueprint_text,
+                allowed_function_item_targets=allowed_function_item_targets,
+            )
+            _validate_prepare_semantic_function_item_topology(
+                allowed_function_item_targets, semantic_function_items,
+            )
+            if not actual_noop:
+                requirement_projection = await _plan_executable_requirement_allocations(
+                    request=request, blueprint_text=frozen_blueprint_text,
+                    function_items=semantic_function_items, planner_model=route.model,
+                )
+                requirement_allocations = requirement_projection["requirement_allocations"]
+                requirement_channels = requirement_projection["requirement_channels"]
+            semantic_review = await _review_blueprint_semantic_closure(
+                request=request, blueprint_text=frozen_blueprint_text,
+                function_items=semantic_function_items,
+                requirement_allocations=requirement_allocations,
+                requirement_channels=requirement_channels, planner_model=route.model,
+            )
+            blocking_issues = list(semantic_review["issues"])
+
+        if blocking_issues:
+            for scope in ("allocation", "blueprint", "resource", "graph", "none"):
+                scoped = [issue for issue in blocking_issues if issue.get("repair_scope") == scope]
+                if scoped:
+                    logger.info(
+                        "[Creator][semantic_repair_route] scope=%s issue_count=%d",
+                        scope, len(scoped),
+                    )
+            raise PreparePlanProtocolError(
+                "Pre-graph semantic closure has unresolved blocking issues; "
+                f"issues={blocking_issues}"
+            )
         first_planner_result = {
             **first_planner_result,
             "internal_blueprint_text": frozen_blueprint_text,
