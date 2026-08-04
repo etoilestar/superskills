@@ -39,7 +39,13 @@ _BLUEPRINT_SEMANTIC_ISSUE_TYPES = {
     "requirement_partially_covered",
     "responsibility_mismatch",
     "resource_semantic_conflict",
+    "deferred_verification",
 }
+
+_SEMANTIC_EVIDENCE_STAGES = {
+    "blueprint", "graph", "generation", "runtime", "boundary", "resource",
+}
+_SEMANTIC_REPAIR_SCOPES = {"blueprint", "allocation", "graph", "resource", "none"}
 
 
 def validate_requirement_allocations(
@@ -105,22 +111,36 @@ def validate_blueprint_semantic_review(
     review: Any,
     *,
     allowed_function_item_targets: Iterable[str],
+    supplied_requirement_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Validate the bounded semantic-review envelope, not its conclusions."""
     if not isinstance(review, Mapping) or not isinstance(review.get("passed"), bool):
         raise ValueError("blueprint semantic review must contain boolean passed")
+    if set(review) != {"passed", "issues", "deferred_checks"}:
+        raise ValueError("blueprint semantic review must contain only passed, issues, and deferred_checks")
     issues = review.get("issues")
-    if not isinstance(issues, list):
-        raise ValueError("blueprint semantic review issues must be an array")
+    deferred_checks = review.get("deferred_checks")
+    if not isinstance(issues, list) or not isinstance(deferred_checks, list):
+        raise ValueError("blueprint semantic review issues and deferred_checks must be arrays")
     normalized: list[dict[str, Any]] = []
     allowed_targets = {
         str(target).strip()
         for target in allowed_function_item_targets
         if str(target).strip()
     }
-    for index, issue in enumerate(issues):
+    valid_requirement_ids = {str(value).strip() for value in supplied_requirement_ids if str(value).strip()}
+
+    def normalize_issue(issue: Any, *, index: int, deferred: bool) -> dict[str, Any]:
         if not isinstance(issue, Mapping):
             raise ValueError(f"blueprint semantic review issue {index} must be an object")
+        allowed_fields = {
+            "issue_type", "requirement_id", "blocking_now", "evidence_stage",
+            "repair_scope", "affected_targets", "evidence", "expected_fact",
+            "reason", "repair_guidance", "resource",
+        }
+        unknown_fields = sorted(set(issue) - allowed_fields)
+        if unknown_fields:
+            raise ValueError(f"blueprint semantic review issue {index} has unknown fields: {unknown_fields}")
         issue_type = str(issue.get("issue_type") or "").strip()
         if issue_type not in _BLUEPRINT_SEMANTIC_ISSUE_TYPES:
             raise ValueError(f"unsupported blueprint semantic issue_type: {issue_type}")
@@ -134,12 +154,42 @@ def validate_blueprint_semantic_review(
                 "blueprint semantic review affected_targets are outside current FunctionItem domain; "
                 f"invalid_targets={invalid_targets}"
             )
-        normalized.append({**dict(issue), "issue_type": issue_type, "affected_targets": normalized_targets})
-    if bool(review["passed"]) and normalized:
-        raise ValueError("passed blueprint semantic review cannot contain issues")
-    if not bool(review["passed"]) and not normalized:
-        raise ValueError("failed blueprint semantic review must contain issues")
-    return {"passed": bool(review["passed"]), "issues": normalized}
+        requirement_id = str(issue.get("requirement_id") or "").strip()
+        if requirement_id and requirement_id not in valid_requirement_ids:
+            raise ValueError(f"blueprint semantic review requirement_id is outside supplied allocation domain: {requirement_id}")
+        if not isinstance(issue.get("blocking_now"), bool):
+            raise ValueError(f"blueprint semantic review issue {index} blocking_now must be boolean")
+        stage = str(issue.get("evidence_stage") or "").strip()
+        scope = str(issue.get("repair_scope") or "").strip()
+        if stage not in _SEMANTIC_EVIDENCE_STAGES or scope not in _SEMANTIC_REPAIR_SCOPES:
+            raise ValueError(f"blueprint semantic review issue {index} has invalid lifecycle routing")
+        evidence = issue.get("evidence")
+        if not isinstance(evidence, list) or any(not isinstance(value, Mapping) for value in evidence):
+            raise ValueError(f"blueprint semantic review issue {index} evidence must be an object array")
+        for fact in evidence:
+            if set(fact) != {"source", "target", "field", "observed"}:
+                raise ValueError(f"blueprint semantic review issue {index} evidence has invalid fields")
+            if fact.get("source") == "function_item" and fact.get("target") not in allowed_targets:
+                raise ValueError(f"blueprint semantic review evidence target is outside current FunctionItem domain: {fact.get('target')}")
+        blocking = bool(issue["blocking_now"])
+        if blocking and (not evidence or not str(issue.get("expected_fact") or "").strip()):
+            raise ValueError("blocking blueprint semantic review issue requires evidence and expected_fact")
+        if blocking and scope not in {"blueprint", "allocation", "resource"}:
+            raise ValueError("blocking pre-graph issue has a repair_scope unavailable at this stage")
+        if blocking and scope == "allocation" and not requirement_id:
+            raise ValueError("allocation repair issue requires a supplied requirement_id")
+        if deferred and (issue_type != "deferred_verification" or blocking or scope != "none"):
+            raise ValueError("deferred_checks must be non-blocking deferred_verification with repair_scope=none")
+        if not deferred and not blocking:
+            raise ValueError("issues must contain only blocking_now=true issues")
+        return {**dict(issue), "issue_type": issue_type, "requirement_id": requirement_id, "affected_targets": normalized_targets, "evidence_stage": stage, "repair_scope": scope, "evidence": [dict(value) for value in evidence]}
+
+    normalized = [normalize_issue(issue, index=index, deferred=False) for index, issue in enumerate(issues)]
+    normalized_deferred = [normalize_issue(issue, index=index, deferred=True) for index, issue in enumerate(deferred_checks)]
+    expected_passed = not normalized
+    if bool(review["passed"]) != expected_passed:
+        raise ValueError("blueprint semantic review passed must reflect blocking issues only")
+    return {"passed": expected_passed, "issues": normalized, "deferred_checks": normalized_deferred}
 
 
 @dataclass(frozen=True)
