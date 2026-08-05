@@ -51,7 +51,7 @@ from .command_normalizer import _effective_command_lines
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
 from .responsibility_graph_expansion import ResponsibilityGraphExpansionError, expand_responsibility_graph
-from .subsystem_interface_plan import plan_subsystem_interfaces, repair_subsystem_interfaces
+from .subsystem_interface_plan import plan_function_item_interfaces, repair_interface_intents
 
 
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
@@ -7106,7 +7106,7 @@ async def _bind_executable_responsibility_plan(
         )
 
     platform_contract = build_platform_io_contract()
-    subsystem_plan = await plan_subsystem_interfaces(
+    interface_plan = await plan_function_item_interfaces(
         original_user_goal=request.user_request,
         frozen_blueprint=frozen_blueprint_text,
         frozen_function_items=frozen_function_items,
@@ -7120,7 +7120,7 @@ async def _bind_executable_responsibility_plan(
         "user_request": request.user_request,
         "confirmed_blueprint": frozen_blueprint_text,
         "skill_name": current_planner_result.get("skill_name", ""),
-        "subsystem_plan": subsystem_plan,
+        "interface_plan": interface_plan,
     }
     try:
         responsibility_edges = await expand_responsibility_graph(
@@ -7129,34 +7129,36 @@ async def _bind_executable_responsibility_plan(
             planner_model=planner_model,
             model_call=select_sources,
             goal_context=graph_context,
-            subsystem_plan=subsystem_plan,
+            interface_plan=interface_plan,
         )
     except ResponsibilityGraphExpansionError as exc:
-        if exc.code != "subsystem_plan_incomplete":
+        if exc.code != "interface_plan_incomplete":
             raise
-        subsystem_plan = await repair_subsystem_interfaces(
+        interface_plan = await repair_interface_intents(
             original_user_goal=request.user_request,
             frozen_blueprint=frozen_blueprint_text,
             frozen_function_items=frozen_function_items,
             requirement_allocations=requirement_allocations or [],
             requirement_channels=requirement_channels or {},
             platform_contract=platform_contract,
+            current_interface_plan=interface_plan,
+            affected_interface_ids=[],
             validation_errors=[{
                 "code": exc.code,
                 "details": getattr(exc, "details", {}),
-                "instruction": "Repair only subsystem/interface declarations for uncovered required input intents. Do not modify Blueprint or FunctionItems.",
+                "instruction": "Repair only interface declarations for uncovered required input intents. Do not modify Blueprint or FunctionItems.",
             }],
             planner_model=planner_model,
             model_call=select_sources,
         )
-        graph_context["subsystem_plan"] = subsystem_plan
+        graph_context["interface_plan"] = interface_plan
         responsibility_edges = await expand_responsibility_graph(
             function_items=frozen_function_items,
             platform_contract=platform_contract,
             planner_model=planner_model,
             model_call=select_sources,
             goal_context=graph_context,
-            subsystem_plan=subsystem_plan,
+            interface_plan=interface_plan,
         )
     return {
         "function_items": frozen_function_items,

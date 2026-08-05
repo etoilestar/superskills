@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .subsystem_interface_plan import build_graph_obligations_from_subsystems
+from .subsystem_interface_plan import build_graph_obligations_from_interfaces
 from ..skill_plan import GraphValidationError, normalize_structured_function_items, validate_structured_responsibility_edge_transport
 
 logger = logging.getLogger(__name__)
@@ -335,73 +335,73 @@ def _public_script_outputs(registry: dict, member: str) -> list[dict]:
     return [{key: value[key] for key in ("output_id", "node_id", "node_purpose", "port_id", "description", "contract")} for value in registry["script_outputs"] if value["target_file"] == member]
 
 
-def _validate_subsystem_selection_protocol(*, obligation: dict, response: Any) -> dict:
+def _validate_interface_selection_protocol(*, obligation: dict, response: Any) -> dict:
     if not isinstance(response, dict):
-        raise ResponsibilityGraphExpansionError("endpoint selection must be a JSON object", code="invalid_subsystem_endpoint_protocol")
+        raise ResponsibilityGraphExpansionError("endpoint selection must be a JSON object", code="invalid_interface_endpoint_protocol")
     kind = obligation.get("kind")
     expected = {"source_id", "target_id", "path"} if kind == "platform_to_script" else {"source_id", "target_id"}
     if set(response) != expected:
-        raise ResponsibilityGraphExpansionError("endpoint selection contains invalid fields", code="invalid_subsystem_endpoint_protocol")
+        raise ResponsibilityGraphExpansionError("endpoint selection contains invalid fields", code="invalid_interface_endpoint_protocol")
     if not isinstance(response.get("source_id"), str) or not response["source_id"] or not isinstance(response.get("target_id"), str) or not response["target_id"]:
-        raise ResponsibilityGraphExpansionError("endpoint IDs must be non-empty strings", code="invalid_subsystem_endpoint_protocol")
+        raise ResponsibilityGraphExpansionError("endpoint IDs must be non-empty strings", code="invalid_interface_endpoint_protocol")
     if kind == "platform_to_script":
         path = response.get("path")
         if not isinstance(path, list) or any(not isinstance(value, str) or not value or value.lower() in _DANGEROUS_PATH_PARTS for value in path):
-            raise ResponsibilityGraphExpansionError("platform path is invalid", code="invalid_subsystem_endpoint_protocol")
+            raise ResponsibilityGraphExpansionError("platform path is invalid", code="invalid_interface_endpoint_protocol")
     return dict(response)
 
 
-async def _select_subsystem_endpoint_reference(*, obligation: dict, registry: dict, goal_context: dict, committed_edges: list[dict], planner_model: str, model_call: ModelCall, validation_issue: dict | None = None) -> dict:
+async def _select_interface_endpoint_reference(*, obligation: dict, registry: dict, goal_context: dict, committed_edges: list[dict], planner_model: str, model_call: ModelCall, validation_issue: dict | None = None) -> dict:
     kind = obligation["kind"]
     payload: dict[str, Any] = {"goal_context": goal_context, "current_partial_graph": {"committed_edges": committed_edges}, "obligation": obligation}
     if kind == "platform_to_script":
         payload["platform_inputs"] = [dict(value) for value in registry["platform_inputs"]]
         payload["target_member_inputs"] = _public_script_inputs(registry, obligation["target_member"])
-        prompt = "Select endpoint IDs only for this declared subsystem interface. Return strict JSON with exactly source_id, target_id, and path. Choose source_id from platform_inputs and target_id from target_member_inputs. Do not return an edge, wrapper, obligation_id, or explanation."
+        prompt = "Select endpoint IDs only for this declared interface intent. Return strict JSON with exactly source_id, target_id, and path. Choose source_id from platform_inputs and target_id from target_member_inputs. Do not return an edge, wrapper, obligation_id, or explanation."
     elif kind == "script_to_platform":
         payload["source_member_outputs"] = _public_script_outputs(registry, obligation["source_member"])
         payload["platform_outputs"] = [dict(value) for value in registry["platform_outputs"]]
-        prompt = "Select endpoint IDs only for this declared subsystem interface. Return strict JSON with exactly source_id and target_id. Choose source_id from source_member_outputs and target_id from platform_outputs. Do not return an edge, wrapper, obligation_id, or explanation."
+        prompt = "Select endpoint IDs only for this declared interface intent. Return strict JSON with exactly source_id and target_id. Choose source_id from source_member_outputs and target_id from platform_outputs. Do not return an edge, wrapper, obligation_id, or explanation."
     else:
         payload["source_member_outputs"] = _public_script_outputs(registry, obligation["source_member"])
         payload["target_member_inputs"] = _public_script_inputs(registry, obligation["target_member"])
-        prompt = "Select endpoint IDs only for this declared subsystem interface. Return strict JSON with exactly source_id and target_id. Choose source_id from source_member_outputs and target_id from target_member_inputs. Do not return an edge, wrapper, obligation_id, or explanation."
+        prompt = "Select endpoint IDs only for this declared interface intent. Return strict JSON with exactly source_id and target_id. Choose source_id from source_member_outputs and target_id from target_member_inputs. Do not return an edge, wrapper, obligation_id, or explanation."
     if validation_issue:
         payload.update(validation_issue)
     text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
-    return _validate_subsystem_selection_protocol(obligation=obligation, response=_parse_object(text, "invalid_subsystem_endpoint_protocol"))
+    return _validate_interface_selection_protocol(obligation=obligation, response=_parse_object(text, "invalid_interface_endpoint_protocol"))
 
 
-def _materialize_subsystem_obligation(*, obligation: dict, selection: dict, registry: dict, state: GraphExpansionState) -> dict:
-    selection = _validate_subsystem_selection_protocol(obligation=obligation, response=selection)
+def _materialize_interface_obligation(*, obligation: dict, selection: dict, registry: dict, state: GraphExpansionState) -> dict:
+    selection = _validate_interface_selection_protocol(obligation=obligation, response=selection)
     kind = obligation["kind"]
     if kind == "platform_to_script":
         source = next((value for value in registry["platform_inputs"] if value["slot_id"] == selection["source_id"]), None)
         target = next((value for value in registry["script_inputs"] if value["input_id"] == selection["target_id"] and value["target_file"] == obligation["target_member"]), None)
         if source is None or target is None:
-            raise ResponsibilityGraphExpansionError("selected endpoint is outside declared subsystem obligation scope", code="invalid_subsystem_endpoint_reference")
+            raise ResponsibilityGraphExpansionError("selected endpoint is outside declared interface obligation scope", code="invalid_interface_endpoint_reference")
         if _types_conflict(source.get("contract") or {}, target.get("contract") or {}):
-            raise ResponsibilityGraphExpansionError("selected endpoints have conflicting types", code="subsystem_endpoint_type_conflict")
+            raise ResponsibilityGraphExpansionError("selected endpoints have conflicting types", code="interface_endpoint_type_conflict")
         constraints = [{"type": "platform_parameter_binding", "source_key": ".".join(selection["path"]), "source_path": list(selection["path"]), "required": True}] if selection["path"] else []
         return _edge(PLATFORM_INPUT_NODE, source["field"], target["target_file"], target["port_id"], constraints=constraints)
     if kind == "script_to_platform":
         source = next((value for value in registry["script_outputs"] if value["output_id"] == selection["source_id"] and value["target_file"] == obligation["source_member"]), None)
         target = next((value for value in registry["platform_outputs"] if value["slot_id"] == selection["target_id"]), None)
         if source is None or target is None:
-            raise ResponsibilityGraphExpansionError("selected endpoint is outside declared subsystem obligation scope", code="invalid_subsystem_endpoint_reference")
+            raise ResponsibilityGraphExpansionError("selected endpoint is outside declared interface obligation scope", code="invalid_interface_endpoint_reference")
         if _types_conflict(source.get("contract") or {}, target.get("contract") or {}):
-            raise ResponsibilityGraphExpansionError("selected endpoints have conflicting types", code="subsystem_endpoint_type_conflict")
+            raise ResponsibilityGraphExpansionError("selected endpoints have conflicting types", code="interface_endpoint_type_conflict")
         return _edge(source["target_file"], source["port_id"], PLATFORM_OUTPUT_NODE, target["field"])
     source = next((value for value in registry["script_outputs"] if value["output_id"] == selection["source_id"] and value["target_file"] == obligation["source_member"]), None)
     target = next((value for value in registry["script_inputs"] if value["input_id"] == selection["target_id"] and value["target_file"] == obligation["target_member"]), None)
     if source is None or target is None:
-        raise ResponsibilityGraphExpansionError("selected endpoint is outside declared subsystem obligation scope", code="invalid_subsystem_endpoint_reference")
+        raise ResponsibilityGraphExpansionError("selected endpoint is outside declared interface obligation scope", code="invalid_interface_endpoint_reference")
     if source["target_file"] == target["target_file"]:
         raise ResponsibilityGraphExpansionError("self connection is forbidden", code="invalid_graph_endpoint")
     if _would_cycle(state.committed_edges, source["target_file"], target["target_file"]):
         raise ResponsibilityGraphExpansionError("selected source forms a directed cycle", code="responsibility_graph_cycle")
     if _types_conflict(source.get("contract") or {}, target.get("contract") or {}):
-        raise ResponsibilityGraphExpansionError("selected endpoints have conflicting types", code="subsystem_endpoint_type_conflict")
+        raise ResponsibilityGraphExpansionError("selected endpoints have conflicting types", code="interface_endpoint_type_conflict")
     return _edge(source["target_file"], source["port_id"], target["target_file"], target["port_id"])
 
 
@@ -422,7 +422,7 @@ def _validate_platform_terminal_edges(*, terminal_edges: list[dict], platform_co
             raise ResponsibilityGraphExpansionError("terminal selection does not cover every required platform output", code="missing_required_terminal_binding", details={"missing_required_final_output_fields": missing})
 
 
-def _validate_required_input_interface_coverage(*, obligations: list[dict], registry: dict, normalized: list[dict]) -> None:
+def _validate_required_input_interface_coverage(*, obligations: list[dict], normalized: list[dict]) -> None:
     declared_input_intents = Counter(
         ob["target_member"]
         for ob in obligations
@@ -443,13 +443,14 @@ def _validate_required_input_interface_coverage(*, obligations: list[dict], regi
                 "declared_input_interface_count": declared_input_intents[target],
             })
     if missing:
-        raise ResponsibilityGraphExpansionError("subsystem plan does not declare enough input interface intents for required FunctionItem inputs", code="subsystem_plan_incomplete", details={"uncovered_inputs": missing})
+        raise ResponsibilityGraphExpansionError("interface plan does not declare enough input interface intents for required FunctionItem inputs", code="interface_plan_incomplete", details={"uncovered_inputs": missing})
 
 
-async def _expand_from_subsystem_plan(*, normalized: list[dict], platform_contract: dict, registry: dict, subsystem_plan: dict, planner_model: str, goal_context: dict, model_call: ModelCall) -> list[dict]:
-    obligations = build_graph_obligations_from_subsystems(subsystem_plan=subsystem_plan)
+async def _expand_from_interface_plan(*, normalized: list[dict], platform_contract: dict, registry: dict, interface_plan: dict, planner_model: str, goal_context: dict, model_call: ModelCall) -> list[dict]:
+    obligations = build_graph_obligations_from_interfaces(interface_plan=interface_plan)
+    logger.info("[Creator][graph_expansion] mode=function_item_interface_expansion obligation_count=%d", len(obligations))
     item_by_target = {item["target_file"]: item for item in normalized}
-    _validate_required_input_interface_coverage(obligations=obligations, registry=registry, normalized=normalized)
+    _validate_required_input_interface_coverage(obligations=obligations, normalized=normalized)
     state = GraphExpansionState(active_nodes=set(item_by_target), activation_order=list(item_by_target))
     retries = model_calls = 0
     async def counted(messages: list[dict[str, str]], model: str) -> str:
@@ -460,14 +461,14 @@ async def _expand_from_subsystem_plan(*, normalized: list[dict], platform_contra
         issue = None
         for attempt in range(2):
             try:
-                selection = await _select_subsystem_endpoint_reference(obligation=obligation, registry=registry, goal_context=goal_context, committed_edges=state.committed_edges, planner_model=planner_model, model_call=counted, validation_issue=issue)
-                edge = _materialize_subsystem_obligation(obligation=obligation, selection=selection, registry=registry, state=state)
+                selection = await _select_interface_endpoint_reference(obligation=obligation, registry=registry, goal_context=goal_context, committed_edges=state.committed_edges, planner_model=planner_model, model_call=counted, validation_issue=issue)
+                edge = _materialize_interface_obligation(obligation=obligation, selection=selection, registry=registry, state=state)
                 _validate_transaction(state.committed_edges + [edge], normalized)
             except ValueError as exc:
                 if attempt:
-                    raise ResponsibilityGraphExpansionError("current subsystem obligation failed after one retry", code="graph_expansion_selection_failed", details={"obligation_id": obligation["obligation_id"], "validation_error": str(exc)}) from exc
+                    raise ResponsibilityGraphExpansionError("current interface obligation failed after one retry", code="graph_expansion_selection_failed", details={"obligation_id": obligation["obligation_id"], "validation_error": str(exc)}) from exc
                 retries += 1
-                issue = {"current_goal": obligation.get("goal", ""), "previous_selection": locals().get("selection", {}), "validation_error": {"code": getattr(exc, "code", "invalid_subsystem_endpoint_reference"), "details": getattr(exc, "details", {})}, "instruction": "Replace only the endpoint selection for the current interface."}
+                issue = {"current_goal": obligation.get("goal", ""), "previous_selection": locals().get("selection", {}), "validation_error": {"code": getattr(exc, "code", "invalid_interface_endpoint_reference"), "details": getattr(exc, "details", {})}, "instruction": "Replace only the endpoint selection for the current interface."}
                 continue
             state.committed_edges.append(edge)
             break
@@ -477,7 +478,7 @@ async def _expand_from_subsystem_plan(*, normalized: list[dict], platform_contra
     logger.info("[Creator][graph_expansion] inactive_function_items=[] model_call_count=%d selection_retry_count=%d graph_valid=true", model_calls, retries)
     return edges
 
-async def expand_responsibility_graph(*, function_items: list[dict], platform_contract: dict, planner_model: str, goal_context: dict | None = None, model_call: ModelCall | None = None, subsystem_plan: dict | None = None) -> list[dict]:
+async def expand_responsibility_graph(*, function_items: list[dict], platform_contract: dict, planner_model: str, goal_context: dict | None = None, model_call: ModelCall | None = None, interface_plan: dict | None = None) -> list[dict]:
     """Select endpoint references and expand activated inputs one at a time."""
     if model_call is None:
         from ..creator_model_profiles import complete_creator_role_once
@@ -486,12 +487,12 @@ async def expand_responsibility_graph(*, function_items: list[dict], platform_co
     normalized = normalize_structured_function_items(function_items, source="graph_expansion")
     context = dict(goal_context or {})
     registry = build_endpoint_registry(function_items=normalized, platform_contract=platform_contract)
-    mode = "subsystem_interface_expansion" if subsystem_plan is not None else "legacy_goal_expansion"
+    mode = "function_item_interface_expansion" if interface_plan is not None else "legacy_goal_expansion"
     logger.info("[Creator][graph_expansion] mode=%s script_output_count=%d platform_input_count=%d platform_output_count=%d", mode, len(registry["script_outputs"]), len(registry["platform_inputs"]), len(registry["platform_outputs"]))
-    if subsystem_plan is not None:
-        return await _expand_from_subsystem_plan(
+    if interface_plan is not None:
+        return await _expand_from_interface_plan(
             normalized=normalized, platform_contract=platform_contract, registry=registry,
-            subsystem_plan=subsystem_plan, planner_model=planner_model,
+            interface_plan=interface_plan, planner_model=planner_model,
             goal_context=context, model_call=model_call,
         )
     model_calls = retries = 0
