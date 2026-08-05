@@ -51,7 +51,7 @@ from .command_normalizer import _effective_command_lines
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
 from .responsibility_graph_expansion import ResponsibilityGraphExpansionError, expand_responsibility_graph
-from .subsystem_interface_plan import plan_subsystem_interfaces, repair_subsystem_interfaces
+from .function_item_interface_plan import plan_function_item_interfaces, repair_interface_intents
 
 
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
@@ -7064,6 +7064,95 @@ def _validate_function_item_targets_in_allowed_domain(
         )
 
 
+def validate_frozen_function_item_structure(
+    *,
+    function_items: list[dict[str, Any]],
+    requirement_allocations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Confirm frozen FunctionItems are structurally valid atomic subgoals."""
+    normalized_items = normalize_structured_function_items(
+        function_items, source="system_decomposition"
+    )
+    targets = [item["target_file"] for item in normalized_items]
+    if len(targets) != len(set(targets)):
+        raise PreparePlanProtocolError(
+            "Frozen FunctionItem targets must be unique for system decomposition"
+        )
+    if any(not str(item.get("purpose") or "").strip() for item in normalized_items):
+        raise PreparePlanProtocolError(
+            "Frozen FunctionItem purpose must be non-empty for system decomposition"
+        )
+    validate_requirement_allocations(
+        requirement_allocations, allowed_owner_targets=targets
+    )
+    purpose_digests = {
+        item["target_file"]: hashlib.sha256(
+            str(item.get("purpose") or "").encode("utf-8")
+        ).hexdigest()[:12]
+        for item in normalized_items
+    }
+    summary = {
+        "source": "blueprint",
+        "function_item_count": len(normalized_items),
+        "decomposition_valid": True,
+        "targets": targets,
+        "purpose_digests": purpose_digests,
+    }
+    logger.info(
+        "[Creator][system_decomposition] source=blueprint function_item_count=%d "
+        "decomposition_valid=true targets=%s purpose_digests=%s",
+        summary["function_item_count"],
+        summary["targets"],
+        summary["purpose_digests"],
+    )
+    return summary
+
+
+def validate_final_executable_requirement_ownership(
+    *,
+    requirement_allocations: list[dict[str, Any]],
+    requirement_channels: dict[str, str],
+    allowed_owner_targets: list[str] | None = None,
+) -> dict[str, Any]:
+    """Validate executable requirement ownership after allocation repair is complete."""
+    allocations = validate_requirement_allocations(
+        requirement_allocations, allowed_owner_targets=allowed_owner_targets or []
+    )
+    channels = _validate_requirement_channels(requirement_channels, allocations)
+    executable_ids = [
+        item["requirement_id"]
+        for item in allocations
+        if channels[item["requirement_id"]] == "executable"
+    ]
+    missing_owners = [
+        item["requirement_id"]
+        for item in allocations
+        if channels[item["requirement_id"]] == "executable" and not item.get("owners")
+    ]
+    if missing_owners:
+        raise PreparePlanProtocolError(
+            "Executable requirements must reference at least one frozen FunctionItem owner after allocation reconciliation; "
+            f"requirement_ids={missing_owners}"
+        )
+    allocated_executable_count = sum(
+        1 for item in allocations
+        if channels[item["requirement_id"]] == "executable" and item.get("owners")
+    )
+    summary = {
+        "executable_requirement_count": len(executable_ids),
+        "allocated_executable_requirement_count": allocated_executable_count,
+        "ownership_valid": True,
+    }
+    logger.info(
+        "[Creator][requirement_ownership] executable_requirement_count=%d "
+        "allocated_executable_requirement_count=%d ownership_valid=true",
+        summary["executable_requirement_count"],
+        summary["allocated_executable_requirement_count"],
+    )
+    return summary
+
+
+
 def _validate_prepare_semantic_function_item_topology(
     authoritative_scripts: list[str],
     function_items: list[dict[str, Any]],
@@ -7106,9 +7195,8 @@ async def _bind_executable_responsibility_plan(
         )
 
     platform_contract = build_platform_io_contract()
-    subsystem_plan = await plan_subsystem_interfaces(
+    interface_plan = await plan_function_item_interfaces(
         original_user_goal=request.user_request,
-        frozen_blueprint=frozen_blueprint_text,
         frozen_function_items=frozen_function_items,
         requirement_allocations=requirement_allocations or [],
         requirement_channels=requirement_channels or {},
@@ -7117,10 +7205,8 @@ async def _bind_executable_responsibility_plan(
         model_call=select_sources,
     )
     graph_context = {
-        "user_request": request.user_request,
-        "confirmed_blueprint": frozen_blueprint_text,
+        "system_goal": request.user_request,
         "skill_name": current_planner_result.get("skill_name", ""),
-        "subsystem_plan": subsystem_plan,
     }
     try:
         responsibility_edges = await expand_responsibility_graph(
@@ -7129,34 +7215,35 @@ async def _bind_executable_responsibility_plan(
             planner_model=planner_model,
             model_call=select_sources,
             goal_context=graph_context,
-            subsystem_plan=subsystem_plan,
+            interface_plan=interface_plan,
         )
     except ResponsibilityGraphExpansionError as exc:
-        if exc.code != "subsystem_plan_incomplete":
+        if exc.code != "interface_plan_incomplete":
             raise
-        subsystem_plan = await repair_subsystem_interfaces(
+        interface_plan = await repair_interface_intents(
             original_user_goal=request.user_request,
-            frozen_blueprint=frozen_blueprint_text,
             frozen_function_items=frozen_function_items,
             requirement_allocations=requirement_allocations or [],
             requirement_channels=requirement_channels or {},
             platform_contract=platform_contract,
+            current_interface_plan=interface_plan,
+            affected_members=sorted({value.get("target", "") for value in (getattr(exc, "details", {}).get("uncovered_inputs") or []) if value.get("target")}),
+            missing_platform_output_fields=getattr(exc, "details", {}).get("missing_required_final_output_fields") or [],
             validation_errors=[{
                 "code": exc.code,
                 "details": getattr(exc, "details", {}),
-                "instruction": "Repair only subsystem/interface declarations for uncovered required input intents. Do not modify Blueprint or FunctionItems.",
+                "instruction": "Repair only interface declarations for uncovered required input intents. Do not modify Blueprint or FunctionItems.",
             }],
             planner_model=planner_model,
             model_call=select_sources,
         )
-        graph_context["subsystem_plan"] = subsystem_plan
         responsibility_edges = await expand_responsibility_graph(
             function_items=frozen_function_items,
             platform_contract=platform_contract,
             planner_model=planner_model,
             model_call=select_sources,
             goal_context=graph_context,
-            subsystem_plan=subsystem_plan,
+            interface_plan=interface_plan,
         )
     return {
         "function_items": frozen_function_items,
@@ -8164,6 +8251,8 @@ Do not decide which files can become graph nodes beyond declaring the FilePlan i
 
 FunctionItems and ResponsibilityEdges will be bound in a second protocol binding pass by the same Blueprint Planner after the backend freezes the exact executable target domain from this FilePlan.
 
+The Blueprint must decompose the complete user goal exactly once into the minimum coherent set of executable FunctionItems. Each FunctionItem represents one atomic executable sub-goal. For every FunctionItem: purpose must state the concrete sub-goal completed by this FunctionItem; inputs must declare only data required from the platform or another FunctionItem; outputs must declare only data produced for the platform or another FunctionItem; the FunctionItem must have a distinct execution responsibility; do not create duplicate FunctionItems with equivalent responsibilities. Collectively, the FunctionItems must cover all executable parts of the complete user goal. Do not generate ResponsibilityEdges in the Blueprint. Do not create a second subsystem or grouping layer.
+
 In this pass, FilePlan owns file topology and file-local metadata.
 Declare script file responsibilities inside SkillPlan entries only.
 Resource usage remains in FilePlan dependencies/references/resource metadata.
@@ -8804,6 +8893,16 @@ Blueprint Planner 只规划业务责任。
             channel_counts["resource_requirement_count"],
             channel_counts["direct_requirement_count"],
         )
+        decomposition_summary = validate_frozen_function_item_structure(
+            function_items=semantic_function_items,
+            requirement_allocations=requirement_allocations,
+        )
+        if event_emitter is not None:
+            await event_emitter({
+                "stage": "system_decomposition",
+                "status": "ready",
+                "function_item_count": decomposition_summary["function_item_count"],
+            })
         semantic_review = await _review_blueprint_semantic_closure(
             request=request, blueprint_text=frozen_blueprint_text,
             function_items=semantic_function_items,
@@ -8831,6 +8930,10 @@ Blueprint Planner 只规划业务责任。
             )
             requirement_allocations = requirement_projection["requirement_allocations"]
             requirement_channels = requirement_projection["requirement_channels"]
+            validate_frozen_function_item_structure(
+                function_items=semantic_function_items,
+                requirement_allocations=requirement_allocations,
+            )
             semantic_review = await _review_blueprint_semantic_closure(
                 request=request, blueprint_text=frozen_blueprint_text,
                 function_items=semantic_function_items,
@@ -8901,6 +9004,10 @@ Blueprint Planner 只规划业务责任。
                 )
                 requirement_allocations = requirement_projection["requirement_allocations"]
                 requirement_channels = requirement_projection["requirement_channels"]
+            validate_frozen_function_item_structure(
+                function_items=semantic_function_items,
+                requirement_allocations=requirement_allocations,
+            )
             semantic_review = await _review_blueprint_semantic_closure(
                 request=request, blueprint_text=frozen_blueprint_text,
                 function_items=semantic_function_items,
@@ -8908,6 +9015,12 @@ Blueprint Planner 只规划业务责任。
                 requirement_channels=requirement_channels, planner_model=route.model,
             )
             blocking_issues = list(semantic_review["issues"])
+
+        validate_final_executable_requirement_ownership(
+            requirement_allocations=requirement_allocations,
+            requirement_channels=requirement_channels,
+            allowed_owner_targets=allowed_function_item_targets,
+        )
 
         if blocking_issues:
             for scope in ("allocation", "blueprint", "resource", "graph", "none"):

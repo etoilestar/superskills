@@ -359,6 +359,48 @@ def _normalize_string_array(value: object, *, source: str, index: int, field: st
     return [item for item in value]
 
 
+def _port_identifier(value: object) -> str:
+    if isinstance(value, dict):
+        return str(
+            value.get("port_id")
+            or value.get("id")
+            or value.get("name")
+            or value.get("field")
+            or ""
+        ).strip()
+    return str(value or "").strip()
+
+
+def _normalize_port_array(value: object, *, source: str, index: int, field: str) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError(f"{source}.function_items[{index}].{field} must be an array")
+    normalized: list[object] = []
+    for port_index, item in enumerate(value):
+        if isinstance(item, str):
+            normalized.append(item)
+            continue
+        if isinstance(item, dict):
+            port_id = _port_identifier(item)
+            if not port_id:
+                raise ValueError(
+                    f"{source}.function_items[{index}].{field}[{port_index}] must declare non-empty port_id"
+                )
+            port = dict(item)
+            port["port_id"] = port_id
+            if "description" in port and not isinstance(port.get("description"), str):
+                port["description"] = str(port.get("description") or "")
+            if "contract" in port and not isinstance(port.get("contract"), dict):
+                raise ValueError(
+                    f"{source}.function_items[{index}].{field}[{port_index}].contract must be an object"
+                )
+            normalized.append(port)
+            continue
+        raise ValueError(
+            f"{source}.function_items[{index}].{field}[{port_index}] must be a string or port object"
+        )
+    return normalized
+
+
 def normalize_structured_function_items(raw_items: object, *, source: str = "planner") -> list[dict[str, object]]:
     """Normalize structured planner FunctionItems without semantic repair."""
     if not isinstance(raw_items, list):
@@ -401,15 +443,18 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             invalid.append({"index": index, "field": "purpose"})
             continue
         try:
-            inputs = _normalize_string_array(item.get("inputs"), source=source, index=index, field="inputs")
-            outputs = _normalize_string_array(item.get("outputs"), source=source, index=index, field="outputs")
+            inputs = _normalize_port_array(item.get("inputs"), source=source, index=index, field="inputs")
+            outputs = _normalize_port_array(item.get("outputs"), source=source, index=index, field="outputs")
             required_capabilities = _normalize_string_array(item.get("required_capabilities"), source=source, index=index, field="required_capabilities")
         except ValueError as exc:
             invalid.append({"index": index, "error": str(exc)})
             continue
-        normalized_inputs: list[str] = []
+        normalized_inputs: list[object] = []
         inline_defaults: dict[str, object] = {}
         for raw_input in inputs:
+            if isinstance(raw_input, dict):
+                normalized_inputs.append(raw_input)
+                continue
             input_name, inline_default = parse_schema_input_item(raw_input)
             has_inline_default = "=" in raw_input or bool(re.search(r"(?:default|默认|缺省)", raw_input, re.I))
             normalized_inputs.append(input_name or raw_input)
@@ -421,7 +466,7 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             invalid.append({"index": index, "field": "default_values"})
             continue
         default_values = {**inline_defaults, **default_values}
-        input_names = set(inputs)
+        input_names = {_port_identifier(value) for value in inputs}
         if any(not isinstance(key, str) or key not in input_names for key in default_values):
             invalid.append({"index": index, "field": "default_values", "reason": "keys_must_be_declared_inputs"})
             continue
@@ -540,20 +585,20 @@ def validate_structured_responsibility_edge_transport(
         boundary = {}
 
     input_fields = {
-        str(value)
+        _port_identifier(value)
         for value in (
             boundary.get("input_envelope_fields")
             or []
         )
-        if str(value or "").strip()
+        if _port_identifier(value)
     }
     output_fields = {
-        str(value)
+        _port_identifier(value)
         for value in (
             boundary.get("final_output_fields")
             or []
         )
-        if str(value or "").strip()
+        if _port_identifier(value)
     }
 
     function_item_targets: set[str] | None = None
@@ -570,14 +615,14 @@ def validate_structured_responsibility_edge_transport(
         function_item_io = {
             str(item.get("target_file") or "").strip(): {
                 "inputs": {
-                    str(value)
+                    _port_identifier(value)
                     for value in (item.get("inputs") or [])
-                    if str(value or "").strip()
+                    if _port_identifier(value)
                 },
                 "outputs": {
-                    str(value)
+                    _port_identifier(value)
                     for value in (item.get("outputs") or [])
-                    if str(value or "").strip()
+                    if _port_identifier(value)
                 },
             }
             for item in normalized_function_items
@@ -805,8 +850,10 @@ def structured_responsibility_graph_input_provenance_gaps(
     return [
         (str(item["target_file"]), input_name)
         for item in normalized_function_items
-        for input_name in item["inputs"]
-        if (str(item["target_file"]), input_name) not in incoming
+        for raw_input in item["inputs"]
+        for input_name in [_port_identifier(raw_input)]
+        if input_name
+        and (str(item["target_file"]), input_name) not in incoming
         and (str(item["target_file"]), input_name) not in defaults
     ]
 
