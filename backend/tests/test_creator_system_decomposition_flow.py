@@ -427,6 +427,53 @@ async def test_requirement_planner_receives_compact_clarification_context(monkey
 
 
 @pytest.mark.asyncio
+async def test_requirement_projection_protocol_repair_is_once_and_shape_only(monkeypatch):
+    calls = []
+    repaired = {
+        "requirement_allocations": [
+            _allocation("R1", []), _allocation("R2", ["scripts/unit_a.py"]),
+        ],
+        "requirement_channels": {"R1": "resource", "R2": "executable"},
+    }
+
+    async def model(messages, _role, fallback_model=None):
+        calls.append(messages)
+        if len(calls) == 1:
+            return '{"requirement_allocations":[{"requirement_id":"R1"},"requirement_id":"R2"]}'
+        payload = json.loads(messages[1]["content"])
+        assert payload["raw_response"].endswith('"R2"]}')
+        assert "required_schema" in payload
+        assert "repairing only the JSON transport" in messages[0]["content"]
+        return json.dumps(repaired)
+
+    monkeypatch.setattr(api, "complete_creator_role_once", model)
+    result = await api._plan_requirement_allocations(
+        request=_request(), blueprint_text=_blueprint(),
+        function_items=[{"target_file": "scripts/unit_a.py"}], planner_model="p",
+    )
+    assert result == repaired
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_requirement_projection_protocol_repair_does_not_loop(monkeypatch):
+    calls = 0
+
+    async def model(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return "not json"
+
+    monkeypatch.setattr(api, "complete_creator_role_once", model)
+    with pytest.raises(api.PreparePlanProtocolError, match="after one repair"):
+        await api._plan_requirement_allocations(
+            request=_request(), blueprint_text=_blueprint(),
+            function_items=[], planner_model="p",
+        )
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_graph(monkeypatch):
     blueprint = _blueprint()
     calls: list[str] = []
