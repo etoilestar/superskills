@@ -52,6 +52,7 @@ from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
 from .responsibility_graph_expansion import ResponsibilityGraphExpansionError, expand_responsibility_graph
 from .function_item_interface_plan import (
+    AUTHORITY_CONTRACT,
     InterfaceIntentPlanError,
     plan_function_item_interfaces,
     repair_interface_intents,
@@ -6360,7 +6361,7 @@ async def _converge_ready_executable_plan(
         }, ensure_ascii=False, default=str),
     )
 
-    prompt = """
+    prompt = AUTHORITY_CONTRACT + """
 You are the same Blueprint Planner converging a ResponsibilityGraph over frozen
 FunctionItems. Blueprint defines responsibilities; Graph connects them.
 
@@ -7216,7 +7217,11 @@ async def _bind_executable_responsibility_plan(
     )
     async def select_sources(messages: list[dict[str, str]], model: str) -> str:
         return await complete_creator_role_once(
-            messages, "planner", fallback_model=model,
+            messages, "planner", fallback_model=model, stage="Interface Planner / Repair Generator / Endpoint Binder",
+        )
+    async def review_interfaces(messages: list[dict[str, str]], model: str) -> str:
+        return await complete_creator_role_once(
+            messages, "reviewer", fallback_model=model, stage="Interface Reviewer / Repair Critic",
         )
 
     platform_contract = build_platform_io_contract()
@@ -7235,6 +7240,7 @@ async def _bind_executable_responsibility_plan(
         planner_model=planner_model,
         model_call=select_sources,
         reviewer_model=planner_model,
+        reviewer_model_call=review_interfaces,
     )
     graph_context = {
         "system_goal": request.user_request,
@@ -7255,7 +7261,7 @@ async def _bind_executable_responsibility_plan(
             error_details.get("uncovered_inputs")
             or error_details.get("missing_required_final_output_fields")
             or error_details.get("missing_platform_output_interface")
-            or (error_details.get("interface_id") and error_details.get("reason"))
+            or error_details.get("interface_id")
         )
         if not repairable_facts_present:
             raise
@@ -7298,6 +7304,7 @@ async def _bind_executable_responsibility_plan(
             planner_model=planner_model,
             model_call=select_sources,
             reviewer_model=planner_model,
+            reviewer_model_call=review_interfaces,
         )
         try:
             responsibility_edges = await expand_responsibility_graph(
@@ -7315,7 +7322,7 @@ async def _bind_executable_responsibility_plan(
             )
             raise InterfaceIntentPlanError(
                 "interface semantic repair did not produce a valid responsibility graph",
-                code="interface_semantic_repair_failed",
+                code="graph_revalidation_failed",
                 details={
                     "stage": "graph_expansion_feedback", "repair_attempts": 1,
                     "original_graph_error": {"code": exc.code, "details": exc.details},
@@ -7334,7 +7341,7 @@ async def _plan_requirement_allocations(
     function_items: list[dict[str, Any]], planner_model: str,
 ) -> dict[str, Any]:
     """Ask the Planner for the semantic requirement-to-owner projection."""
-    prompt = """
+    prompt = AUTHORITY_CONTRACT + """
 1. AUTHORITATIVE FACTS
 The payload contains the confirmed user context, compact frozen FunctionItems,
 LEGAL CHANNEL VALUES ["executable", "resource", "direct"], and LEGAL OWNER
@@ -7409,6 +7416,11 @@ fields at the root level. Complete the entire requirement_allocations array
 before writing requirement_channels.
 
 4. FINAL SELF-CHECK
+Before returning, check whether two projected requirements express the same
+constraint at different wording levels. Do not duplicate one semantic obligation
+because it appeared once for a component and again globally. Keep both only when
+they impose distinct responsibilities or distinct verification facts.
+
 Before returning, silently verify allocation IDs and channel keys exactly equal
 the derived requirement IDs; each occurs once; none is omitted; every executable
 requirement has a legal owner; non-executable requirements have none; and no
@@ -7713,7 +7725,9 @@ async def repair_requirement_ownership(
         str(issue.get("requirement_id") or "").strip()
         for issue in ownership_issues if str(issue.get("requirement_id") or "").strip()
     }
-    prompt = """1. AUTHORITATIVE FACTS
+    prompt = AUTHORITY_CONTRACT + """
+
+1. AUTHORITATIVE FACTS
 The payload contains frozen requirements, compact frozen FunctionItems, the
 current complete projection, exact validation issues, LEGAL CHANNEL VALUES, and
 LEGAL OWNER TARGET FILES.
@@ -8154,7 +8168,7 @@ async def _review_blueprint_semantic_closure(
     requirement_channels: dict[str, str], planner_model: str,
 ) -> dict[str, Any]:
     """Review only semantic facts observable before ResponsibilityGraph creation."""
-    prompt = """1. AUTHORITATIVE FACTS
+    prompt = AUTHORITY_CONTRACT + """1. AUTHORITATIVE FACTS
 You are the pre-graph Blueprint semantic coverage Reviewer. Review only the
 supplied original user requirement, frozen Blueprint, frozen FunctionItems,
 requirement allocations, requirement channels, and authoritative FunctionItem
@@ -8216,6 +8230,12 @@ means the FunctionItem performs the runtime action that fulfills the requirement
 Affected or governed FunctionItems are not necessarily owners.
 
 3. CURRENT-STAGE BLOCKING RULES
+A review issue represents an actual defect, not proof that a requirement was
+reviewed. If the observed fact satisfies the expected fact, emit nothing. Never
+emit an issue whose reason says the state is valid, correct, already satisfied,
+or needs no repair; never set blocking_now=true when repair_guidance says no
+repair is needed. A valid requirement contributes no issue.
+
 A blocking Blueprint-stage issue requires concrete evidence that the current
 frozen Blueprint, FunctionItems, requirement allocation, or channel is already
 incorrect at the current stage. It must be resolvable by a currently permitted
@@ -8269,6 +8289,7 @@ Before returning, silently verify:
 - every blocking issue has non-empty expected_fact and valid non-empty evidence;
 - every issue is resolvable within its declared repair_scope;
 - passed is true exactly when no blocking issues remain.
+- for every issue, a concrete current-stage fact can be stated as wrong; otherwise remove it.
 
 7. OUTPUT CONTRACT
 Use the allowed issue types as follows:

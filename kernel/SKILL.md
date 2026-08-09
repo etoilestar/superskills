@@ -37,77 +37,40 @@ Creator 前半段应尽量短：用户已经给出需求、选择已有 Skill �
 - 默认优先可执行、可验证、可通过 E2E 的实现。
 - 默认 `assets/**` 只接收用户上传或 bundled 静态文件，运行时生成产物写入 `OUTPUT_DIR` 并通过 stdout JSON 返回。
 
-### 1.2 仅追问阻塞信息
+### 1.2 澄清与 Readiness Principle
 
-只有缺少会阻止生成或 E2E 打通的信息时才追问。每轮只提出 1 个问题，并且问题必须直接对应当前最阻塞的未解决点。
+需求在模型无需虚构重要用户意图，就能构造一个连贯、可执行、可验证的 Blueprint 时即为 ready。
 
-可追问的阻塞信息示例：
-- 必需输入/输出无法确定，导致脚本 argv、stdout JSON 或最终回答协议无法设计。
-- 必需静态素材缺失，且不能由模型创建或替代。
-- 必需外部工具/API/凭证/数据库未说明，且没有可用的本地或平台能力替代。
-- 用户要求修改已有 Skill，但没有说明修改目标或冲突范围。
+缺失事实只有在不同合理答案会实质改变用户可见能力、必要资源边界或执行契约时才构成阻塞。如果缺失选择只影响实现细节，且存在安全、可逆的默认值，应采用默认值并继续。
 
-不要默认询问以下非阻塞偏好：
-- 使用平台或编辑器。
-- 使用频率。
-- 质量优先还是速度优先。
-- 是否拆模块。
-- 是否需要完整架构讲解。
+模型每轮静默判断：
 
+1. 是否仍有重要用户意图未知；
+2. 继续执行是否必须虚构该意图。
 
-### 1.3 Prepare readiness gate（需求成熟度判断）
+只有两者均为 yes 时才返回 `needs_clarification`，且只询问一个最阻塞的业务事实。否则返回 `ready`。输入、输出、资源和外部依赖是需要结合完整上下文考虑的事实，不是固定触发器；不得使用缺字段计数、固定维度列表或问题模板库控制状态。
 
-在生成 `internal_blueprint_text` 之前，必须判断用户需求是否达到 ready。以下任一情况不明确时，不得直接 ready，必须返回 `needs_clarification`：
+不得要求用户批准 Blueprint、Interface Plan、Graph、endpoint mapping 或其他 Creator 内部表示来推进流水线。已经确认的事实不得重复询问。
 
-1. 运行时输入来源不明确。
-2. 最终输出结构不明确。
-3. 是否需要脚本执行不明确。
-4. 是否需要外部模型、平台工具、API、数据库、上传文件或静态素材不明确。
-5. 用户提到“文档、文件、图片、表格、数据集、素材”等输入，但不清楚它是运行时输入还是 Creator 静态 assets。
-6. 输出字段会影响 stdout JSON schema，但字段名、层级或格式不明确。
-7. 文件计划可能产生 assets、references、scripts 不一致风险。
-8. 无法判断是否能生成合法 SkillPlan / 文件职责计划。
+### 1.3 安全默认值
 
-只有在输入、输出、执行方式、资源边界、文件计划都足够明确时，才能 `status=ready`。用户运行 Skill 时上传或粘贴的输入文件，不属于 Creator assets；这类内容应写入 I/O 契约和脚本 inputs，例如 runtime input 字段。只有 Skill 自带的模板、固定示例、图标、字体、静态参考素材，才属于 assets。
-
-### 有限澄清与要点确认
-
-Creator prepare-plan 不能无限追问。
-
-每轮只能问 1 个业务问题。
-最多问 2 个业务澄清问题。
-达到上限后，必须停止业务追问，基于已有信息和默认推荐项归纳创建要点。
-
-创建要点必须体现后续蓝图和责任图谱合同需要落实的功能：
-- 目标功能；
-- 运行时输入；
-- 运行时输出；
-- 处理流程；
-- 文件职责；
-- 脚本 inputs / outputs / stdout JSON 字段；
-- 资源边界；
-- 默认决策。
-
-创建要点不展示风险项，不展示平台内部协议错误，不展示泛泛注意事项。
-
-归纳要点后，必须询问用户是否补充：
-“以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明”
-
-用户选择没有补充后，必须继续生成 internal_blueprint_text，不得继续追问。
-用户补充后，必须重新归纳创建要点；补充确认达到上限后，必须继续生成 internal_blueprint_text。
-
-默认推荐项：
-1. 优先责任闭合、可执行、可验证；脚本数量根据任务复杂度和真实责任边界决定；
-2. 优先可执行、可验证、可通过 E2E；
-3. 运行时输入优先视为 runtime input，不视为 Creator assets；
-4. 输出格式不明确时，优先 JSON + 可读 Markdown；
-5. 文件计划不明确时，先识别工作流中的独立执行责任、producer/consumer handoff、能力边界、产物责任和独立验证边界，再决定脚本拓扑；简单任务可为 1 个脚本，中等或复杂任务通常为 2～3 个清晰责任脚本，不以文件数量最少或最多为目标；
-6. 不确定是否生成文件时，优先不生成文件；
-7. 不确定是否需要外部 API 时，优先使用平台已有能力；
-8. 不确定 assets 边界时，不创建 assets path。
-
+可以安全默认的实现选择包括 Creator 沙盒位置、按真实责任边界规划文件、优先可执行与可验证的实现，以及将运行时产物写入 `OUTPUT_DIR` 并通过 stdout JSON 返回。默认值不得覆盖用户已经确认的业务事实。
 
 ### 脚本数量、上传文件和工具选择规则
+
+#### FunctionItem Input Contract
+
+Every declared FunctionItem input represents one distinct receiving slot.
+Inputs are conjunctive by default: when two inputs both have
+`runtime_source_required=true`, runtime must be able to supply both. Do not
+declare aliases, alternative names, fallback forms, or two expressions of one
+runtime value as separate required inputs. Choose one canonical logical input.
+Declare several required inputs only for genuinely distinct runtime values.
+
+Do not emit placeholder resources, example assets, example references, example
+tools, or example files as actual Blueprint content. Instruction examples are
+explanatory only. Keep an empty resource category empty, or omit it only when
+the protocol permits omission.
 
 - 文件数量只在蓝图阶段确定；蓝图通过后，不再新增、删除、拆分或合并脚本文件。
 
@@ -141,78 +104,16 @@ Creator prepare-plan 不能无限追问。
 
 - `uploaded_files` 是 Creator 创建阶段上下文文件，不等于 Skill assets。上传文件必须先判断是参考文件、运行时输入文件，还是静态 assets 候选。没有用户明确确认，不得写入 `assets/**`。
 
-- 需要使用已有工具时，应写 `required_tool_slots` 或 `selected_tools`，不要只依赖 `required_capabilities`。reference 文件和 asset 文件不得声明运行时工具能力。
+- Blueprint 只声明脚本所需的抽象能力、必须由运行时工具实现的能力约束，以及用户明确指定且不可替换的外部依赖。普通场景不得提前绑定 `selected_tools` 或具体 helper；最终绑定归后续 Tool Planner。reference 文件和 asset 文件不得声明运行时工具能力。
 
 - 上传图片需要理解内容时，应使用 `vision_understanding`，不要要求用户手动描述图片，不要把图像理解误当成图像生成，不要把上传图片默认加入 assets。
-### 1.4 澄清问题模板库
+### 1.4 澄清原则
 
-当 `status=needs_clarification` 时，`clarifying_questions` 必须只包含 1 个带选项的问题。每个问题 2～4 个选项，尽量包含推荐项。问题必须聚焦当前最阻塞点，不要恢复长问卷。
+决定当前缺失信息是否会阻止构造一个有效、可执行、可验证的 Blueprint。只有缺失的业务事实确实阻止该构造时，才向用户提问。
 
-通用模板：
+可以通过安全、可逆默认值解决的实现选择，不是澄清阻塞项。每次只询问一个最阻塞、尚未解决的业务事实。不得再次询问对话中已经确认的信息。
 
-1. 输入来源不明确时：输入来源希望支持哪种？A. 只支持粘贴文本 B. 只支持上传文件 C. 两者都支持（推荐）
-2. 文件类型不明确时：需要支持哪些输入文件类型？A. 只支持纯文本 B. 支持 PDF/DOCX/TXT（推荐） C. 支持表格/图片等更多类型
-3. 输出格式不明确时：输出格式希望是哪种？A. 严格 JSON B. JSON + 可读 Markdown（推荐） C. 只要可读文本
-4. 输出详细程度不明确时：输出详细程度希望是哪种？A. 简短摘要 B. 中等要点式（推荐） C. 尽量详细
-5. 结构化字段不明确时：结果字段希望如何组织？A. 使用固定 JSON 字段（推荐） B. 按用户原文结构自由组织 C. 同时返回结构化字段和可读说明
-6. 是否生成文件不明确时：最终结果需要生成文件吗？A. 不需要，只返回文本/JSON（推荐） B. 需要生成 PDF/DOCX C. 需要同时返回文本和文件
-7. 运行时输入和静态素材边界不明确时：你提到的文件是运行时每次上传的输入，还是创建 Skill 时固定使用的素材？A. 每次运行时上传的输入（推荐） B. 创建 Skill 时固定上传的静态素材 C. 两者都有
-8. 外部依赖不明确时：是否允许调用外部服务或 API？A. 不允许，只用本地/平台能力（推荐） B. 允许调用指定 API C. 暂时不确定
-9. 修改已有 Skill 但目标不明确时：这次主要想修改哪部分？A. 修改输入/输出 B. 修改执行逻辑 C. 修复报错 D. 增加新功能
-
-### 单问推进规则
-
-当 `status=needs_clarification` 时，`clarifying_questions` 必须只包含 1 个问题。
-
-不要一次性列出多个问题。不要把输入来源、输出格式、补充确认等多个问题合并到同一轮。每轮只问当前最阻塞、最需要用户确认的一个问题。
-
-用户回答后，下一轮 prepare-plan 必须结合 `conversation_history`、`human_feedback`、上一轮问题和用户选择，再判断：
-
-1. 是否还有未解决的阻塞点；
-2. 如果有，只问下一个最关键问题；
-3. 如果没有，单独询问用户是否还有其他补充内容；
-4. 如果用户明确没有补充，才允许生成 `internal_blueprint_text` 并进入 ready。
-
-澄清问题模板库只是候选问题来源。每次 `needs_clarification` 只能从模板库中选择或改写 1 个最关键问题，不得一次性返回多个模板问题。
-
-### 补充内容确认规则
-
-“还有其他需要补充的要求吗？”必须作为最后阶段的单独问题出现。
-
-只有当所有必要阻塞问题都已经根据前文回答解决后，才问：
-
-还有其他需要补充的要求吗？A. 没有，按上面的选择继续 B. 有，我补充说明
-
-不要把这个问题和其他业务问题放在同一轮。不要在还有未解决阻塞问题时提前询问补充内容。
-
-如果用户选择 “A. 没有，按上面的选择继续”，下一轮可以进入 ready 判断。如果用户选择 “B. 有，我补充说明”，不要 ready，应等待用户输入补充内容。用户补充内容后，需要重新判断是否还有新的阻塞点；如果没有，再次单独询问是否还有其他补充内容。
-
-不要问以下非阻塞偏好：
-
-- 使用平台。
-- 使用频率。
-- 质量优先还是速度优先。
-- 是否拆模块。
-- 是否需要完整架构讲解。
-- 是否确认进入下一阶段。
-- 是否要我现在开始创建。
-
-已经明确提供或已经确认的需求，在后续 prepare 轮次和 Blueprint 生成中必须保持不变，除非最新 `human_feedback` 明确修改该项。用户需求 → clarification answer → Blueprint 是单向继承关系。
-
-- 已确认的 runtime input、final output / artifact、required business actions 不得重新解释或重新询问。
-- 已经问过并得到明确回答的问题不得再次询问。
-- 实现需要某个参数不代表用户必须提供该参数。
-- 用户没有明确要求运行时控制的普通实现参数，优先写入对应 script 的 `default_values`，不要提升为 runtime input。
-- 不得为了让 ResponsibilityGraph provenance 闭合，把内部默认参数改成 `platform_input_node` 输入。
-
-**Phase 1 完成标志**：需求足以生成内部蓝图；或已返回 1 个真正必要的澄清问题。
-
----
-
-## Phase 2: 内部 plan 生成 (Internal Blueprint)
-
-在编写任何代码前，生成完整的内部蓝图 `internal_blueprint_text`。蓝图仍然必须存在，并且必须满足现有 `analyze_blueprint` 可解析的格式；但它是后端 plan 准备链路的内部中间产物，不默认展示给用户。
-
+不得仅为了推进流水线而要求用户批准内部 Blueprint、Interface Plan、Graph、endpoint mapping 或其他 Creator 内部表示。固定问题模板只能作为措辞示例，绝不能形成“缺失维度 → 固定触发问题”的决策表；是否需要询问必须根据完整上下文进行语义判断。
 
 ### 2.0 status=ready 的必要条件
 
@@ -225,7 +126,6 @@ Creator prepare-plan 不能无限追问。
 7. `review_summary.files_to_create_or_update` 能由最终 `plan.files` 回填。
 8. `review_summary.assets_to_upload` 只包含 Creator 静态素材上传需求，不包含运行时输入文件。
 9. 如果上一轮用户选择“有，我补充说明”，但尚未给出补充内容，不得 ready。
-10. 如果本轮之前曾进入澄清流程，则必须满足：所有必要阻塞问题都已有用户回答；已经单独询问过“是否还有其他补充内容”；用户明确选择“没有，按上面的选择继续”，或用户补充完内容后再次确认没有其他补充。否则不得 `status=ready`。
 
 ### 2.1 生成内部蓝图
 

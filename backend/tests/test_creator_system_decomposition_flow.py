@@ -527,7 +527,7 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
             "blockers": [],
         })
 
-    async def creator_model(messages, role, fallback_model=None):
+    async def creator_model(messages, role, fallback_model=None, **_kwargs):
         system = str(messages[0].get("content") or "")
         payload = json.loads(messages[-1]["content"])
         if "Skill Creator 模式" in system:
@@ -562,17 +562,17 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
                 "requirement_allocations": [_allocation("R1", ["scripts/a.py"]), _allocation("R2", ["scripts/b.py"])],
                 "requirement_channels": {"R1": "executable", "R2": "executable"},
             })
-        if "planning semantic interfaces between already-frozen executable FunctionItems" in system:
+        if "minimum complete semantic Interface Plan" in system:
             calls.append("interface_intent_planner")
             interface_payloads.append(payload)
             return json.dumps({
                 "interfaces": [
-                    {"interface_id": "I0001", "kind": "platform_to_member", "goal": "runtime input", "target_member": "scripts/a.py"},
-                    {"interface_id": "I0002", "kind": "member_to_member", "goal": "handoff", "source_member": "scripts/a.py", "target_member": "scripts/b.py"},
-                    {"interface_id": "I0003", "kind": "member_to_platform", "goal": "final output", "source_member": "scripts/b.py"},
+                    {"interface_id": "I0001", "kind": "platform_to_member", "source_platform_input": "fields", "source_path": [], "goal": "runtime input", "target_member": "scripts/a.py", "target_input": "input_1"},
+                    {"interface_id": "I0002", "kind": "member_to_member", "goal": "handoff", "source_member": "scripts/a.py", "source_output": "output_1", "target_member": "scripts/b.py", "target_input": "input_1"},
+                    {"interface_id": "I0003", "kind": "member_to_platform", "goal": "final output", "source_member": "scripts/b.py", "source_output": "output_1", "target_platform_output": "text"},
                 ]
             })
-        if "Review an Interface Intent Plan" in system:
+        if "Independently determine whether the complete" in system:
             calls.append("interface_semantic_review")
             return json.dumps({"passed": True, "issues": []})
         if "source_path" in system or "Return exactly one strict JSON object" in system:
@@ -606,9 +606,7 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
     assert interface_payloads
     assert {item["target_file"] for item in interface_payloads[0]["function_items"]} == {"scripts/a.py", "scripts/b.py"}
     assert not {"subsystems", "subsystem_links", "members"} & set(interface_payloads[0])
-    assert endpoint_payloads
-    assert all("binding_candidates" not in payload for payload in endpoint_payloads)
-    assert all("legacy_" + "goal_expansion" not in json.dumps(payload) for payload in endpoint_payloads)
+    assert endpoint_payloads == []
     assert calls[:5] == [
         "blueprint_planner",
         "requirement_allocation",
@@ -617,7 +615,7 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
         "interface_intent_planner",
     ]
     assert calls[5] == "interface_semantic_review"
-    assert calls.count("endpoint_planner") == 3
+    assert calls.count("endpoint_planner") == 0
 
 
 @pytest.mark.asyncio
