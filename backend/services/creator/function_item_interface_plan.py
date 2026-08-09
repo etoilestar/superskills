@@ -530,6 +530,7 @@ You may decide only Interface records and their structured logical bindings.
 {STRUCTURED_BINDING_AUTHORITY}
 
 REQUIRED DECISIONS / REVIEW DUTIES
+Produce a complete semantic Interface Plan over the frozen logical ports.
 For every runtime-required receiving slot: (1) identify the semantic value it
 requires; (2) identify which authoritative upstream source, if any, actually
 produces that value; and (3) create exactly one provenance binding. Do not bind
@@ -602,7 +603,7 @@ def _validate_existing_binding_review_response(*, value: dict[str, Any], interfa
     """Validate diagnostic protocol only; never infer whether the diagnosis is true."""
     if set(value) != {"passed", "issues"} or not isinstance(value.get("passed"), bool) or not isinstance(value.get("issues"), list):
         _raise("existing-binding review response has invalid shape", "invalid_existing_binding_review_protocol", path="$")
-    known = {str(item.get("interface_id") or "") for item in interface_plan.get("interfaces") or []}
+    known = {str(item.get("interface_id") or ""): item for item in interface_plan.get("interfaces") or []}
     normalized = []
     for index, issue in enumerate(value["issues"]):
         path = f"$.issues[{index}]"
@@ -614,12 +615,29 @@ def _validate_existing_binding_review_response(*, value: dict[str, Any], interfa
             _raise("existing-binding issue type is invalid", "invalid_existing_binding_review_protocol", path=f"{path}.issue_type")
         for field in ("source_ref", "target_ref"):
             ref = issue.get(field)
-            if not isinstance(ref, dict) or set(ref) != {"member", "port"} or not all(isinstance(v, str) for v in ref.values()):
+            if (not isinstance(ref, dict) or set(ref) != {"member", "port"}
+                    or not all(isinstance(v, str) and v.strip() for v in ref.values())):
                 _raise("existing-binding issue ref is invalid", "invalid_existing_binding_review_protocol", path=f"{path}.{field}")
+        binding = known[issue["interface_id"]]
+        if binding.get("kind") == "platform_to_member":
+            expected_source = {"member": "platform", "port": binding.get("source_platform_input")}
+            expected_target = {"member": binding.get("target_member"), "port": binding.get("target_input")}
+        elif binding.get("kind") == "member_to_member":
+            expected_source = {"member": binding.get("source_member"), "port": binding.get("source_output")}
+            expected_target = {"member": binding.get("target_member"), "port": binding.get("target_input")}
+        else:
+            expected_source = {"member": binding.get("source_member"), "port": binding.get("source_output")}
+            expected_target = {"member": "platform", "port": binding.get("target_platform_output")}
+        if issue["source_ref"] != expected_source or issue["target_ref"] != expected_target:
+            _raise("existing-binding issue refs do not match the structured binding", "invalid_existing_binding_review_reference", path=path)
         if any(not isinstance(issue.get(field), str) or not issue[field].strip() for field in ("observed_fact", "expected_condition", "reason")):
             _raise("existing-binding issue lacks an auditable diagnosis", "invalid_existing_binding_review_protocol", path=path)
         evidence = issue.get("evidence")
-        if not isinstance(evidence, list) or not evidence or any(not isinstance(item, dict) or not item.get("source") or not item.get("ref") or not item.get("fact") for item in evidence):
+        evidence_fields = {"source", "ref", "field", "fact"}
+        if (not isinstance(evidence, list) or not evidence
+                or any(not isinstance(item, dict) or set(item) != evidence_fields
+                       or not all(isinstance(item[field], str) and item[field].strip() for field in evidence_fields)
+                       for item in evidence)):
             _raise("existing-binding issue lacks frozen evidence", "invalid_existing_binding_review_protocol", path=f"{path}.evidence")
         normalized.append({**issue, "stage": "existing_binding_semantic_review", "source_stage": "existing_binding_semantic_review", "path": path,
                            "message": issue["reason"], "details": dict(issue)})
@@ -713,54 +731,53 @@ async def review_interface_plan_semantically(
     model_call: ModelCall,
 ) -> list[dict[str, Any]]:
     """Ask once for semantic diagnostics; never ask the reviewer for a repair."""
-    prompt = AUTHORITY_CONTRACT + """
+    prompt = f"""ROLE
+You are the independent full-plan semantic Interface Reviewer. You validate the
+accepted Interface Plan as a whole and never repair it.
 
-""" + PLATFORM_OUTPUT_CONTRACT + """
+{AUTHORITATIVE_FACT_PRIORITY}
 
-""" + RUNTIME_INPUT_PROVENANCE_CONTRACT + """
-
-""" + SOURCE_PATH_CONTRACT + """
-
-1. AUTHORITATIVE FACTS
+AUTHORITATIVE FACTS
 The payload contains confirmed requirements, frozen FunctionItem responsibilities
-and logical port contracts, runtime_source_required facts, the platform logical
-contract, and the complete Interface Plan. Structured logical binding fields are
-part of the Interface semantic layer and are authoritative for transfer identity.
+and logical-port contracts, the platform contract, and a deterministically closed
+Interface Plan. Structured logical binding fields define transfer identity.
 
-2. DETERMINISTIC VALIDITY PRECONDITION
-The backend has already established Interface protocol validity,
-logical-reference validity, runtime-required receiving-slot structural
-coverage, single-provenance validity, and legal platform terminal existence.
-Do not repeat those deterministic checks.
+EDITABLE SCOPE
+None. Do not change Interface records, select opaque Graph endpoint IDs, generate
+edges, or prescribe add/split/remove operations or replacement paths.
 
-3. SEMANTIC REVIEW TASK
-Do not trust the Planner conclusion. Independently determine whether the complete
-Interface Plan faithfully realizes confirmed requirements over frozen logical
-ports. For every transfer, decide whether its declared semantic source can
-faithfully satisfy its declared receiving slot, whether source_path selects the
-intended semantic platform value, and whether selected final platform results
-semantically satisfy the requested output. Do not search for predefined error
-categories and do not propose a repair.
+{NON_AUTHORITATIVE_CONTEXT}
 
-4. EVIDENCE STANDARD
-A structurally valid logical reference is not automatically semantically correct.
-A different valid design is not a defect. Report only a concrete defect in this
-plan, supported by observed and expected facts. An issue is not a record that a
-fact was reviewed.
+{PLATFORM_OUTPUT_CONTRACT}
 
-5. AUTHORITY LIMIT
-Do not select opaque Graph endpoint IDs, generate edges, change Interface records,
-or prescribe add/split/remove operations. The Interface
-stage declares logical FunctionItem/platform ports; it does not declare registry
-IDs, argv serialization, or runtime placeholder paths. When source_path is
-declared, evaluate whether that nested platform value can semantically satisfy
-target_input. Report a defect without proposing another path.
+{RUNTIME_INPUT_PROVENANCE_CONTRACT}
 
-6. OUTPUT CONTRACT
-Verify every affected Interface and logical input exists. passed=true exactly
-when issues is empty.
+{SOURCE_PATH_CONTRACT}
+
+{STRUCTURED_BINDING_AUTHORITY}
+
+REQUIRED DECISIONS / REVIEW DUTIES
+Independently determine whether the complete Interface Plan realizes confirmed workflow
+semantics, final-result provenance, explicit fan-out/dependency constraints,
+source_path selection, and combinations whose local bindings may be valid but
+whose whole-plan semantics are not. Do not repeat protocol, reference, coverage,
+single-provenance, or terminal-existence checks already established by the
+backend. Do not trust Planner prose or infer correctness from valid JSON,
+matching names, plausible goals, workflow order, or previous reviewer output.
+
+HARD ACCEPTANCE CONDITIONS
+A structurally valid reference is not automatically semantically correct, while
+a different valid design is not a defect. Report only concrete blocking defects
+supported by observed and expected facts. Do not propose a repair.
+
+SILENT SELF-CHECK
+Silently check every full-plan review duty before returning passed=true. Verify
+every affected Interface and logical input exists and passed=true exactly when
+issues is empty.
+
+OUTPUT CONTRACT
 Return only strict JSON matching this schema:
-""" + json.dumps(INTERFACE_REVIEW_SCHEMA, ensure_ascii=False)
+{json.dumps(INTERFACE_REVIEW_SCHEMA, ensure_ascii=False)}"""
     payload = {
         "system_goal": original_user_goal,
         "function_items": _compact_function_items(frozen_function_items),
@@ -936,26 +953,40 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
 
 {SOURCE_PATH_CONTRACT}
 
-INTERFACE PLAN CORRECTION
-1. AUTHORITATIVE FACTS
+ROLE
+INTERFACE PLAN CORRECTION: You are a bounded replanner for the editable
+Interface layer. The previous
+candidate is a failed proposal, not an authoritative fact.
+
+{AUTHORITATIVE_FACT_PRIORITY}
+
+AUTHORITATIVE FACTS
 Confirmed requirements, frozen FunctionItems, logical ports, runtime source
 facts, platform contract, and shared Interface contracts remain authoritative.
-2. SHARED CONTRACTS
+
+EDITABLE SCOPE
+Modify only the Interface semantic layer; never redesign frozen upstream facts
+or choose Graph endpoint identities.
+
+{NON_AUTHORITATIVE_CONTEXT}
+
+REQUIRED DECISIONS / REVIEW DUTIES
 INTERFACE_SCHEMA and the shared contracts above define the protocol.
-3. CURRENT TASK
-The previous plan failed deterministic acceptance. Reconstruct one complete
+The previous plan failed acceptance. Reconstruct one complete
 corrected Interface Plan and resolve every supplied acceptance failure
 simultaneously. Facts describe invalid state; they do not prescribe a producer.
 Do not patch only visible wording. Return the complete corrected plan.
-4. CURRENT AUTHORITY
 Modify only the Interface semantic layer. You may add or remove an Interface,
 revise a logical binding or source_path, and preserve correct bindings. You
 decide the semantic repair; the backend does not choose the producer.
-5. HARD ACCEPTANCE CONDITIONS
+
+HARD ACCEPTANCE CONDITIONS
 The complete result must match INTERFACE_SCHEMA and pass all supplied facts.
-6. SILENT SELF-CHECK
+
+SILENT SELF-CHECK
 Silently rebuild the complete required-slot coverage ledger before returning.
-7. OUTPUT CONTRACT
+
+OUTPUT CONTRACT
 Return strict JSON matching INTERFACE_SCHEMA only."""
         correction_prompt = f"{correction_prompt}\n\n{REFINEMENT_FEEDBACK_CONTRACT}"
 

@@ -572,6 +572,9 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
                     {"interface_id": "I0003", "kind": "member_to_platform", "goal": "final output", "source_member": "scripts/b.py", "source_output": "output_1", "target_platform_output": "text"},
                 ]
             })
+        if "independent semantic validator" in system:
+            calls.append("existing_binding_semantic_review")
+            return json.dumps({"passed": True, "issues": []})
         if "Independently determine whether the complete" in system:
             calls.append("interface_semantic_review")
             return json.dumps({"passed": True, "issues": []})
@@ -614,7 +617,10 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
         "semantic_review",
         "interface_intent_planner",
     ]
-    assert calls[5] == "interface_semantic_review"
+    assert calls[5:7] == [
+        "existing_binding_semantic_review",
+        "interface_semantic_review",
+    ]
     assert calls.count("endpoint_planner") == 0
 
 

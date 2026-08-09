@@ -2,7 +2,7 @@ import json
 import pytest
 
 from backend.services.creator.function_item_interface_plan import (
-    CRITIC_SCHEMA, InterfaceIntentPlanError, _compact_function_items,
+    CREATOR_PROMPT_SECTIONS, CRITIC_SCHEMA, InterfaceIntentPlanError, _compact_function_items,
     _interface_plan_prompt, build_graph_obligations_from_interfaces,
     build_interface_repair_scope, collect_interface_plan_validation_issues,
     canonical_logical_binding_signatures,
@@ -239,6 +239,7 @@ async def test_valid_json_missing_source_path_uses_planner_correction_not_reform
     assert len(prompts) == 2
     assert "INTERFACE PLAN CORRECTION" in prompts[1]
     assert "PROTOCOL REPAIR AUTHORITY" not in prompts[1]
+    assert all(section in prompts[1] for section in CREATOR_PROMPT_SECTIONS)
 
 
 @pytest.mark.asyncio
@@ -336,6 +337,61 @@ def test_existing_binding_reviewer_requires_localized_auditable_issue():
         _validate_existing_binding_review_response(
             value={"passed": False, "issues": [{**issue, "evidence": []}]},
             interface_plan=plan,
+        )
+
+
+@pytest.mark.parametrize(("binding", "source_ref", "target_ref"), [
+    (p2m("I1", "scripts/unit_a.py"),
+     {"member": "platform", "port": "payload"},
+     {"member": "scripts/unit_a.py", "port": "slot_x"}),
+    (m2m("I1", "scripts/unit_a.py", "value_x", "scripts/unit_b.py", "slot_x"),
+     {"member": "scripts/unit_a.py", "port": "value_x"},
+     {"member": "scripts/unit_b.py", "port": "slot_x"}),
+    (m2p("I1", "scripts/unit_a.py"),
+     {"member": "scripts/unit_a.py", "port": "result_z"},
+     {"member": "platform", "port": "text"}),
+])
+def test_existing_binding_reviewer_refs_must_match_structured_binding(binding, source_ref, target_ref):
+    from backend.services.creator.function_item_interface_plan import _validate_existing_binding_review_response
+    issue = {
+        "issue_type": "semantic_binding_mismatch", "blocking": True,
+        "scope": "existing_binding", "interface_id": "I1",
+        "source_ref": source_ref, "target_ref": target_ref,
+        "observed_fact": "source produces alpha", "expected_condition": "target requires beta",
+        "evidence": [{"source": "function_item", "ref": "scripts/unit_a.py",
+                      "field": "outputs.value_x.description", "fact": "alpha"}],
+        "reason": "source and target meanings conflict",
+    }
+    assert _validate_existing_binding_review_response(
+        value={"passed": False, "issues": [issue]},
+        interface_plan={"interfaces": [binding]},
+    )[0]["interface_id"] == "I1"
+    with pytest.raises(InterfaceIntentPlanError) as raised:
+        _validate_existing_binding_review_response(
+            value={"passed": False, "issues": [{**issue, "source_ref": {"member": "wrong", "port": "wrong"}}]},
+            interface_plan={"interfaces": [binding]},
+        )
+    assert raised.value.code == "invalid_existing_binding_review_reference"
+
+
+@pytest.mark.parametrize("invalid_evidence", [
+    [{"source": "function_item", "ref": "scripts/unit_a.py", "field": "", "fact": "alpha"}],
+    [{"source": "function_item", "ref": "scripts/unit_a.py", "fact": "alpha"}],
+    [{"source": "function_item", "ref": "scripts/unit_a.py", "field": "outputs.x", "fact": "alpha", "extra": "x"}],
+])
+def test_existing_binding_reviewer_evidence_fields_are_exact_and_nonempty(invalid_evidence):
+    from backend.services.creator.function_item_interface_plan import _validate_existing_binding_review_response
+    issue = {
+        "issue_type": "semantic_binding_mismatch", "blocking": True, "scope": "existing_binding",
+        "interface_id": "I1", "source_ref": {"member": "platform", "port": "payload"},
+        "target_ref": {"member": "scripts/unit_a.py", "port": "slot_x"},
+        "observed_fact": "alpha", "expected_condition": "beta",
+        "evidence": invalid_evidence, "reason": "conflict",
+    }
+    with pytest.raises(InterfaceIntentPlanError):
+        _validate_existing_binding_review_response(
+            value={"passed": False, "issues": [issue]},
+            interface_plan={"interfaces": [p2m("I1", "scripts/unit_a.py")]},
         )
 
 
@@ -543,3 +599,4 @@ async def test_reviewer_protocol_repair_runs_on_reviewer_route():
     assert models == ["reviewer-test-model", "reviewer-test-model"]
     assert "final_output_fields defines the legal platform-output domain" in prompts[0]
     assert "Do not treat every legal final_output_field as required" in prompts[0]
+    assert all(section in prompts[0] for section in CREATOR_PROMPT_SECTIONS)
