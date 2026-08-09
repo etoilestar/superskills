@@ -120,7 +120,8 @@ async def test_unknown_semantic_defect_runs_generic_repair_and_revalidation():
         return json.dumps({"diagnosis": "root cause", "required_postcondition": "correct binding semantics"} if "validation_issues" in payload else {"passed": True, "issues": []})
     async def planner(_messages, _model): return json.dumps(repaired)
     result = await repair_interface_plan_semantically(original_user_goal="g", frozen_function_items=items, current_interface_plan=current, validation_issues=[issue], repair_scope=build_interface_repair_scope([issue]), platform_contract=platform(), planner_model="planner-test-model", model_call=planner, reviewer_model="reviewer-test-model", reviewer_model_call=reviewer)
-    assert result == repaired and reviewer_calls == 2
+    # Critic + existing-binding audit + full-plan audit.
+    assert result == repaired and reviewer_calls == 3
 
 
 def test_planner_prompt_separates_logical_ports_from_endpoint_ids():
@@ -277,7 +278,9 @@ async def test_planner_correction_uses_second_attempt_for_staged_residual():
     assert correction_payloads[1]["previous_interface_plan"] == first
     assert any(value["code"] == "uncovered_required_logical_input"
                for value in correction_payloads[1]["refinement_feedback"]["acceptance_facts"])
-    assert reviewer_calls == 1
+    # Partial audit runs after each reference-valid candidate; full audit runs
+    # only once deterministic closure and partial semantics both pass.
+    assert reviewer_calls == 3
 
 
 @pytest.mark.asyncio
@@ -307,6 +310,76 @@ async def test_planner_correction_no_progress_uses_full_budget():
     assert raised.value.code == "interface_plan_deterministic_closure_failed"
     assert raised.value.details["semantic_changed"] is False
     assert calls == 3
+
+
+def test_existing_binding_reviewer_requires_localized_auditable_issue():
+    from backend.services.creator.function_item_interface_plan import (
+        _validate_existing_binding_review_response,
+    )
+    plan = {"interfaces": [p2m("I1", "scripts/unit_a.py")]}
+    issue = {
+        "issue_type": "semantic_binding_mismatch", "blocking": True,
+        "scope": "existing_binding", "interface_id": "I1",
+        "source_ref": {"member": "platform", "port": "payload"},
+        "target_ref": {"member": "scripts/unit_a.py", "port": "slot_x"},
+        "observed_fact": "payload supplies semantic alpha",
+        "expected_condition": "slot_x requires semantic beta",
+        "evidence": [{"source": "function_item", "ref": "scripts/unit_a.py",
+                      "field": "inputs.slot_x.description", "fact": "semantic beta"}],
+        "reason": "The structured source cannot provide the required value.",
+    }
+    result = _validate_existing_binding_review_response(
+        value={"passed": False, "issues": [issue]}, interface_plan=plan,
+    )
+    assert result[0]["source_stage"] == "existing_binding_semantic_review"
+    with pytest.raises(InterfaceIntentPlanError):
+        _validate_existing_binding_review_response(
+            value={"passed": False, "issues": [{**issue, "evidence": []}]},
+            interface_plan=plan,
+        )
+
+
+@pytest.mark.asyncio
+async def test_partial_semantic_and_coverage_facts_reach_one_correction_round():
+    from backend.services.creator.function_item_interface_plan import plan_function_item_interfaces
+    items = [item("scripts/unit_a.py", ["slot_x", "slot_y"], ["result_z"])]
+    incomplete = {"interfaces": [p2m("I1", "scripts/unit_a.py"), m2p("I2", "scripts/unit_a.py")]}
+    complete = {"interfaces": [p2m("I1", "scripts/unit_a.py"),
+                               {**p2m("I3", "scripts/unit_a.py"), "target_input": "slot_y"},
+                               m2p("I2", "scripts/unit_a.py")]}
+    planner_payloads = []
+    planner_results = iter([incomplete, complete])
+
+    async def planner(messages, _model):
+        if "INTERFACE PLAN CORRECTION" in messages[0]["content"]:
+            planner_payloads.append(json.loads(messages[-1]["content"]))
+        return json.dumps(next(planner_results))
+
+    partial_calls = 0
+    async def reviewer(messages, _model):
+        nonlocal partial_calls
+        if "every existing Interface" in messages[0]["content"]:
+            partial_calls += 1
+            if partial_calls == 1:
+                return json.dumps({"passed": False, "issues": [{
+                    "issue_type": "semantic_binding_mismatch", "blocking": True,
+                    "scope": "existing_binding", "interface_id": "I1",
+                    "source_ref": {"member": "platform", "port": "payload"},
+                    "target_ref": {"member": "scripts/unit_a.py", "port": "slot_x"},
+                    "observed_fact": "source represents alpha", "expected_condition": "target requires beta",
+                    "evidence": [{"source": "function_item", "ref": "scripts/unit_a.py", "field": "inputs.slot_x", "fact": "beta"}],
+                    "reason": "semantic values conflict",
+                }]})
+        return json.dumps({"passed": True, "issues": []})
+
+    assert await plan_function_item_interfaces(
+        original_user_goal="g", frozen_function_items=items, platform_contract=platform(),
+        planner_model="p", model_call=planner, reviewer_model="r", reviewer_model_call=reviewer,
+    ) == complete
+    facts = planner_payloads[0]["refinement_feedback"]["acceptance_facts"]
+    assert {fact.get("source_stage") or fact.get("stage") for fact in facts} == {
+        "deterministic_closure", "existing_binding_semantic_review",
+    }
 
 
 @pytest.mark.asyncio
@@ -379,7 +452,7 @@ async def test_generator_schema_invalid_candidate_becomes_second_attempt_residua
     assert len(generator_payloads) == 2
     assert generator_payloads[1]["current_interface_plan"] == invalid
     assert generator_payloads[1]["refinement_feedback"]["acceptance_facts"][0]["code"] == "invalid_interface_protocol"
-    assert reviewer_calls == 1
+    assert reviewer_calls == 2
 
 
 @pytest.mark.asyncio
