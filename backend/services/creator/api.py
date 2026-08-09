@@ -7322,7 +7322,7 @@ async def _bind_executable_responsibility_plan(
             )
             raise InterfaceIntentPlanError(
                 "interface semantic repair did not produce a valid responsibility graph",
-                code="interface_semantic_repair_failed",
+                code="graph_revalidation_failed",
                 details={
                     "stage": "graph_expansion_feedback", "repair_attempts": 1,
                     "original_graph_error": {"code": exc.code, "details": exc.details},
