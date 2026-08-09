@@ -7,6 +7,7 @@ from backend.services.creator.function_item_interface_plan import (
     build_interface_repair_scope, collect_interface_plan_validation_issues,
     canonical_logical_binding_signatures,
     normalize_interface_review_issue, repair_interface_plan_semantically,
+    plan_function_item_interfaces, review_interface_plan_semantically,
     validate_interface_intent_plan, validate_interface_repair_critic,
 )
 
@@ -277,7 +278,8 @@ async def test_planner_correction_uses_second_attempt_for_staged_residual():
     assert correction_payloads[1]["previous_interface_plan"] == first
     assert any(value["code"] == "uncovered_required_logical_input"
                for value in correction_payloads[1]["refinement_feedback"]["acceptance_facts"])
-    assert reviewer_calls == 1
+    # Each deterministic-invalid candidate is now audited as well as the final plan.
+    assert reviewer_calls == 3
 
 
 @pytest.mark.asyncio
@@ -470,3 +472,102 @@ async def test_reviewer_protocol_repair_runs_on_reviewer_route():
     assert models == ["reviewer-test-model", "reviewer-test-model"]
     assert "final_output_fields defines the legal platform-output domain" in prompts[0]
     assert "Do not treat every legal final_output_field as required" in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_correction_receives_uncovered_slot_and_existing_binding_semantic_fact():
+    items = [
+        item("scripts/a.py", [], [
+            {"port_id": "alpha", "description": "alpha value"},
+            {"port_id": "beta", "description": "beta value"},
+        ]),
+        item("scripts/b.py", [{"port_id": "beta", "description": "beta value"}], ["result"]),
+        item("scripts/c.py", [{"port_id": "gamma", "description": "gamma value"}], ["result"]),
+    ]
+    initial = {"interfaces": [
+        m2m("I1", "scripts/a.py", "alpha", "scripts/b.py", "beta"),
+        m2p("I2", "scripts/c.py", "result"),
+    ]}
+    corrected = {"interfaces": [
+        m2m("I1", "scripts/a.py", "beta", "scripts/b.py", "beta"),
+        p2m("I3", "scripts/c.py", "gamma"),
+        m2p("I2", "scripts/c.py", "result"),
+    ]}
+    correction_facts = []
+
+    async def planner(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        if "refinement_feedback" not in payload:
+            return json.dumps(initial)
+        correction_facts.extend(payload["refinement_feedback"]["acceptance_facts"])
+        return json.dumps(corrected)
+
+    async def reviewer(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        binding = payload["current_interface_plan"]["interfaces"][0]
+        if binding.get("source_output") == "alpha":
+            return json.dumps({"passed": False, "issues": [{
+                "message": "declared alpha does not satisfy beta",
+                "affected_interfaces": ["I1"],
+                "affected_inputs": [{"target_member": "scripts/b.py", "target_input": "beta"}],
+                "evidence": {"observed": "alpha", "expected": "beta"},
+            }]})
+        return json.dumps({"passed": True, "issues": []})
+
+    result = await plan_function_item_interfaces(
+        original_user_goal="transform values", frozen_function_items=items,
+        platform_contract=platform(), planner_model="planner-test-model",
+        model_call=planner, reviewer_model="reviewer-test-model",
+        reviewer_model_call=reviewer,
+    )
+    assert result == corrected
+    assert any(fact.get("code") == "uncovered_required_logical_input" for fact in correction_facts)
+    semantic = [fact for fact in correction_facts if fact.get("source_stage") == "existing_binding_semantic_review"]
+    assert semantic == [{
+        "source_stage": "existing_binding_semantic_review",
+        "interface_id": "I1", "current_binding": initial["interfaces"][0],
+        "message": "declared alpha does not satisfy beta",
+        "expected_constraint": "Declared semantic source must satisfy declared receiving slot.",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_early_semantic_review_protocol_failure_fails_open():
+    items = [item("scripts/a.py", ["alpha", "gamma"], ["result"])]
+    initial = {"interfaces": [p2m("I1", "scripts/a.py", "alpha"), m2p("I2", "scripts/a.py", "result")]}
+    corrected = {"interfaces": [p2m("I1", "scripts/a.py", "alpha"), p2m("I3", "scripts/a.py", "gamma"), m2p("I2", "scripts/a.py", "result")]}
+    reviewer_responses = iter(["bad-json", "still-bad"])
+    correction_facts = []
+
+    async def planner(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        if "refinement_feedback" not in payload:
+            return json.dumps(initial)
+        correction_facts.extend(payload["refinement_feedback"]["acceptance_facts"])
+        return json.dumps(corrected)
+
+    async def reviewer(_messages, _model):
+        try:
+            return next(reviewer_responses)
+        except StopIteration:
+            return json.dumps({"passed": True, "issues": []})
+
+    assert await plan_function_item_interfaces(
+        original_user_goal="process alpha and gamma", frozen_function_items=items,
+        platform_contract=platform(), planner_model="planner-test-model",
+        model_call=planner, reviewer_model="reviewer-test-model",
+        reviewer_model_call=reviewer,
+    ) == corrected
+    assert [fact["code"] for fact in correction_facts] == ["uncovered_required_logical_input"]
+
+
+def test_prompts_define_structured_binding_and_canonical_input_semantics():
+    import inspect
+    from backend.services.creator import api
+
+    interface_prompt = _interface_plan_prompt()
+    assert "verify every structured binding in both directions" not in interface_prompt
+    assert "identify the semantic value that\nslot requires" in interface_prompt
+    source = inspect.getsource(api._generate_internal_blueprint_or_questions)
+    assert "FUNCTIONITEM INPUT SEMANTICS" in source
+    assert "upstream\nFunctionItem output" in source

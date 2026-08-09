@@ -8980,6 +8980,18 @@ FunctionItems and ResponsibilityEdges will be bound in a second protocol binding
 
 The Blueprint must decompose the complete user goal exactly once into the minimum coherent set of executable FunctionItems. Each FunctionItem represents one atomic executable sub-goal. For every FunctionItem: purpose must state the concrete sub-goal completed by this FunctionItem; inputs must declare only data required from the platform or another FunctionItem; outputs must declare only data produced for the platform or another FunctionItem; the FunctionItem must have a distinct execution responsibility; do not create duplicate FunctionItems with equivalent responsibilities. Collectively, the FunctionItems must cover all executable parts of the complete user goal. Do not generate ResponsibilityEdges in the Blueprint. Do not create a second subsystem or grouping layer.
 
+FUNCTIONITEM INPUT SEMANTICS
+
+A FunctionItem input represents one distinct semantic runtime value genuinely
+consumed by that FunctionItem. Inputs are conjunctive by default: declaring
+inputs [A, B] means the FunctionItem genuinely requires both A and B. Do not
+declare compatibility aliases, fallback names, or alternative representations
+of the same runtime value as multiple required FunctionItem inputs.
+
+The provenance of an input is NOT part of the definition of that input. A valid
+FunctionItem input may later be supplied by a platform input, an upstream
+FunctionItem output, or a frozen/default value. Interface Planner owns provenance.
+
 For every FunctionItem input, explicitly state whether it is required at
 runtime. When the input may be omitted, mark required=false. When the
 implementation has a valid fallback, declare that a default is present and put
