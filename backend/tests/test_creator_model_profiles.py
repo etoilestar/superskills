@@ -88,6 +88,20 @@ def test_role_temperature_override_is_forwarded(tmp_path, monkeypatch, caplog):
     assert "temperature=0.15" in caplog.text
 
 
+def test_deployed_structural_defaults_are_logged_for_both_roles(tmp_path, monkeypatch, caplog):
+    from backend.config import settings
+    from backend.services import creator_model_profiles as profiles
+
+    caplog.set_level("INFO")
+    monkeypatch.setattr(settings, "governance_path", tmp_path)
+    profiles._save(_empty_profiles())
+    with patch.object(profiles, "complete_chat_once", new=AsyncMock(return_value="ok")):
+        asyncio.run(profiles.complete_creator_role_once([], "planner", fallback_model="model", stage="blueprint"))
+        asyncio.run(profiles.complete_creator_role_once([], "reviewer", fallback_model="model", stage="semantic"))
+    assert "role=planner model=model temperature=0.1" in caplog.text
+    assert "role=reviewer model=model temperature=0.0" in caplog.text
+
+
 def test_structural_role_defaults_and_role_override_wins(tmp_path, monkeypatch):
     from backend.config import settings
     from backend.services import creator_model_profiles as profiles

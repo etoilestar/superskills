@@ -72,6 +72,7 @@ from .semantic_review_contracts import (
     ALLOWED_EVIDENCE_SOURCES,
     ReviewAuditCoverageError,
     ReviewEvidenceReferenceError,
+    ReviewIdentityError,
     ReviewSchemaError,
     build_evidence_context,
     validate_and_ground_review,
@@ -8169,95 +8170,161 @@ schema shape only. The supplied machine schema is authoritative. Return JSON onl
     return _parse_prepare_plan_json(text)
 
 
+async def _normalize_semantic_review_transport(
+    *, raw: str, reviewer: str, planner_model: str,
+) -> tuple[dict[str, Any], bool]:
+    """Parse and perform at most one transport-only schema normalization."""
+    try:
+        parsed = _parse_prepare_plan_json(raw)
+    except (PreparePlanProtocolError, ValueError) as exc:
+        return await _reformat_semantic_review_transport(
+            raw_response=raw, validation_error=exc, reviewer=reviewer,
+            planner_model=planner_model,
+        ), True
+    schema = BLUEPRINT_SEMANTIC_REVIEW_SCHEMA[reviewer]
+    if not isinstance(parsed, dict) or set(parsed) != set(schema["required"]):
+        exc = ReviewSchemaError(f"{reviewer} fields do not match its machine schema")
+        return await _reformat_semantic_review_transport(
+            raw_response=raw, validation_error=exc, reviewer=reviewer,
+            planner_model=planner_model,
+        ), True
+    return parsed, False
+
+
 async def _run_grounded_blueprint_reviewer(
-    *, reviewer: str, evidence_context: dict[str, Any], audit_domain: list[str],
+    *, reviewer: str, evidence_context: dict[str, Any],
+    expected_requirement_ids: list[str], expected_function_items: list[str],
+    frozen_requirement_ids: list[str], frozen_function_items: list[str],
     explanatory_blueprint: str, planner_model: str,
 ) -> dict[str, Any]:
-    """Run one focused reviewer with separate transport and reference recovery."""
-    if reviewer == "requirement_provenance":
-        responsibility = """Review only whether each executable requirement's existing owner
-semantically fulfills it, whether every substantive FunctionItem has confirmed
+    """Execute two semantic attempts, each with at most one transport repair."""
+    responsibilities = {
+        "requirement_provenance": """Review only whether each executable requirement's existing
+owner semantically fulfills it, whether every frozen FunctionItem has confirmed
 requirement provenance, and whether many-to-many provenance is justified.
 Deterministic ownership validity has already been established. Do not re-evaluate
 whether an owner exists or whether its identity is legal. Do not audit channels,
-input aliases, ports, file formats, Graph, or runtime."""
-    else:
-        responsibility = """Review only responsibility-to-input/output consistency,
+input aliases, ports, file formats, Graph, or runtime.""",
+        "function_item_contract": """Review only responsibility-to-input/output consistency,
 canonical input slots, conjunctive required-input semantics, internal temporary
 values promoted to external inputs, and workflow dependency semantics. Compatibility
 aliases at the platform boundary do not automatically become conjunctive FunctionItem
 inputs. Do not audit owner counts, channel classification, resource ownership, or
-Graph endpoints. Never choose which alias to retain and never modify inputs."""
+Graph endpoints. Never choose which alias to retain and never modify inputs.""",
+        "constraint_semantics": """You are the structural/direct requirement semantic Reviewer.
+Review only whether each supplied resource or direct requirement is represented by
+current authoritative FilePlan, Resource Authority, FunctionItem topology, or Platform
+Contract facts. Do not review executable ownership, assign FunctionItem owners,
+reclassify channels, inspect Interface/Graph endpoints, or require future generation,
+runtime, execution, or sandbox evidence. Without a concrete current-stage
+contradiction, return no blocking issue.""",
+    }
     schema = BLUEPRINT_SEMANTIC_REVIEW_SCHEMA[reviewer]
     prompt = AUTHORITY_CONTRACT + f"""
 You are the focused {reviewer} semantic Reviewer.
-{responsibility}
+{responsibilities[reviewer]}
 
 STRUCTURED SATISFACTION PRINCIPLE
 When a requirement is already satisfied by authoritative structured facts, do
 not require a redundant natural-language sentence restating the same constraint.
-Absence of redundant prose is not a defect. Judge canonical topology,
-responsibilities, ports, dependencies, file identities, resources, and platform
-contracts directly.
+Absence of redundant prose is not a defect. Judge only the structured facts
+present in evidence_context.
 
-The evidence_context is authoritative. Raw Blueprint prose is non-authoritative
-explanatory context. Select fact references only; the Backend resolves exact
-observed values. Never emit observed, expected_fact, repair_guidance, or a repair
-operation. required_condition states only the condition that must hold. Reviewer
-type determines the editable authority layer. Machine schema is authoritative;
-prose does not redefine its keys or types.
+The evidence_context is authoritative and contains Requirement Projection,
+FunctionItems, FilePlan, Resource Authority, and the real Platform Contract.
+Raw Blueprint prose is non-authoritative explanatory context. Select fact
+references only; the Backend resolves exact observed values. Never emit observed,
+expected_fact, repair_guidance, repair_scope, or a repair operation.
+required_condition states only the condition that must hold. Machine schema is
+authoritative; prose does not redefine keys or types.
 
 OUTPUT CONTRACT
 """ + json.dumps(schema, ensure_ascii=False, sort_keys=True)
     payload = {
         "evidence_context": evidence_context,
-        "audit_domain": audit_domain,
+        "audit_domain": {
+            "requirement_ids": expected_requirement_ids,
+            "function_items": expected_function_items,
+        },
         "explanatory_blueprint": explanatory_blueprint,
     }
     protocol_retry = False
-    for semantic_attempt in range(2):
+    reference_retry = False
+    coverage_retry = False
+    for semantic_attempt in range(1, 3):
         raw = await complete_creator_role_once(
             [{"role": "system", "content": prompt},
              {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
             "reviewer", fallback_model=planner_model, stage=reviewer,
         )
-        try:
-            parsed = _parse_prepare_plan_json(raw)
-        except PreparePlanProtocolError as exc:
-            protocol_retry = True
-            parsed = await _reformat_semantic_review_transport(
-                raw_response=raw, validation_error=exc, reviewer=reviewer,
-                planner_model=planner_model,
-            )
+        parsed, transport_retried = await _normalize_semantic_review_transport(
+            raw=raw, reviewer=reviewer, planner_model=planner_model,
+        )
+        protocol_retry = protocol_retry or transport_retried
         try:
             grounded = validate_and_ground_review(
                 parsed, reviewer=reviewer, evidence_context=evidence_context,
-                expected_audit_domain=audit_domain,
+                expected_requirement_ids=expected_requirement_ids,
+                expected_function_items=expected_function_items,
+                frozen_requirement_ids=frozen_requirement_ids,
+                frozen_function_items=frozen_function_items,
             )
         except ReviewSchemaError as exc:
-            protocol_retry = True
-            parsed = await _reformat_semantic_review_transport(
-                raw_response=raw, validation_error=exc, reviewer=reviewer,
-                planner_model=planner_model,
+            if transport_retried:
+                failure = "review_schema_invalid"
+            else:
+                parsed = await _reformat_semantic_review_transport(
+                    raw_response=raw, validation_error=exc, reviewer=reviewer,
+                    planner_model=planner_model,
+                )
+                protocol_retry = True
+                try:
+                    grounded = validate_and_ground_review(
+                        parsed, reviewer=reviewer, evidence_context=evidence_context,
+                        expected_requirement_ids=expected_requirement_ids,
+                        expected_function_items=expected_function_items,
+                        frozen_requirement_ids=frozen_requirement_ids,
+                        frozen_function_items=frozen_function_items,
+                    )
+                except (ReviewSchemaError, ReviewEvidenceReferenceError,
+                        ReviewAuditCoverageError, ReviewIdentityError) as repaired_exc:
+                    exc = repaired_exc
+                    failure = (
+                        "review_evidence_ref_invalid" if isinstance(exc, ReviewEvidenceReferenceError)
+                        else "review_audit_coverage_invalid" if isinstance(exc, ReviewAuditCoverageError)
+                        else "review_identity_invalid" if isinstance(exc, ReviewIdentityError)
+                        else "review_schema_invalid"
+                    )
+                else:
+                    failure = ""
+            if not failure:
+                pass
+            elif semantic_attempt == 1:
+                reference_retry |= failure in {"review_evidence_ref_invalid", "review_identity_invalid"}
+                coverage_retry |= failure == "review_audit_coverage_invalid"
+                logger.warning("[Creator][semantic_reviewer] reviewer=%s failure=%s fresh_semantic_retry=true", reviewer, failure)
+                continue
+            else:
+                raise PreparePlanProtocolError(f"{failure}: {exc}") from exc
+        except (ReviewEvidenceReferenceError, ReviewAuditCoverageError, ReviewIdentityError) as exc:
+            failure = (
+                "review_evidence_ref_invalid" if isinstance(exc, ReviewEvidenceReferenceError)
+                else "review_audit_coverage_invalid" if isinstance(exc, ReviewAuditCoverageError)
+                else "review_identity_invalid"
             )
-            grounded = validate_and_ground_review(
-                parsed, reviewer=reviewer, evidence_context=evidence_context,
-                expected_audit_domain=audit_domain,
-            )
-        except (ReviewEvidenceReferenceError, ReviewAuditCoverageError) as exc:
-            failure = ("review_evidence_ref_invalid" if isinstance(exc, ReviewEvidenceReferenceError)
-                       else "review_audit_coverage_invalid")
-            logger.error("[Creator][semantic_reviewer] reviewer=%s failure=%s error=%s",
-                         reviewer, failure, exc)
-            if semantic_attempt == 0:
-                continue  # fresh semantic review; never ask transport to select another fact
+            reference_retry |= failure in {"review_evidence_ref_invalid", "review_identity_invalid"}
+            coverage_retry |= failure == "review_audit_coverage_invalid"
+            logger.warning("[Creator][semantic_reviewer] reviewer=%s failure=%s fresh_semantic_retry=%s", reviewer, failure, str(semantic_attempt == 1).lower())
+            if semantic_attempt == 1:
+                continue
             raise PreparePlanProtocolError(f"{failure}: {exc}") from exc
         evidence_count = sum(len(issue["evidence"]) for issue in grounded["issues"])
-        digest = hashlib.sha256(json.dumps(evidence_context["blueprint_facts"], sort_keys=True, default=str).encode()).hexdigest()[:12]
+        digest = hashlib.sha256(json.dumps(evidence_context, sort_keys=True, default=str).encode()).hexdigest()[:12]
         logger.info(
-            "[Creator][semantic_reviewer] reviewer=%s audited_count=%d issue_count=%d evidence_ref_count=%d protocol_retry=%s candidate_digest=%s",
-            reviewer, len(audit_domain), len(grounded["issues"]), evidence_count,
-            str(protocol_retry).lower(), digest,
+            "[Creator][semantic_reviewer] reviewer=%s audited_requirements=%d audited_function_items=%d issue_count=%d evidence_ref_count=%d transport_retry=%s reference_retry=%s coverage_retry=%s candidate_digest=%s",
+            reviewer, len(expected_requirement_ids), len(expected_function_items),
+            len(grounded["issues"]), evidence_count, str(protocol_retry).lower(),
+            str(reference_retry).lower(), str(coverage_retry).lower(), digest,
         )
         return grounded
     raise PreparePlanProtocolError(f"{reviewer} review failed without a grounded result")
@@ -8265,44 +8332,109 @@ OUTPUT CONTRACT
 
 async def _review_blueprint_semantic_closure(
     *, request: PreparePlanRequest, blueprint_text: str,
-    function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]],
-    requirement_channels: dict[str, str], planner_model: str,
+    facts_snapshot: CreatorFactsSnapshot, planner_model: str,
 ) -> dict[str, Any]:
-    """Merge two focused, independently complete grounded semantic audits."""
-    evidence_context = build_evidence_context(
-        requirement_channels=requirement_channels,
-        requirement_allocations=requirement_allocations,
-        function_items=function_items,
-        platform_contract=build_platform_io_contract(),
-    )
-    executable_ids = [
+    """Run all three independent semantic domains before Blueprint freeze."""
+    evidence_context = build_evidence_context(snapshot=facts_snapshot)
+    projection = facts_snapshot.requirement_projection
+    requirement_channels = projection.get("channels") or {}
+    requirement_allocations = projection.get("allocations") or []
+    frozen_requirement_ids = [
         str(row.get("requirement_id") or "") for row in requirement_allocations
-        if requirement_channels.get(str(row.get("requirement_id") or "")) == "executable"
     ]
-    function_targets = [str(item.get("target_file") or "") for item in function_items]
-    requirement_review, function_review = await asyncio.gather(
+    function_targets = [
+        str(item.get("target_file") or "") for item in facts_snapshot.function_items
+    ]
+    executable_ids = [
+        requirement_id for requirement_id in frozen_requirement_ids
+        if requirement_channels.get(requirement_id) == "executable"
+    ]
+    constraint_ids = [
+        requirement_id for requirement_id in frozen_requirement_ids
+        if requirement_channels.get(requirement_id) in {"resource", "direct"}
+    ]
+    common = {
+        "evidence_context": evidence_context,
+        "frozen_requirement_ids": frozen_requirement_ids,
+        "frozen_function_items": function_targets,
+        "explanatory_blueprint": blueprint_text,
+        "planner_model": planner_model,
+    }
+    requirement_review, function_review, constraint_review = await asyncio.gather(
         _run_grounded_blueprint_reviewer(
-            reviewer="requirement_provenance", evidence_context=evidence_context,
-            audit_domain=executable_ids, explanatory_blueprint=blueprint_text,
-            planner_model=planner_model,
+            reviewer="requirement_provenance",
+            expected_requirement_ids=executable_ids,
+            expected_function_items=function_targets,
+            **common,
         ),
         _run_grounded_blueprint_reviewer(
-            reviewer="function_item_contract", evidence_context=evidence_context,
-            audit_domain=function_targets, explanatory_blueprint=blueprint_text,
-            planner_model=planner_model,
+            reviewer="function_item_contract",
+            expected_requirement_ids=[],
+            expected_function_items=function_targets,
+            **common,
+        ),
+        _run_grounded_blueprint_reviewer(
+            reviewer="constraint_semantics",
+            expected_requirement_ids=constraint_ids,
+            expected_function_items=[],
+            **common,
         ),
     )
     issues = []
-    for authority, result in (("requirement_projection", requirement_review),
-                              ("blueprint", function_review)):
+    for authority, result in (
+        ("requirement_projection", requirement_review),
+        ("blueprint", function_review),
+    ):
         for issue in result["issues"]:
             issues.append({**issue, "repair_scope": authority, "blocking_now": True})
-    logger.info("[Creator][semantic_review] blocking_issue_count=%d", len(issues))
+    constraint_authorities = {
+        "requirement_channels": "requirement_projection",
+        "requirement_allocations": "requirement_projection",
+        "function_items": "blueprint",
+        "file_plan": "blueprint",
+        "resource_authority": "resource_authority",
+        "platform_contract": "platform_contract",
+    }
+    for issue in constraint_review["issues"]:
+        selected_sources = {fact["source"] for fact in issue["evidence"]}
+        editable_sources = selected_sources - {"requirement_channels", "requirement_allocations"}
+        authority_domain = {
+            constraint_authorities[source] for source in (editable_sources or selected_sources)
+        }
+        authority = next(iter(authority_domain)) if len(authority_domain) == 1 else "none"
+        issues.append({**issue, "repair_scope": authority, "blocking_now": True})
+    logger.info(
+        "[Creator][semantic_review] requirement_provenance_issues=%d function_item_contract_issues=%d constraint_semantics_issues=%d blocking_issue_count=%d",
+        len(requirement_review["issues"]), len(function_review["issues"]),
+        len(constraint_review["issues"]), len(issues),
+    )
     return {
         "passed": not issues, "issues": issues, "deferred_checks": [],
         "audited_requirement_ids": requirement_review["audited_requirement_ids"],
+        "audited_provenance_function_items": requirement_review["audited_function_items"],
         "audited_function_items": function_review["audited_function_items"],
+        "audited_constraint_requirement_ids": constraint_review["audited_requirement_ids"],
     }
+
+
+def _candidate_semantic_facts_snapshot(
+    *, request: PreparePlanRequest, blueprint_text: str,
+    function_items: list[dict[str, Any]],
+    requirement_allocations: list[dict[str, Any]],
+    requirement_channels: dict[str, str], allowed_resources: set[str] | list[str],
+) -> CreatorFactsSnapshot:
+    """Freeze parser/resource/platform facts for one semantic candidate review."""
+    canonical_plan = parse_blueprint(
+        [{"role": "assistant", "content": blueprint_text}], strict=True,
+    )
+    return _freeze_creator_facts_snapshot(
+        request=request, plan_files=canonical_plan.files,
+        function_items=function_items,
+        requirement_allocations=requirement_allocations,
+        requirement_channels=requirement_channels,
+        allowed_resources=allowed_resources,
+        platform_contract=build_platform_io_contract(),
+    )
 
 
 async def _replan_blueprint_for_semantic_closure(
@@ -8379,7 +8511,7 @@ existing supplied requirement; then make only the minimum required change.
 
 
 def _semantic_projection_facts(blueprint_text: str) -> dict[str, Any]:
-    """Project parsed facts whose real changes permit requirement reprojection."""
+    """Canonical structured signature; prose-only edits compare unchanged."""
     parsed = parse_blueprint(
         [{"role": "assistant", "content": blueprint_text}], strict=True
     )
@@ -8390,18 +8522,29 @@ def _semantic_projection_facts(blueprint_text: str) -> dict[str, Any]:
             "purpose": entry.purpose,
             "inputs": list(entry.inputs),
             "outputs": list(entry.outputs),
+            "dependencies": list(entry.dependencies),
             "constraints": copy.deepcopy(entry.constraints),
         }
         for entry in entries
         if str(entry.path).startswith("scripts/")
     ]
-    resources = [
-        copy.deepcopy(vars(entry))
+    resource_authority = [
+        {"path": entry.path, "file_type": entry.file_type,
+         "asset_source": entry.asset_source}
         for entry in entries
         if not str(entry.path).startswith("scripts/")
         and str(entry.path) != "SKILL.md"
     ]
-    return {"function_items": function_items, "resources": resources}
+    file_plan = [
+        {"path": entry.path, "file_type": entry.file_type,
+         "asset_source": entry.asset_source}
+        for entry in entries
+    ]
+    return {
+        "file_plan": file_plan,
+        "function_items": function_items,
+        "resource_authority": resource_authority,
+    }
 
 
 def _strict_blueprint_compatibility_fields(
@@ -9524,9 +9667,14 @@ Blueprint Planner 只规划业务责任。
             })
         semantic_review = await _review_blueprint_semantic_closure(
             request=request, blueprint_text=frozen_blueprint_text,
-            function_items=semantic_function_items,
-            requirement_allocations=requirement_allocations,
-            requirement_channels=requirement_channels, planner_model=route.model,
+            facts_snapshot=_candidate_semantic_facts_snapshot(
+                request=request, blueprint_text=frozen_blueprint_text,
+                function_items=semantic_function_items,
+                requirement_allocations=requirement_allocations,
+                requirement_channels=requirement_channels,
+                allowed_resources=allowed_resource_paths,
+            ),
+            planner_model=route.model,
         )
         blocking_issues = list(semantic_review["issues"])
         allocation_issues = [
@@ -9563,9 +9711,14 @@ Blueprint Planner 只规划业务责任。
             )
             semantic_review = await _review_blueprint_semantic_closure(
                 request=request, blueprint_text=frozen_blueprint_text,
-                function_items=semantic_function_items,
-                requirement_allocations=requirement_allocations,
-                requirement_channels=requirement_channels, planner_model=route.model,
+                facts_snapshot=_candidate_semantic_facts_snapshot(
+                    request=request, blueprint_text=frozen_blueprint_text,
+                    function_items=semantic_function_items,
+                    requirement_allocations=requirement_allocations,
+                    requirement_channels=requirement_channels,
+                    allowed_resources=allowed_resource_paths,
+                ),
+                planner_model=route.model,
             )
             blocking_issues = list(semantic_review["issues"])
 
@@ -9643,9 +9796,14 @@ Blueprint Planner 只规划业务责任。
             )
             semantic_review = await _review_blueprint_semantic_closure(
                 request=request, blueprint_text=frozen_blueprint_text,
-                function_items=semantic_function_items,
-                requirement_allocations=requirement_allocations,
-                requirement_channels=requirement_channels, planner_model=route.model,
+                facts_snapshot=_candidate_semantic_facts_snapshot(
+                    request=request, blueprint_text=frozen_blueprint_text,
+                    function_items=semantic_function_items,
+                    requirement_allocations=requirement_allocations,
+                    requirement_channels=requirement_channels,
+                    allowed_resources=allowed_resource_paths,
+                ),
+                planner_model=route.model,
             )
             blocking_issues = list(semantic_review["issues"])
 
@@ -9656,7 +9814,7 @@ Blueprint Planner 只规划业务责任。
         )
 
         if blocking_issues:
-            for scope in ("requirement_projection", "blueprint", "resource", "graph", "none"):
+            for scope in ("requirement_projection", "blueprint", "resource_authority", "platform_contract", "resource", "graph", "none"):
                 scoped = [issue for issue in blocking_issues if issue.get("repair_scope") == scope]
                 if scoped:
                     logger.info(
@@ -9677,6 +9835,7 @@ Blueprint Planner 只规划业务责任。
             requirement_allocations=requirement_allocations,
             requirement_channels=requirement_channels,
             allowed_resources=allowed_resource_paths,
+            platform_contract=build_platform_io_contract(),
         )
         log_frozen_fact_digests(stage="blueprint_closure", snapshot=facts_snapshot)
         first_planner_result = {

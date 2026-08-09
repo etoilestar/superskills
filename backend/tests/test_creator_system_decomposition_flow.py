@@ -371,14 +371,19 @@ async def test_requirement_ownership_repair_fails_after_exactly_one_attempt(monk
 async def test_requirement_prompts_define_ownership_closure(monkeypatch):
     prompts = []
 
-    async def model(messages, _role, fallback_model=None):
+    async def model(messages, _role, fallback_model=None, **kwargs):
         prompts.append(messages[0]["content"])
         if "requirement coverage projection" in messages[0]["content"]:
             return json.dumps({
                 "requirement_allocations": [_allocation("R1", ["scripts/unit_a.py"])],
                 "requirement_channels": {"R1": "executable"},
             })
-        return json.dumps({"passed": True, "issues": [], "deferred_checks": []})
+        stage = kwargs.get("stage")
+        if stage == "requirement_provenance":
+            return json.dumps({"audited_requirement_ids": ["R1"], "audited_function_items": ["scripts/unit_a.py"], "issues": []})
+        if stage == "function_item_contract":
+            return json.dumps({"audited_function_items": ["scripts/unit_a.py"], "issues": []})
+        return json.dumps({"audited_requirement_ids": [], "issues": []})
 
     monkeypatch.setattr(api, "complete_creator_role_once", model)
     await api._plan_requirement_allocations(
@@ -387,14 +392,17 @@ async def test_requirement_prompts_define_ownership_closure(monkeypatch):
     )
     await api._review_blueprint_semantic_closure(
         request=_request(), blueprint_text=_blueprint(),
-        function_items=[{"target_file": "scripts/unit_a.py"}],
-        requirement_allocations=[_allocation("R1", ["scripts/unit_a.py"])],
-        requirement_channels={"R1": "executable"}, planner_model="p",
+        facts_snapshot=api._candidate_semantic_facts_snapshot(
+            request=_request(), blueprint_text=_blueprint(),
+            function_items=[{"target_file": "scripts/unit_a.py"}],
+            requirement_allocations=[_allocation("R1", ["scripts/unit_a.py"])],
+            requirement_channels={"R1": "executable"}, allowed_resources=set(),
+        ), planner_model="p",
     )
     assert "channel = executable\nowners = []" in prompts[0]
     assert "Every executable requirement must have at least one owner" in " ".join(prompts[0].split())
-    assert "must not pass if an executable requirement has no owner" in prompts[1]
-    assert "exact frozen FunctionItem target_file" in prompts[1]
+    assert "Deterministic ownership validity has already been established" in prompts[1]
+    assert "audited_function_items" in prompts[1]
 
 
 @pytest.mark.asyncio
@@ -546,9 +554,15 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
                 "requirement_allocations": [_allocation("R1", ["scripts/a.py"]), _allocation("R2", [])],
                 "requirement_channels": {"R1": "executable", "R2": "executable"},
             })
-        if "semantic coverage Reviewer" in system:
-            calls.append("semantic_review")
-            return json.dumps(next(review_responses))
+        if _kwargs.get("stage") == "requirement_provenance":
+            calls.append("semantic_review_requirement_provenance")
+            return json.dumps({"audited_requirement_ids": ["R1", "R2"], "audited_function_items": ["scripts/a.py", "scripts/b.py"], "issues": []})
+        if _kwargs.get("stage") == "function_item_contract":
+            calls.append("semantic_review_function_item_contract")
+            return json.dumps({"audited_function_items": ["scripts/a.py", "scripts/b.py"], "issues": []})
+        if _kwargs.get("stage") == "constraint_semantics":
+            calls.append("semantic_review_constraint_semantics")
+            return json.dumps({"audited_requirement_ids": [], "issues": []})
         if "Repair only the listed requirement channel and ownership issues" in system:
             calls.append("requirement_ownership_repair")
             assert payload["affected_requirement_ids"] == ["R2"]
@@ -610,14 +624,16 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
     assert {item["target_file"] for item in interface_payloads[0]["function_items"]} == {"scripts/a.py", "scripts/b.py"}
     assert not {"subsystems", "subsystem_links", "members"} & set(interface_payloads[0])
     assert endpoint_payloads == []
-    assert calls[:5] == [
+    assert calls[:7] == [
         "blueprint_planner",
         "requirement_allocation",
         "requirement_ownership_repair",
-        "semantic_review",
+        "semantic_review_requirement_provenance",
+        "semantic_review_function_item_contract",
+        "semantic_review_constraint_semantics",
         "interface_intent_planner",
     ]
-    assert calls[5:7] == [
+    assert calls[7:9] == [
         "existing_binding_semantic_review",
         "interface_semantic_review",
     ]

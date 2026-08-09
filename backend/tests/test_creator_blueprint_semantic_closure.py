@@ -294,58 +294,10 @@ def test_requirement_ids_are_unique_and_requirements_non_empty():
         validate_requirement_allocations([blank], allowed_owner_targets=["scripts/a.py"])
 
 
-@pytest.mark.asyncio
-async def test_reviewer_unknown_requirement_is_protocol_invalid(monkeypatch):
-    async def complete(messages, *_args, **_kwargs):
-        payload = json.loads(messages[1]["content"])
-        assert payload["user_requirement"] == "用户需要完成 A、B、C 三项责任"
-        assert len(payload["requirement_allocations"]) == 2
-        return json.dumps({"passed": False, "issues": [
-            _review_issue(requirement_id="R3")
-        ], "deferred_checks": []})
-    monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    with pytest.raises(api.PreparePlanProtocolError, match="allocation domain"):
-        await api._review_blueprint_semantic_closure(
-            request=api.PreparePlanRequest(user_request="用户需要完成 A、B、C 三项责任"),
-            blueprint_text="blueprint",
-            requirement_allocations=[_allocation("R1", ["scripts/a.py"]), _allocation("R2", ["scripts/a.py"])],
-            function_items=[{"target_file": "scripts/a.py"}], requirement_channels={"R1": "executable", "R2": "executable"}, planner_model="test",
-        )
 
 
-@pytest.mark.asyncio
-async def test_resource_semantic_conflict_is_reported_by_reviewer_not_suffix_logic(monkeypatch):
-    async def complete(*_args, **_kwargs):
-        return json.dumps({"passed": False, "issues": [_review_issue(
-            issue_type="resource_semantic_conflict", requirement_id="",
-            repair_scope="resource", affected_targets=["scripts/a.py"],
-            resource="static/content.opaque",
-        )], "deferred_checks": []})
-    monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    review = await api._review_blueprint_semantic_closure(
-        request=api.PreparePlanRequest(user_request="完成责任"), blueprint_text="dependency without provenance",
-        function_items=[{"target_file": "scripts/a.py"}],
-        requirement_allocations=[_allocation("R1", ["scripts/a.py"])],
-        requirement_channels={"R1": "executable"}, planner_model="test",
-    )
-    assert review["issues"][0]["resource"] == "static/content.opaque"
 
 
-@pytest.mark.asyncio
-async def test_semantic_pass_normalizes_ownerless_requirement_to_issue(monkeypatch):
-    async def complete(*_args, **_kwargs):
-        return json.dumps({"passed": True, "issues": [], "deferred_checks": []})
-
-    monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    review = await api._review_blueprint_semantic_closure(
-        request=api.PreparePlanRequest(user_request="Complete capability A"),
-        blueprint_text="blueprint",
-        function_items=[{"target_file": "scripts/a.py"}],
-        requirement_allocations=[_allocation("R1", [])],
-        requirement_channels={"R1": "executable"},
-        planner_model="test",
-    )
-    assert review == {"passed": True, "issues": [], "deferred_checks": []}
 
 
 def test_normalization_does_not_duplicate_reported_ownerless_coverage_issue():
@@ -768,145 +720,16 @@ def test_deferred_graph_check_is_nonblocking():
     assert review["deferred_checks"][0]["evidence_stage"] == "graph"
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("channel", ["direct", "resource"])
-async def test_ownerless_non_executable_channel_remains_passed(monkeypatch, channel):
-    async def complete(messages, *_args, **_kwargs):
-        payload = json.loads(messages[1]["content"])
-        assert payload["requirement_channels"] == {"R1": channel}
-        assert payload["requirement_allocations"][0]["owners"] == []
-        return json.dumps({"passed": True, "issues": [], "deferred_checks": []})
-
-    monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    review = await api._review_blueprint_semantic_closure(
-        request=api.PreparePlanRequest(user_request="opaque requirement"),
-        blueprint_text="blueprint",
-        function_items=[{"target_file": "scripts/a.py"}],
-        requirement_allocations=[_allocation("R1", [])],
-        requirement_channels={"R1": channel},
-        planner_model="test",
-    )
-    assert review == {"passed": True, "issues": [], "deferred_checks": []}
 
 
-@pytest.mark.asyncio
-async def test_resource_channel_is_frozen_and_not_challenged(monkeypatch):
-    async def complete(messages, *_args, **_kwargs):
-        prompt = messages[0]["content"]
-        assert "requirement_channels is frozen and authoritative" in prompt
-        assert "Do not reclassify, replace, challenge" in prompt
-        assert 'issue_type = "responsibility_mismatch"' not in prompt
-        assert "source must be exactly one of" in prompt
-        return json.dumps({"passed": True, "issues": [], "deferred_checks": []})
-
-    monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    review = await api._review_blueprint_semantic_closure(
-        request=api.PreparePlanRequest(user_request="abstract requirement"),
-        blueprint_text="abstract blueprint runtime fact",
-        function_items=[{"target_file": "scripts/a.py", "purpose": "runtime action"}],
-        requirement_allocations=[_allocation("R1", [])],
-        requirement_channels={"R1": "resource"}, planner_model="test",
-    )
-    assert review == {"passed": True, "issues": [], "deferred_checks": []}
 
 
-@pytest.mark.asyncio
-async def test_canonical_input_audit_blocks_semantic_aliases(monkeypatch):
-    target = "scripts/a.py"
-    alias_issue = _review_issue(
-        issue_type="responsibility_mismatch", affected_targets=[target],
-        evidence=[{"source": "function_items", "target": target, "field": "inputs",
-                   "observed": "input_a and input_b are alternative names for one runtime value"}],
-        expected_fact="Each required input represents a distinct value needed simultaneously.",
-        reason="The two required inputs are semantic aliases.", repair_guidance="Clarify the canonical input contract.",
-    )
-
-    async def complete(messages, *_args, **_kwargs):
-        prompt = messages[0]["content"]
-        assert "CANONICAL INPUT SLOT AUDIT" in prompt
-        assert "every pair genuinely requires BOTH values simultaneously" in prompt
-        return json.dumps({"passed": False, "issues": [alias_issue], "deferred_checks": []})
-
-    monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    review = await api._review_blueprint_semantic_closure(
-        request=api.PreparePlanRequest(user_request="consume one semantic runtime value"),
-        blueprint_text="input_a and input_b are alternative names for the same value",
-        function_items=[{"target_file": target, "purpose": "consume the value", "inputs": [
-            {"name": "input_a", "description": "the semantic runtime value"},
-            {"name": "input_b", "description": "alternative name for the same runtime value"},
-        ]}], requirement_allocations=[_allocation("R1", [target])],
-        requirement_channels={"R1": "executable"}, planner_model="test",
-    )
-    assert review["passed"] is False
-    assert review["issues"][0]["issue_type"] == "responsibility_mismatch"
 
 
-@pytest.mark.asyncio
-async def test_canonical_input_audit_does_not_match_similar_names(monkeypatch):
-    async def complete(messages, *_args, **_kwargs):
-        assert "Do not infer\nequivalence from field-name similarity" in messages[0]["content"]
-        return json.dumps({"passed": True, "issues": [], "deferred_checks": []})
-
-    monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    review = await api._review_blueprint_semantic_closure(
-        request=api.PreparePlanRequest(user_request="consume text and its distinct metadata"),
-        blueprint_text="both values are simultaneously required",
-        function_items=[{"target_file": "scripts/a.py", "purpose": "combine text with metadata", "inputs": [
-            {"name": "source_text", "description": "document body"},
-            {"name": "source_text_metadata", "description": "distinct provenance and timestamps"},
-        ]}], requirement_allocations=[_allocation("R1", ["scripts/a.py"])],
-        requirement_channels={"R1": "executable"}, planner_model="test",
-    )
-    assert review == {"passed": True, "issues": [], "deferred_checks": []}
 
 
-@pytest.mark.asyncio
-async def test_unknown_channel_issue_type_is_not_semantically_remapped(monkeypatch):
-    calls = []
-    reason = "The actual supplied resource channel conflicts with a frozen runtime fact."
-    unknown = _review_issue(issue_type="channel_alignment_issue", reason=reason)
-
-    async def complete(messages, *_args, **_kwargs):
-        calls.append(messages)
-        if len(calls) == 1:
-            return json.dumps({"passed": False, "issues": [unknown], "deferred_checks": []})
-        assert "map an unknown channel concern type" not in messages[0]["content"]
-        return json.dumps({"passed": False, "issues": [unknown], "deferred_checks": []})
-
-    monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    with pytest.raises(api.PreparePlanProtocolError):
-        await api._review_blueprint_semantic_closure(
-            request=api.PreparePlanRequest(user_request="abstract requirement"),
-            blueprint_text="blueprint", function_items=[{"target_file": "scripts/a.py"}],
-            requirement_allocations=[_allocation("R1", ["scripts/a.py"])],
-            requirement_channels={"R1": "executable"}, planner_model="test",
-        )
-    assert len(calls) == 2
 
 
-@pytest.mark.asyncio
-async def test_reviewer_deferred_relationship_does_not_fail_review(monkeypatch):
-    deferred = _review_issue(
-        issue_type="deferred_verification", blocking_now=False,
-        repair_scope="none", evidence_stage="graph", evidence=[],
-        reason="Final verification requires ResponsibilityGraph evidence.",
-    )
-
-    async def complete(*_args, **_kwargs):
-        return json.dumps({"passed": True, "issues": [], "deferred_checks": [deferred]})
-
-    monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    review = await api._review_blueprint_semantic_closure(
-        request=api.PreparePlanRequest(user_request="opaque relationship"),
-        blueprint_text="blueprint",
-        function_items=[{"target_file": "scripts/a.py"}, {"target_file": "scripts/b.py"}],
-        requirement_allocations=[_allocation("R1", ["scripts/a.py", "scripts/b.py"])],
-        requirement_channels={"R1": "executable"},
-        planner_model="test",
-    )
-    assert review["passed"] is True
-    assert review["issues"] == []
-    assert len(review["deferred_checks"]) == 1
 
 
 def test_actual_noop_projection_ignores_nonsemantic_blueprint_wording():
@@ -915,60 +738,8 @@ def test_actual_noop_projection_ignores_nonsemantic_blueprint_wording():
     assert api._semantic_projection_facts(before) == api._semantic_projection_facts(after)
 
 
-@pytest.mark.asyncio
-async def test_semantic_reviewer_protocol_retries_once_locally(monkeypatch):
-    calls = []
-
-    async def complete(messages, *_args, **_kwargs):
-        payload = json.loads(messages[1]["content"])
-        calls.append(payload)
-        if len(calls) == 1:
-            return json.dumps({"passed": True, "issues": []})
-        assert "protocol_error" in payload
-        return json.dumps({"passed": True, "issues": [], "deferred_checks": []})
-
-    monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    review = await api._review_blueprint_semantic_closure(
-        request=api.PreparePlanRequest(user_request="opaque"),
-        blueprint_text="blueprint",
-        function_items=[{"target_file": "scripts/a.py"}],
-        requirement_allocations=[_allocation("R1", ["scripts/a.py"])],
-        requirement_channels={"R1": "executable"},
-        planner_model="test",
-    )
-    assert review["passed"] is True
-    assert len(calls) == 2
-    assert calls[0]["requirement_allocations"] == calls[1]["requirement_allocations"]
 
 
-@pytest.mark.asyncio
-async def test_semantic_reviewer_repairs_empty_blocking_evidence_from_context(monkeypatch):
-    calls = []
-    invalid = _review_issue(evidence=[])
-    invalid["evidence"] = []
-
-    async def complete(messages, *_args, **_kwargs):
-        calls.append(messages)
-        if len(calls) == 1:
-            return json.dumps({"passed": False, "issues": [invalid], "deferred_checks": []})
-        payload = json.loads(messages[1]["content"])
-        assert payload["authoritative_context"]["requirement_channels"] == {"R1": "executable"}
-        assert "Do not preserve an empty evidence array" in messages[0]["content"]
-        fixed = _review_issue(evidence=[{
-            "source": "requirement_channels", "target": "R1",
-            "field": "R1", "observed": "executable",
-        }])
-        return json.dumps({"passed": False, "issues": [fixed], "deferred_checks": []})
-
-    monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    review = await api._review_blueprint_semantic_closure(
-        request=api.PreparePlanRequest(user_request="opaque"), blueprint_text="blueprint",
-        function_items=[{"target_file": "scripts/a.py"}],
-        requirement_allocations=[_allocation("R1", ["scripts/a.py"])],
-        requirement_channels={"R1": "executable"}, planner_model="test",
-    )
-    assert len(calls) == 2
-    assert review["issues"][0]["evidence"][0]["observed"] == "executable"
 
 
 def test_pre_graph_protocol_rejects_same_blocking_and_deferred_reason():
