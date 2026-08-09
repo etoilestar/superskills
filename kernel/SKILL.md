@@ -58,6 +58,20 @@ Creator 前半段应尽量短：用户已经给出需求、选择已有 Skill �
 
 ### 脚本数量、上传文件和工具选择规则
 
+#### FunctionItem Input Contract
+
+Every declared FunctionItem input represents one distinct receiving slot.
+Inputs are conjunctive by default: when two inputs both have
+`runtime_source_required=true`, runtime must be able to supply both. Do not
+declare aliases, alternative names, fallback forms, or two expressions of one
+runtime value as separate required inputs. Choose one canonical logical input.
+Declare several required inputs only for genuinely distinct runtime values.
+
+Do not emit placeholder resources, example assets, example references, example
+tools, or example files as actual Blueprint content. Instruction examples are
+explanatory only. Keep an empty resource category empty, or omit it only when
+the protocol permits omission.
+
 - 文件数量只在蓝图阶段确定；蓝图通过后，不再新增、删除、拆分或合并脚本文件。
 
 - 脚本数量必须由任务复杂度和真实责任边界决定。脚本更少和脚本更多都不是优化目标。
