@@ -18,6 +18,7 @@ from ..config import settings
 from .llm_proxy import complete_chat_once
 
 ROLES = ("planner", "reviewer")
+DEFAULT_ROLE_TEMPERATURES = {"planner": 0.1, "reviewer": 0.0}
 _lock = RLock()
 logger = logging.getLogger(__name__)
 
@@ -85,7 +86,8 @@ def resolve_creator_model_profile(
         api_key=str(saved["api_key"]) if saved.get("api_key") else None,
         model=str(saved.get("model") or fallback_model),
         max_tokens=saved.get("max_tokens") if saved.get("max_tokens") is not None else settings.max_tokens,
-        temperature=saved.get("temperature") if saved.get("temperature") is not None else settings.temperature,
+        temperature=(saved.get("temperature") if saved.get("temperature") is not None
+                     else DEFAULT_ROLE_TEMPERATURES[role]),
     )
 
 

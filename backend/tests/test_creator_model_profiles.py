@@ -35,9 +35,9 @@ def test_profile_model_override_wins_and_provider_fields_remain_isolated(tmp_pat
         asyncio.run(profiles.complete_creator_role_once([], "planner", fallback_model="planner-original"))
         asyncio.run(profiles.complete_creator_role_once([], "reviewer", fallback_model="reviewer-original"))
     assert call.await_args_list[0].args[1] == "model-A"
-    assert call.await_args_list[0].kwargs == {"base_url": "https://a.test", "api_key": "key-A", "max_tokens": 1234}
+    assert call.await_args_list[0].kwargs == {"base_url": "https://a.test", "api_key": "key-A", "max_tokens": 1234, "temperature": 0.1}
     assert call.await_args_list[1].args[1] == "model-B"
-    assert call.await_args_list[1].kwargs == {"base_url": "https://b.test", "api_key": "key-B", "max_tokens": 2345}
+    assert call.await_args_list[1].kwargs == {"base_url": "https://b.test", "api_key": "key-B", "max_tokens": 2345, "temperature": 0.0}
 
 
 def test_empty_fields_clear_overrides_and_keep_api_key(tmp_path, monkeypatch):
@@ -88,7 +88,7 @@ def test_role_temperature_override_is_forwarded(tmp_path, monkeypatch, caplog):
     assert "temperature=0.15" in caplog.text
 
 
-def test_temperature_inherits_global_and_role_override_wins(tmp_path, monkeypatch):
+def test_structural_role_defaults_and_role_override_wins(tmp_path, monkeypatch):
     from backend.config import settings
     from backend.services import creator_model_profiles as profiles
 
@@ -96,9 +96,8 @@ def test_temperature_inherits_global_and_role_override_wins(tmp_path, monkeypatc
     monkeypatch.setattr(settings, "temperature", 0.2)
     saved = _empty_profiles()
     profiles._save(saved)
-    assert profiles.resolve_creator_model_profile(
-        "planner", fallback_model="model"
-    ).temperature == 0.2
+    assert profiles.resolve_creator_model_profile("planner", fallback_model="model").temperature == 0.1
+    assert profiles.resolve_creator_model_profile("reviewer", fallback_model="model").temperature == 0.0
     saved["planner"]["temperature"] = 0.05
     profiles._save(saved)
     assert profiles.resolve_creator_model_profile(

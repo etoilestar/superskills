@@ -67,6 +67,15 @@ from .frozen_facts import (
     project_frozen_facts_to_summary,
 )
 from .model_gateway import creator_model_call
+from .semantic_review_contracts import (
+    BLUEPRINT_SEMANTIC_REVIEW_SCHEMA,
+    ALLOWED_EVIDENCE_SOURCES,
+    ReviewAuditCoverageError,
+    ReviewEvidenceReferenceError,
+    ReviewSchemaError,
+    build_evidence_context,
+    validate_and_ground_review,
+)
 
 
 async def complete_creator_role_once(
@@ -8135,322 +8144,165 @@ def _requirement_channel_summary(
     }
 
 
+async def _reformat_semantic_review_transport(
+    *, raw_response: str, validation_error: Exception, reviewer: str,
+    planner_model: str,
+) -> dict[str, Any]:
+    """Repair serialization/schema only; semantic evidence selection is immutable."""
+    schema = BLUEPRINT_SEMANTIC_REVIEW_SCHEMA[reviewer]
+    prompt = """You are a transport-only JSON reformatter.
+Do not add, remove, merge, split, withdraw, or reinterpret semantic findings.
+Do not change evidence source, ref, or field selection. Repair serialization and
+schema shape only. The supplied machine schema is authoritative. Return JSON only.
+""" + json.dumps(schema, ensure_ascii=False, sort_keys=True)
+    payload = {
+        "raw_response": raw_response,
+        "exact_json_schema": schema,
+        "validation_error": str(validation_error),
+        "allowed_evidence_sources": list(ALLOWED_EVIDENCE_SOURCES),
+    }
+    text = await complete_creator_role_once(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+        "reviewer", fallback_model=planner_model, stage="semantic_review_transport",
+    )
+    return _parse_prepare_plan_json(text)
+
+
+async def _run_grounded_blueprint_reviewer(
+    *, reviewer: str, evidence_context: dict[str, Any], audit_domain: list[str],
+    explanatory_blueprint: str, planner_model: str,
+) -> dict[str, Any]:
+    """Run one focused reviewer with separate transport and reference recovery."""
+    if reviewer == "requirement_provenance":
+        responsibility = """Review only whether each executable requirement's existing owner
+semantically fulfills it, whether every substantive FunctionItem has confirmed
+requirement provenance, and whether many-to-many provenance is justified.
+Deterministic ownership validity has already been established. Do not re-evaluate
+whether an owner exists or whether its identity is legal. Do not audit channels,
+input aliases, ports, file formats, Graph, or runtime."""
+    else:
+        responsibility = """Review only responsibility-to-input/output consistency,
+canonical input slots, conjunctive required-input semantics, internal temporary
+values promoted to external inputs, and workflow dependency semantics. Compatibility
+aliases at the platform boundary do not automatically become conjunctive FunctionItem
+inputs. Do not audit owner counts, channel classification, resource ownership, or
+Graph endpoints. Never choose which alias to retain and never modify inputs."""
+    schema = BLUEPRINT_SEMANTIC_REVIEW_SCHEMA[reviewer]
+    prompt = AUTHORITY_CONTRACT + f"""
+You are the focused {reviewer} semantic Reviewer.
+{responsibility}
+
+STRUCTURED SATISFACTION PRINCIPLE
+When a requirement is already satisfied by authoritative structured facts, do
+not require a redundant natural-language sentence restating the same constraint.
+Absence of redundant prose is not a defect. Judge canonical topology,
+responsibilities, ports, dependencies, file identities, resources, and platform
+contracts directly.
+
+The evidence_context is authoritative. Raw Blueprint prose is non-authoritative
+explanatory context. Select fact references only; the Backend resolves exact
+observed values. Never emit observed, expected_fact, repair_guidance, or a repair
+operation. required_condition states only the condition that must hold. Reviewer
+type determines the editable authority layer. Machine schema is authoritative;
+prose does not redefine its keys or types.
+
+OUTPUT CONTRACT
+""" + json.dumps(schema, ensure_ascii=False, sort_keys=True)
+    payload = {
+        "evidence_context": evidence_context,
+        "audit_domain": audit_domain,
+        "explanatory_blueprint": explanatory_blueprint,
+    }
+    protocol_retry = False
+    for semantic_attempt in range(2):
+        raw = await complete_creator_role_once(
+            [{"role": "system", "content": prompt},
+             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+            "reviewer", fallback_model=planner_model, stage=reviewer,
+        )
+        try:
+            parsed = _parse_prepare_plan_json(raw)
+        except PreparePlanProtocolError as exc:
+            protocol_retry = True
+            parsed = await _reformat_semantic_review_transport(
+                raw_response=raw, validation_error=exc, reviewer=reviewer,
+                planner_model=planner_model,
+            )
+        try:
+            grounded = validate_and_ground_review(
+                parsed, reviewer=reviewer, evidence_context=evidence_context,
+                expected_audit_domain=audit_domain,
+            )
+        except ReviewSchemaError as exc:
+            protocol_retry = True
+            parsed = await _reformat_semantic_review_transport(
+                raw_response=raw, validation_error=exc, reviewer=reviewer,
+                planner_model=planner_model,
+            )
+            grounded = validate_and_ground_review(
+                parsed, reviewer=reviewer, evidence_context=evidence_context,
+                expected_audit_domain=audit_domain,
+            )
+        except (ReviewEvidenceReferenceError, ReviewAuditCoverageError) as exc:
+            failure = ("review_evidence_ref_invalid" if isinstance(exc, ReviewEvidenceReferenceError)
+                       else "review_audit_coverage_invalid")
+            logger.error("[Creator][semantic_reviewer] reviewer=%s failure=%s error=%s",
+                         reviewer, failure, exc)
+            if semantic_attempt == 0:
+                continue  # fresh semantic review; never ask transport to select another fact
+            raise PreparePlanProtocolError(f"{failure}: {exc}") from exc
+        evidence_count = sum(len(issue["evidence"]) for issue in grounded["issues"])
+        digest = hashlib.sha256(json.dumps(evidence_context["blueprint_facts"], sort_keys=True, default=str).encode()).hexdigest()[:12]
+        logger.info(
+            "[Creator][semantic_reviewer] reviewer=%s audited_count=%d issue_count=%d evidence_ref_count=%d protocol_retry=%s candidate_digest=%s",
+            reviewer, len(audit_domain), len(grounded["issues"]), evidence_count,
+            str(protocol_retry).lower(), digest,
+        )
+        return grounded
+    raise PreparePlanProtocolError(f"{reviewer} review failed without a grounded result")
+
+
 async def _review_blueprint_semantic_closure(
     *, request: PreparePlanRequest, blueprint_text: str,
     function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]],
     requirement_channels: dict[str, str], planner_model: str,
 ) -> dict[str, Any]:
-    """Review only semantic facts observable before ResponsibilityGraph creation."""
-    prompt = AUTHORITY_CONTRACT + """1. AUTHORITATIVE FACTS
-You are the pre-graph Blueprint semantic coverage Reviewer. Review only the
-supplied original user requirement, frozen Blueprint, frozen FunctionItems,
-requirement allocations, requirement channels, and authoritative FunctionItem
-target domain.
-
-The review must not pass if an executable requirement has no owner.
-
-requirement_channels is the authoritative classification produced by the
-Requirement Projection stage for this review pass. Review each requirement
-using its supplied channel. Do not silently reinterpret a resource or direct
-requirement as executable.
-
-CHANNEL AUTHORITY
-
-requirement_channels is frozen and authoritative for this review pass.
-Do not reclassify, replace, challenge, reinterpret, or recommend changing any
-requirement channel. Do not report that a resource or direct requirement should
-be executable. Do not create an issue whose repair_guidance asks to change a
-requirement channel. Review only whether the current Blueprint and allocations
-are valid under the supplied channel.
-
-REVERSE PROVENANCE AUDIT
-
-For every frozen substantive executable FunctionItem, determine whether its
-runtime responsibility is semantically justified by the confirmed requirement
-set and executable allocations. A FunctionItem may synthesize several
-requirements, and one requirement may justify several FunctionItems. A derived
-helper is valid when its necessity follows semantically from confirmed
-requirements and upstream frozen responsibilities. Do not infer provenance from
-filename, role label, matching field names, or array position. If provenance is
-missing or contradictory, report a responsibility_mismatch with evidence that
-references only supplied requirement and FunctionItem identities. Diagnose the
-gap; do not prescribe reclassification, a new owner, or a repair operation.
-
-CANONICAL INPUT SLOT AUDIT
-
-For every FunctionItem, inspect all runtime-required logical inputs. Determine
-from confirmed requirements, responsibility, input descriptions/contracts, and
-the platform contract whether any two inputs are aliases, fallback names,
-alternative representations, or equivalent ways to supply one semantic runtime
-value. Ask whether every pair genuinely requires BOTH values simultaneously at
-runtime. If either can replace the other while preserving the same semantic
-runtime value, report a blocking responsibility_mismatch. Do not infer
-equivalence from field-name similarity and do not decide which name to retain.
-
-PORT / RESPONSIBILITY SELF-CONSISTENCY AUDIT
-
-For every FunctionItem, verify each required input is an external value its
-responsibility actually needs, each output is a value that responsibility can
-produce, internal temporary values were not promoted to external inputs, and no
-input or output is unrelated to the responsibility. This is a semantic model
-judgment over supplied facts; never use a backend naming heuristic and never
-prescribe a replacement port.
-
-2. CHANNEL-AWARE REVIEW RULES
-Ownership rules are channel-aware:
-- For executable requirements, at least one owner must exist; every owner must
-  be an existing frozen FunctionItem, perform a runtime action contributing
-  directly to fulfillment, and have evidence citing current FunctionItem facts.
-- For resource requirements, owners=[] is valid and required. Verify only that
-  the structural, protocol, prohibition, topology, capability, or resource
-  constraint is represented in the Blueprint or platform contract. Do not assign
-  affected FunctionItems as owners, including when a rule applies globally.
-- For direct requirements, owners=[] is valid and required. Verify only that the
-  platform or assistant responsibility is represented; never synthesize an owner.
-
-Every executable requirement must have at least one frozen FunctionItem owner.
-Every resource or direct requirement must remain represented in the projection,
-but does not require a FunctionItem owner. Do not report resource or direct as
-requirement_uncovered merely because it has no owner. Do not require a validator,
-orchestrator, policy script, output controller, security script, or other new
-FunctionItem for resource or direct requirements.
-
-The absence of FunctionItem owners is not evidence of a defect when the actual
-supplied channel is resource or direct. Do not generate a blocking issue whose
-only evidence is:
-- channel = resource and owners = [];
-- channel = direct and owners = [];
-- a requirement will need later validation;
-- no validator FunctionItem exists.
-
-A requirement may be validly resource or direct while still requiring later
-verification. Later verification does not create executable ownership. Graph,
-generation, runtime, file validation, and sandbox validation are possible later
-evidence stages. Do not change resource/direct to executable merely because its
-compliance will be checked later.
-
-A FunctionItem being constrained by a requirement does not make that
-FunctionItem an owner of the requirement. A requirement that applies to all
-FunctionItems is not automatically a distributed executable requirement. Owner
-means the FunctionItem performs the runtime action that fulfills the requirement.
-Affected or governed FunctionItems are not necessarily owners.
-
-3. CURRENT-STAGE BLOCKING RULES
-A review issue represents an actual defect, not proof that a requirement was
-reviewed. If the observed fact satisfies the expected fact, emit nothing. Never
-emit an issue whose reason says the state is valid, correct, already satisfied,
-or needs no repair; never set blocking_now=true when repair_guidance says no
-repair is needed. A valid requirement contributes no issue.
-
-A blocking Blueprint-stage issue requires concrete evidence that the current
-frozen Blueprint, FunctionItems, requirement allocation, or channel is already
-incorrect at the current stage. It must be resolvable by a currently permitted
-Blueprint-stage or allocation-stage repair.
-
-For every blocking issue, expected_fact must be a non-empty string and evidence
-must be a non-empty array. Evidence must cite at least one concrete fact from the
-supplied authoritative payload and identify the observed value and why it
-conflicts with the expected current-stage fact. Do not return evidence=[] or
-empty evidence facts. Do not use future graph/runtime assumptions as current
-Blueprint evidence.
-
-4. DEFERRED-CHECK RULES
-A deferred check records a requirement whose compliance cannot yet be verified
-because graph, generated code, runtime, sandbox, file content, or execution
-evidence does not yet exist. A deferred check is not a current failure.
-
-Do not report the same requirement as both a blocking issue and a deferred check
-for the same reason. It may appear in both only when the blocking issue identifies
-one concrete current-stage defect and the deferred check identifies a different
-later-stage fact. Explain the distinction explicitly in their reasons.
-
-Do not describe the same missing lifecycle evidence in both issues and
-deferred_checks, even using different wording. A requirement may appear in both
-only when the blocking entry cites a concrete current-stage defect and the
-deferred entry cites a distinct future-stage fact.
-
-5. FROZEN-SCOPE INVARIANTS
-FunctionItems are frozen. The complete owner domain is
-`authoritative_function_item_targets`. Never propose a new script, file,
-FunctionItem, owner identity, or changed target_file outside that domain.
-Every owner must be an exact frozen FunctionItem target_file from that domain.
-Do not create a blocking issue whose repair requires adding a FunctionItem/file,
-inventing a validator/orchestrator, changing frozen target_file identities, or
-accessing unavailable graph/runtime evidence. Such concerns are deferred unless
-a separate current Blueprint defect is already evidenced.
-
-6. FINAL SELF-CHECK
-Before returning, silently verify:
-- every requirement statement uses the actual supplied channel;
-- every FunctionItem's responsibility, required inputs, and outputs were audited;
-- every pair of required inputs was checked for conjunctive canonical-slot semantics;
-- no issue proposes changing a requirement channel;
-- no resource/direct requirement is made blocking merely because owners=[];
-- no issue assigns all FunctionItems only because a constraint applies globally;
-- no issue confuses governed FunctionItems with owners;
-- every blocking issue can be repaired without changing requirement_channels;
-- only executable requirements are required to have owners;
-- no issue proposes an owner outside authoritative_function_item_targets;
-- no issue proposes a new FunctionItem or file;
-- no blocking issue depends only on future graph/runtime evidence;
-- the same reason is not both blocking and deferred;
-- every blocking issue has non-empty expected_fact and valid non-empty evidence;
-- every issue is resolvable within its declared repair_scope;
-- passed is true exactly when no blocking issues remain.
-- for every issue, a concrete current-stage fact can be stated as wrong; otherwise remove it.
-
-7. OUTPUT CONTRACT
-Use the allowed issue types as follows:
-- requirement_uncovered: a fact required to exist in the current pre-graph
-  payload is absent.
-- requirement_partially_covered: the current pre-graph payload covers only part
-  of an explicit executable responsibility.
-- responsibility_mismatch: the supplied channel, owner, FunctionItem
-  responsibility, or allocation is inconsistent with another concrete
-  current-stage fact.
-- resource_semantic_conflict: a declared resource requirement conflicts with
-  supplied authoritative resource facts and satisfies the resource-specific
-  protocol.
-- deferred_verification: compliance requires evidence from a later Creator
-  stage and is not currently blocking.
-
-Return strict JSON with exactly passed, issues, and deferred_checks. issues has
-only blocking_now=true entries; deferred_checks has only non-blocking
-`deferred_verification` entries. Allowed issue_type values are
-requirement_uncovered, requirement_partially_covered, responsibility_mismatch,
-resource_semantic_conflict, deferred_verification. Allowed evidence_stage values
-are blueprint, graph, generation, runtime, boundary, resource. Allowed
-repair_scope values are blueprint, allocation, graph, resource, none.
-
-Every entry contains exactly issue_type, requirement_id, blocking_now,
-evidence_stage, repair_scope, affected_targets, evidence, expected_fact, reason,
-and repair_guidance (plus resource only for resource_semantic_conflict).
-
-source must be exactly one of:
-- requirement_channels
-- requirement_allocations
-- function_items
-- blueprint
-- platform_contract
-
-source identifies the authoritative payload section. target identifies the exact
-requirement ID, FunctionItem target_file, Blueprint section, or platform-contract
-object being cited. field identifies the exact field within that source.
-observed contains the concrete supplied value. Do not put an explanation,
-multiple sources, or a natural-language sentence in source or field.
-
-A blocking entry requires non-empty evidence and expected_fact. A deferred entry
-uses evidence=[], expected_fact="", affected_targets=[], repair_scope="none", and
-empty repair_guidance. Return no explanation outside the JSON object.
-""".strip()
-    authoritative_targets = [
-        str(item.get("target_file") or "").strip()
-        for item in function_items
-        if str(item.get("target_file") or "").strip()
+    """Merge two focused, independently complete grounded semantic audits."""
+    evidence_context = build_evidence_context(
+        requirement_channels=requirement_channels,
+        requirement_allocations=requirement_allocations,
+        function_items=function_items,
+        platform_contract=build_platform_io_contract(),
+    )
+    executable_ids = [
+        str(row.get("requirement_id") or "") for row in requirement_allocations
+        if requirement_channels.get(str(row.get("requirement_id") or "")) == "executable"
     ]
-    valid_requirement_ids = [
-        str(item.get("requirement_id") or "").strip()
-        for item in requirement_allocations
-        if str(item.get("requirement_id") or "").strip()
-    ]
-    payload = {
-        "original_user_requirement": request.user_request,
-        "user_requirement": request.user_request,
-        "conversation_history": request.conversation_history,
-        "human_feedback": request.human_feedback,
-        "current_blueprint": blueprint_text,
-        "frozen_function_items": function_items,
-        "requirement_allocations": requirement_allocations,
-        "requirement_channels": requirement_channels,
-        "authoritative_function_item_targets": authoritative_targets,
+    function_targets = [str(item.get("target_file") or "") for item in function_items]
+    requirement_review, function_review = await asyncio.gather(
+        _run_grounded_blueprint_reviewer(
+            reviewer="requirement_provenance", evidence_context=evidence_context,
+            audit_domain=executable_ids, explanatory_blueprint=blueprint_text,
+            planner_model=planner_model,
+        ),
+        _run_grounded_blueprint_reviewer(
+            reviewer="function_item_contract", evidence_context=evidence_context,
+            audit_domain=function_targets, explanatory_blueprint=blueprint_text,
+            planner_model=planner_model,
+        ),
+    )
+    issues = []
+    for authority, result in (("requirement_projection", requirement_review),
+                              ("blueprint", function_review)):
+        for issue in result["issues"]:
+            issues.append({**issue, "repair_scope": authority, "blocking_now": True})
+    logger.info("[Creator][semantic_review] blocking_issue_count=%d", len(issues))
+    return {
+        "passed": not issues, "issues": issues, "deferred_checks": [],
+        "audited_requirement_ids": requirement_review["audited_requirement_ids"],
+        "audited_function_items": function_review["audited_function_items"],
     }
-    review: dict[str, Any] | None = None
-    raw_review_response = ""
-    for protocol_attempt in range(2):
-        system_prompt = prompt
-        if protocol_attempt:
-            system_prompt = prompt + """
-
-PROTOCOL REPAIR ONLY
-The previous response violated the blocking issue protocol. For every issue
-with blocking_now=true, expected_fact must be a non-empty string and evidence
-must use the exact required non-empty evidence array shape. Evidence may contain
-only facts already present in the supplied authoritative context.
-Do not preserve an empty evidence array or empty evidence object.
-
-Repair protocol shape only. Do not add, remove, merge, split, or reinterpret
-semantic issues. Preserve the original issues and deferred checks, correcting
-only invalid JSON/envelope/field types, reference-domain violations, lifecycle
-routing fields, passed consistency, and required evidence protocol fields.
-
-When repairing evidence protocol:
-- preserve the original issue_type;
-- preserve requirement_id;
-- preserve blocking_now;
-- preserve the semantic reason;
-- preserve whether the issue is blocking or deferred;
-- do not turn a deferred check into a blocking issue;
-- do not turn a blocking issue into a deferred check;
-- do not introduce a new issue_type.
-
-Only correct JSON shape, legal enum values, evidence structure, reference values,
-and passed consistency.
-Return no repair notes."""
-        text = await complete_creator_role_once(
-            [{"role": "system", "content": system_prompt},
-             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
-            "reviewer", fallback_model=planner_model,
-        )
-        raw_review_response = text
-        try:
-            review = validate_blueprint_semantic_review(
-                _parse_prepare_plan_json(text),
-                allowed_function_item_targets=authoritative_targets,
-                supplied_requirement_ids=valid_requirement_ids,
-            )
-            break
-        except (ValueError, PreparePlanProtocolError) as exc:
-            logger.error(
-                "[Creator][semantic_review_protocol_violation] attempt=%d error=%s",
-                protocol_attempt + 1, exc,
-            )
-            if protocol_attempt:
-                raise PreparePlanProtocolError(
-                    "Pre-graph semantic Reviewer returned an invalid protocol "
-                    f"after one local retry: {exc}"
-                ) from exc
-            payload["protocol_error"] = {
-                "message": str(exc),
-                "instruction": (
-                    "Repair protocol shape only; retain the same semantic issues. "
-                    "Populate required evidence only from authoritative_context."
-                ),
-            }
-            payload["raw_review_response"] = raw_review_response
-            payload["authoritative_context"] = {
-                key: value for key, value in payload.items()
-                if key not in {"protocol_error", "raw_review_response", "authoritative_context"}
-            }
-    if review is None:
-        raise PreparePlanProtocolError(
-            "Pre-graph semantic Reviewer protocol retry produced no review"
-        )
-    review = _normalize_semantic_review_against_allocations(
-        review, requirement_allocations, requirement_channels
-    )
-    deferred = review["deferred_checks"]
-    advisory_count = sum(not issue.get("blocking_now") for issue in review["issues"])
-    logger.info(
-        "[Creator][semantic_review] blocking_issue_count=%d deferred_check_count=%d advisory_issue_count=%d",
-        len(review["issues"]), len(deferred), advisory_count,
-    )
-    for issue in deferred:
-        logger.info(
-            "[Creator][semantic_review_deferred] requirement_id=%s evidence_stage=%s reason=%s",
-            issue.get("requirement_id", ""), issue.get("evidence_stage", ""),
-            issue.get("reason", ""),
-        )
-    return review
 
 
 async def _replan_blueprint_for_semantic_closure(
@@ -9679,11 +9531,11 @@ Blueprint Planner 只规划业务责任。
         blocking_issues = list(semantic_review["issues"])
         allocation_issues = [
             issue for issue in blocking_issues
-            if issue.get("repair_scope") == "allocation"
+            if issue.get("repair_scope") == "requirement_projection"
         ]
         if allocation_issues:
             logger.info(
-                "[Creator][semantic_repair_route] scope=allocation issue_count=%d",
+                "[Creator][semantic_repair_route] scope=requirement_projection issue_count=%d",
                 len(allocation_issues),
             )
             requirement_projection = await _reconcile_requirement_allocations(
@@ -9804,7 +9656,7 @@ Blueprint Planner 只规划业务责任。
         )
 
         if blocking_issues:
-            for scope in ("allocation", "blueprint", "resource", "graph", "none"):
+            for scope in ("requirement_projection", "blueprint", "resource", "graph", "none"):
                 scoped = [issue for issue in blocking_issues if issue.get("repair_scope") == scope]
                 if scoped:
                     logger.info(
