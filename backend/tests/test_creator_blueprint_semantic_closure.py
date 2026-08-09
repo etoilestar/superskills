@@ -811,6 +811,56 @@ async def test_resource_channel_is_frozen_and_not_challenged(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_canonical_input_audit_blocks_semantic_aliases(monkeypatch):
+    target = "scripts/a.py"
+    alias_issue = _review_issue(
+        issue_type="responsibility_mismatch", affected_targets=[target],
+        evidence=[{"source": "function_items", "target": target, "field": "inputs",
+                   "observed": "input_a and input_b are alternative names for one runtime value"}],
+        expected_fact="Each required input represents a distinct value needed simultaneously.",
+        reason="The two required inputs are semantic aliases.", repair_guidance="Clarify the canonical input contract.",
+    )
+
+    async def complete(messages, *_args, **_kwargs):
+        prompt = messages[0]["content"]
+        assert "CANONICAL INPUT SLOT AUDIT" in prompt
+        assert "every pair genuinely requires BOTH values simultaneously" in prompt
+        return json.dumps({"passed": False, "issues": [alias_issue], "deferred_checks": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    review = await api._review_blueprint_semantic_closure(
+        request=api.PreparePlanRequest(user_request="consume one semantic runtime value"),
+        blueprint_text="input_a and input_b are alternative names for the same value",
+        function_items=[{"target_file": target, "purpose": "consume the value", "inputs": [
+            {"name": "input_a", "description": "the semantic runtime value"},
+            {"name": "input_b", "description": "alternative name for the same runtime value"},
+        ]}], requirement_allocations=[_allocation("R1", [target])],
+        requirement_channels={"R1": "executable"}, planner_model="test",
+    )
+    assert review["passed"] is False
+    assert review["issues"][0]["issue_type"] == "responsibility_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_canonical_input_audit_does_not_match_similar_names(monkeypatch):
+    async def complete(messages, *_args, **_kwargs):
+        assert "Do not infer\nequivalence from field-name similarity" in messages[0]["content"]
+        return json.dumps({"passed": True, "issues": [], "deferred_checks": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    review = await api._review_blueprint_semantic_closure(
+        request=api.PreparePlanRequest(user_request="consume text and its distinct metadata"),
+        blueprint_text="both values are simultaneously required",
+        function_items=[{"target_file": "scripts/a.py", "purpose": "combine text with metadata", "inputs": [
+            {"name": "source_text", "description": "document body"},
+            {"name": "source_text_metadata", "description": "distinct provenance and timestamps"},
+        ]}], requirement_allocations=[_allocation("R1", ["scripts/a.py"])],
+        requirement_channels={"R1": "executable"}, planner_model="test",
+    )
+    assert review == {"passed": True, "issues": [], "deferred_checks": []}
+
+
+@pytest.mark.asyncio
 async def test_unknown_channel_issue_type_is_not_semantically_remapped(monkeypatch):
     calls = []
     reason = "The actual supplied resource channel conflicts with a frozen runtime fact."

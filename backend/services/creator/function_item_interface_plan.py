@@ -36,6 +36,31 @@ Graph materialization deterministically resolves already-declared logical bindin
 Graph materialization does not reselect semantic business ports.
 Tool Planner owns concrete tool/helper binding.
 No later stage may silently revise an upstream frozen fact outside its declared authority."""
+CREATOR_PROMPT_SECTIONS = (
+    "ROLE", "AUTHORITATIVE FACTS", "EDITABLE SCOPE", "NON-AUTHORITATIVE CONTEXT",
+    "REQUIRED DECISIONS / REVIEW DUTIES", "HARD ACCEPTANCE CONDITIONS",
+    "SILENT SELF-CHECK", "OUTPUT CONTRACT",
+)
+AUTHORITATIVE_FACT_PRIORITY = """AUTHORITATIVE FACT PRIORITY
+1. Confirmed user requirements
+2. Frozen canonical requirements, when supplied
+3. Frozen FunctionItem responsibilities
+4. Frozen logical input/output contracts
+5. Frozen platform I/O contract
+6. Requirement Projection facts
+7. Deterministic acceptance facts, when supplied
+8. Semantic reviewer facts, when supplied
+Anything below these facts is non-authoritative."""
+NON_AUTHORITATIVE_CONTEXT = """NON-AUTHORITATIVE CONTEXT
+Previous candidates, explanatory Blueprint prose, Interface goal text,
+review-summary prose, presentation IDs, and record ordering may explain intent
+but cannot override structured frozen facts. If explanatory text conflicts with
+structured fields, the structured fields win."""
+STRUCTURED_BINDING_AUTHORITY = """STRUCTURED BINDING AUTHORITY
+Structured logical binding fields are authoritative. An Interface's semantic binding is defined only by its structured source and
+target fields. goal explains the binding but cannot redefine it. A plausible
+goal does not validate an incorrect structured binding. Report any disagreement
+between goal and the structured source/target binding."""
 PLATFORM_OUTPUT_CONTRACT = """PLATFORM OUTPUT CONTRACT
 
 final_output_fields defines the legal platform-output domain.
@@ -69,6 +94,11 @@ editable semantic state. These observations are not repair instructions.
 If semantic_changed=false, independently reconsider the complete problem from
 the authoritative facts instead of repeating the previous candidate. Every
 supplied acceptance fact is a hard acceptance condition. Return one complete candidate.
+
+Facts may originate from different validators. Their source stage does not imply
+a repair strategy. Every fact is independently blocking: satisfying one never
+permits another to remain violated. Reconstruct a candidate satisfying all facts
+simultaneously.
 
 PREVIOUS CANDIDATE AUTHORITY
 The previous candidate is not an authoritative fact. It is only a prior proposal
@@ -327,7 +357,7 @@ def collect_interface_plan_validation_issues(
     issues: list[dict[str, Any]] = []
 
     def issue(code: str, path: str, interface_id: str, observed: Any, expected: Any) -> None:
-        issues.append({"code": code, "stage": "interface_plan_validation", "path": path,
+        issues.append({"code": code, "stage": "interface_plan_validation", "source_stage": "deterministic_closure", "path": path,
                        "interface_id": interface_id, "message": "Interface logical contract is invalid.",
                        "observed_value": observed, "expected_constraint": expected, "details": {}})
 
@@ -471,7 +501,25 @@ def build_graph_obligations_from_interfaces(*, interface_plan: dict[str, Any]) -
 
 
 def _interface_plan_prompt() -> str:
-    return f"""{AUTHORITY_CONTRACT}
+    return f"""ROLE
+You are the semantic Interface Planner. Your only responsibility is to select
+complete semantic logical bindings between frozen platform ports and
+FunctionItem logical ports. You do not redesign requirements, FunctionItems,
+files, tools, or Graph endpoint identities.
+Logical ports are not opaque endpoint IDs; Graph materialization resolves those
+IDs later without choosing semantic ports.
+
+{AUTHORITATIVE_FACT_PRIORITY}
+
+AUTHORITATIVE FACTS
+The payload contains confirmed requirements, frozen FunctionItem responsibilities
+and logical port contracts, runtime-source-required facts, and the platform I/O
+contract. Those structured facts are authoritative.
+
+EDITABLE SCOPE
+You may decide only Interface records and their structured logical bindings.
+
+{NON_AUTHORITATIVE_CONTEXT}
 
 {PLATFORM_OUTPUT_CONTRACT}
 
@@ -479,67 +527,33 @@ def _interface_plan_prompt() -> str:
 
 {SOURCE_PATH_CONTRACT}
 
-1. AUTHORITATIVE FACTS
-The payload contains confirmed requirements, frozen FunctionItems and their
-logical input/output contracts, runtime_source_required facts, and the platform
-logical input/output contract. These facts are authoritative.
+{STRUCTURED_BINDING_AUTHORITY}
 
-Logical ports are declared FunctionItem/platform input or output names. Opaque
-endpoint IDs are later registry identities such as INxxxx/OUTxxxx/PINxxxx/POUTxxxx.
+REQUIRED DECISIONS / REVIEW DUTIES
+Produce a complete semantic Interface Plan over the frozen logical ports.
+For every runtime-required receiving slot: (1) identify the semantic value it
+requires; (2) identify which authoritative upstream source, if any, actually
+produces that value; and (3) create exactly one provenance binding. Do not bind
+a merely available but semantically different value, rely on name similarity,
+omit a required slot, or bind only to satisfy structural coverage. For every
+required platform output, select the FunctionItem output that semantically
+represents that final result.
+Do not choose by field-name similarity alone.
 
-2. SHARED CONTRACTS
-WIRE CONTRACT
-platform_to_member always contains: interface_id, kind, source_platform_input,
-source_path, target_member, target_input, goal.
-member_to_member always contains: interface_id, kind, source_member,
-source_output, target_member, target_input, goal.
-member_to_platform always contains: interface_id, kind, source_member,
-source_output, target_platform_output, goal.
-This wire contract and INTERFACE_SCHEMA describe the same protocol. Do not omit
-a required field because its value is empty-like; source_path=[] is the explicit
-representation of whole-slot platform binding.
+HARD ACCEPTANCE CONDITIONS
+Every runtime-required receiving slot has exactly one valid runtime provenance,
+and every required platform terminal is represented according to the platform
+output contract. Structured records must match this schema. Do not modify frozen
+facts, invent platform inputs, or return opaque IDs or Graph edges.
 
-3. CURRENT TASK
-Produce a complete semantic Interface Plan over frozen logical ports.
-For every runtime_source_required FunctionItem input choose the semantic source
-value. For every required platform output choose the frozen FunctionItem output.
-Record each choice in structured logical binding fields.
+SILENT SELF-CHECK
+Silently build a coverage ledger. Target-to-source: verify each required target's
+chosen source actually provides its required semantic value. Source-to-target:
+verify each declared source value is semantically appropriate for its declared
+target. Verify goal agrees with the structured binding. Coverage alone is
+insufficient. Do not output the ledger.
 
-4. CURRENT AUTHORITY
-You, not the backend, choose the semantic producer using responsibilities, port
-descriptions and contracts, confirmed requirements, workflow semantics, and the
-platform contract. Do not choose by field-name similarity alone.
-
-INTERFACE BINDING AUTHORITY
-Structured logical binding fields are authoritative for transfer identity. goal
-explains why the declared logical source satisfies the declared receiving slot;
-it does not redefine, broaden, merge, or replace that binding. One Interface is
-one declared logical source -> one declared receiving slot -> one future edge.
-Two independently selectable receiving slots require separate records. A source
-output may be reused by separate Interfaces.
-
-5. HARD ACCEPTANCE CONDITIONS
-COMPLETENESS PRIORITY
-Completeness is a hard acceptance condition. First construct a complete
-semantic Interface Plan that covers every runtime_source_required receiving
-slot and every semantically required platform output. Only after completeness
-is established may redundant Interfaces be avoided. Never omit a required
-receiving slot in order to reduce Interface count.
-
-Do not modify FunctionItems, requirements, channels, or logical ports. Do not
-return opaque endpoint IDs, Graph edges, or extra fields. Do not
-invent platform inputs to close coverage.
-
-6. SILENT SELF-CHECK
-Before returning JSON, silently construct a coverage ledger. For every frozen
-FunctionItem: (1) enumerate every input whose runtime_source_required=true; (2)
-identify exactly which Interface supplies that receiving slot. For every
-semantically required platform output: (3) identify the member_to_platform
-Interface that produces it. Do not return until every required receiving slot
-and required final result is accounted for. The coverage ledger is internal
-verification only. Do not output the ledger.
-
-7. OUTPUT CONTRACT
+OUTPUT CONTRACT
 Return only strict JSON matching this schema:
 {json.dumps(INTERFACE_SCHEMA, ensure_ascii=False)}
 """.strip()
@@ -567,6 +581,69 @@ Return strict parseable JSON only."""
 
 INTERFACE_REVIEW_ISSUE_FIELDS = {"message", "affected_interfaces", "affected_inputs", "evidence"}
 INTERFACE_REVIEW_SCHEMA = {"passed": "boolean", "issues": [{"message": "string", "affected_interfaces": ["string"], "affected_inputs": [{"target_member": "string", "target_input": "string"}], "evidence": {"observed": "any", "expected": "any"}}]}
+EXISTING_BINDING_ISSUE_FIELDS = {
+    "issue_type", "blocking", "scope", "interface_id", "source_ref",
+    "target_ref", "observed_fact", "expected_condition", "evidence", "reason",
+}
+EXISTING_BINDING_REVIEW_SCHEMA = {
+    "passed": "boolean",
+    "issues": [{
+        "issue_type": "semantic_binding_mismatch | semantic_source_path_mismatch | semantic_terminal_mismatch | semantic_contract_inconsistency",
+        "blocking": True, "scope": "existing_binding", "interface_id": "string",
+        "source_ref": {"member": "string", "port": "string"},
+        "target_ref": {"member": "string", "port": "string"},
+        "observed_fact": "string", "expected_condition": "string",
+        "evidence": [{"source": "string", "ref": "string", "field": "string", "fact": "string"}],
+        "reason": "string",
+    }],
+}
+
+
+def _validate_existing_binding_review_response(*, value: dict[str, Any], interface_plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validate diagnostic protocol only; never infer whether the diagnosis is true."""
+    if set(value) != {"passed", "issues"} or not isinstance(value.get("passed"), bool) or not isinstance(value.get("issues"), list):
+        _raise("existing-binding review response has invalid shape", "invalid_existing_binding_review_protocol", path="$")
+    known = {str(item.get("interface_id") or ""): item for item in interface_plan.get("interfaces") or []}
+    normalized = []
+    for index, issue in enumerate(value["issues"]):
+        path = f"$.issues[{index}]"
+        if not isinstance(issue, dict) or set(issue) != EXISTING_BINDING_ISSUE_FIELDS:
+            _raise("existing-binding issue has invalid shape", "invalid_existing_binding_review_protocol", path=path)
+        if issue.get("blocking") is not True or issue.get("scope") != "existing_binding" or issue.get("interface_id") not in known:
+            _raise("existing-binding issue is not blocking or has an unknown affected ref", "invalid_existing_binding_review_protocol", path=path)
+        if issue.get("issue_type") not in {"semantic_binding_mismatch", "semantic_source_path_mismatch", "semantic_terminal_mismatch", "semantic_contract_inconsistency"}:
+            _raise("existing-binding issue type is invalid", "invalid_existing_binding_review_protocol", path=f"{path}.issue_type")
+        for field in ("source_ref", "target_ref"):
+            ref = issue.get(field)
+            if (not isinstance(ref, dict) or set(ref) != {"member", "port"}
+                    or not all(isinstance(v, str) and v.strip() for v in ref.values())):
+                _raise("existing-binding issue ref is invalid", "invalid_existing_binding_review_protocol", path=f"{path}.{field}")
+        binding = known[issue["interface_id"]]
+        if binding.get("kind") == "platform_to_member":
+            expected_source = {"member": "platform", "port": binding.get("source_platform_input")}
+            expected_target = {"member": binding.get("target_member"), "port": binding.get("target_input")}
+        elif binding.get("kind") == "member_to_member":
+            expected_source = {"member": binding.get("source_member"), "port": binding.get("source_output")}
+            expected_target = {"member": binding.get("target_member"), "port": binding.get("target_input")}
+        else:
+            expected_source = {"member": binding.get("source_member"), "port": binding.get("source_output")}
+            expected_target = {"member": "platform", "port": binding.get("target_platform_output")}
+        if issue["source_ref"] != expected_source or issue["target_ref"] != expected_target:
+            _raise("existing-binding issue refs do not match the structured binding", "invalid_existing_binding_review_reference", path=path)
+        if any(not isinstance(issue.get(field), str) or not issue[field].strip() for field in ("observed_fact", "expected_condition", "reason")):
+            _raise("existing-binding issue lacks an auditable diagnosis", "invalid_existing_binding_review_protocol", path=path)
+        evidence = issue.get("evidence")
+        evidence_fields = {"source", "ref", "field", "fact"}
+        if (not isinstance(evidence, list) or not evidence
+                or any(not isinstance(item, dict) or set(item) != evidence_fields
+                       or not all(isinstance(item[field], str) and item[field].strip() for field in evidence_fields)
+                       for item in evidence)):
+            _raise("existing-binding issue lacks frozen evidence", "invalid_existing_binding_review_protocol", path=f"{path}.evidence")
+        normalized.append({**issue, "stage": "existing_binding_semantic_review", "source_stage": "existing_binding_semantic_review", "path": path,
+                           "message": issue["reason"], "details": dict(issue)})
+    if value["passed"] != (not normalized):
+        _raise("existing-binding review passed flag contradicts blocking issues", "invalid_existing_binding_review_protocol", path="$.passed")
+    return normalized
 
 
 def normalize_interface_review_issue(raw_issue: dict[str, Any], frozen_function_items: list[dict[str, Any]], current_interface_plan: dict[str, Any], *, path: str = "$.issues[]") -> dict[str, Any]:
@@ -654,54 +731,53 @@ async def review_interface_plan_semantically(
     model_call: ModelCall,
 ) -> list[dict[str, Any]]:
     """Ask once for semantic diagnostics; never ask the reviewer for a repair."""
-    prompt = AUTHORITY_CONTRACT + """
+    prompt = f"""ROLE
+You are the independent full-plan semantic Interface Reviewer. You validate the
+accepted Interface Plan as a whole and never repair it.
 
-""" + PLATFORM_OUTPUT_CONTRACT + """
+{AUTHORITATIVE_FACT_PRIORITY}
 
-""" + RUNTIME_INPUT_PROVENANCE_CONTRACT + """
-
-""" + SOURCE_PATH_CONTRACT + """
-
-1. AUTHORITATIVE FACTS
+AUTHORITATIVE FACTS
 The payload contains confirmed requirements, frozen FunctionItem responsibilities
-and logical port contracts, runtime_source_required facts, the platform logical
-contract, and the complete Interface Plan. Structured logical binding fields are
-part of the Interface semantic layer and are authoritative for transfer identity.
+and logical-port contracts, the platform contract, and a deterministically closed
+Interface Plan. Structured logical binding fields define transfer identity.
 
-2. DETERMINISTIC VALIDITY PRECONDITION
-The backend has already established Interface protocol validity,
-logical-reference validity, runtime-required receiving-slot structural
-coverage, single-provenance validity, and legal platform terminal existence.
-Do not repeat those deterministic checks.
+EDITABLE SCOPE
+None. Do not change Interface records, select opaque Graph endpoint IDs, generate
+edges, or prescribe add/split/remove operations or replacement paths.
 
-3. SEMANTIC REVIEW TASK
-Do not trust the Planner conclusion. Independently determine whether the complete
-Interface Plan faithfully realizes confirmed requirements over frozen logical
-ports. For every transfer, decide whether its declared semantic source can
-faithfully satisfy its declared receiving slot, whether source_path selects the
-intended semantic platform value, and whether selected final platform results
-semantically satisfy the requested output. Do not search for predefined error
-categories and do not propose a repair.
+{NON_AUTHORITATIVE_CONTEXT}
 
-4. EVIDENCE STANDARD
-A structurally valid logical reference is not automatically semantically correct.
-A different valid design is not a defect. Report only a concrete defect in this
-plan, supported by observed and expected facts. An issue is not a record that a
-fact was reviewed.
+{PLATFORM_OUTPUT_CONTRACT}
 
-5. AUTHORITY LIMIT
-Do not select opaque Graph endpoint IDs, generate edges, change Interface records,
-or prescribe add/split/remove operations. The Interface
-stage declares logical FunctionItem/platform ports; it does not declare registry
-IDs, argv serialization, or runtime placeholder paths. When source_path is
-declared, evaluate whether that nested platform value can semantically satisfy
-target_input. Report a defect without proposing another path.
+{RUNTIME_INPUT_PROVENANCE_CONTRACT}
 
-6. OUTPUT CONTRACT
-Verify every affected Interface and logical input exists. passed=true exactly
-when issues is empty.
+{SOURCE_PATH_CONTRACT}
+
+{STRUCTURED_BINDING_AUTHORITY}
+
+REQUIRED DECISIONS / REVIEW DUTIES
+Independently determine whether the complete Interface Plan realizes confirmed workflow
+semantics, final-result provenance, explicit fan-out/dependency constraints,
+source_path selection, and combinations whose local bindings may be valid but
+whose whole-plan semantics are not. Do not repeat protocol, reference, coverage,
+single-provenance, or terminal-existence checks already established by the
+backend. Do not trust Planner prose or infer correctness from valid JSON,
+matching names, plausible goals, workflow order, or previous reviewer output.
+
+HARD ACCEPTANCE CONDITIONS
+A structurally valid reference is not automatically semantically correct, while
+a different valid design is not a defect. Report only concrete blocking defects
+supported by observed and expected facts. Do not propose a repair.
+
+SILENT SELF-CHECK
+Silently check every full-plan review duty before returning passed=true. Verify
+every affected Interface and logical input exists and passed=true exactly when
+issues is empty.
+
+OUTPUT CONTRACT
 Return only strict JSON matching this schema:
-""" + json.dumps(INTERFACE_REVIEW_SCHEMA, ensure_ascii=False)
+{json.dumps(INTERFACE_REVIEW_SCHEMA, ensure_ascii=False)}"""
     payload = {
         "system_goal": original_user_goal,
         "function_items": _compact_function_items(frozen_function_items),
@@ -749,6 +825,70 @@ Return only strict JSON matching this schema:
     return issues
 
 
+async def review_existing_bindings_semantically(
+    *, original_user_goal: str, frozen_function_items: list[dict[str, Any]],
+    interface_plan: dict[str, Any], requirement_allocations: list[dict[str, Any]] | None,
+    requirement_channels: dict[str, str] | None, system_requirements: list[dict[str, Any]] | None,
+    platform_contract: dict[str, Any] | None, reviewer_model: str, model_call: ModelCall,
+) -> list[dict[str, Any]]:
+    """Audit all existing, reference-valid bindings without requiring coverage."""
+    prompt = f"""ROLE
+You are an independent semantic validator. You do not repair the candidate; you
+report every blocking semantic defect in every existing Interface.
+
+{AUTHORITATIVE_FACT_PRIORITY}
+
+AUTHORITATIVE FACTS
+Protocol validity and all logical member/port references have already been
+established. Frozen responsibilities, port descriptions/contracts, confirmed
+requirements, and the platform contract define semantic acceptance.
+
+EDITABLE SCOPE
+None. Review only; never return a replacement, action, patch, or source choice.
+
+{NON_AUTHORITATIVE_CONTEXT}
+
+{STRUCTURED_BINDING_AUTHORITY}
+
+REQUIRED DECISIONS / REVIEW DUTIES
+Independently audit every existing Interface exactly once. For each structured
+source and target, determine whether the source can provide the target's required
+semantic value and agrees with both FunctionItem responsibilities. Audit
+platform_to_member source selection and source_path, member_to_member output to
+input meaning, member_to_platform final-result meaning, and goal consistency.
+Do not trust valid JSON, matching names, plausible goal prose, apparent workflow
+order, or previous review output. Do not stop at the first issue.
+
+HARD ACCEPTANCE CONDITIONS
+Missing bindings and completeness are outside this stage; deterministic closure
+owns coverage. Report an issue only where observed and expected states materially
+conflict. Every issue must identify its exact Interface/source/target, observed
+fact, expected condition, frozen evidence, and blocking reason. Do not prescribe
+how to repair it.
+
+SILENT SELF-CHECK
+Silently verify every existing Interface was audited exactly once and every
+reported issue is fully evidenced. passed=true only after all duties were checked.
+
+OUTPUT CONTRACT
+Return only strict JSON matching:
+{json.dumps(EXISTING_BINDING_REVIEW_SCHEMA, ensure_ascii=False)}"""
+    payload = {"system_goal": original_user_goal, "function_items": _compact_function_items(frozen_function_items),
+               "current_interface_plan": interface_plan, "requirement_allocations": requirement_allocations or [],
+               "requirement_channels": requirement_channels or {}, "unowned_system_requirements": system_requirements or [],
+               "platform_contract": platform_contract or {}}
+    raw = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], reviewer_model)
+    try:
+        return _validate_existing_binding_review_response(value=_parse_object(raw), interface_plan=interface_plan)
+    except InterfaceIntentPlanError as original_exc:
+        reformat_prompt = """Repair only JSON syntax and the exact supplied review schema. Preserve every semantic conclusion and fact. Do not add, remove, merge, split, reinterpret, or repair issues. Return strict JSON only."""
+        repaired = await model_call([{"role": "system", "content": reformat_prompt}, {"role": "user", "content": json.dumps({"raw_response": raw, "validation_error": {"code": original_exc.code, "details": original_exc.details}, "review_schema": EXISTING_BINDING_REVIEW_SCHEMA}, ensure_ascii=False)}], reviewer_model)
+        try:
+            return _validate_existing_binding_review_response(value=_parse_object(repaired), interface_plan=interface_plan)
+        except InterfaceIntentPlanError as repair_exc:
+            raise InterfaceIntentPlanError("existing-binding semantic review failed", code="existing_binding_semantic_review_failed", details={"review_attempts": 1, "protocol_repair_attempts": 1, "original_error": original_exc.details, "repair_error": repair_exc.details}) from repair_exc
+
+
 async def plan_function_item_interfaces(*, original_user_goal: str, frozen_function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]] | None = None, requirement_channels: dict[str, str] | None = None, system_requirements: list[dict[str, Any]] | None = None, interaction_requirements: list[dict[str, Any]] | None = None, platform_contract: dict[str, Any] | None = None, skill_name: str = "", planner_model: str, model_call: ModelCall, reviewer_model: str | None = None, reviewer_model_call: ModelCall | None = None) -> dict[str, Any]:
     """Ask the model for interaction intents between frozen FunctionItems."""
 
@@ -791,9 +931,20 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
     deterministic_issues = collect_interface_plan_validation_issues(
         plan=parsed, function_items=frozen_function_items, platform_contract=platform_contract,
     ) if protocol_issue is None else []
-    if protocol_issue is not None or deterministic_issues:
+    reference_issue_codes = {"unknown_platform_logical_input", "unknown_interface_logical_input", "unknown_interface_logical_output", "unknown_platform_logical_output", "interface_self_connection"}
+    existing_binding_issues: list[dict[str, Any]] = []
+    references_valid = protocol_issue is None and not any(issue.get("code") in reference_issue_codes for issue in deterministic_issues)
+    if reviewer_model and references_valid:
+        existing_binding_issues = await review_existing_bindings_semantically(
+            original_user_goal=original_user_goal, frozen_function_items=frozen_function_items,
+            interface_plan=parsed, requirement_allocations=requirement_allocations,
+            requirement_channels=requirement_channels, system_requirements=system_requirements_context,
+            platform_contract=platform_contract, reviewer_model=reviewer_model,
+            model_call=reviewer_model_call or model_call,
+        )
+    if protocol_issue is not None or deterministic_issues or existing_binding_issues:
         facts = ([{"code": protocol_issue.code, "message": str(protocol_issue), "details": protocol_issue.details}]
-                 if protocol_issue is not None else deterministic_issues)
+                 if protocol_issue is not None else merge_interface_validation_issues(deterministic_issues, existing_binding_issues))
         correction_prompt = f"""{AUTHORITY_CONTRACT}
 
 {PLATFORM_OUTPUT_CONTRACT}
@@ -802,26 +953,40 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
 
 {SOURCE_PATH_CONTRACT}
 
-INTERFACE PLAN CORRECTION
-1. AUTHORITATIVE FACTS
+ROLE
+INTERFACE PLAN CORRECTION: You are a bounded replanner for the editable
+Interface layer. The previous
+candidate is a failed proposal, not an authoritative fact.
+
+{AUTHORITATIVE_FACT_PRIORITY}
+
+AUTHORITATIVE FACTS
 Confirmed requirements, frozen FunctionItems, logical ports, runtime source
 facts, platform contract, and shared Interface contracts remain authoritative.
-2. SHARED CONTRACTS
+
+EDITABLE SCOPE
+Modify only the Interface semantic layer; never redesign frozen upstream facts
+or choose Graph endpoint identities.
+
+{NON_AUTHORITATIVE_CONTEXT}
+
+REQUIRED DECISIONS / REVIEW DUTIES
 INTERFACE_SCHEMA and the shared contracts above define the protocol.
-3. CURRENT TASK
-The previous plan failed deterministic acceptance. Reconstruct one complete
+The previous plan failed acceptance. Reconstruct one complete
 corrected Interface Plan and resolve every supplied acceptance failure
 simultaneously. Facts describe invalid state; they do not prescribe a producer.
 Do not patch only visible wording. Return the complete corrected plan.
-4. CURRENT AUTHORITY
 Modify only the Interface semantic layer. You may add or remove an Interface,
 revise a logical binding or source_path, and preserve correct bindings. You
 decide the semantic repair; the backend does not choose the producer.
-5. HARD ACCEPTANCE CONDITIONS
+
+HARD ACCEPTANCE CONDITIONS
 The complete result must match INTERFACE_SCHEMA and pass all supplied facts.
-6. SILENT SELF-CHECK
+
+SILENT SELF-CHECK
 Silently rebuild the complete required-slot coverage ledger before returning.
-7. OUTPUT CONTRACT
+
+OUTPUT CONTRACT
 Return strict JSON matching INTERFACE_SCHEMA only."""
         correction_prompt = f"{correction_prompt}\n\n{REFINEMENT_FEEDBACK_CONTRACT}"
 
@@ -855,9 +1020,20 @@ Return strict JSON matching INTERFACE_SCHEMA only."""
                 plan=candidate, function_items=frozen_function_items,
                 platform_contract=platform_contract,
             )
+            partial_issues: list[dict[str, Any]] = []
+            refs_valid = not any(issue.get("code") in reference_issue_codes for issue in remaining)
+            if reviewer_model and refs_valid:
+                partial_issues = await review_existing_bindings_semantically(
+                    original_user_goal=original_user_goal, frozen_function_items=frozen_function_items,
+                    interface_plan=candidate, requirement_allocations=requirement_allocations,
+                    requirement_channels=requirement_channels, system_requirements=system_requirements_context,
+                    platform_contract=platform_contract, reviewer_model=reviewer_model,
+                    model_call=reviewer_model_call or model_call,
+                )
+            residual = merge_interface_validation_issues(remaining, partial_issues)
             return CandidateEvaluation(
-                accepted=not remaining, candidate=candidate,
-                acceptance_facts=remaining, semantic_comparable=True,
+                accepted=not residual, candidate=candidate,
+                acceptance_facts=residual, semantic_comparable=True,
             )
 
         initial_evaluation = CandidateEvaluation(
@@ -874,6 +1050,7 @@ Return strict JSON matching INTERFACE_SCHEMA only."""
                 max_attempts=2,
             )
             deterministic_issues = []
+            existing_binding_issues = []
         except BoundedRefinementFailed as exc:
             raise InterfaceIntentPlanError(
                 "interface plan deterministic closure failed after correction",
@@ -1160,7 +1337,17 @@ Return only strict JSON matching critic_schema."""
             platform_contract=platform_contract,
         )
         review_issues: list[dict[str, Any]] = []
-        if not remaining and reviewer_model:
+        reference_codes = {"unknown_platform_logical_input", "unknown_interface_logical_input", "unknown_interface_logical_output", "unknown_platform_logical_output", "interface_self_connection"}
+        partial_issues: list[dict[str, Any]] = []
+        if reviewer_model and not any(issue.get("code") in reference_codes for issue in remaining):
+            partial_issues = await review_existing_bindings_semantically(
+                original_user_goal=original_user_goal, frozen_function_items=frozen_function_items,
+                interface_plan=candidate, requirement_allocations=requirement_allocations,
+                requirement_channels=requirement_channels, system_requirements=system_requirements_context,
+                platform_contract=platform_contract, reviewer_model=reviewer_model,
+                model_call=reviewer_model_call or model_call,
+            )
+        if not remaining and not partial_issues and reviewer_model:
             review_issues = await review_interface_plan_semantically(
                 original_user_goal=original_user_goal,
                 frozen_function_items=frozen_function_items,
@@ -1172,7 +1359,7 @@ Return only strict JSON matching critic_schema."""
                 reviewer_model=reviewer_model,
                 model_call=reviewer_model_call or model_call,
             )
-        residual = merge_interface_validation_issues(remaining, review_issues)
+        residual = merge_interface_validation_issues(remaining, partial_issues, review_issues)
         return CandidateEvaluation(
             accepted=not residual, candidate=candidate,
             acceptance_facts=residual, semantic_comparable=True,

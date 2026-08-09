@@ -8176,6 +8176,26 @@ missing or contradictory, report a responsibility_mismatch with evidence that
 references only supplied requirement and FunctionItem identities. Diagnose the
 gap; do not prescribe reclassification, a new owner, or a repair operation.
 
+CANONICAL INPUT SLOT AUDIT
+
+For every FunctionItem, inspect all runtime-required logical inputs. Determine
+from confirmed requirements, responsibility, input descriptions/contracts, and
+the platform contract whether any two inputs are aliases, fallback names,
+alternative representations, or equivalent ways to supply one semantic runtime
+value. Ask whether every pair genuinely requires BOTH values simultaneously at
+runtime. If either can replace the other while preserving the same semantic
+runtime value, report a blocking responsibility_mismatch. Do not infer
+equivalence from field-name similarity and do not decide which name to retain.
+
+PORT / RESPONSIBILITY SELF-CONSISTENCY AUDIT
+
+For every FunctionItem, verify each required input is an external value its
+responsibility actually needs, each output is a value that responsibility can
+produce, internal temporary values were not promoted to external inputs, and no
+input or output is unrelated to the responsibility. This is a semantic model
+judgment over supplied facts; never use a backend naming heuristic and never
+prescribe a replacement port.
+
 2. CHANNEL-AWARE REVIEW RULES
 Ownership rules are channel-aware:
 - For executable requirements, at least one owner must exist; every owner must
@@ -8262,6 +8282,8 @@ a separate current Blueprint defect is already evidenced.
 6. FINAL SELF-CHECK
 Before returning, silently verify:
 - every requirement statement uses the actual supplied channel;
+- every FunctionItem's responsibility, required inputs, and outputs were audited;
+- every pair of required inputs was checked for conjunctive canonical-slot semantics;
 - no issue proposes changing a requirement channel;
 - no resource/direct requirement is made blocking merely because owners=[];
 - no issue assigns all FunctionItems only because a constraint applies globally;
@@ -8986,6 +9008,14 @@ implementation has a valid fallback, declare that a default is present and put
 its value in default_values. Do not mark an input optional merely because it
 sounds like a preference; judge only from the confirmed user goal and proposed
 runtime contract. Do not infer optionality from the input field name.
+
+Before declaring multiple required inputs for one FunctionItem, verify that
+each is a genuinely distinct runtime value needed simultaneously. Do not model
+compatibility aliases, fallback names, or alternative representations of one
+runtime value as separate required inputs. Describe each port's semantic value,
+not how another script happens to provide it. Prefer a canonical port object
+with name and description and add contract only for explicit schema/shape facts;
+legacy string ports remain valid. Never infer a contract from a port name.
 
 In this pass, FilePlan owns file topology and file-local metadata.
 Declare script file responsibilities inside SkillPlan entries only.
