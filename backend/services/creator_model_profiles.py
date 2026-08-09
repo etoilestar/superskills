@@ -87,9 +87,10 @@ def resolve_creator_model_profile(
 
 async def complete_creator_role_once(
     messages: list[dict], role: Literal["planner", "reviewer"], *, fallback_model: str,
+    stage: str = "creator",
 ) -> str:
     profile = resolve_creator_model_profile(role, fallback_model=fallback_model)
-    logger.info("[Creator][model] task=%s model=%s provider_base_url=%s", role, profile.model, profile.base_url)
+    logger.info("[Creator][model] stage=%s role=%s resolved_model=%s provider_base_url=%s", stage, role, profile.model, profile.base_url)
     return await complete_chat_once(messages, profile.model, base_url=profile.base_url, api_key=profile.api_key, max_tokens=profile.max_tokens)
 
 
