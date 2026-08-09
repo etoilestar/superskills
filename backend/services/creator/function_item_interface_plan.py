@@ -988,6 +988,12 @@ Return only strict JSON matching critic_schema."""
                     details={"stage": repair_stage, "original_issues": validation_issues,
                              "remaining_issues": after_issues},
                 )
+            if after_issues:
+                raise InterfaceIntentPlanError(
+                    "semantic issues remain after repair", code="semantic_issues_remain",
+                    details={"stage": repair_stage, "original_issues": validation_issues,
+                             "remaining_issues": after_issues},
+                )
         result = validate_interface_intent_plan(plan=candidate, function_items=frozen_function_items)
         final_issues = after_issues if reviewer_model else remaining
         logger.info(
