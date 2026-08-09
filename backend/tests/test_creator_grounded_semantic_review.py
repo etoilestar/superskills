@@ -77,7 +77,7 @@ def test_file_plan_resource_and_platform_grounding_use_snapshot_values():
         ({"source": "platform_contract", "ref": "platform_skill_boundary", "field": "final_output_fields"}, ["text"]),
     ]
     for ref, observed in cases:
-        review = {"audited_requirement_ids": ["R1", "R3"], "issues": [{"requirement_id": "R1", "evidence_refs": [ref], "required_condition": "Constraint holds.", "reason": "Check structured fact."}]}
+        review = {"audited_requirement_ids": ["R1", "R3"], "issues": [{"requirement_id": "R1", "evidence_refs": [ref], "violated_fact_ref": ref, "required_condition": "Constraint holds.", "reason": "Check structured fact."}]}
         grounded = _validate(review, "constraint_semantics", ["R1", "R3"], [])
         assert grounded["issues"][0]["evidence"][0]["observed"] == observed
 
@@ -102,6 +102,17 @@ def test_unknown_issue_identities_and_evidence_refs_are_rejected():
         _validate(bad_requirement, "requirement_provenance", ["R2"], ["scripts/a.py"])
     with pytest.raises(ReviewEvidenceReferenceError):
         _validate(_provenance({"source": "requirement_allocations", "ref": "R404", "field": "owners"}), "requirement_provenance", ["R2"], ["scripts/a.py"])
+
+
+def test_issue_identities_must_belong_to_the_reviewer_audit_domain():
+    wrong_requirement = _provenance({"source": "requirement_allocations", "ref": "R1", "field": "owners"})
+    wrong_requirement["issues"][0]["requirement_id"] = "R1"  # frozen, but not executable
+    with pytest.raises(ReviewIdentityError):
+        _validate(wrong_requirement, "requirement_provenance", ["R2"], ["scripts/a.py"])
+    wrong_target = _provenance({"source": "requirement_allocations", "ref": "R2", "field": "owners"})
+    wrong_target["audited_function_items"] = []
+    with pytest.raises(ReviewIdentityError):
+        _validate(wrong_target, "requirement_provenance", ["R2"], [])
 
 
 def test_model_observed_is_a_schema_error():
@@ -199,3 +210,46 @@ async def test_three_reviewer_funnel_covers_channels_and_blocks_alias_before_fre
     assert review["audited_provenance_function_items"] == ["scripts/a.py"]
     assert review["issues"][0]["repair_scope"] == "blueprint"
     assert review["issues"][0]["evidence"][0]["observed"] == ["payload"]
+
+
+@pytest.mark.asyncio
+async def test_constraint_authority_comes_from_violated_fact_not_supporting_evidence(monkeypatch):
+    async def complete(_messages, _role, **kwargs):
+        if kwargs["stage"] == "requirement_provenance":
+            return json.dumps({"audited_requirement_ids": ["R2"], "audited_function_items": ["scripts/a.py"], "issues": []})
+        if kwargs["stage"] == "function_item_contract":
+            return json.dumps({"audited_function_items": ["scripts/a.py"], "issues": []})
+        return json.dumps({"audited_requirement_ids": ["R1", "R3"], "issues": [{
+            "requirement_id": "R1",
+            "evidence_refs": [{"source": "file_plan", "ref": "references/guide.md", "field": "file_type"}],
+            "violated_fact_ref": {"source": "resource_authority", "ref": "authority", "field": "authoritative_assets"},
+            "required_condition": "Resource authority must represent the confirmed constraint.",
+            "reason": "The authoritative resource fact contradicts the constraint.",
+        }]})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    review = await api._review_blueprint_semantic_closure(
+        request=api.PreparePlanRequest(user_request="generic"),
+        blueprint_text="prose", facts_snapshot=_snapshot(), planner_model="test",
+    )
+    assert review["issues"][0]["repair_scope"] == "resource_authority"
+    assert review["issues"][0]["violated_fact"]["observed"] == []
+
+
+@pytest.mark.asyncio
+async def test_future_stage_only_constraint_is_not_blocking(monkeypatch):
+    async def complete(_messages, _role, **kwargs):
+        if kwargs["stage"] == "requirement_provenance":
+            return json.dumps({"audited_requirement_ids": ["R2"], "audited_function_items": ["scripts/a.py"], "issues": []})
+        if kwargs["stage"] == "function_item_contract":
+            return json.dumps({"audited_function_items": ["scripts/a.py"], "issues": []})
+        # Runtime-only verification has no current structured contradiction.
+        return json.dumps({"audited_requirement_ids": ["R1", "R3"], "issues": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    review = await api._review_blueprint_semantic_closure(
+        request=api.PreparePlanRequest(user_request="verify only after runtime"),
+        blueprint_text="no future evidence yet", facts_snapshot=_snapshot(), planner_model="test",
+    )
+    assert review["passed"] is True
+    assert review["issues"] == []

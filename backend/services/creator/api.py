@@ -8217,7 +8217,9 @@ current authoritative FilePlan, Resource Authority, FunctionItem topology, or Pl
 Contract facts. Do not review executable ownership, assign FunctionItem owners,
 reclassify channels, inspect Interface/Graph endpoints, or require future generation,
 runtime, execution, or sandbox evidence. Without a concrete current-stage
-contradiction, return no blocking issue.""",
+contradiction, return no blocking issue. For each issue, violated_fact_ref must
+identify the single authoritative structured fact that is currently violated;
+supporting evidence_refs may provide context but do not determine repair authority.""",
     }
     schema = BLUEPRINT_SEMANTIC_REVIEW_SCHEMA[reviewer]
     prompt = AUTHORITY_CONTRACT + f"""
@@ -8396,12 +8398,7 @@ async def _review_blueprint_semantic_closure(
         "platform_contract": "platform_contract",
     }
     for issue in constraint_review["issues"]:
-        selected_sources = {fact["source"] for fact in issue["evidence"]}
-        editable_sources = selected_sources - {"requirement_channels", "requirement_allocations"}
-        authority_domain = {
-            constraint_authorities[source] for source in (editable_sources or selected_sources)
-        }
-        authority = next(iter(authority_domain)) if len(authority_domain) == 1 else "none"
+        authority = constraint_authorities[issue["violated_fact"]["source"]]
         issues.append({**issue, "repair_scope": authority, "blocking_now": True})
     logger.info(
         "[Creator][semantic_review] requirement_provenance_issues=%d function_item_contract_issues=%d constraint_semantics_issues=%d blocking_issue_count=%d",

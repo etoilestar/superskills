@@ -54,6 +54,8 @@ REVIEW_ISSUE_SCHEMAS = {
     "function_item_contract": _issue_schema(requirement=False, targets=True),
     "constraint_semantics": _issue_schema(requirement=True, targets=False),
 }
+REVIEW_ISSUE_SCHEMAS["constraint_semantics"]["properties"]["violated_fact_ref"] = EVIDENCE_REF_SCHEMA
+REVIEW_ISSUE_SCHEMAS["constraint_semantics"]["required"].append("violated_fact_ref")
 
 BLUEPRINT_SEMANTIC_REVIEW_SCHEMA = {
     "requirement_provenance": {
@@ -193,13 +195,13 @@ def validate_and_ground_review(
         if not isinstance(issue, Mapping) or set(issue) != set(issue_schema["required"]):
             raise ReviewSchemaError(f"issue {index} fields do not match the {reviewer} schema")
         requirement_id = str(issue.get("requirement_id") or "").strip()
-        if "requirement_id" in issue and requirement_id not in frozen_requirement_ids:
+        if "requirement_id" in issue and requirement_id not in expected_requirement_ids:
             raise ReviewIdentityError(f"unknown issue requirement_id: {requirement_id}")
         targets = issue.get("affected_targets", [])
         if "affected_targets" in issue:
             if not isinstance(targets, list) or any(not isinstance(value, str) for value in targets):
                 raise ReviewSchemaError(f"issue {index} affected_targets must be a string array")
-            unknown = sorted(set(targets) - set(frozen_function_items))
+            unknown = sorted(set(targets) - set(expected_function_items))
             if unknown:
                 raise ReviewIdentityError(f"unknown issue affected_targets: {unknown}")
         refs = issue.get("evidence_refs")
@@ -208,7 +210,13 @@ def validate_and_ground_review(
         if not str(issue.get("required_condition") or "").strip() or not str(issue.get("reason") or "").strip():
             raise ReviewSchemaError(f"issue {index} requires required_condition and reason")
         evidence = [resolve_evidence_ref(evidence_context, ref) for ref in refs]
+        violated_fact = None
+        if reviewer == "constraint_semantics":
+            violated_fact = resolve_evidence_ref(evidence_context, issue["violated_fact_ref"])
         grounded.append({key: deepcopy(value) for key, value in issue.items()
-                         if key != "evidence_refs"} | {"evidence": evidence})
+                         if key not in {"evidence_refs", "violated_fact_ref"}} | {
+                             "evidence": evidence,
+                             **({"violated_fact": violated_fact} if violated_fact else {}),
+                         })
     normalized["issues"] = grounded
     return normalized
