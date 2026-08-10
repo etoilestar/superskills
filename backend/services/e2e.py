@@ -7,6 +7,11 @@ from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
 from .command_normalizer import canonicalize_skill_md_runtime_commands
 from .creator.basic_format import check_patch_candidate_basic_format
+from .platform_io_contract import (
+    get_platform_output_sink,
+    normalize_platform_output_sinks,
+    value_matches_platform_schema,
+)
 
 
 
@@ -262,9 +267,10 @@ def _format_json_shape(obj: dict[str, Any]) -> str:
     shape = _json_object_shape(obj)
     return json.dumps(shape, ensure_ascii=False, sort_keys=True)
 
-_SANDBOX_TERMINAL_OUTPUT_KEYS = set(
-    build_platform_io_contract().get("platform_skill_boundary", {}).get("final_output_fields", [])
-)
+_SANDBOX_OUTPUT_CONTRACT = build_platform_io_contract()
+_SANDBOX_TERMINAL_OUTPUT_KEYS = {
+    sink["name"] for sink in normalize_platform_output_sinks(_SANDBOX_OUTPUT_CONTRACT)
+}
 
 
 def _e2e_trace_line(trace: E2EStepTrace) -> str:
@@ -288,23 +294,13 @@ def _format_e2e_trace(traces: list[E2EStepTrace]) -> str:
 
 
 def _terminal_output_expected_type(key: str) -> str:
-    if key in {"text", "markdown", "image_path", "pdf_path", "docx_path", "pptx_path", "html_path"}:
-        return "non-empty string"
-    if key in {"image_paths", "file_paths", "file_outputs"}:
-        return "non-empty list[string]"
-    return "platform terminal field"
+    sink = get_platform_output_sink(_SANDBOX_OUTPUT_CONTRACT, key)
+    return json.dumps(sink["value_schema"], ensure_ascii=False, sort_keys=True) if sink else "platform terminal field"
 
 
 def _valid_terminal_output_value(key: str, value: Any) -> bool:
-    if key in {"text", "markdown", "image_path", "pdf_path", "docx_path", "pptx_path", "html_path"}:
-        return isinstance(value, str) and bool(value.strip())
-    if key in {"image_paths", "file_paths", "file_outputs"}:
-        return (
-            isinstance(value, list)
-            and bool(value)
-            and all(isinstance(item, str) and item.strip() for item in value)
-        )
-    return False
+    sink = get_platform_output_sink(_SANDBOX_OUTPUT_CONTRACT, key)
+    return bool(sink and value_matches_platform_schema(value, sink["value_schema"]))
 
 
 def _invalid_terminal_output_values(payload: dict[str, Any]) -> list[dict[str, str]]:
