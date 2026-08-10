@@ -15,7 +15,7 @@ import re
 from typing import Literal
 from .creator_tool_registry import get_role_pattern, get_script_roles, get_tool_capability, is_resource_role, is_script_role
 from .skill_dataflow import parse_schema_input_item
-from .platform_io_contract import build_platform_io_contract
+from .platform_io_contract import build_platform_io_contract, platform_output_names
 
 
 FileKind = Literal["script", "skill_doc", "reference", "asset", "config"]
@@ -554,6 +554,7 @@ def validate_structured_responsibility_edge_transport(
     *,
     function_items: object | None = None,
     source: str = "planner",
+    platform_contract: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
     """Validate canonical ResponsibilityEdge transport topology.
 
@@ -575,7 +576,7 @@ def validate_structured_responsibility_edge_transport(
         source=source,
     )
 
-    contract = build_platform_io_contract()
+    contract = platform_contract or build_platform_io_contract()
     boundary = (
         contract.get("platform_skill_boundary")
         if isinstance(contract, dict)
@@ -592,14 +593,7 @@ def validate_structured_responsibility_edge_transport(
         )
         if _port_identifier(value)
     }
-    output_fields = {
-        _port_identifier(value)
-        for value in (
-            boundary.get("final_output_fields")
-            or []
-        )
-        if _port_identifier(value)
-    }
+    output_fields = set(platform_output_names(contract))
 
     function_item_targets: set[str] | None = None
     if function_items is not None:

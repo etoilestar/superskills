@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..skill_plan import GraphValidationError, normalize_structured_function_items
+from ..platform_io_contract import platform_output_names
 from .bounded_refinement import (
     BoundedRefinementFailed,
     CandidateEvaluation,
@@ -350,7 +351,7 @@ def collect_interface_plan_validation_issues(
     required_slots = {(item["target_file"], value["name"]) for item in compact for value in item["inputs"] if value["runtime_source_required"]}
     boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
     platform_inputs = {_compact_port_id(value) for value in boundary.get("input_envelope_fields") or []}
-    platform_outputs = {_compact_port_id(value) for value in boundary.get("final_output_fields") or []}
+    platform_outputs = set(platform_output_names(platform_contract))
     required_platform_outputs = required_platform_output_fields(platform_contract)
     covered_slots: set[tuple[str, str]] = set()
     incoming_counts: dict[tuple[str, str], int] = {}
@@ -848,7 +849,7 @@ def existing_binding_references_valid(
     }
     platform_outputs = {
         _compact_port_id(value)
-        for value in boundary.get("final_output_fields") or []
+        for value in platform_output_names(platform_contract)
     }
     return all(
         (interface["kind"] != "platform_to_member"

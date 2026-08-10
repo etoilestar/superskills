@@ -15,6 +15,7 @@ from .function_item_interface_plan import (
     required_platform_output_fields,
 )
 from ..skill_plan import GraphValidationError, normalize_structured_function_items, validate_structured_responsibility_edge_transport
+from ..platform_io_contract import get_platform_output_sink, normalize_platform_output_sinks
 
 logger = logging.getLogger(__name__)
 PLATFORM_INPUT_NODE = "platform_input_node"
@@ -92,10 +93,8 @@ def build_endpoint_registry(*, function_items: list[dict], platform_contract: di
         if field_name:
             platform_inputs.append({"slot_id": f"PIN{len(platform_inputs) + 1:04d}", "field": field_name, "description": description, "contract": contract})
     platform_outputs = []
-    for raw_slot in boundary.get("final_output_fields") or []:
-        field_name, description, contract = _port(raw_slot)
-        if field_name:
-            platform_outputs.append({"slot_id": f"POUT{len(platform_outputs) + 1:04d}", "field": field_name, "description": description, "contract": contract})
+    for sink in normalize_platform_output_sinks(platform_contract):
+        platform_outputs.append({"slot_id": f"POUT{len(platform_outputs) + 1:04d}", "field": sink["name"], "description": "", "contract": sink["value_schema"], "sink_contract": sink})
     return {"nodes": nodes, "script_inputs": inputs, "script_outputs": outputs, "platform_inputs": platform_inputs, "platform_outputs": platform_outputs}
 
 
@@ -136,8 +135,8 @@ def _would_cycle(edges: list[dict], source: str, target: str) -> bool:
     return False
 
 
-def _validate_transaction(edges: list[dict], function_items: list[dict]) -> None:
-    validate_structured_responsibility_edge_transport(edges, function_items=function_items, source="graph_expansion")
+def _validate_transaction(edges: list[dict], function_items: list[dict], platform_contract: dict | None = None) -> None:
+    validate_structured_responsibility_edge_transport(edges, function_items=function_items, source="graph_expansion", platform_contract=platform_contract)
     incoming: set[tuple[str, str]] = set()
     for edge in edges:
         others = [value for value in edges if value is not edge]
@@ -150,8 +149,8 @@ def _validate_transaction(edges: list[dict], function_items: list[dict]) -> None
             incoming.add(key)
 
 
-def _finalize_graph(*, state: GraphExpansionState, function_items: list[dict], terminal_edges: list[dict]) -> list[dict]:
-    _validate_transaction(state.committed_edges, function_items)
+def _finalize_graph(*, state: GraphExpansionState, function_items: list[dict], terminal_edges: list[dict], platform_contract: dict | None = None) -> list[dict]:
+    _validate_transaction(state.committed_edges, function_items, platform_contract)
     actual_terminals = [edge for edge in state.committed_edges if edge["to_node"] == PLATFORM_OUTPUT_NODE]
     if actual_terminals != terminal_edges or not actual_terminals:
         raise ResponsibilityGraphExpansionError("terminal set changed during expansion", code="invalid_terminal_closure")
@@ -353,10 +352,11 @@ def _validate_platform_terminal_edges(*, terminal_edges: list[dict], platform_co
     selected_fields: set[str] = set()
     for edge in terminal_edges:
         field = str(edge.get("to_input") or "")
-        if field in selected_fields:
+        sink = get_platform_output_sink(platform_contract, field)
+        if field in selected_fields and (not sink or sink["cardinality"] == "one"):
             raise ResponsibilityGraphExpansionError("a platform output slot may have only one source", code="duplicate_terminal_provenance", details={"platform_output_field": field})
         selected_fields.add(field)
-    legal_fields = {_port(value)[0] for value in _boundary(platform_contract).get("final_output_fields") or [] if _port(value)[0]}
+    legal_fields = {sink["name"] for sink in normalize_platform_output_sinks(platform_contract)}
     required_fields = required_platform_output_fields(platform_contract)
     invalid_required = sorted(required_fields - legal_fields)
     if invalid_required:
@@ -391,11 +391,11 @@ def validate_responsibility_graph_candidate(
     for obligation in obligations:
         selection = _resolve_declared_logical_binding(obligation=obligation, registry=registry)
         edge = _materialize_interface_obligation(obligation=obligation, selection=selection, registry=registry, state=state)
-        _validate_transaction(state.committed_edges + [edge], normalized)
+        _validate_transaction(state.committed_edges + [edge], normalized, platform_contract)
         state.committed_edges.append(edge)
     terminals = [edge for edge in state.committed_edges if edge["to_node"] == PLATFORM_OUTPUT_NODE]
     _validate_platform_terminal_edges(terminal_edges=terminals, platform_contract=platform_contract)
-    edges = _finalize_graph(state=state, function_items=normalized, terminal_edges=terminals)
+    edges = _finalize_graph(state=state, function_items=normalized, terminal_edges=terminals, platform_contract=platform_contract)
     logger.info("[Creator][graph_expansion] inactive_function_items=[] model_call_count=%d selection_retry_count=0 graph_valid=true", model_calls)
     return edges
 
