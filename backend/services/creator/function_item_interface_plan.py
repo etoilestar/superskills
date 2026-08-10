@@ -121,6 +121,10 @@ INTERFACE_SCHEMA: dict[str, Any] = {
 }
 
 
+def _include_previous_interface_plan(feedback: dict[str, Any]) -> bool:
+    return feedback["progress"]["semantic_changed"] is not False
+
+
 
 class InterfaceIntentPlanError(GraphValidationError):
     """Machine-readable Interface Intent Plan failure."""
@@ -1028,10 +1032,11 @@ Return strict JSON matching INTERFACE_SCHEMA only."""
         async def propose_correction(previous_candidate: Any, feedback: dict[str, Any]) -> Any:
             correction_payload = {
                 **payload,
-                "previous_interface_plan": previous_candidate,
                 "refinement_feedback": feedback,
                 "interface_schema": INTERFACE_SCHEMA,
             }
+            if _include_previous_interface_plan(feedback):
+                correction_payload["previous_interface_plan"] = previous_candidate
             corrected_text = await model_call(
                 [{"role": "system", "content": correction_prompt},
                  {"role": "user", "content": json.dumps(correction_payload, ensure_ascii=False, default=str)}],
