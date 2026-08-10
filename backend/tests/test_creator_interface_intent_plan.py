@@ -3,7 +3,7 @@ import pytest
 
 from backend.services.creator.function_item_interface_plan import (
     CRITIC_SCHEMA, PLATFORM_BOUNDARY_CONTRACT, InterfaceIntentPlanError, _compact_function_items,
-    _interface_plan_prompt, build_graph_obligations_from_interfaces,
+    _interface_correction_payload, _interface_plan_prompt, build_graph_obligations_from_interfaces,
     build_interface_repair_scope, collect_interface_plan_validation_issues,
     canonical_logical_binding_signatures,
     existing_binding_references_valid,
@@ -145,6 +145,36 @@ def platform():
     return {"platform_skill_boundary": {"input_envelope_fields": ["payload"], "final_output_fields": ["text"]
 , "required_final_output_fields": ["text"]
 }}
+
+
+@pytest.mark.parametrize("acceptance_fact", [
+    {"code": "abstract_failure", "observed_value": "x", "expected_constraint": "y"},
+    {"code": "unrelated_condition", "observed_value": 1, "expected_constraint": 2},
+])
+def test_no_progress_restart_is_independent_of_acceptance_fact(acceptance_fact):
+    previous = {"interfaces": [{"opaque": "candidate"}]}
+    feedback = {
+        "acceptance_facts": [acceptance_fact],
+        "progress": {"semantic_changed": False},
+        "attempt": 2,
+        "max_attempts": 2,
+    }
+    result = _interface_correction_payload({"system_goal": "abstract"}, previous, feedback)
+    assert "previous_interface_plan" not in result
+    assert result["refinement_feedback"] == feedback
+
+
+def test_progressing_correction_keeps_previous_candidate_and_budget():
+    previous = {"interfaces": [{"opaque": "candidate"}]}
+    feedback = {
+        "acceptance_facts": [],
+        "progress": {"semantic_changed": True},
+        "attempt": 2,
+        "max_attempts": 2,
+    }
+    result = _interface_correction_payload({"system_goal": "abstract"}, previous, feedback)
+    assert result["previous_interface_plan"] is previous
+    assert result["refinement_feedback"]["max_attempts"] == 2
 
 
 def test_interface_schema_has_explicit_logical_bindings():
@@ -396,7 +426,7 @@ async def test_planner_correction_uses_second_attempt_for_staged_residual():
 
 
 @pytest.mark.asyncio
-async def test_planner_correction_no_progress_uses_full_budget():
+async def test_planner_correction_no_progress_reconstructs_without_previous_candidate():
     from backend.services.creator.function_item_interface_plan import plan_function_item_interfaces
     items = [item("scripts/unit_a.py", ["slot_x", "slot_y"], ["result_z"])]
     initial = {"interfaces": [p2m("I1", "scripts/unit_a.py"), m2p("I2", "scripts/unit_a.py")]}
@@ -404,24 +434,28 @@ async def test_planner_correction_no_progress_uses_full_budget():
     presentation_only["interfaces"].reverse()
     presentation_only["interfaces"][0]["interface_id"] = "I9"
     presentation_only["interfaces"][0]["goal"] = "value_x"
-    repeated = json.loads(json.dumps(presentation_only))
-    responses = iter([initial, presentation_only, repeated])
-    calls = 0
+    complete = {"interfaces": [
+        p2m("I1", "scripts/unit_a.py", "slot_x"),
+        p2m("I2", "scripts/unit_a.py", "slot_y"),
+        m2p("I3", "scripts/unit_a.py"),
+    ]}
+    responses = iter([initial, presentation_only, complete])
+    payloads = []
 
-    async def planner(_messages, _model):
-        nonlocal calls
-        calls += 1
+    async def planner(messages, _model):
+        if "INTERFACE PLAN CORRECTION" in messages[0]["content"]:
+            payloads.append(json.loads(messages[-1]["content"]))
         return json.dumps(next(responses))
 
-    with pytest.raises(InterfaceIntentPlanError) as raised:
-        await plan_function_item_interfaces(
-            original_user_goal="g", frozen_function_items=items,
-            platform_contract=platform(), planner_model="planner-test-model",
-            model_call=planner,
-        )
-    assert raised.value.code == "interface_plan_deterministic_closure_failed"
-    assert raised.value.details["semantic_changed"] is False
-    assert calls == 3
+    result = await plan_function_item_interfaces(
+        original_user_goal="g", frozen_function_items=items,
+        platform_contract=platform(),
+        planner_model="planner-test-model", model_call=planner,
+    )
+    assert result == complete
+    assert payloads[0]["previous_interface_plan"] == initial
+    assert payloads[1]["refinement_feedback"]["progress"]["semantic_changed"] is False
+    assert "previous_interface_plan" not in payloads[1]
 
 
 @pytest.mark.asyncio
