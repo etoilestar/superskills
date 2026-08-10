@@ -238,6 +238,19 @@ def _compact_function_items(function_items: list[dict[str, Any]]) -> list[dict[s
     return compact_items
 
 
+def _interface_correction_payload(
+    authoritative_payload: dict[str, Any], previous_candidate: Any, feedback: dict[str, Any],
+) -> dict[str, Any]:
+    correction_payload = {
+        **authoritative_payload,
+        "refinement_feedback": feedback,
+        "interface_schema": INTERFACE_SCHEMA,
+    }
+    if feedback.get("progress", {}).get("semantic_changed") is not False:
+        correction_payload["previous_interface_plan"] = previous_candidate
+    return correction_payload
+
+
 def validate_interface_plan_protocol(plan: dict[str, Any]) -> dict[str, Any]:
     """Validate and normalize only the wire protocol, not member semantics."""
     if not isinstance(plan, dict) or set(plan) != {"interfaces"}:
@@ -1026,12 +1039,7 @@ Return strict JSON matching INTERFACE_SCHEMA only."""
         correction_prompt = f"{correction_prompt}\n\n{REFINEMENT_FEEDBACK_CONTRACT}"
 
         async def propose_correction(previous_candidate: Any, feedback: dict[str, Any]) -> Any:
-            correction_payload = {
-                **payload,
-                "previous_interface_plan": previous_candidate,
-                "refinement_feedback": feedback,
-                "interface_schema": INTERFACE_SCHEMA,
-            }
+            correction_payload = _interface_correction_payload(payload, previous_candidate, feedback)
             corrected_text = await model_call(
                 [{"role": "system", "content": correction_prompt},
                  {"role": "user", "content": json.dumps(correction_payload, ensure_ascii=False, default=str)}],
