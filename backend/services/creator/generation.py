@@ -1169,7 +1169,7 @@ def _script_local_contract_payload(
     prompt_runtime_contract = dict(plan_entry.runtime_contract or {})
     prompt_runtime_contract["tool_binding_summary"] = dict(prompt_tool_binding_summary)
 
-    return {
+    payload = {
         "file_path": file_path,
         "runtime": plan_entry.runtime,
         "language": plan_entry.language,
@@ -1332,6 +1332,13 @@ def _script_local_contract_payload(
             ),
         },
     }
+    script_contract = (plan_entry.runtime_contract or {}).get("frozen_script_contract")
+    skill_tool_contract = (plan_entry.runtime_contract or {}).get("frozen_skill_tool_contract")
+    if isinstance(script_contract, dict):
+        payload["frozen_script_contract"] = script_contract
+    if isinstance(skill_tool_contract, dict):
+        payload["frozen_skill_tool_contract"] = skill_tool_contract
+    return payload
 
 
 def _creator_file_generation_messages(task_content: str, *, system_rule: str | None = None) -> list[dict]:
