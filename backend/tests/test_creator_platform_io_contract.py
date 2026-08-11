@@ -34,6 +34,28 @@ def test_platform_io_contract_declares_output_dir_final_outputs_dir():
     assert "Do not append 'outputs' to OUTPUT_DIR" in prompt
 
 
+def test_platform_input_source_families_are_optional_and_wire_fields_are_unchanged():
+    boundary = build_platform_io_contract()["platform_skill_boundary"]
+    assert boundary["input_envelope_fields"] == [
+        "user_request", "input", "text", "payload", "fields", "options",
+        "input_files", "files", "resources",
+    ]
+    semantics = boundary["input_source_semantics"]
+    assert semantics["freeform_request"] == {
+        "canonical": "user_request",
+        "representations": ["user_request", "input", "text"],
+        "globally_required": False,
+    }
+    assert semantics["runtime_files"]["canonical"] == "input_files"
+    assert semantics["runtime_files"]["representations"] == ["input_files", "files"]
+    assert semantics["structured_parameters"]["canonical"] == "fields"
+    assert all(not family["globally_required"] for family in semantics.values())
+
+    prompt = platform_io_contract_prompt_text()
+    assert "PLATFORM INPUT SEMANTICS" in prompt
+    assert "No platform input source is globally required" in prompt
+
+
 def test_requirement_graph_injects_and_normalize_overrides_platform_io_contract():
     graph = build_default_requirement_graph([DummyFile()])
     assert graph.platform_io_contract["environment"]["OUTPUT_DIR"].startswith("already points")
@@ -83,6 +105,21 @@ def test_skill_md_prompt_requires_role_inputs_outputs_action_schema():
     assert "inputs: ..." in text
     assert "outputs: ..." in text
     assert "command JSON argv keys" in text
+
+
+def test_skill_md_prompt_preserves_frozen_binding_authority():
+    text = _prompt_text(_build_generate_file_prompt(
+        file_path="SKILL.md",
+        skill_name="demo",
+        purpose="skill docs",
+        blueprint_text="Files: scripts/report.py",
+        conversation_history=[],
+        role=None,
+        skill_plan_entry=None,
+    ))
+    assert "FIRST-ROUND BINDING AUTHORITY" in text
+    assert "available_sources may be considered only for unresolved_target_keys" in text
+    assert "Frozen Interface / Graph > command_alignment_snapshot" in text
 
 
 @pytest.mark.parametrize("bad_new", [

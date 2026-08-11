@@ -1471,7 +1471,8 @@ def _existing_script_argv_context_for_skill_md(
             "declared_prior_stdout_fields": declared_prior_stdout_by_path.get(script_path, []),
             "note": (
                 "Shared fact snapshot for both SKILL.md writer and judge. "
-                "confirmed_bindings must be preserved exactly; candidate_bindings may be checked/adjusted; unresolved_target_keys may be bound only to available_sources; "
+                "confirmed_bindings are frozen read-only source authority and must be preserved exactly; candidate_bindings are non-authoritative; "
+                "available_sources is a candidate domain only for unresolved_target_keys; "
                 "do not match by name similarity, hard-code by role/script name, or invent business fields."
             ),
         })
@@ -2343,6 +2344,9 @@ def _build_generate_file_prompt(
             "6b. 输入 JSON key 必须使用对应脚本真实 strict_json_argv_guard schema 中的字段；如果 guard 不完整，再以 run_args_analysis 和 function_execution_context/function_item_graph_context 为事实依据补足，不能自行编造业务字段或别名。\n"
             "6b-1. actual_argv_schema 是 argv key identity 的唯一 authority；必须逐字复制 key，不得根据 role、purpose 或蓝图 prose 重命名。confirmed_bindings/exact incoming Graph provenance 与 frozen_defaults 只决定这些 key 的 value。\n"
             "6b-2. frozen_defaults 中的值必须按原生 JSON 类型直接序列化；不得改为 fields/options placeholder。confirmed_bindings 必须使用该 target key 对应的精确 source，不得换用另一个可用字段。\n"
+            "FIRST-ROUND BINDING AUTHORITY\n"
+            "When command_alignment_snapshot.confirmed_bindings contains a binding for an argv key, preserve that exact source identity. Do not select or reinterpret another platform source for that target. available_sources may be considered only for unresolved_target_keys. Raw Blueprint runtime prose or command examples must not override frozen Interface / Graph bindings. Generation implements upstream planning; it does not create another dataflow plan.\n"
+            "Authority order: Frozen Interface / Graph > command_alignment_snapshot > actual script argv contract > descriptive Blueprint runtime prose/example. First round does not need to prove runtime success, but it must preserve every already-known upstream binding. E2E verifies execution correctness; it does not justify redesigning a frozen binding.\n"
             "6c. 输入字段是脚本入口接口字段，不是平台字段白名单；输入值必须绑定到平台输入、责任图谱 incoming edge、已排序前序 stdout、reference/assets、literal_default、runtime_constant 或脚本默认值中的真实来源。\n"
             "6d. 不要为同一语义输入同时编造多个别名字段；选定一个输入字段后，command block、输入 JSON 说明和正文说明要一致。\n"
             "6e. 必填动态参数不能写成普通示例字符串、字段名字符串或只重复参数名的字符串；动态值必须使用 `{{...}}` placeholder，并且 placeholder 根节点必须存在于允许来源。\n"

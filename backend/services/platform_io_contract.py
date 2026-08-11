@@ -146,6 +146,21 @@ def build_platform_io_contract() -> dict[str, Any]:
         },
         "platform_skill_boundary": {
             "input_envelope_fields": ["user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources"],
+            "input_source_semantics": {
+                "freeform_request": {
+                    "canonical": "user_request",
+                    "representations": ["user_request", "input", "text"],
+                    "globally_required": False,
+                },
+                "runtime_files": {
+                    "canonical": "input_files",
+                    "representations": ["input_files", "files"],
+                    "globally_required": False,
+                },
+                "structured_parameters": {"canonical": "fields", "globally_required": False},
+                "runtime_options": {"canonical": "options", "globally_required": False},
+                "runtime_resources": {"canonical": "resources", "globally_required": False},
+            },
             "preferred_structured_input_root": "fields",
             "final_output_fields": [
                 {"name": "text", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
@@ -214,6 +229,13 @@ def platform_io_contract_prompt_text() -> str:
         "- Artifact allowed roots: outputs/ and assets/generated/.",
         "- Absolute paths under current skill workspace outputs/ or assets/generated/ are valid if the files exist.",
         "- Platform boundary input source slots: user_request, input, text, payload, fields, options, input_files, files, resources.",
+        "PLATFORM INPUT SEMANTICS",
+        "- No platform input source is globally required.",
+        "- user_request is the canonical representation of a runtime free-form natural-language request when such input is required by the Skill.",
+        "- input/text may be compatibility representations of that same request and must not be treated as independent business values merely because their names match FunctionItem ports.",
+        "- input_files represents runtime-uploaded file or multimodal content; files may be its derived compatibility view.",
+        "- fields is the namespace for Skill-specific structured parameters.",
+        "- A Skill may consume zero, one, or multiple source families according to confirmed requirements.",
         "- Platform final output terminal slots: text, markdown, image_path, image_paths, pdf_path, docx_path, pptx_path, html_path, file_paths, file_outputs.",
         "- Platform boundary fields are source/terminal slots, not a whitelist for script argv keys.",
         "- SKILL.md should document how platform source slots map to script argv keys.",
