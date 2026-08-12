@@ -7300,8 +7300,15 @@ async def _bind_executable_responsibility_plan(
 async def _plan_requirement_allocations(
     *, request: PreparePlanRequest, blueprint_text: str,
     function_items: list[dict[str, Any]], planner_model: str,
+    semantic_task_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Ask the Planner for the semantic requirement-to-owner projection."""
+    if semantic_task_plan:
+        return await _allocate_frozen_semantic_tasks(
+            semantic_task_plan=semantic_task_plan,
+            function_items=function_items,
+            planner_model=planner_model,
+        )
     prompt = AUTHORITY_CONTRACT + """
 1. AUTHORITATIVE FACTS
 The payload contains the confirmed user context, compact frozen FunctionItems,
@@ -7520,6 +7527,169 @@ allocation object and one channel entry for every requirement you derive.
         "requirement_allocations": allocations,
         "requirement_channels": channels,
     }
+
+
+async def _decompose_semantic_tasks(
+    *, request: PreparePlanRequest, planner_model: str,
+) -> dict[str, Any]:
+    """Freeze implementation-independent responsibilities from confirmed facts only."""
+    prompt = """SEMANTIC TASK RESPONSIBILITY DECOMPOSITION
+
+Decompose the confirmed user goal into a small set of implementation-independent
+semantic responsibility blocks. Each task describes WHAT must be accomplished
+for the user's final goal to be satisfied. Do not design HOW it will be implemented.
+
+Do not choose files or script names, runtime field names, argv keys, tools or
+capabilities, references or assets, interfaces, or graph endpoints.
+
+TASK GRANULARITY
+Each task is one coherent responsibility that can later be assigned to an
+implementation owner. Separate materially different transformations or stages,
+but do not split merely for helper calls or internal steps.
+
+PRESERVE SEMANTIC COMPLETENESS
+Preserve confirmed complete-input processing, required results, relationships,
+aggregation or transformation, ordering or correspondence, and final
+deliverables. These are examples, not a taxonomy. Do not invent unsupported
+quantities, formats, relationships, constraints, or deliverables.
+
+IMPLEMENTATION-INDEPENDENT SEMANTICS
+semantic_inputs and semantic_outputs are conceptual information or deliverables,
+not implementation field identities unless explicitly established by the user.
+Static implementation resources are not independent business tasks. Express a
+confirmed static constraint on the relevant real task instead.
+
+Return JSON only with exactly {"tasks":[{"goal":"...","must_do":[],
+"semantic_inputs":[],"semantic_outputs":[],"constraints":[]}]}. Do not return IDs."""
+    clarification_answers: list[dict[str, str]] = []
+    pending_question = ""
+    for item in request.conversation_history or []:
+        if not isinstance(item, dict):
+            continue
+        role, content = str(item.get("role") or "").strip(), str(item.get("content") or "").strip()
+        if role == "assistant" and content:
+            pending_question = content
+        elif role == "user" and content:
+            clarification_answers.append({"question": pending_question, "answer": content})
+            pending_question = ""
+    payload = {"confirmed_user_context": {
+        "original_user_request": request.user_request,
+        "clarification_answers": clarification_answers,
+        "human_feedback": request.human_feedback,
+    }}
+    text = await complete_creator_role_once(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+        "planner", fallback_model=planner_model,
+    )
+    data = _parse_prepare_plan_json(text)
+    if set(data) != {"tasks"} or not isinstance(data["tasks"], list) or not data["tasks"]:
+        raise PreparePlanProtocolError("Semantic task decomposition must return a non-empty tasks array")
+    tasks: list[dict[str, Any]] = []
+    fields = {"goal", "must_do", "semantic_inputs", "semantic_outputs", "constraints"}
+    for index, raw in enumerate(data["tasks"], 1):
+        if not isinstance(raw, dict) or set(raw) != fields:
+            raise PreparePlanProtocolError(f"Semantic task {index} has invalid fields")
+        task = {"task_id": f"T{index}", "goal": str(raw["goal"] or "").strip()}
+        if not task["goal"]:
+            raise PreparePlanProtocolError(f"Semantic task {index} goal must be non-empty")
+        for field in fields - {"goal"}:
+            if not isinstance(raw[field], list) or not all(isinstance(value, str) for value in raw[field]):
+                raise PreparePlanProtocolError(f"Semantic task {index}.{field} must be a string array")
+            task[field] = list(dict.fromkeys(value.strip() for value in raw[field] if value.strip()))
+        tasks.append(task)
+    logger.info("[Creator][semantic_task_decomposition] task_count=%d", len(tasks))
+    logger.info("[Creator][semantic_task_freeze] task_ids=%s", [task["task_id"] for task in tasks])
+    return {"tasks": tasks}
+
+
+async def _allocate_frozen_semantic_tasks(
+    *, semantic_task_plan: dict[str, Any], function_items: list[dict[str, Any]],
+    planner_model: str,
+) -> dict[str, Any]:
+    """Allocate frozen identities to legal executable owners without re-derivation."""
+    prompt = AUTHORITY_CONTRACT + """FROZEN TASK ALLOCATION
+Semantic task identity and responsibility are frozen. Only allocate each task to
+the existing FunctionItem whose executable responsibility should implement it.
+Do not create, merge, split, weaken, or rewrite tasks, and do not derive additional
+requirements from purposes, capabilities, forbidden capabilities, resources,
+filenames, interfaces, or implementation convenience. Static resources may
+support executable work but do not replace its executable owner. Prefer a clear
+primary owner. Do not allocate by filename similarity; use FunctionItem
+responsibility and I/O semantics.
+
+Return exactly {"requirement_allocations":[{"requirement_id":"T1",
+"requirement":"<exact frozen goal>","owners":["<exact target_file>"],
+"evidence":{"responsibility":"...","outputs":[],"capabilities":[]}}]}.
+Return every supplied task exactly once and no other requirement."""
+    tasks = semantic_task_plan.get("tasks") or []
+    payload = {
+        "frozen_semantic_tasks": tasks,
+        "function_items": function_items,
+        "legal_owner_target_files": [item.get("target_file") for item in function_items],
+    }
+    raw = await complete_creator_role_once(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+        "planner", fallback_model=planner_model,
+    )
+    data = _parse_prepare_plan_json(raw)
+    if set(data) != {"requirement_allocations"}:
+        raise PreparePlanProtocolError("Frozen task allocation has invalid root fields")
+    targets = [str(item.get("target_file") or "").strip() for item in function_items]
+    allocations = validate_requirement_allocations(
+        data["requirement_allocations"], allowed_owner_targets=targets,
+    )
+    task_by_id = {task["task_id"]: task for task in tasks}
+    if [item["requirement_id"] for item in allocations] != list(task_by_id):
+        raise PreparePlanProtocolError("Frozen task allocation IDs must preserve every task in order")
+    for item in allocations:
+        task = task_by_id[item["requirement_id"]]
+        if item["requirement"] != task["goal"] or not item["owners"]:
+            raise PreparePlanProtocolError("Frozen task meaning and executable ownership must be preserved")
+        logger.info("[Creator][semantic_task_allocation] task_id=%s owners=%s", item["requirement_id"], item["owners"])
+    return {
+        "requirement_allocations": allocations,
+        "requirement_channels": {task_id: "executable" for task_id in task_by_id},
+    }
+
+
+def _transport_semantic_task_responsibilities(
+    *, function_items: list[dict[str, Any]], semantic_task_plan: dict[str, Any],
+    requirement_allocations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Stable exact task -> selected owner transport; performs no semantic inference."""
+    task_by_id = {task["task_id"]: task for task in semantic_task_plan.get("tasks") or []}
+    if [item.get("requirement_id") for item in requirement_allocations] != list(task_by_id):
+        raise PreparePlanProtocolError("Frozen semantic tasks cannot disappear or change identity downstream")
+    by_target = {str(item.get("target_file") or ""): item for item in function_items}
+    owned_ids: dict[str, list[str]] = {target: [] for target in by_target}
+    for allocation in requirement_allocations:
+        task_id = allocation["requirement_id"]
+        if task_id not in task_by_id:
+            raise PreparePlanProtocolError(f"Unknown frozen semantic task allocation: {task_id}")
+        task = task_by_id[task_id]
+        for owner in allocation.get("owners") or []:
+            if owner not in by_target:
+                raise PreparePlanProtocolError(f"Unknown FunctionItem owner: {owner}")
+            item = by_target[owner]
+            item["must_do"] = list(dict.fromkeys([*(item.get("must_do") or []), *task["must_do"]]))
+            constraints = list(item.get("constraints") or [])
+            constraints.extend({
+                "name": value, "kind": "constraint", "value": value,
+                "comparator": "describes", "source": "semantic_task_plan", "required": True,
+            } for value in task["constraints"] if not any(
+                isinstance(existing, dict) and existing.get("source") == "semantic_task_plan"
+                and existing.get("value") == value for existing in constraints
+            ))
+            item["constraints"] = constraints
+            owned_ids[owner].append(task_id)
+    for target, item in by_target.items():
+        logger.info(
+            "[Creator][function_item_responsibility] target=%s task_ids=%s must_do_count=%d constraint_count=%d",
+            target, owned_ids[target], len(item.get("must_do") or []), len(item.get("constraints") or []),
+        )
+    return function_items
 
 
 def _validate_requirement_projection_protocol(text: str) -> dict[str, Any]:
@@ -7984,6 +8154,7 @@ def _validate_requirement_channels(
 async def _plan_executable_requirement_allocations(
     *, request: PreparePlanRequest, blueprint_text: str,
     function_items: list[dict[str, Any]], planner_model: str,
+    semantic_task_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Plan the complete requirement projection and per-requirement channels."""
     return await _plan_requirement_allocations(
@@ -7991,6 +8162,7 @@ async def _plan_executable_requirement_allocations(
         blueprint_text=blueprint_text,
         function_items=function_items,
         planner_model=planner_model,
+        semantic_task_plan=semantic_task_plan,
     )
 
 
@@ -8881,6 +9053,7 @@ async def _final_blueprint_cleanup(
     blueprint_text: str,
     existing_resource_facts: dict[str, Any],
     planner_model: str,
+    semantic_task_plan: dict[str, Any] | None = None,
 ) -> str:
     """Run one narrow semantic cleanup before Blueprint facts become downstream facts."""
     prompt = """
@@ -8898,6 +9071,15 @@ by the user.
 
 Your task is not to redesign the Skill from scratch.
 Preserve all confirmed user decisions and unrelated script responsibilities.
+
+SEMANTIC TASK AUTHORITY
+The frozen semantic task plan defines WHAT the completed Skill must accomplish.
+The current Blueprint is an implementation proposal defining HOW/WHERE those
+responsibilities will be implemented. The Blueprint must support every frozen
+task. Do not rewrite, delete, weaken, or invent task meaning, or turn executable
+responsibility into a static resource. Repair implementation structure when it
+cannot support a task. One task need not equal one script; a script may implement
+multiple compatible tasks.
 
 RESOURCE SEMANTICS
 
@@ -8970,6 +9152,8 @@ Return the complete corrected Blueprint only.
         },
         "bundled_resource_facts": bundled_resource_facts,
     }
+    if semantic_task_plan:
+        payload["frozen_semantic_task_plan"] = semantic_task_plan
     cleaned = await complete_creator_role_once(
         [
             {"role": "system", "content": prompt},
@@ -9886,11 +10070,15 @@ Blueprint Planner 只规划业务责任。
         )
         data["responsibility_edges"] = normalized_edges
     elif status == "ready":
+        semantic_task_plan = await _decompose_semantic_tasks(
+            request=request, planner_model=route.model,
+        )
         frozen_blueprint_text = await _final_blueprint_cleanup(
             request=request,
             blueprint_text=frozen_blueprint_text,
             existing_resource_facts=existing_context,
             planner_model=route.model,
+            semantic_task_plan=semantic_task_plan,
         )
         first_planner_result = {
             **first_planner_result,
@@ -10008,6 +10196,12 @@ Blueprint Planner 只规划业务责任。
         requirement_projection = await _plan_executable_requirement_allocations(
             request=request, blueprint_text=frozen_blueprint_text,
             function_items=semantic_function_items, planner_model=route.model,
+            semantic_task_plan=semantic_task_plan,
+        )
+        semantic_function_items = _transport_semantic_task_responsibilities(
+            function_items=semantic_function_items,
+            semantic_task_plan=semantic_task_plan,
+            requirement_allocations=requirement_projection["requirement_allocations"],
         )
         requirement_projection = await _validate_and_repair_requirement_ownership(
             request=request, blueprint_text=frozen_blueprint_text,
@@ -10137,6 +10331,7 @@ Blueprint Planner 只规划业务责任。
                 requirement_projection = await _plan_executable_requirement_allocations(
                     request=request, blueprint_text=frozen_blueprint_text,
                     function_items=semantic_function_items, planner_model=route.model,
+                    semantic_task_plan=semantic_task_plan,
                 )
                 requirement_projection = await _validate_and_repair_requirement_ownership(
                     request=request, blueprint_text=frozen_blueprint_text,
@@ -10146,6 +10341,11 @@ Blueprint Planner 只规划业务责任。
                 )
                 requirement_allocations = requirement_projection["requirement_allocations"]
                 requirement_channels = requirement_projection["requirement_channels"]
+            semantic_function_items = _transport_semantic_task_responsibilities(
+                function_items=semantic_function_items,
+                semantic_task_plan=semantic_task_plan,
+                requirement_allocations=requirement_allocations,
+            )
             validate_frozen_function_item_structure(
                 function_items=semantic_function_items,
                 requirement_allocations=requirement_allocations,
@@ -10210,6 +10410,11 @@ Blueprint Planner 只规划业务责任。
         )
         normalized_function_items = normalize_structured_function_items(
             binding_data.get("function_items"), source="graph_expansion"
+        )
+        normalized_function_items = _transport_semantic_task_responsibilities(
+            function_items=normalized_function_items,
+            semantic_task_plan=semantic_task_plan,
+            requirement_allocations=requirement_allocations,
         )
         _validate_function_item_targets_in_allowed_domain(
             normalized_function_items, allowed_function_item_targets
@@ -11414,6 +11619,7 @@ async def _normalize_script_purpose_short_contracts(
             "格式必须是：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
             "来源/动作/交付/约束要来自蓝图语义；inputs/outputs 只是接口提示。\n"
             "This phase compresses wording only. It must not add a core action; must not remove a core action; must not replace an owned action with consumption of an already-produced result; must not change required capability ownership; must not change incoming/outgoing ResponsibilityEdge obligations; must not change FunctionItem constraints; must not move responsibility to another script. target_file must be copied exactly from one provided script path. Do not invent, abbreviate, normalize, or replace the path. Unknown targets are ignored by exact match only; no fuzzy match."
+            "\nPURPOSE IS A SUMMARY, NOT RESPONSIBILITY AUTHORITY. purpose is a concise human-readable summary. FunctionItem.must_do and FunctionItem.constraints preserve executable responsibility closure and must survive purpose shortening unchanged. Do not weaken, replace, or reinterpret them through purpose compression."
         )},
         {"role": "user", "content": (
             "compact_context_by_target:\n"

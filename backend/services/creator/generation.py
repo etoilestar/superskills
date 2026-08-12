@@ -2029,6 +2029,13 @@ def _build_script_generate_file_prompt_variant(
             "脚本内部局部变量、helper 参数和 Tool 参数仍由实现自由决定。"
         ),
         (
+            "EXECUTABLE RESPONSIBILITY AUTHORITY\n"
+            "Runtime inputs and outputs define the script interface; they do not by themselves prove completion of responsibility. "
+            "FunctionItem.must_do and FunctionItem.constraints are mandatory executable obligations inherited from the frozen semantic task plan. "
+            "The implementation must causally realize every applicable must_do obligation. Accepting input, invoking an allowed tool, and returning a declared output key are insufficient when semantic transformation is required. "
+            "Choose the implementation strategy using authorized tools and local logic. Do not infer additional business requirements beyond supplied obligations."
+        ),
+        (
             "coverage_requirements 是职责覆盖约束，不是 argv/stdout 字段；"
             "它用于判断脚本是否覆盖声明的输入来源、输入格式、核心动作、"
             "输出形态、参考读取和最终交付义务。"

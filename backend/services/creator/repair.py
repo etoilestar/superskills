@@ -4979,6 +4979,8 @@ async def _run_script_responsibility_review(
                 "Judge checks whether the current script implements its FunctionItem. Reference files may only serve as dependency/resource evidence for the current FunctionItem; SKILL.md, references/**, and assets/** do not own executable workflow responsibilities.\n\n"
                 "核心原则（图谱式可观察边界）：\n"
                 "- 当前脚本的语义职责以 current script FunctionItem（通过现有 requirements/responsibility_requirements payload 传输）的 purpose、must_do、must_not_do 和 constraints 为准；inputs/outputs 只是接口提示。\n"
+                "\nRESPONSIBILITY COMPLETENESS\n"
+                "Judge the implementation against supplied FunctionItem.must_do and FunctionItem.constraints. Required inputs, an allowed capability call, declared stdout keys, and valid imports alone are insufficient. For every supplied executable obligation, determine whether logic causally realizes it. Do not require a loop, a particular helper-call count, a specific algorithm, or a variable name. Judge semantic implementation, not surface syntax. Do not invent obligations absent from the frozen responsibility contract.\n"
                 "- FunctionItem describes what the current script owns. Incoming ResponsibilityEdges describe what upstream responsibilities must provide to the current script. Outgoing ResponsibilityEdges describe what the current script must make available to downstream responsibilities. Required edge constraints must be checked against the current FunctionItem implementation.\n"
                 "- requirements.constraints 是当前文件拥有的开放责任约束。\n"
                 "- 所有 required=true constraints 都必须检查实现证据。\n"
