@@ -7661,11 +7661,6 @@ once and no additional requirement."""
         if item["requirement"] != task["goal"]:
             raise PreparePlanProtocolError("Frozen task meaning must be preserved")
         logger.info("[Creator][semantic_task_allocation] task_id=%s owners=%s", item["requirement_id"], item["owners"])
-    validate_final_executable_requirement_ownership(
-        requirement_allocations=allocations,
-        requirement_channels=channels,
-        allowed_owner_targets=targets,
-    )
     return {
         "requirement_allocations": allocations,
         "requirement_channels": channels,

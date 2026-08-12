@@ -151,7 +151,6 @@ async def test_frozen_task_allocation_preserves_three_channels(monkeypatch):
 @pytest.mark.parametrize("mutate", [
     lambda data: data["requirement_allocations"][1].update(owners=["scripts/worker.py"]),
     lambda data: data["requirement_allocations"][2].update(owners=["scripts/worker.py"]),
-    lambda data: data["requirement_allocations"][0].update(owners=[]),
     lambda data: data["requirement_channels"].update(T1="unknown"),
     lambda data: data["requirement_allocations"][0].update(owners=["scripts/missing.py"]),
     lambda data: data["requirement_allocations"].pop(0),
@@ -190,6 +189,51 @@ async def test_frozen_task_allocation_rejects_invalid_protocol(monkeypatch, muta
             function_items=[{"target_file": "scripts/worker.py", "purpose": "Transform."}],
             planner_model="test",
         )
+
+
+@pytest.mark.asyncio
+async def test_ownerless_executable_allocation_is_repaired_by_ownership_stage(monkeypatch):
+    task = {
+        "task_id": "T1", "goal": "transform source records", "must_do": [],
+        "semantic_inputs": [], "semantic_outputs": [], "constraints": [],
+    }
+    allocation = {
+        "requirement_id": "T1", "requirement": task["goal"], "owners": [],
+        "evidence": {"responsibility": "", "outputs": [], "capabilities": []},
+    }
+
+    async def allocation_model(*_args, **_kwargs):
+        return json.dumps({
+            "requirement_allocations": [allocation],
+            "requirement_channels": {"T1": "executable"},
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", allocation_model)
+    projection = await api._allocate_frozen_semantic_tasks(
+        semantic_task_plan={"tasks": [task]},
+        function_items=[{"target_file": "scripts/worker.py", "purpose": "Transform."}],
+        planner_model="test",
+    )
+    assert projection["requirement_allocations"][0]["owners"] == []
+
+    async def repair_model(*_args, **_kwargs):
+        repaired = copy.deepcopy(allocation)
+        repaired["owners"] = ["scripts/worker.py"]
+        return json.dumps({
+            "requirement_allocations": [repaired],
+            "requirement_channels": {"T1": "executable"},
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", repair_model)
+    repaired_projection = await api._validate_and_repair_requirement_ownership(
+        request=api.PreparePlanRequest(user_request="transform source records"),
+        blueprint_text="frozen blueprint",
+        function_items=[{"target_file": "scripts/worker.py", "purpose": "Transform."}],
+        projection=projection,
+        planner_model="test",
+        repair_budget=api.RequirementOwnershipRepairBudget(),
+    )
+    assert repaired_projection["requirement_allocations"][0]["owners"] == ["scripts/worker.py"]
 
 
 def test_responsibility_authority_is_shared_by_producer_and_reviewer():
