@@ -7607,21 +7607,33 @@ async def _allocate_frozen_semantic_tasks(
     *, semantic_task_plan: dict[str, Any], function_items: list[dict[str, Any]],
     planner_model: str,
 ) -> dict[str, Any]:
-    """Allocate frozen identities to legal executable owners without re-derivation."""
-    prompt = AUTHORITY_CONTRACT + """FROZEN TASK ALLOCATION
-Semantic task identity and responsibility are frozen. Only allocate each task to
-the existing FunctionItem whose executable responsibility should implement it.
-Do not create, merge, split, weaken, or rewrite tasks, and do not derive additional
-requirements from purposes, capabilities, forbidden capabilities, resources,
-filenames, interfaces, or implementation convenience. Static resources may
-support executable work but do not replace its executable owner. Prefer a clear
-primary owner. Do not allocate by filename similarity; use FunctionItem
-responsibility and I/O semantics.
+    """Allocate frozen identities to existing channels and legal owners."""
+    prompt = AUTHORITY_CONTRACT + """FROZEN TASK CHANNEL AND OWNER ALLOCATION
+
+Task identity, goal, must_do, semantic inputs/outputs, and constraints are frozen.
+For each frozen task, decide only its existing requirement channel (executable,
+resource, or direct) and, if and only if channel=executable, its legitimate
+existing FunctionItem owner or owners. Do not create, merge, split, rewrite,
+weaken, or reinterpret tasks.
+
+CHANNEL MEANING
+executable: satisfied by runtime behavior performed by existing executable
+FunctionItems. It requires at least one legal owner.
+resource: satisfied primarily by the presence or semantic content of an
+authorized static resource rather than runtime script behavior. owners must be empty.
+direct: satisfied directly at the Skill/platform boundary without an executable
+FunctionItem owner. owners must be empty.
+
+Static resources may support executable tasks but do not replace executable
+ownership. Do not classify based on filename, suffix, capability name, business
+keyword, array position, or implementation convenience. Use frozen task semantics
+and actual FunctionItem responsibilities.
 
 Return exactly {"requirement_allocations":[{"requirement_id":"T1",
-"requirement":"<exact frozen goal>","owners":["<exact target_file>"],
-"evidence":{"responsibility":"...","outputs":[],"capabilities":[]}}]}.
-Return every supplied task exactly once and no other requirement."""
+"requirement":"<exact frozen goal>","owners":[],"evidence":{
+"responsibility":"...","outputs":[],"capabilities":[]}}],
+"requirement_channels":{"T1":"resource"}}. Return every supplied task exactly
+once and no additional requirement."""
     tasks = semantic_task_plan.get("tasks") or []
     payload = {
         "frozen_semantic_tasks": tasks,
@@ -7634,23 +7646,29 @@ Return every supplied task exactly once and no other requirement."""
         "planner", fallback_model=planner_model,
     )
     data = _parse_prepare_plan_json(raw)
-    if set(data) != {"requirement_allocations"}:
+    if set(data) != {"requirement_allocations", "requirement_channels"}:
         raise PreparePlanProtocolError("Frozen task allocation has invalid root fields")
     targets = [str(item.get("target_file") or "").strip() for item in function_items]
     allocations = validate_requirement_allocations(
         data["requirement_allocations"], allowed_owner_targets=targets,
     )
+    channels = _validate_requirement_channels(data["requirement_channels"], allocations)
     task_by_id = {task["task_id"]: task for task in tasks}
     if [item["requirement_id"] for item in allocations] != list(task_by_id):
         raise PreparePlanProtocolError("Frozen task allocation IDs must preserve every task in order")
     for item in allocations:
         task = task_by_id[item["requirement_id"]]
-        if item["requirement"] != task["goal"] or not item["owners"]:
-            raise PreparePlanProtocolError("Frozen task meaning and executable ownership must be preserved")
+        if item["requirement"] != task["goal"]:
+            raise PreparePlanProtocolError("Frozen task meaning must be preserved")
         logger.info("[Creator][semantic_task_allocation] task_id=%s owners=%s", item["requirement_id"], item["owners"])
+    validate_final_executable_requirement_ownership(
+        requirement_allocations=allocations,
+        requirement_channels=channels,
+        allowed_owner_targets=targets,
+    )
     return {
         "requirement_allocations": allocations,
-        "requirement_channels": {task_id: "executable" for task_id in task_by_id},
+        "requirement_channels": channels,
     }
 
 
@@ -10198,11 +10216,6 @@ Blueprint Planner 只规划业务责任。
             function_items=semantic_function_items, planner_model=route.model,
             semantic_task_plan=semantic_task_plan,
         )
-        semantic_function_items = _transport_semantic_task_responsibilities(
-            function_items=semantic_function_items,
-            semantic_task_plan=semantic_task_plan,
-            requirement_allocations=requirement_projection["requirement_allocations"],
-        )
         requirement_projection = await _validate_and_repair_requirement_ownership(
             request=request, blueprint_text=frozen_blueprint_text,
             function_items=semantic_function_items, projection=requirement_projection,
@@ -10210,6 +10223,11 @@ Blueprint Planner 只规划业务责任。
         )
         requirement_allocations = requirement_projection["requirement_allocations"]
         requirement_channels = requirement_projection["requirement_channels"]
+        semantic_function_items = _transport_semantic_task_responsibilities(
+            function_items=semantic_function_items,
+            semantic_task_plan=semantic_task_plan,
+            requirement_allocations=requirement_allocations,
+        )
         channel_counts = _requirement_channel_summary(requirement_channels)
         logger.info(
             "[Creator][requirement_channel] executable_requirement_count=%d "
@@ -10263,6 +10281,18 @@ Blueprint Planner 只规划业务责任。
             )
             requirement_allocations = requirement_projection["requirement_allocations"]
             requirement_channels = requirement_projection["requirement_channels"]
+            semantic_function_items = _frozen_function_items_from_blueprint(
+                frozen_blueprint_text=frozen_blueprint_text,
+                allowed_function_item_targets=allowed_function_item_targets,
+            )
+            _validate_prepare_semantic_function_item_topology(
+                allowed_function_item_targets, semantic_function_items,
+            )
+            semantic_function_items = _transport_semantic_task_responsibilities(
+                function_items=semantic_function_items,
+                semantic_task_plan=semantic_task_plan,
+                requirement_allocations=requirement_allocations,
+            )
             validate_frozen_function_item_structure(
                 function_items=semantic_function_items,
                 requirement_allocations=requirement_allocations,
