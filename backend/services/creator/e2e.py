@@ -1,6 +1,7 @@
 """E2E workflow validation, script static checks, and trial-run helpers."""
 
 import hashlib
+import csv
 import uuid
 from collections import Counter
 
@@ -1411,6 +1412,266 @@ def _materialize_e2e_sample_value(
     return "sample value"
 
 
+_E2E_TRIAL_FORMATS = {"txt", "md", "json", "csv", "pdf", "docx"}
+_E2E_TRIAL_CONTENT_KINDS = {"text", "json", "tabular"}
+
+
+def _validate_e2e_trial_case_spec(
+    value: Any,
+    *,
+    input_specs: dict[str, E2ETypedInputSpec],
+    requirement_ids_by_input: dict[str, set[str]],
+) -> dict[str, Any] | None:
+    """Validate the deliberately small, model-produced trial fixture format."""
+    if not isinstance(value, dict) or value.get("status") == "unsupported" or value.get("version") != 1:
+        return None
+    inputs = value.get("inputs")
+    if not isinstance(inputs, list) or not inputs:
+        return None
+    seen: set[str] = set()
+    for item in inputs:
+        if not isinstance(item, dict):
+            return None
+        name, shape = str(item.get("name") or ""), _canonical_e2e_shape(str(item.get("shape") or ""))
+        spec = input_specs.get(name)
+        if spec is None or name in seen or shape != _canonical_e2e_shape(spec.shape):
+            return None
+        seen.add(name)
+        evidence = item.get("evidence_requirement_ids", [])
+        relevant_requirement_ids = requirement_ids_by_input.get(name, set())
+        if (
+            not isinstance(evidence, list)
+            or (relevant_requirement_ids and not evidence)
+            or any(str(req_id) not in relevant_requirement_ids for req_id in evidence)
+        ):
+            return None
+        fixture = item.get("fixture")
+        if not isinstance(fixture, dict):
+            return None
+        fixture_kind = str(fixture.get("kind") or "")
+        scalar_shapes = {"string", "number", "integer", "boolean"}
+        if shape in scalar_shapes and fixture_kind != "scalar":
+            return None
+        if shape == "file_path" and fixture_kind == "scalar":
+            return None
+        if shape == "list[file_path]" and fixture_kind != "file_list":
+            return None
+        if fixture.get("kind") == "scalar":
+            scalar = fixture.get("value")
+            expected = {"string": str, "number": (int, float), "integer": int, "boolean": bool}.get(shape)
+            if expected is None or not isinstance(scalar, expected) or (shape in {"number", "integer"} and isinstance(scalar, bool)):
+                return None
+            continue
+        files = fixture.get("files") if fixture.get("kind") == "file_list" else [fixture]
+        if not isinstance(files, list) or not 1 <= len(files) <= 3:
+            return None
+        if shape == "file_path" and len(files) != 1:
+            return None
+        for file_spec in files:
+            if not isinstance(file_spec, dict):
+                return None
+            fmt, content_kind = str(file_spec.get("format") or "").lower(), str(file_spec.get("content_kind") or "").lower()
+            if fmt not in _E2E_TRIAL_FORMATS or content_kind not in _E2E_TRIAL_CONTENT_KINDS:
+                return None
+            if fmt == "csv":
+                columns, rows = file_spec.get("columns"), file_spec.get("rows")
+                if content_kind != "tabular" or not isinstance(columns, list) or not columns or not isinstance(rows, list) or not rows:
+                    return None
+                names = [str(column.get("name") or "") for column in columns if isinstance(column, dict)]
+                if len(names) != len(columns) or not all(names) or len(set(names)) != len(names):
+                    return None
+                column_types = {
+                    str(column["name"]): str(column.get("type") or "").lower()
+                    for column in columns
+                }
+                if any(value_type not in {"string", "number", "integer", "boolean"} for value_type in column_types.values()):
+                    return None
+                nullable = {
+                    str(column["name"]): column.get("nullable") is True
+                    for column in columns
+                }
+                if any(not isinstance(row, dict) or not set(row).issubset(names) for row in rows):
+                    return None
+                for row in rows:
+                    for column_name, value_type in column_types.items():
+                        cell = row.get(column_name)
+                        if cell is None:
+                            if not nullable[column_name]:
+                                return None
+                            continue
+                        if value_type == "string" and not isinstance(cell, str):
+                            return None
+                        if value_type == "boolean" and not isinstance(cell, bool):
+                            return None
+                        if value_type == "integer" and (not isinstance(cell, int) or isinstance(cell, bool)):
+                            return None
+                        if value_type == "number" and (not isinstance(cell, (int, float)) or isinstance(cell, bool)):
+                            return None
+            elif fmt == "json":
+                if content_kind != "json" or "value" not in file_spec:
+                    return None
+                try:
+                    json.dumps(file_spec["value"], allow_nan=False)
+                except (TypeError, ValueError):
+                    return None
+            elif content_kind != "text" or not isinstance(file_spec.get("text"), str) or not file_spec["text"].strip():
+                return None
+    return value
+
+
+def _materialize_e2e_trial_fixture(item: dict[str, Any], *, skill_dir: Path) -> Any:
+    fixture = item["fixture"]
+    if fixture.get("kind") == "scalar":
+        return fixture["value"]
+    files = fixture["files"] if fixture.get("kind") == "file_list" else [fixture]
+    paths: list[str] = []
+    for index, file_spec in enumerate(files, 1):
+        fmt = file_spec["format"]
+        path = Path(_e2e_sample_file(skill_dir, item["name"], index, kind=fmt))
+        if fmt == "csv":
+            names = [column["name"] for column in file_spec["columns"]]
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=names, extrasaction="raise")
+                writer.writeheader()
+                for row in file_spec["rows"]:
+                    writer.writerow({name: ("true" if value is True else "false" if value is False else "" if value is None else value) for name, value in row.items()})
+        elif fmt == "json":
+            path.write_text(json.dumps(file_spec["value"], ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        elif fmt == "pdf":
+            _write_minimal_pdf(path, file_spec["text"])
+        elif fmt == "docx":
+            _write_minimal_docx(path, file_spec["text"])
+        else:
+            path.write_text(file_spec["text"], encoding="utf-8")
+        paths.append(str(path))
+    return paths if _canonical_e2e_shape(item["shape"]).startswith("list") else paths[0]
+
+
+def _build_e2e_trial_case(facts: dict[str, Any], *, requested_model: str | None = None) -> Any:
+    """Make the single narrow model call used to project frozen facts to inputs."""
+    route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator grounded E2E trial case")
+    schema = _e2e_trial_case_response_schema(facts)
+    messages = [{"role": "system", "content": (
+        "You are not a Skill planner. You may not modify requirements, interfaces, tools, scripts, or Blueprint. "
+        "Construct only the smallest deterministic happy-path input consistent with the supplied frozen facts. "
+        "Do not invent platform inputs or requirements, optimize the Skill, or judge implementation quality. "
+        "Return exactly the Trial Case object required by the bound JSON Schema."
+    )}, {"role": "user", "content": json.dumps(facts, ensure_ascii=False, sort_keys=True)}]
+    return _complete_creator_json_object_once_sync_for_e2e(
+        messages=messages,
+        model=route.model,
+        phase="creator_e2e_trial_case",
+        response_schema=schema,
+    )
+
+
+def _complete_creator_json_object_once_sync_for_e2e(**kwargs: Any) -> dict[str, Any]:
+    """Synchronously reuse Creator's existing strict JSON-Schema completion."""
+    import asyncio
+    import concurrent.futures
+    from .api import _complete_creator_json_object_once
+
+    async def call() -> dict[str, Any]:
+        return await _complete_creator_json_object_once(**kwargs)
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(call())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(lambda: asyncio.run(call())).result()
+
+
+def _e2e_trial_case_response_schema(facts: dict[str, Any]) -> dict[str, Any]:
+    """Bind the Trial Case output contract to the supplied frozen input facts."""
+    scalar_json = {"type": ["string", "number", "integer", "boolean", "null"]}
+    column = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["name", "type", "nullable"],
+        "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "type": {"type": "string", "enum": ["string", "number", "integer", "boolean"]},
+            "nullable": {"type": "boolean"},
+        },
+    }
+    text_file_variants = [
+        {
+            "type": "object", "additionalProperties": False,
+            "required": ["format", "content_kind", "text"],
+            "properties": {
+                "format": {"const": fmt}, "content_kind": {"const": "text"},
+                "text": {"type": "string", "minLength": 1},
+            },
+        }
+        for fmt in ("txt", "md", "pdf", "docx")
+    ]
+    csv_file = {
+        "type": "object", "additionalProperties": False,
+        "required": ["format", "content_kind", "columns", "rows"],
+        "properties": {
+            "format": {"const": "csv"}, "content_kind": {"const": "tabular"},
+            "columns": {"type": "array", "minItems": 1, "items": column},
+            "rows": {"type": "array", "minItems": 1, "items": {
+                "type": "object", "additionalProperties": scalar_json,
+            }},
+        },
+    }
+    json_file = {
+        "type": "object", "additionalProperties": False,
+        "required": ["format", "content_kind", "value"],
+        "properties": {"format": {"const": "json"}, "content_kind": {"const": "json"}, "value": {}},
+    }
+    file_schema = {"oneOf": [*text_file_variants, json_file, csv_file]}
+    input_variants: list[dict[str, Any]] = []
+    for frozen in facts.get("external_inputs", []):
+        platform_input = frozen.get("platform_input", {}) if isinstance(frozen, dict) else {}
+        name, shape = str(platform_input.get("name") or ""), _canonical_e2e_shape(str(platform_input.get("shape") or ""))
+        evidence_ids = [str(item.get("id")) for item in frozen.get("requirements", []) if isinstance(item, dict) and item.get("id")]
+        evidence_schema: dict[str, Any] = {
+            "type": "array", "uniqueItems": True,
+            "items": {"type": "string", "enum": evidence_ids} if evidence_ids else {"type": "string"},
+            "minItems": 1 if evidence_ids else 0,
+            "maxItems": len(evidence_ids),
+        }
+        if shape in {"string", "number", "integer", "boolean"}:
+            fixture = {
+                "type": "object", "additionalProperties": False,
+                "required": ["kind", "value"],
+                "properties": {"kind": {"const": "scalar"}, "value": {"type": shape}},
+            }
+        elif shape == "file_path":
+            fixture = {"oneOf": [file_schema, {
+                "type": "object", "additionalProperties": False,
+                "required": ["kind", "files"],
+                "properties": {"kind": {"const": "file_list"}, "files": {"type": "array", "minItems": 1, "maxItems": 1, "items": file_schema}},
+            }]}
+        else:
+            fixture = {
+                "type": "object", "additionalProperties": False,
+                "required": ["kind", "files"],
+                "properties": {"kind": {"const": "file_list"}, "files": {"type": "array", "minItems": 1, "maxItems": 3, "items": file_schema}},
+            }
+        input_variants.append({
+            "type": "object", "additionalProperties": False,
+            "required": ["name", "shape", "fixture", "evidence_requirement_ids"],
+            "properties": {"name": {"const": name}, "shape": {"const": shape}, "fixture": fixture, "evidence_requirement_ids": evidence_schema},
+        })
+    trial_case = {
+        "type": "object", "additionalProperties": False,
+        "required": ["version", "inputs"],
+        "properties": {
+            "version": {"const": 1},
+            "inputs": {"type": "array", "minItems": 1, "maxItems": len(input_variants), "items": {"oneOf": input_variants}},
+        },
+    }
+    unsupported = {
+        "type": "object", "additionalProperties": False, "required": ["status"],
+        "properties": {"status": {"const": "unsupported"}},
+    }
+    return {"oneOf": [trial_case, unsupported]}
+
+
 def _collect_placeholders_from_payload_template(template: dict[str, Any]) -> set[str]:
     placeholders: set[str] = set()
     for value in template.values():
@@ -1819,6 +2080,7 @@ def _seed_initial_e2e_payload(
     skill_dir: Path | None = None,
     requirements_by_file: dict[str, list[RequirementItem]] | None = None,
     skill_plan_entries: dict[str, SkillPlanEntry] | None = None,
+    trial_case: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Seed Creator E2E with a non-empty generic external input envelope.
 
@@ -1834,6 +2096,11 @@ def _seed_initial_e2e_payload(
         base_context = build_creator_external_input_context(messages=[])
 
     payload: dict[str, Any] = dict(base_context or {})
+    trial_inputs = {
+        str(item.get("name")): item
+        for item in ((trial_case or {}).get("inputs") or [])
+        if isinstance(item, dict)
+    }
 
     seed_value = ""
     for key in ("user_request", "input", "text", "payload"):
@@ -1945,9 +2212,11 @@ def _seed_initial_e2e_payload(
             continue
         spec = typed_specs_by_target.get((target_file, target_input))
         if spec is not None:
-            container[key_parts[-1]] = _materialize_e2e_sample_value(
-                spec,
-                skill_dir=skill_dir,
+            trial_item = trial_inputs.get(root) or trial_inputs.get(spec.name)
+            container[key_parts[-1]] = (
+                _materialize_e2e_trial_fixture(trial_item, skill_dir=skill_dir)
+                if trial_item is not None and skill_dir is not None
+                else _materialize_e2e_sample_value(spec, skill_dir=skill_dir)
             )
 
     platform_edge_targets = {
@@ -1996,7 +2265,12 @@ def _seed_initial_e2e_payload(
                 container[child] = _materialize_e2e_sample_value(spec, skill_dir=skill_dir)
             continue
         if spec.name in platform_roots and not _json_value_non_empty(payload.get(spec.name)):
-            payload[spec.name] = _materialize_e2e_sample_value(spec, skill_dir=skill_dir)
+            trial_item = trial_inputs.get(spec.name)
+            payload[spec.name] = (
+                _materialize_e2e_trial_fixture(trial_item, skill_dir=skill_dir)
+                if trial_item is not None and skill_dir is not None
+                else _materialize_e2e_sample_value(spec, skill_dir=skill_dir)
+            )
 
     if (
         isinstance(payload.get("input_files"), list)
@@ -2110,6 +2384,9 @@ class CreatorE2ESession:
     debug_attempts: list[dict[str, Any]] = field(default_factory=list)
     verified_bindings_by_script: dict[str, dict[str, str]] = field(default_factory=dict)
     runtime_dependency_attempts: set[str] = field(default_factory=set)
+    trial_case: dict[str, Any] | None = None
+    trial_case_digest: str = ""
+    trial_case_prepared: bool = False
 
     def to_event_base(self) -> dict[str, Any]:
         return {
@@ -2128,6 +2405,85 @@ class CreatorE2ESession:
 def _stable_json_hash(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _prepare_e2e_trial_case(
+    *,
+    typed_specs: list[E2ETypedInputSpec],
+    requirements_by_file: dict[str, list[RequirementItem]],
+    skill_plan_entries: dict[str, SkillPlanEntry],
+    external_context: dict[str, Any] | None,
+    requested_model: str | None,
+    session: CreatorE2ESession | None,
+) -> dict[str, Any] | None:
+    if session is not None and session.trial_case_prepared:
+        logger.info("[Creator][E2E][trial_case_reused] digest=%s", session.trial_case_digest)
+        return session.trial_case
+
+    external = external_context if isinstance(external_context, dict) else {}
+    candidates: dict[str, E2ETypedInputSpec] = {}
+    for spec in typed_specs:
+        shape = _canonical_e2e_shape(spec.shape)
+        entry = skill_plan_entries.get(spec.target_file)
+        defaults = getattr(entry, "default_values", {}) or {}
+        if shape not in {"string", "number", "integer", "boolean", "file_path", "list[file_path]"} or _json_value_non_empty(external.get(spec.name)) or spec.name in defaults:
+            continue
+        candidates.setdefault(spec.name, spec)
+    if not candidates:
+        if session is not None:
+            session.trial_case_prepared = True
+        return None
+
+    requirements: list[dict[str, str]] = []
+    requirement_ids_by_input: dict[str, set[str]] = {}
+    for target in {spec.target_file for spec in candidates.values()}:
+        for requirement in requirements_by_file.get(target, []):
+            req_id = str(getattr(requirement, "id", "") or "")
+            if not req_id:
+                continue
+            text = str(getattr(requirement, "purpose", "") or "")
+            if not text:
+                text = "; ".join(str(value) for value in (getattr(requirement, "inputs", []) or []))
+            requirements.append({"id": req_id, "text": text})
+    for name, spec in candidates.items():
+        requirement_ids_by_input[name] = {
+            str(getattr(requirement, "id", "") or "")
+            for requirement in requirements_by_file.get(spec.target_file, [])
+            if str(getattr(requirement, "id", "") or "")
+        }
+    facts = {"version": 1, "external_inputs": [
+        {"platform_input": {"name": spec.name, "shape": _canonical_e2e_shape(spec.shape)},
+         "target": {"script": spec.target_file, "input": spec.name},
+         "requirements": [item for item in requirements if item["id"] in {
+             str(getattr(req, "id", "") or "") for req in requirements_by_file.get(spec.target_file, [])
+         }]}
+        for spec in candidates.values()
+    ]}
+    logger.info("[Creator][E2E][trial_case_build_start] input_names=%s", sorted(candidates))
+    accepted = None
+    fallback_reason = "schema_invalid"
+    try:
+        generated = _build_e2e_trial_case(facts, requested_model=requested_model)
+        if isinstance(generated, dict) and generated.get("status") == "unsupported":
+            fallback_reason = "unsupported"
+            raise ValueError("trial case unsupported")
+        accepted = _validate_e2e_trial_case_spec(
+            generated,
+            input_specs=candidates,
+            requirement_ids_by_input=requirement_ids_by_input,
+        )
+        if accepted is None:
+            raise ValueError("deterministic trial case validation rejected the response")
+    except Exception as exc:
+        if isinstance(exc, (json.JSONDecodeError,)) or "invalid JSON" in str(exc):
+            fallback_reason = "json_parse_failed"
+        logger.warning("[Creator][E2E][trial_case_fallback] reason=%s", fallback_reason)
+    digest = _stable_json_hash(accepted) if accepted is not None else ""
+    if session is not None:
+        session.trial_case, session.trial_case_digest, session.trial_case_prepared = accepted, digest, True
+    if accepted is not None:
+        logger.info("[Creator][E2E][trial_case_frozen] digest=%s input_names=%s fixture_kinds=%s", digest, sorted(candidates), [item["fixture"].get("kind", item["fixture"].get("content_kind")) for item in accepted["inputs"]])
+    return accepted
 
 
 def _file_sha256(path: Path) -> str:
@@ -3945,12 +4301,27 @@ def _run_skill_workflow_e2e_once(
             str(key)
             for key in (external_context or {}).keys()
         } if isinstance(external_context, dict) else set()
+        typed_input_specs = _collect_e2e_typed_inputs_from_graph(
+            commands=commands,
+            requirements_by_file=requirements_by_file,
+            skill_plan_entries=skill_plan_entries,
+            skill_dir=trial_skill_dir,
+        )
+        trial_case = _prepare_e2e_trial_case(
+            typed_specs=typed_input_specs,
+            requirements_by_file=requirements_by_file,
+            skill_plan_entries=skill_plan_entries,
+            external_context=external_context,
+            requested_model=requested_model,
+            session=e2e_session,
+        )
         payload: dict[str, Any] = _seed_initial_e2e_payload(
             commands,
             external_context=external_context,
             skill_dir=trial_skill_dir,
             requirements_by_file=requirements_by_file,
             skill_plan_entries=skill_plan_entries,
+            trial_case=trial_case,
         )
         value_provenance: dict[str, Any] = {
             str(key): _provenance_record(
@@ -3961,12 +4332,6 @@ def _run_skill_workflow_e2e_once(
             )
             for key, value in payload.items()
         }
-        typed_input_specs = _collect_e2e_typed_inputs_from_graph(
-            commands=commands,
-            requirements_by_file=requirements_by_file,
-            skill_plan_entries=skill_plan_entries,
-            skill_dir=trial_skill_dir,
-        )
         traces: list[E2EStepTrace] = []
         completed_outputs: dict[str, dict[str, Any]] = {}
 
