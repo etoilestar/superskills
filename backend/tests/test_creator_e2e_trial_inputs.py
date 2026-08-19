@@ -190,10 +190,10 @@ def test_declared_default_beats_trial_case_and_invalid_case_uses_generic_fallbac
 def test_trial_builder_prompt_contains_only_supplied_frozen_facts(monkeypatch):
     captured = {}
     monkeypatch.setattr(e2e, "route_model", lambda *args, **kwargs: type("Route", (), {"model": "test"})())
-    def complete(messages, model):
-        captured["messages"] = messages
-        return '{"status":"unsupported"}'
-    monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", complete)
+    def complete(**kwargs):
+        captured.update(kwargs)
+        return {"status": "unsupported"}
+    monkeypatch.setattr(e2e, "_complete_creator_json_object_once_sync_for_e2e", complete)
     facts = {"external_inputs": [{"platform_input": {"name": "input_files", "shape": "list[file_path]"},
               "target": {"script": "scripts/analyze.py", "input": "input_files"},
               "requirements": [{"id": "R1", "text": "Read numeric CSV"}]}]}
@@ -203,3 +203,64 @@ def test_trial_builder_prompt_contains_only_supplied_frozen_facts(monkeypatch):
         assert expected in prompt
     for forbidden in ("Tool alternatives", "repair history", "previous candidate patch", "Registry search results"):
         assert forbidden not in prompt
+    schema = json.dumps(captured["response_schema"], ensure_ascii=False)
+    for required_contract in ("version", "inputs", "fixture", "evidence_requirement_ids", "input_files", "list[file_path]", "R1", "csv", "tabular"):
+        assert required_contract in schema
+
+
+def test_structured_builder_contract_freezes_and_materializes_csv(tmp_path, monkeypatch):
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir()
+    session = e2e.CreatorE2ESession("session", "demo", skill_dir, skill_dir / ".venv", skill_dir / "outputs")
+    response = {"version": 1, "inputs": [_item({
+        "format": "csv", "content_kind": "tabular",
+        "columns": [{"name": "value", "type": "number", "nullable": False}],
+        "rows": [{"value": 1}, {"value": 2}],
+    }, evidence=["R1", "R7"])]}
+    captured = {}
+    monkeypatch.setattr(e2e, "route_model", lambda *args, **kwargs: type("Route", (), {"model": "test"})())
+    monkeypatch.setattr(
+        e2e, "_complete_creator_json_object_once_sync_for_e2e",
+        lambda **kwargs: captured.update(kwargs) or response,
+    )
+    requirements = [
+        e2e.RequirementItem(id="R1", target_file="scripts/analyze.py", purpose="Read CSV"),
+        e2e.RequirementItem(id="R7", target_file="scripts/analyze.py", purpose="Numeric statistics"),
+    ]
+    accepted = e2e._prepare_e2e_trial_case(
+        typed_specs=[_spec()], requirements_by_file={"scripts/analyze.py": requirements},
+        skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
+        external_context={}, requested_model=None, session=session,
+    )
+    assert accepted == response
+    assert session.trial_case_prepared is True
+    assert session.trial_case_digest
+    path = Path(e2e._materialize_e2e_trial_fixture(accepted["inputs"][0], skill_dir=skill_dir)[0])
+    assert path.is_file()
+    assert list(csv.DictReader(path.open(encoding="utf-8"))) == [{"value": "1"}, {"value": "2"}]
+    schema = json.dumps(captured["response_schema"])
+    assert all(value in schema for value in ("input_files", "list[file_path]", "R1", "R7"))
+
+
+def test_malformed_structured_builder_response_is_rejected_to_fallback(tmp_path, monkeypatch):
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir()
+    session = e2e.CreatorE2ESession("session", "demo", skill_dir, skill_dir / ".venv", skill_dir / "outputs")
+    monkeypatch.setattr(e2e, "route_model", lambda *args, **kwargs: type("Route", (), {"model": "test"})())
+    monkeypatch.setattr(
+        e2e, "_complete_creator_json_object_once_sync_for_e2e",
+        lambda **kwargs: {"input_files": ["sample.csv"], "script": "scripts/a.py"},
+    )
+    accepted = e2e._prepare_e2e_trial_case(
+        typed_specs=[_spec()],
+        requirements_by_file={"scripts/analyze.py": [e2e.RequirementItem(
+            id="R1", target_file="scripts/analyze.py", purpose="Read CSV",
+        )]},
+        skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
+        external_context={}, requested_model=None, session=session,
+    )
+    assert accepted is None
+    assert session.trial_case_prepared is True
+    assert session.trial_case_digest == ""
+    fallback = e2e._materialize_e2e_sample_value(_spec(), skill_dir=skill_dir)
+    assert fallback and Path(fallback[0]).is_file()

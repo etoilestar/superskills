@@ -1550,15 +1550,126 @@ def _materialize_e2e_trial_fixture(item: dict[str, Any], *, skill_dir: Path) -> 
 def _build_e2e_trial_case(facts: dict[str, Any], *, requested_model: str | None = None) -> Any:
     """Make the single narrow model call used to project frozen facts to inputs."""
     route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator grounded E2E trial case")
+    schema = _e2e_trial_case_response_schema(facts)
     messages = [{"role": "system", "content": (
         "You are not a Skill planner. You may not modify requirements, interfaces, tools, scripts, or Blueprint. "
         "Construct only the smallest deterministic happy-path input consistent with the supplied frozen facts. "
-        "Do not invent platform inputs or requirements, optimize the Skill, or judge implementation quality. Output JSON only."
+        "Do not invent platform inputs or requirements, optimize the Skill, or judge implementation quality. "
+        "Return exactly the Trial Case object required by the bound JSON Schema."
     )}, {"role": "user", "content": json.dumps(facts, ensure_ascii=False, sort_keys=True)}]
-    raw = _complete_chat_once_sync_for_e2e(messages, route.model).strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
-    return json.loads(raw)
+    return _complete_creator_json_object_once_sync_for_e2e(
+        messages=messages,
+        model=route.model,
+        phase="creator_e2e_trial_case",
+        response_schema=schema,
+    )
+
+
+def _complete_creator_json_object_once_sync_for_e2e(**kwargs: Any) -> dict[str, Any]:
+    """Synchronously reuse Creator's existing strict JSON-Schema completion."""
+    import asyncio
+    import concurrent.futures
+    from .api import _complete_creator_json_object_once
+
+    async def call() -> dict[str, Any]:
+        return await _complete_creator_json_object_once(**kwargs)
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(call())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(lambda: asyncio.run(call())).result()
+
+
+def _e2e_trial_case_response_schema(facts: dict[str, Any]) -> dict[str, Any]:
+    """Bind the Trial Case output contract to the supplied frozen input facts."""
+    scalar_json = {"type": ["string", "number", "integer", "boolean", "null"]}
+    column = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["name", "type", "nullable"],
+        "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "type": {"type": "string", "enum": ["string", "number", "integer", "boolean"]},
+            "nullable": {"type": "boolean"},
+        },
+    }
+    text_file_variants = [
+        {
+            "type": "object", "additionalProperties": False,
+            "required": ["format", "content_kind", "text"],
+            "properties": {
+                "format": {"const": fmt}, "content_kind": {"const": "text"},
+                "text": {"type": "string", "minLength": 1},
+            },
+        }
+        for fmt in ("txt", "md", "pdf", "docx")
+    ]
+    csv_file = {
+        "type": "object", "additionalProperties": False,
+        "required": ["format", "content_kind", "columns", "rows"],
+        "properties": {
+            "format": {"const": "csv"}, "content_kind": {"const": "tabular"},
+            "columns": {"type": "array", "minItems": 1, "items": column},
+            "rows": {"type": "array", "minItems": 1, "items": {
+                "type": "object", "additionalProperties": scalar_json,
+            }},
+        },
+    }
+    json_file = {
+        "type": "object", "additionalProperties": False,
+        "required": ["format", "content_kind", "value"],
+        "properties": {"format": {"const": "json"}, "content_kind": {"const": "json"}, "value": {}},
+    }
+    file_schema = {"oneOf": [*text_file_variants, json_file, csv_file]}
+    input_variants: list[dict[str, Any]] = []
+    for frozen in facts.get("external_inputs", []):
+        platform_input = frozen.get("platform_input", {}) if isinstance(frozen, dict) else {}
+        name, shape = str(platform_input.get("name") or ""), _canonical_e2e_shape(str(platform_input.get("shape") or ""))
+        evidence_ids = [str(item.get("id")) for item in frozen.get("requirements", []) if isinstance(item, dict) and item.get("id")]
+        evidence_schema: dict[str, Any] = {
+            "type": "array", "uniqueItems": True,
+            "items": {"type": "string", "enum": evidence_ids} if evidence_ids else {"type": "string"},
+            "minItems": 1 if evidence_ids else 0,
+            "maxItems": len(evidence_ids),
+        }
+        if shape in {"string", "number", "integer", "boolean"}:
+            fixture = {
+                "type": "object", "additionalProperties": False,
+                "required": ["kind", "value"],
+                "properties": {"kind": {"const": "scalar"}, "value": {"type": shape}},
+            }
+        elif shape == "file_path":
+            fixture = {"oneOf": [file_schema, {
+                "type": "object", "additionalProperties": False,
+                "required": ["kind", "files"],
+                "properties": {"kind": {"const": "file_list"}, "files": {"type": "array", "minItems": 1, "maxItems": 1, "items": file_schema}},
+            }]}
+        else:
+            fixture = {
+                "type": "object", "additionalProperties": False,
+                "required": ["kind", "files"],
+                "properties": {"kind": {"const": "file_list"}, "files": {"type": "array", "minItems": 1, "maxItems": 3, "items": file_schema}},
+            }
+        input_variants.append({
+            "type": "object", "additionalProperties": False,
+            "required": ["name", "shape", "fixture", "evidence_requirement_ids"],
+            "properties": {"name": {"const": name}, "shape": {"const": shape}, "fixture": fixture, "evidence_requirement_ids": evidence_schema},
+        })
+    trial_case = {
+        "type": "object", "additionalProperties": False,
+        "required": ["version", "inputs"],
+        "properties": {
+            "version": {"const": 1},
+            "inputs": {"type": "array", "minItems": 1, "maxItems": len(input_variants), "items": {"oneOf": input_variants}},
+        },
+    }
+    unsupported = {
+        "type": "object", "additionalProperties": False, "required": ["status"],
+        "properties": {"status": {"const": "unsupported"}},
+    }
+    return {"oneOf": [trial_case, unsupported]}
 
 
 def _collect_placeholders_from_payload_template(template: dict[str, Any]) -> set[str]:
@@ -2350,8 +2461,12 @@ def _prepare_e2e_trial_case(
     ]}
     logger.info("[Creator][E2E][trial_case_build_start] input_names=%s", sorted(candidates))
     accepted = None
+    fallback_reason = "schema_invalid"
     try:
         generated = _build_e2e_trial_case(facts, requested_model=requested_model)
+        if isinstance(generated, dict) and generated.get("status") == "unsupported":
+            fallback_reason = "unsupported"
+            raise ValueError("trial case unsupported")
         accepted = _validate_e2e_trial_case_spec(
             generated,
             input_specs=candidates,
@@ -2360,7 +2475,9 @@ def _prepare_e2e_trial_case(
         if accepted is None:
             raise ValueError("deterministic trial case validation rejected the response")
     except Exception as exc:
-        logger.warning("[Creator][E2E][trial_case_fallback] reason=%s", type(exc).__name__)
+        if isinstance(exc, (json.JSONDecodeError,)) or "invalid JSON" in str(exc):
+            fallback_reason = "json_parse_failed"
+        logger.warning("[Creator][E2E][trial_case_fallback] reason=%s", fallback_reason)
     digest = _stable_json_hash(accepted) if accepted is not None else ""
     if session is not None:
         session.trial_case, session.trial_case_digest, session.trial_case_prepared = accepted, digest, True
