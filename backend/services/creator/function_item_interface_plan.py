@@ -678,11 +678,38 @@ def normalize_interface_review_issue(raw_issue: dict[str, Any], frozen_function_
         _raise("semantic review issue is not auditable", "invalid_interface_semantic_review_protocol", path=path)
     known_interfaces = {str(value.get("interface_id") or "") for value in current_interface_plan.get("interfaces") or []}
     inputs = {item["target_file"]: {value["name"] for value in item["inputs"]} for item in _compact_function_items(frozen_function_items)}
+    interfaces = current_interface_plan.get("interfaces") or []
+    planned_inputs = {value.get("target_input") for value in interfaces if value.get("target_input")}
+    platform_inputs = {value.get("source_platform_input") for value in interfaces if value.get("source_platform_input")}
+    platform_outputs = {value.get("target_platform_output") for value in interfaces if value.get("target_platform_output")}
     if any(not isinstance(value, str) or value not in known_interfaces for value in interface_ids):
         _raise("review issue references an unknown Interface", "invalid_interface_semantic_review_reference", path=f"{path}.affected_interfaces")
     normalized_inputs = []
     for index, value in enumerate(affected_inputs):
-        if not isinstance(value, dict) or set(value) != {"target_member", "target_input"} or value.get("target_input") not in inputs.get(value.get("target_member"), set()):
+        if not isinstance(value, dict):
+            _raise("review issue references an unknown logical input", "invalid_interface_semantic_review_reference", path=f"{path}.affected_inputs[{index}]")
+
+        # Reviewers sometimes identify the affected binding rather than emit
+        # the full member/input pair. Resolve those references in a stable
+        # priority order, against the logical names already present in the
+        # Interface Plan. A supplied member still narrows target_input to that
+        # member's frozen input contract.
+        if value.get("interface_id") is not None:
+            valid = isinstance(value["interface_id"], str) and value["interface_id"] in known_interfaces
+        elif value.get("target_input") is not None:
+            target_input = value["target_input"]
+            target_member = value.get("target_member")
+            valid = isinstance(target_input, str) and (
+                target_input in inputs.get(target_member, set()) if target_member is not None
+                else target_input in planned_inputs
+            )
+        elif value.get("source_platform_input") is not None:
+            valid = isinstance(value["source_platform_input"], str) and value["source_platform_input"] in platform_inputs
+        elif value.get("target_platform_output") is not None:
+            valid = isinstance(value["target_platform_output"], str) and value["target_platform_output"] in platform_outputs
+        else:
+            valid = False
+        if not valid:
             _raise("review issue references an unknown logical input", "invalid_interface_semantic_review_reference", path=f"{path}.affected_inputs[{index}]")
         normalized_inputs.append(dict(value))
     envelope = {"severity": severity, "code": code.strip(), "message": message.strip(), "affected_interfaces": list(interface_ids), "affected_inputs": normalized_inputs, "evidence": dict(evidence)}
@@ -747,8 +774,11 @@ def _downgrade_unsupported_interface_review_blockers(
     )
     result = []
     for issue in issues:
-        evidence_text = json.dumps(issue.get("evidence") or {}, ensure_ascii=False, default=str).casefold()
-        unsupported = any(term in evidence_text and term not in authority for term in speculative_concepts)
+        review_text = json.dumps(
+            {field: issue.get(field) for field in ("message", "evidence", "expected", "details")},
+            ensure_ascii=False, default=str,
+        ).casefold()
+        unsupported = any(term in review_text and term not in authority for term in speculative_concepts)
         if issue.get("severity") == "blocking" and unsupported:
             issue = dict(issue)
             issue["severity"] = "warning"
@@ -878,6 +908,18 @@ frozen requirements, frozen Blueprint/FunctionItems, and frozen platform or
 Interface schema in the payload. Do not use inferred best practices, tool
 implementation habits, file/directory naming conventions, or undeclared fields.
 An issue is not a record that a fact was reviewed.
+
+Issue references:
+
+When reporting an issue:
+
+affected_interfaces MUST use existing interface_id.
+
+affected_inputs MUST use existing logical input names.
+
+Do not create new input names.
+
+Do not describe hypothetical schemas as references.
 
 SEVERITY
 Use blocking only when an Interface references a nonexistent input, a

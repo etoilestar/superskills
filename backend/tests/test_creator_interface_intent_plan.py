@@ -8,6 +8,7 @@ from backend.services.creator.function_item_interface_plan import (
     canonical_logical_binding_signatures,
     existing_binding_references_valid,
     _include_previous_interface_plan,
+    _downgrade_unsupported_interface_review_blockers,
     normalize_interface_review_issue, repair_interface_plan_semantically,
     plan_function_item_interfaces, review_interface_plan_semantically,
     validate_interface_intent_plan, validate_interface_repair_critic,
@@ -294,6 +295,57 @@ def test_reviewer_issue_has_explicit_severity_and_code():
     raw = {"severity": "blocking", "code": "type_mismatch", "message": "semantic mismatch", "affected_interfaces": ["I1"], "affected_inputs": [{"target_member": "scripts/unit_a.py", "target_input": "slot_x"}], "evidence": {"observed": "value_a", "expected": "value_b"}}
     issue = normalize_interface_review_issue(raw, [item("scripts/unit_a.py", ["slot_x"], ["value_a"])], {"interfaces": [p2m("I1", "scripts/unit_a.py")]})
     assert issue["severity"] == "blocking" and issue["code"] == "type_mismatch"
+
+
+def test_reviewer_issue_accepts_planned_target_input_without_interface_id_or_member():
+    raw = {
+        "severity": "blocking", "code": "type_mismatch", "message": "semantic mismatch",
+        "affected_interfaces": [], "affected_inputs": [{"target_input": "input_files"}],
+        "evidence": {"observed": "files", "expected": "input files"},
+    }
+    plan = {"interfaces": [p2m("I1", "scripts/unit_a.py", "input_files")]}
+
+    issue = normalize_interface_review_issue(
+        raw, [item("scripts/unit_a.py", ["input_files"], ["result"])], plan,
+    )
+
+    assert issue["affected_inputs"] == [{"target_input": "input_files"}]
+
+
+def test_reviewer_issue_rejects_unknown_target_input_without_interface_id_or_member():
+    raw = {
+        "severity": "blocking", "code": "type_mismatch", "message": "semantic mismatch",
+        "affected_interfaces": [], "affected_inputs": [{"target_input": "unknown_input"}],
+        "evidence": {"observed": "files", "expected": "input files"},
+    }
+    plan = {"interfaces": [p2m("I1", "scripts/unit_a.py", "input_files")]}
+
+    with pytest.raises(InterfaceIntentPlanError) as exc_info:
+        normalize_interface_review_issue(
+            raw, [item("scripts/unit_a.py", ["input_files"], ["result"])], plan,
+        )
+
+    assert exc_info.value.code == "invalid_interface_semantic_review_reference"
+
+
+@pytest.mark.parametrize("field", ["message", "evidence", "expected", "details"])
+def test_speculative_blocker_downgrade_checks_all_review_text_fields(field):
+    issue = {
+        "severity": "blocking", "message": "semantic mismatch", "evidence": {},
+        "expected": "declared semantics", "details": {},
+    }
+    issue[field] = (
+        {"review_note": "requires key inference"}
+        if field in {"evidence", "details"}
+        else "requires key inference"
+    )
+
+    result = _downgrade_unsupported_interface_review_blockers(
+        [issue], frozen_function_items=[item("scripts/unit_a.py", ["fields"], ["result"])],
+        requirement_allocations=[], system_requirements=[],
+    )
+
+    assert result[0]["severity"] == "warning"
 
 
 @pytest.mark.asyncio
