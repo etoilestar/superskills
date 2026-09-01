@@ -831,6 +831,53 @@ async def test_nonblocking_interface_review_issues_are_retained_without_failing(
 
 
 @pytest.mark.asyncio
+async def test_optional_fields_does_not_support_inferred_primary_key_blocker():
+    items = [item(
+        "scripts/unit_a.py",
+        [{"port_id": "fields", "description": "optional configuration", "required": False}],
+        ["result"],
+    )]
+    plan = {"interfaces": [p2m("I1", "scripts/unit_a.py", "fields", "fields"), m2p("I2", "scripts/unit_a.py", "result")]}
+
+    async def reviewer(messages, _model):
+        assert "optional/configuration `fields` never establishes" in messages[0]["content"]
+        return json.dumps({"passed": False, "issues": [{
+            "severity": "blocking", "code": "INTERFACE_SEMANTIC_MISMATCH",
+            "message": "fields might be used to infer a primary key",
+            "affected_interfaces": ["I1"],
+            "affected_inputs": [{"target_member": "scripts/unit_a.py", "target_input": "fields"}],
+            "evidence": {"observed": "optional fields configuration", "expected": "primary_key inference runtime input"},
+        }]})
+
+    issues = await review_interface_plan_semantically(
+        original_user_goal="configure fields optionally", frozen_function_items=items,
+        interface_plan=plan, requirement_allocations=[], requirement_channels={},
+        system_requirements=[], platform_contract=platform(), reviewer_model="reviewer",
+        model_call=reviewer,
+    )
+    assert issues[0]["severity"] == "warning"
+    assert issues[0]["details"]["severity"] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_review_protocol_repair_rejects_review_schema_wrapper():
+    items = [item("scripts/unit_a.py", ["slot_x"], ["result"])]
+    plan = {"interfaces": [p2m("I1", "scripts/unit_a.py"), m2p("I2", "scripts/unit_a.py", "result")]}
+    responses = iter(["not-json", json.dumps({"review_schema": {}})])
+
+    async def reviewer(_messages, _model):
+        return next(responses)
+
+    with pytest.raises(InterfaceIntentPlanError) as exc_info:
+        await review_interface_plan_semantically(
+            original_user_goal="g", frozen_function_items=items, interface_plan=plan,
+            requirement_allocations=[], requirement_channels={}, system_requirements=[],
+            platform_contract=platform(), reviewer_model="reviewer", model_call=reviewer,
+        )
+    assert exc_info.value.code == "invalid_interface_semantic_review_protocol"
+
+
+@pytest.mark.asyncio
 async def test_correction_receives_uncovered_slot_and_existing_binding_semantic_fact():
     items = [
         item("scripts/a.py", [], [

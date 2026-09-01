@@ -724,6 +724,39 @@ def blocking_interface_review_issues(issues: list[dict[str, Any]]) -> list[dict[
     return [issue for issue in issues if issue.get("severity") == "blocking"]
 
 
+def _downgrade_unsupported_interface_review_blockers(
+    issues: list[dict[str, Any]], *, frozen_function_items: list[dict[str, Any]],
+    requirement_allocations: list[dict[str, Any]] | None,
+    system_requirements: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Keep speculative findings, but do not let them block a frozen plan.
+
+    This is deliberately a narrow semantic-review guard, rather than a new
+    contract interpreter.  Concrete concepts commonly invented by a reviewer
+    are blocking only when that concept actually occurs in Blueprint or
+    requirement authority.
+    """
+    authority = json.dumps({
+        "function_items": _compact_function_items(frozen_function_items),
+        "requirement_allocations": requirement_allocations or [],
+        "system_requirements": system_requirements or [],
+    }, ensure_ascii=False, default=str).casefold()
+    speculative_concepts = (
+        "primary_key", "primary key", "key inference", "output_dir",
+        "主键", "输出目录", "固定文件名",
+    )
+    result = []
+    for issue in issues:
+        evidence_text = json.dumps(issue.get("evidence") or {}, ensure_ascii=False, default=str).casefold()
+        unsupported = any(term in evidence_text and term not in authority for term in speculative_concepts)
+        if issue.get("severity") == "blocking" and unsupported:
+            issue = dict(issue)
+            issue["severity"] = "warning"
+            issue["details"] = {**issue["details"], "severity": "warning"}
+        result.append(issue)
+    return result
+
+
 async def _reformat_interface_review_response(
     *, raw_response: str, validation_error: InterfaceIntentPlanError,
     reviewer_model: str, model_call: ModelCall,
@@ -732,7 +765,11 @@ async def _reformat_interface_review_response(
 Preserve every semantic conclusion, message, affected reference, and evidence.
 Do not add, remove, merge, split, or reinterpret issues.
 Every issue must use the single supplied severity-and-code issue schema.
-Return only the corrected JSON object."""
+Return only one of these top-level JSON objects:
+{"passed":true,"issues":[]} or
+{"passed":false,"issues":[...]}
+Never return or nest review_schema. review_schema is input metadata, not an
+output field. Do not return an Interface Plan and do not perform a new review."""
     payload = {
         "review_schema": INTERFACE_REVIEW_SCHEMA,
         "raw_response": raw_response,
@@ -824,6 +861,14 @@ requirement, infer undeclared fields from experience, or change the original
 Interface semantics. In particular, an abstract file_outputs port may carry
 CSV, Markdown, or JSON files and does not require a separate csv_report output.
 An optional fields value does not imply a required fields.primary_key member.
+Judge only the frozen Blueprint, requirement ownership result, and Interface
+schema supplied in the payload. Never guess business meaning from a field name,
+add a hidden constraint from experience, reinterpret optional configuration as
+a core runtime parameter, or expand an abstract output into an implementation
+requirement. In particular, optional/configuration `fields` never establishes
+primary_key, a key-inference strategy, or mandatory runtime input. An artifact
+path `file_outputs` never establishes a fixed filename, OUTPUT_DIR, or another
+output slot.
 
 4. EVIDENCE STANDARD
 A structurally valid logical reference is not automatically semantically correct.
@@ -841,6 +886,9 @@ parameter types cannot match. These remain blocking even when a plausible
 implementation workaround exists. Use warning for clarity suggestions such as
 more explicit output naming, file-format documentation, or field documentation.
 Use advisory for implementation, filename, or directory-layout suggestions.
+Blocking evidence must identify an explicit Blueprint constraint or an explicit
+requirement prohibition. Reasoning, likelihood, convention, or a guessed field
+meaning is never blocking.
 
 5. AUTHORITY LIMIT
 Do not select opaque Graph endpoint IDs, generate edges, change Interface records,
@@ -889,18 +937,20 @@ Return only strict JSON matching this schema:
             )
         except InterfaceIntentPlanError as repair_exc:
             logger.info("[Creator][interface_semantic_review] result=failed error_code=%s", repair_exc.code)
-            raise InterfaceIntentPlanError(
-                "interface semantic review failed", code="interface_semantic_review_failed",
-                details={
-                    "review_attempts": 1, "protocol_repair_attempts": 1,
-                    "original_error": {"code": original_exc.code, "message": str(original_exc), "details": original_exc.details},
-                    "repair_error": {"code": repair_exc.code, "message": str(repair_exc), "details": repair_exc.details},
-                },
-            ) from repair_exc
+            # A repair response is not allowed to disguise another schema (for
+            # example {"review_schema": {...}}) as a semantic-review result.
+            # Preserve the protocol classification so callers cannot continue
+            # as though a review had completed.
+            raise repair_exc
         logger.info("[Creator][interface_semantic_review_protocol_repair] attempt=1 result=success")
     except Exception:
         # Model transport failures remain transport failures, not protocol repair.
         raise
+    issues = _downgrade_unsupported_interface_review_blockers(
+        issues, frozen_function_items=frozen_function_items,
+        requirement_allocations=requirement_allocations,
+        system_requirements=system_requirements,
+    )
     counts = {severity: sum(issue["severity"] == severity for issue in issues)
               for severity in INTERFACE_REVIEW_SEVERITIES}
     logger.info(
@@ -1354,7 +1404,8 @@ unchanged, and the result differs meaningfully from the failed plan.
 
 8. OUTPUT CONTRACT
 Return only the complete Interface Plan JSON matching interface_schema. Do not
-include explanations, Markdown, comments, or hidden reasoning.
+include explanations, Markdown, comments, hidden reasoning, passed, issues, or
+review_schema. Repair changes Interfaces only; it never performs another review.
 """
     payload = {
         "system_goal": original_user_goal,
