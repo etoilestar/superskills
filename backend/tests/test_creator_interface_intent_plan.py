@@ -217,12 +217,14 @@ def test_interface_schema_has_explicit_logical_bindings():
 
 
 @pytest.mark.asyncio
-async def test_planner_serializes_structured_output_to_existing_text_sink():
+async def test_planner_uses_declared_serializer_for_structured_output_to_text_sink():
     items = [item(
         "scripts/unit_a.py", [],
         [{"port_id": "report_json", "description": "structured report", "contract": {"type": "object"}}],
     )]
-    planned = {"interfaces": [m2p("I1", "scripts/unit_a.py", "report_json")]}
+    edge = m2p("I1", "scripts/unit_a.py", "report_json")
+    edge["transform"] = "json_serialize"
+    planned = {"interfaces": [edge]}
 
     async def planner(_messages, _model):
         return json.dumps(planned)
@@ -241,9 +243,7 @@ async def test_planner_serializes_structured_output_to_existing_text_sink():
         reviewer_model="reviewer", reviewer_model_call=reviewer,
     )
 
-    assert result["interfaces"][0] == {
-        **planned["interfaces"][0], "transform": "json_serialize",
-    }
+    assert result["interfaces"][0] == planned["interfaces"][0]
     assert collect_interface_plan_validation_issues(
         plan=result, function_items=items, platform_contract=platform(),
     ) == []
@@ -260,6 +260,51 @@ def test_structured_output_to_text_requires_declared_serializer():
     )
 
     assert [issue["code"] for issue in issues] == ["incompatible_platform_output_type"]
+
+
+def test_untyped_function_output_cannot_be_projected_to_platform():
+    plan = {"interfaces": [m2p("I1", "scripts/unit_a.py", "result_z")]}
+
+    issues = collect_interface_plan_validation_issues(
+        plan=plan,
+        function_items=[item("scripts/unit_a.py", [], ["result_z"])],
+        platform_contract=platform(),
+    )
+
+    assert [issue["code"] for issue in issues] == ["incompatible_platform_output_type"]
+
+
+@pytest.mark.parametrize(
+    ("source_name", "source_type", "target_name", "target_schema", "transform", "valid"),
+    [
+        ("report", "object", "text", {"type": "string"}, "json_serialize", True),
+        ("report", "object", "file_outputs", {"type": "array", "items": {"type": "string"}}, "json_serialize", False),
+        ("artifact", "file_path", "file_outputs", {"type": "array", "items": {"type": "string"}}, "file_collect", True),
+        ("internal_report", "object", "text_result", {"type": "string"}, "json_serialize", True),
+    ],
+)
+def test_output_adapter_contract_closes_types_independently_of_port_names(
+    source_name, source_type, target_name, target_schema, transform, valid,
+):
+    items = [item("scripts/unit_a.py", [], [{
+        "port_id": source_name, "contract": {"type": source_type},
+    }])]
+    contract = {"platform_skill_boundary": {
+        "input_envelope_fields": [],
+        "final_output_fields": [{"name": target_name, "value_schema": target_schema}],
+        "required_final_output_fields": [target_name],
+    }}
+    interface = m2p("I1", "scripts/unit_a.py", source_name, target_name)
+    interface["transform"] = transform
+
+    issues = collect_interface_plan_validation_issues(
+        plan={"interfaces": [interface]}, function_items=items,
+        platform_contract=contract,
+    )
+
+    assert (issues == []) is valid
+    if not valid:
+        assert [issue["code"] for issue in issues] == ["incompatible_platform_output_transform"]
 
 
 def test_canonical_binding_signature_ignores_goal_id_and_order_but_not_binding():

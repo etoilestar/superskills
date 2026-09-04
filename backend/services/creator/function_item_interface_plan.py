@@ -165,6 +165,14 @@ external_result
 The reviewer evaluates semantic compatibility only after deterministic
 validation has established that target_platform_output belongs to the declared
 platform contract.
+
+OUTPUT ADAPTER CONTRACT
+
+transform MUST be selected from the declared OUTPUT_TRANSFORM_REGISTRY. Each
+adapter declares the source_type values it accepts and the target_type/schema
+it produces. The planner MUST NOT invent a transform based only on semantic
+relatedness. Direct mapping is permitted only when source and target types are
+equal; adapter mapping is permitted only when both sides match the adapter.
 """
 
 RUNTIME_INPUT_PROVENANCE_CONTRACT = """RUNTIME INPUT PROVENANCE CONTRACT
@@ -354,7 +362,21 @@ win over the previous candidate. Minimize edits only among candidates that fully
 satisfy all acceptance facts. Never preserve invalid or incomplete semantic state
 merely to minimize changes."""
 INTERFACE_KINDS = {"platform_to_member", "member_to_member", "member_to_platform"}
-MEMBER_TO_PLATFORM_TRANSFORMS = {"json_serialize"}
+# Output transforms are adapters, not free-form planner annotations.  Their
+# contracts are intentionally expressed in terms of value types/schemas rather
+# than output field names, so the same adapter can be used with any compatible
+# platform output namespace.
+OUTPUT_TRANSFORM_REGISTRY: dict[str, dict[str, Any]] = {
+    "json_serialize": {
+        "source_type": ("object", "array"),
+        "target_type": "string",
+    },
+    "file_collect": {
+        "source_type": ("file_path", "list[file_path]"),
+        "target_type": "list[string]",
+    },
+}
+MEMBER_TO_PLATFORM_TRANSFORMS = frozenset(OUTPUT_TRANSFORM_REGISTRY)
 _DANGEROUS_PATH_PARTS = {"__proto__", "prototype", "constructor"}
 INTERFACE_FIELDS = {
     "platform_to_member": {"interface_id", "kind", "source_platform_input", "source_path", "target_member", "target_input", "goal"},
@@ -654,36 +676,38 @@ def generate_provenance_candidates(
     return candidates
 
 
-def supplement_member_to_platform_transforms(
-    *, plan: dict[str, Any], function_items: list[dict[str, Any]],
-    platform_contract: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Add the canonical serializer when a planner maps structured JSON to text."""
-    output_types = {
-        (item["target_file"], output["name"]): output["contract"].get("type")
-        for item in _compact_function_items(function_items)
-        for output in item["outputs"]
-    }
-    normalized = {"interfaces": [dict(interface) for interface in plan.get("interfaces") or []]}
-    for interface in normalized["interfaces"]:
-        if interface.get("kind") != "member_to_platform" or "transform" in interface:
-            continue
-        source_type = output_types.get((interface.get("source_member"), interface.get("source_output")))
-        sink = get_platform_output_sink(platform_contract, str(interface.get("target_platform_output") or ""))
-        target_type = (sink or {}).get("value_schema", {}).get("type")
-        if source_type in {"array", "object"} and target_type == "string":
-            interface["transform"] = "json_serialize"
-    return normalized
+def _schema_type(schema: dict[str, Any]) -> str | None:
+    """Return a structural type identity without changing the platform schema."""
+    value = schema.get("type")
+    type_name = str(value).strip() if value is not None else ""
+    if type_name == "array":
+        item_schema = schema.get("items")
+        item_type = _schema_type(item_schema) if isinstance(item_schema, dict) else None
+        return f"list[{item_type}]" if item_type else "array"
+    return type_name or None
+
+
+def _adapter_matches(
+    adapter: dict[str, Any], *, source_schema: dict[str, Any], target_schema: dict[str, Any]
+) -> bool:
+    source_type = _schema_type(source_schema)
+    source_family = str(source_schema.get("type") or "").strip() or None
+    allowed_sources = adapter["source_type"]
+    if isinstance(allowed_sources, str):
+        allowed_sources = (allowed_sources,)
+    if source_type not in allowed_sources and source_family not in allowed_sources:
+        return False
+    return _schema_type(target_schema) == adapter["target_type"]
 
 def collect_interface_plan_validation_issues(
     *, plan: dict[str, Any], function_items: list[dict[str, Any]],
     platform_contract: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Validate logical references and receiving-slot coverage only."""
+    """Validate logical references, output compatibility, and slot coverage."""
     compact = _compact_function_items(function_items)
     inputs = {item["target_file"]: {value["name"] for value in item["inputs"]} for item in compact}
     outputs = {item["target_file"]: {value["name"] for value in item["outputs"]} for item in compact}
-    output_types = {(item["target_file"], value["name"]): value["contract"].get("type") for item in compact for value in item["outputs"]}
+    output_schemas = {(item["target_file"], value["name"]): value["contract"] for item in compact for value in item["outputs"]}
     required_slots = {(item["target_file"], value["name"]) for item in compact for value in item["inputs"] if value["runtime_source_required"]}
     boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
     platform_inputs = {_compact_port_id(value) for value in boundary.get("input_envelope_fields") or []}
@@ -730,26 +754,26 @@ def collect_interface_plan_validation_issues(
             if target not in platform_outputs: issue("unknown_platform_logical_output", f"{path}.target_platform_output", iid, target, sorted(platform_outputs))
             else:
                 covered_platform.add(target)
-                source_type = output_types.get((source, output))
+                source_schema = output_schemas.get((source, output), {})
                 sink = get_platform_output_sink(platform_contract, target)
-                target_type = (sink or {}).get("value_schema", {}).get("type")
+                target_schema = (sink or {}).get("value_schema", {})
                 transform = interface.get("transform")
-                serializer_compatible = (
-                    source_type in {"array", "object"}
-                    and target_type == "string"
-                    and transform == "json_serialize"
-                )
-                if transform and not serializer_compatible:
+                source_type = _schema_type(source_schema)
+                target_type = _schema_type(target_schema)
+                adapter = OUTPUT_TRANSFORM_REGISTRY.get(transform) if transform else None
+                if transform and (adapter is None or not _adapter_matches(
+                    adapter, source_schema=source_schema, target_schema=target_schema
+                )):
                     issue(
                         "incompatible_platform_output_transform", f"{path}.transform", iid,
                         {"source_type": source_type, "target_type": target_type, "transform": transform},
-                        "json_serialize applies only to array/object -> string",
+                        "transform source_type and target_type must match its declared output adapter contract",
                     )
-                elif source_type and target_type and source_type != target_type and not serializer_compatible:
+                elif not transform and source_type != target_type:
                     issue(
                         "incompatible_platform_output_type", path, iid,
                         {"source_type": source_type, "target_type": target_type, "transform": transform},
-                        "matching types or array/object -> string with transform=json_serialize",
+                        "a declared source type matching the target type, or a declared compatible output adapter",
                     )
     for member, slot in sorted(required_slots - covered_slots):
         candidates = generate_provenance_candidates(
@@ -955,6 +979,9 @@ def _interface_plan_prompt() -> str:
 
     {PLATFORM_OUTPUT_MAPPING_CONTRACT}
 
+    DECLARED OUTPUT_TRANSFORM_REGISTRY:
+    {json.dumps(OUTPUT_TRANSFORM_REGISTRY, ensure_ascii=False, default=list)}
+
     {PLATFORM_BOUNDARY_CONTRACT}
 
     {PLATFORM_INPUT_HIERARCHY_CONTRACT}
@@ -984,8 +1011,9 @@ member_to_member always contains: interface_id, kind, source_member,
 source_output, target_member, target_input, goal.
 member_to_platform always contains: interface_id, kind, source_member,
 source_output, target_platform_output, goal, and may contain transform.
-When an array or object output is mapped to the text or markdown string sink,
-set transform=json_serialize. Never invent another platform output for structured data.
+When source and target types differ, select a transform from the declared
+OUTPUT_TRANSFORM_REGISTRY whose source_type and target_type match both schemas.
+Never invent a transform merely because two values are semantically related.
 This wire contract and INTERFACE_SCHEMA describe the same protocol. Do not omit
 a required field because its value is empty-like; source_path=[] is the explicit
 representation of whole-slot platform binding.
@@ -1399,10 +1427,9 @@ A plausible goal cannot make an incorrect structured source/target binding valid
             ->
     target_platform_output
 
-    A declared transform is part of this compatibility check. json_serialize
-    makes an array/object source compatible with a string-valued text or
-    markdown sink. Do not report that mapping as a type mismatch. Without the
-    serializer, a direct structured-to-string mapping is incompatible.
+    A declared transform is part of this compatibility check. It is valid only
+    when its declared adapter source_type and target_type match the source and
+    target schemas. Without an adapter, differing types are incompatible.
 
 
     The reviewer checks semantic compatibility only.
@@ -1626,11 +1653,6 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
             planner_model=planner_model, model_call=model_call,
         )
         logger.info("[Creator][interface_protocol_repair] attempt=1 result=transport_parseable")
-    if isinstance(transport, dict) and isinstance(transport.get("interfaces"), list):
-        transport = supplement_member_to_platform_transforms(
-            plan=transport, function_items=frozen_function_items,
-            platform_contract=platform_contract,
-        )
     protocol_issue: InterfaceIntentPlanError | None = None
     try:
         parsed = validate_interface_plan_protocol(transport)
@@ -1740,11 +1762,6 @@ Return strict JSON matching INTERFACE_SCHEMA only."""
                 return {"__invalid_transport__": corrected_text}
 
         async def evaluate_correction(candidate_object: Any) -> CandidateEvaluation:
-            if isinstance(candidate_object, dict) and isinstance(candidate_object.get("interfaces"), list):
-                candidate_object = supplement_member_to_platform_transforms(
-                    plan=candidate_object, function_items=frozen_function_items,
-                    platform_contract=platform_contract,
-                )
             try:
                 candidate = validate_interface_plan_protocol(candidate_object)
             except InterfaceIntentPlanError as exc:
