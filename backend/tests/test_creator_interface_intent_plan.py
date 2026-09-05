@@ -307,6 +307,18 @@ def test_structured_output_to_text_requires_declared_serializer():
     assert [issue["code"] for issue in issues] == ["incompatible_platform_output_type"]
 
 
+def test_untyped_function_output_cannot_be_projected_to_platform():
+    plan = {"interfaces": [m2p("I1", "scripts/unit_a.py", "result_z")]}
+
+    issues = collect_interface_plan_validation_issues(
+        plan=plan,
+        function_items=[item("scripts/unit_a.py", [], ["result_z"])],
+        platform_contract=platform(),
+    )
+
+    assert [issue["code"] for issue in issues] == ["incompatible_platform_output_type"]
+
+
 @pytest.mark.parametrize(
     ("source_name", "source_type", "target_name", "target_schema", "transform", "valid"),
     [

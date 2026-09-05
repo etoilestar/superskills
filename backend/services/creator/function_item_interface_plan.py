@@ -390,8 +390,7 @@ OUTPUT_TRANSFORM_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "file_collect": {
         "source_type": ("file_path", "list[file_path]"),
-        "target_type": "file_outputs",
-        "target_schema": {"type": "array", "items": {"type": "string"}},
+        "target_type": "list[string]",
     },
 }
 MEMBER_TO_PLATFORM_TRANSFORMS = frozenset(OUTPUT_TRANSFORM_REGISTRY)
@@ -813,33 +812,26 @@ def generate_provenance_candidates(
 
 
 def _schema_type(schema: dict[str, Any]) -> str | None:
-    """Return the declared type identity used by output adapter contracts."""
+    """Return a structural type identity without changing the platform schema."""
     value = schema.get("type")
-    return str(value).strip() if value is not None and str(value).strip() else None
-
-
-def _schema_matches(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
-    """Match the structural subset declared by an adapter target contract."""
-    return all(
-        _schema_matches(value, actual.get(key, {}))
-        if isinstance(value, dict) and isinstance(actual.get(key), dict)
-        else actual.get(key) == value
-        for key, value in expected.items()
-    )
+    type_name = str(value).strip() if value is not None else ""
+    if type_name == "array":
+        item_schema = schema.get("items")
+        item_type = _schema_type(item_schema) if isinstance(item_schema, dict) else None
+        return f"list[{item_type}]" if item_type else "array"
+    return type_name or None
 
 
 def _adapter_matches(
     adapter: dict[str, Any], *, source_schema: dict[str, Any], target_schema: dict[str, Any]
 ) -> bool:
     source_type = _schema_type(source_schema)
+    source_family = str(source_schema.get("type") or "").strip() or None
     allowed_sources = adapter["source_type"]
     if isinstance(allowed_sources, str):
         allowed_sources = (allowed_sources,)
-    if source_type not in allowed_sources:
+    if source_type not in allowed_sources and source_family not in allowed_sources:
         return False
-    declared_target_schema = adapter.get("target_schema")
-    if isinstance(declared_target_schema, dict):
-        return _schema_matches(declared_target_schema, target_schema)
     return _schema_type(target_schema) == adapter["target_type"]
 
 def collect_interface_plan_validation_issues(
@@ -914,11 +906,11 @@ def collect_interface_plan_validation_issues(
                         {"source_type": source_type, "target_type": target_type, "transform": transform},
                         "transform source_type and target_type must match its declared output adapter contract",
                     )
-                elif not transform and source_type and target_type and source_type != target_type:
+                elif not transform and source_type != target_type:
                     issue(
                         "incompatible_platform_output_type", path, iid,
                         {"source_type": source_type, "target_type": target_type, "transform": transform},
-                        "matching source/target types or a declared compatible output adapter",
+                        "a declared source type matching the target type, or a declared compatible output adapter",
                     )
     for member, slot in sorted(required_slots - covered_slots):
         candidates = generate_provenance_candidates(
