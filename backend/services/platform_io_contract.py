@@ -22,9 +22,9 @@ _LEGACY_OUTPUT_VALUE_SCHEMAS: dict[str, dict[str, Any]] = {
     "file_outputs": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
 }
 
-# Runtime representation adapters are part of the platform boundary contract,
-# not UI output-name rules.  Validators infer the post-transform semantic type
-# from this registry before comparing it with a sink contract.
+# Runtime representation adapters are runtime/platform capabilities. They are
+# intentionally not part of Interface planning or validation; runtime and
+# artifact generation may consult this registry after binding.
 OUTPUT_TRANSFORM_REGISTRY: dict[str, dict[str, Any]] = {
     "json_serialize": {
         "input_types": ("object", "json", "array"),
@@ -52,14 +52,11 @@ def _default_output_semantics(name: str, schema: dict[str, Any]) -> dict[str, An
         return {
             "semantic_type": "file",
             "accepted_source_types": ["artifact", "file", "file_path", "list[file_path]", "object", "json"],
-            "allowed_transforms": ["file_collect", "file_write"],
         }
     semantic_type = "markdown" if name == "markdown" else "text" if schema.get("type") == "string" else str(schema.get("type") or "unknown")
-    allowed = ["markdown_render"] if semantic_type == "markdown" else ["json_serialize", "markdown_render"] if semantic_type == "text" else []
     return {
         "semantic_type": semantic_type,
         "accepted_source_types": [semantic_type, "string", "json", "object", "structured_data"],
-        "allowed_transforms": allowed,
     }
 
 
@@ -98,12 +95,11 @@ def normalize_platform_output_sinks(contract: dict[str, Any] | None) -> list[dic
         if isinstance(declaration, dict):
             semantic_type = str(declaration.get("semantic_type") or defaults["semantic_type"]).strip()
             accepted = declaration.get("accepted_source_types", defaults["accepted_source_types"])
-            allowed = declaration.get("allowed_transforms", defaults["allowed_transforms"])
         else:
-            semantic_type, accepted, allowed = defaults["semantic_type"], defaults["accepted_source_types"], defaults["allowed_transforms"]
+            semantic_type, accepted = defaults["semantic_type"], defaults["accepted_source_types"]
         sinks.append({
             "name": name, "semantic_type": semantic_type,
-            "accepted_source_types": list(accepted), "allowed_transforms": list(allowed),
+            "accepted_source_types": list(accepted),
             "value_schema": schema, "cardinality": cardinality,
             "write_semantics": write_semantics,
         })
@@ -213,7 +209,7 @@ def build_platform_io_contract() -> dict[str, Any]:
                 "runtime_resources": {"canonical": "resources", "globally_required": False},
             },
             "final_output_fields": [
-                {"name": "text", "semantic_type": "text", "accepted_source_types": ["string", "text", "json", "object"], "allowed_transforms": ["json_serialize", "markdown_render"], "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
+                {"name": "text", "semantic_type": "text", "accepted_source_types": ["string", "text", "json", "object"], "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
                 {"name": "markdown", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
                 {"name": "image_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},
                 {"name": "image_paths", "value_schema": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}, "cardinality": "one", "write_semantics": "single"},

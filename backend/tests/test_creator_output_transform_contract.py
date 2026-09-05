@@ -1,95 +1,56 @@
 import pytest
 
 from backend.services.creator.function_item_interface_plan import (
-    build_interface_repair_scope,
+    InterfaceIntentPlanError,
     collect_interface_plan_validation_issues,
-    validate_interface_patch,
+    validate_interface_patch_protocol,
+    validate_interface_plan_protocol,
 )
 
 
-def _issues(source_type, target, transform):
-    contracts = {
-        "text_result": {
-            "name": "text_result", "semantic_type": "text",
-            "accepted_source_types": ["string", "text", "json", "object"],
-            "allowed_transforms": ["json_serialize"],
-            "value_schema": {"type": "string"},
-        },
-        "file_output": {
-            "name": "file_output", "semantic_type": "file",
-            "accepted_source_types": ["artifact", "file", "json", "object"],
-            "allowed_transforms": ["file_write"],
-            "value_schema": {"type": "string"},
-        },
-    }
+def _issues(source_type: str, accepted_source_types: list[str]):
     interface = {
         "interface_id": "I1", "kind": "member_to_platform",
-        "source_member": "scripts/unit.py", "source_output": "arbitrary_name",
-        "target_platform_output": target, "goal": "return result",
+        "source_member": "scripts/unit.py", "source_output": "member_output",
+        "target_platform_output": "platform_output", "goal": "return result",
     }
-    if transform:
-        interface["transform"] = transform
     item = {
         "target_file": "scripts/unit.py", "role": "script", "purpose": "produce result",
-        "inputs": [], "outputs": [{"port_id": "arbitrary_name", "contract": {"type": source_type}}],
+        "inputs": [],
+        "outputs": [{"port_id": "member_output", "contract": {"type": source_type}}],
         "default_values": {}, "required_capabilities": [], "constraints": [],
     }
     return collect_interface_plan_validation_issues(
         plan={"interfaces": [interface]}, function_items=[item],
         platform_contract={"platform_skill_boundary": {
-            "final_output_fields": [contracts[target]],
-            "required_final_output_fields": [target],
+            "final_output_fields": [{
+                "name": "platform_output", "semantic_type": "text",
+                "accepted_source_types": accepted_source_types,
+                "value_schema": {"type": "string"},
+            }],
+            "required_final_output_fields": ["platform_output"],
         }},
     )
 
 
-@pytest.mark.parametrize(("source_type", "target", "transform", "valid"), [
-    ("object", "text_result", "json_serialize", True),
-    ("artifact", "file_output", None, True),
-    ("artifact", "text_result", None, False),
-    ("json", "file_output", None, False),
-    ("json", "file_output", "file_write", True),
-])
-def test_output_validation_uses_source_transform_result_and_target_contract(
-    source_type, target, transform, valid,
-):
-    assert (_issues(source_type, target, transform) == []) is valid
+def test_object_output_can_bind_directly_to_text_platform_output():
+    assert _issues("object", ["text", "object", "json"]) == []
 
 
-def test_transform_failure_is_structured_for_targeted_repair():
-    issue = _issues("artifact", "text_result", "file_collect")[0]
-    reason = build_interface_repair_scope([issue])["failed_validation_reason"][0]
-    assert reason == {
-        "error": "transform_result_type_mismatch", "source_type": "artifact",
-        "transform": "file_collect", "result_type": "file", "target_type": "text",
-    }
-
-
-@pytest.mark.parametrize(("source_type", "transform", "valid"), [
-    ("object", "json_serialize", True),
-    ("object", None, False),
-    ("string", "json_serialize", False),
-])
-def test_json_serialize_contract_is_transform_aware(source_type, transform, valid):
-    assert (_issues(source_type, "text_result", transform) == []) is valid
-
-
-def test_noop_transform_patch_is_rejected():
+def test_legacy_transform_is_read_but_removed_from_canonical_plan():
     plan = {"interfaces": [{
         "interface_id": "I1", "kind": "member_to_platform",
-        "source_member": "scripts/unit.py", "source_output": "arbitrary_name",
-        "target_platform_output": "text_result", "transform": "json_serialize",
-        "goal": "return result",
+        "source_member": "scripts/unit.py", "source_output": "member_output",
+        "target_platform_output": "platform_output", "goal": "return result",
+        "transform": "historical_adapter",
     }]}
-    item = {
-        "target_file": "scripts/unit.py", "role": "script", "purpose": "produce result",
-        "inputs": [], "outputs": [{"port_id": "arbitrary_name", "contract": {"type": "object"}}],
-        "default_values": {}, "required_capabilities": [], "constraints": [],
-    }
-    with pytest.raises(Exception) as exc_info:
-        validate_interface_patch(
-            plan=plan, function_items=[item], violations=[{"interface_id": "I1"}],
-            patch={"operations": [{"op": "replace_transform", "interface_id": "I1",
-                                    "reason": "same transform", "transform": "json_serialize"}]},
-        )
-    assert getattr(exc_info.value, "code", None) == "no_effective_patch"
+    assert "transform" not in validate_interface_plan_protocol(plan)["interfaces"][0]
+
+
+def test_repair_protocol_rejects_replace_transform():
+    with pytest.raises(InterfaceIntentPlanError) as exc_info:
+        validate_interface_patch_protocol({"operations": [{
+            "op": "replace_transform", "interface_id": "I1",
+            "reason": "conversion is not interface planning", "transform": None,
+        }]})
+    assert exc_info.value.code == "invalid_interface_patch"

@@ -75,11 +75,11 @@ def test_derived_input_from_platform_fails():
     assert any(x["error_type"] == "provenance_error" for x in issues([p2m("external")], items))
 
 
-def test_object_to_text_with_declared_transform_passes():
+def test_object_to_text_direct_binding_passes():
     items = [member("scripts/a.py", [], [port("value", "runtime_output", schema_type="object")])]
     plan = {"interfaces": [{"interface_id": "I1", "kind": "member_to_platform",
         "source_member": "scripts/a.py", "source_output": "value",
-        "target_platform_output": "result", "transform": "json_serialize", "goal": "return result"}]}
+        "target_platform_output": "result", "goal": "return result"}]}
     contract = {"platform_skill_boundary": {"final_output_fields": ["result"],
         "output_sinks": {"result": {"value_schema": {"type": "string"}}}}}
     assert collect_interface_plan_validation_issues(plan=plan, function_items=items, platform_contract=contract) == []
