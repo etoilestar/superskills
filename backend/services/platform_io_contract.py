@@ -27,16 +27,16 @@ _LEGACY_OUTPUT_VALUE_SCHEMAS: dict[str, dict[str, Any]] = {
 # from this registry before comparing it with a sink contract.
 OUTPUT_TRANSFORM_REGISTRY: dict[str, dict[str, Any]] = {
     "json_serialize": {
-        "input_types": ("object", "json", "array"),
-        "result_type": "text",
-    },
-    "file_write": {
         "input_types": ("object", "json"),
         "result_type": "file",
     },
-    "markdown_render": {
-        "input_types": ("structured_data", "object", "json"),
-        "result_type": "markdown",
+    "text_render": {
+        "input_types": ("object", "json"),
+        "result_type": "text",
+    },
+    "artifact_pack": {
+        "input_types": ("file", "object", "json"),
+        "result_type": "artifact",
     },
     # Compatibility adapter retained for existing generated plans.
     "file_collect": {
@@ -45,21 +45,57 @@ OUTPUT_TRANSFORM_REGISTRY: dict[str, dict[str, Any]] = {
     },
 }
 
+PLATFORM_OUTPUT_TYPES = frozenset({"text", "json", "file", "artifact"})
+
+
+def _validate_output_transform_compatibility(
+    source_type: str, target_output_type: str, transform: str | None,
+    *, output_encoding: str | None = None,
+) -> bool:
+    """Apply the single platform-output transform compatibility matrix.
+
+    ``json_text`` is an explicit boundary encoding, never an inference that
+    turns the text sink into a general structured-data container.
+    """
+    source = ("json" if source_type in {"object", "array", "list", "dict"}
+              else "text" if source_type == "string"
+              else "file" if source_type in {"file_path", "list[file_path]"}
+              else source_type)
+    target = target_output_type
+    if target not in PLATFORM_OUTPUT_TYPES:
+        return False
+    if not transform or transform == "none":
+        return source == target or (source == "string" and target == "text")
+    if transform == "json_serialize":
+        return source in {"object", "json"} and (
+            target == "file" or (target == "text" and output_encoding == "json_text")
+        )
+    if transform == "text_render":
+        return source in {"object", "json"} and target in {"text", "file"}
+    if transform == "artifact_pack":
+        return source in {"file", "object", "json"} and target == "artifact"
+    # Retained runtime compatibility adapters remain registry entries, but are
+    # not legal for newly planned platform-output contracts.
+    return False
+
+
+_OUTPUT_TYPE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "text": {"accepted_source_types": ["text", "string"], "allowed_transforms": ["text_render"]},
+    "json": {"accepted_source_types": ["object", "json"], "allowed_transforms": []},
+    "file": {"accepted_source_types": ["text", "string", "object", "json", "bytes"], "allowed_transforms": ["json_serialize", "text_render"]},
+    "artifact": {"accepted_source_types": ["file", "object", "json"], "allowed_transforms": ["artifact_pack"]},
+}
+
 
 def _default_output_semantics(name: str, schema: dict[str, Any]) -> dict[str, Any]:
     """Infer compatibility metadata for legacy declarations only."""
-    if name in {"file_outputs", "file_paths", "image_paths"} or name.endswith("_path"):
-        return {
-            "semantic_type": "file",
-            "accepted_source_types": ["artifact", "file", "file_path", "list[file_path]", "object", "json"],
-            "allowed_transforms": ["file_collect", "file_write"],
-        }
-    semantic_type = "markdown" if name == "markdown" else "text" if schema.get("type") == "string" else str(schema.get("type") or "unknown")
-    allowed = ["markdown_render"] if semantic_type == "markdown" else ["json_serialize", "markdown_render"] if semantic_type == "text" else []
+    # Legacy declarations have no semantic metadata. Structural schema is the
+    # only permitted fallback; names and filename-like keywords are irrelevant.
+    semantic_type = "json" if schema.get("type") in {"object", "array"} else "text"
+    defaults = _OUTPUT_TYPE_DEFAULTS[semantic_type]
     return {
         "semantic_type": semantic_type,
-        "accepted_source_types": [semantic_type, "string", "json", "object", "structured_data"],
-        "allowed_transforms": allowed,
+        **defaults,
     }
 
 
@@ -101,11 +137,14 @@ def normalize_platform_output_sinks(contract: dict[str, Any] | None) -> list[dic
             allowed = declaration.get("allowed_transforms", defaults["allowed_transforms"])
         else:
             semantic_type, accepted, allowed = defaults["semantic_type"], defaults["accepted_source_types"], defaults["allowed_transforms"]
+        if semantic_type not in PLATFORM_OUTPUT_TYPES:
+            raise ValueError(f"invalid platform output type: {semantic_type}")
         sinks.append({
             "name": name, "semantic_type": semantic_type,
             "accepted_source_types": list(accepted), "allowed_transforms": list(allowed),
             "value_schema": schema, "cardinality": cardinality,
             "write_semantics": write_semantics,
+            "output_encoding": declaration.get("output_encoding") if isinstance(declaration, dict) else None,
         })
     return sinks
 
@@ -213,16 +252,19 @@ def build_platform_io_contract() -> dict[str, Any]:
                 "runtime_resources": {"canonical": "resources", "globally_required": False},
             },
             "final_output_fields": [
-                {"name": "text", "semantic_type": "text", "accepted_source_types": ["string", "text", "json", "object"], "allowed_transforms": ["json_serialize", "markdown_render"], "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
-                {"name": "markdown", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
-                {"name": "image_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},
-                {"name": "image_paths", "value_schema": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}, "cardinality": "one", "write_semantics": "single"},
-                {"name": "pdf_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},
-                {"name": "docx_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},
-                {"name": "pptx_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},
-                {"name": "html_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},
-                {"name": "file_paths", "value_schema": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}, "cardinality": "one", "write_semantics": "single"},
-                {"name": "file_outputs", "value_schema": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}, "cardinality": "one", "write_semantics": "single"},
+                {"name": "text", "semantic_type": "text", "accepted_source_types": ["string", "text"], "allowed_transforms": ["text_render"], "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
+                {"name": "json", "semantic_type": "json", "accepted_source_types": ["object", "json"], "allowed_transforms": [], "value_schema": {"type": "object"}, "cardinality": "one", "write_semantics": "single"},
+                {"name": "markdown", "semantic_type": "text", "accepted_source_types": ["string", "text", "object", "json"], "allowed_transforms": ["text_render"], "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
+                *[{"name": name, "semantic_type": "file", "accepted_source_types": ["file", "file_path", "list[file_path]", "text", "string", "object", "json", "bytes"], "allowed_transforms": ["json_serialize", "text_render"], "value_schema": schema, "cardinality": "one", "write_semantics": "single"} for name, schema in [
+                    ("image_path", {"type": "string", "minLength": 1}),
+                    ("image_paths", {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}),
+                    ("pdf_path", {"type": "string", "minLength": 1}),
+                    ("docx_path", {"type": "string", "minLength": 1}),
+                    ("pptx_path", {"type": "string", "minLength": 1}),
+                    ("html_path", {"type": "string", "minLength": 1}),
+                    ("file_paths", {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}),
+                    ("file_outputs", {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}),
+                ]],
             ],
             "protocol_notes": [
                 "Platform input_envelope_fields are source slots the platform can provide to a generated SKILL.",

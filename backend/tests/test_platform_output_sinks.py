@@ -122,8 +122,13 @@ def test_legacy_runtime_commit_rejects_multiple_emissions():
 
 def test_real_platform_contract_declares_runtime_capabilities_canonically():
     sinks = normalize_platform_output_sinks(build_platform_io_contract())
-    assert all(set(sink) == {"name", "value_schema", "cardinality", "write_semantics"} for sink in sinks)
+    assert all({"name", "semantic_type", "accepted_source_types", "allowed_transforms",
+                "value_schema", "cardinality", "write_semantics", "output_encoding"} == set(sink)
+               for sink in sinks)
     by_name = {sink["name"]: sink for sink in sinks}
+    assert by_name["text"]["allowed_transforms"] == ["text_render"]
+    assert by_name["json"]["accepted_source_types"] == ["object", "json"]
+    assert by_name["file_outputs"]["semantic_type"] == "file"
     assert (by_name["text"]["cardinality"], by_name["text"]["write_semantics"]) == ("many", "append")
     assert (by_name["file_outputs"]["cardinality"], by_name["file_outputs"]["write_semantics"]) == ("one", "single")
 

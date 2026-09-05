@@ -16,7 +16,8 @@ from typing import Any
 
 from ..skill_plan import GraphValidationError, normalize_structured_function_items
 from ..platform_io_contract import (
-    OUTPUT_TRANSFORM_REGISTRY, get_platform_output_sink, platform_output_names,
+    OUTPUT_TRANSFORM_REGISTRY, _validate_output_transform_compatibility,
+    get_platform_output_sink, platform_output_names,
 )
 from .bounded_refinement import (
     BoundedRefinementFailed,
@@ -62,6 +63,14 @@ semantic layers. Their names may differ, but the target_platform_output must
 always be selected from the declared platform output contract.
 
 Every selected platform output must belong to final_output_fields.
+
+The only platform output types are text, json, file, and artifact. Text is a
+final user-readable string, not a structured-data container. For object/json/
+list/dict member outputs, prefer a direct mapping to platform json. Do not pick
+text merely because a result will eventually be shown to a user. Use
+text_render to text only when the confirmed requirement explicitly asks for
+Markdown, plain text, report content, or readable text. json_serialize targets
+file, never text, unless that sink explicitly declares output_encoding=json_text.
 """
 PLATFORM_BOUNDARY_CONTRACT = """PLATFORM BOUNDARY CONTRACT
 
@@ -125,10 +134,9 @@ The reviewer MUST NOT reject a mapping only because source schema and target
 schema differ, when the declared transform is registered and its source/target
 contracts match.
 
-Examples:
-
-- object -> text with json_serialize is valid.
-- file_path -> file_outputs with file_collect is valid.
+The shared output compatibility matrix is authoritative. In particular,
+object -> text with json_serialize is invalid unless the selected text sink
+explicitly declares output_encoding=json_text.
 
 The reviewer should judge whether semantic meaning is preserved, not require
 structural schema equality.
@@ -214,6 +222,10 @@ adapter declares the source_type values it accepts and the target_type/schema
 it produces. The planner MUST NOT invent a transform based only on semantic
 relatedness. Direct mapping is permitted only when source and target types are
 equal; adapter mapping is permitted only when both sides match the adapter.
+
+Compatibility matrix: none requires equal types; json_serialize maps object/json
+to file; text_render maps object/json to text/file; artifact_pack maps
+file/object/json to artifact.
 """
 
 RUNTIME_INPUT_PROVENANCE_CONTRACT = """RUNTIME INPUT PROVENANCE CONTRACT
@@ -1285,29 +1297,27 @@ def collect_interface_plan_validation_issues(
                 transform = interface.get("transform")
                 source_type = _schema_type(source_schema)
                 target_type = (sink or {}).get("semantic_type") or _schema_type(target_schema)
-                adapter = OUTPUT_TRANSFORM_REGISTRY.get(transform) if transform else None
                 accepted_sources = set((sink or {}).get("accepted_source_types") or [])
                 allowed_transforms = set((sink or {}).get("allowed_transforms") or [])
                 source_semantic = _semantic_identity(source_schema) or source_type
-                result_type = adapter.get("result_type") if adapter else _canonical_semantic_type(source_semantic)
-                invalid_transform = bool(transform) and (
-                    adapter is None
-                    or transform not in allowed_transforms
-                    or source_semantic not in set(adapter.get("input_types") or ())
-                    or result_type != target_type
+                compatible = _validate_output_transform_compatibility(
+                    source_semantic, target_type, transform,
+                    output_encoding=(sink or {}).get("output_encoding"),
                 )
-                if invalid_transform:
+                result_type = ((OUTPUT_TRANSFORM_REGISTRY.get(transform) or {}).get("result_type")
+                               if transform else source_semantic)
+                if not compatible:
+                    inconsistency = (transform == "json_serialize" and target_type == "text"
+                                     and (sink or {}).get("output_encoding") != "json_text")
                     issue(
-                        "transform_result_type_mismatch", f"{path}.transform", iid,
+                        "OUTPUT_CONTRACT_INCONSISTENCY" if inconsistency else "transform_result_type_mismatch",
+                        f"{path}.transform" if transform else path, iid,
                         {"source_type": source_semantic, "transform": transform, "result_type": result_type, "target_type": target_type},
-                        "source type, registered transform result type, and target contract must all match", error_type="invalid_transform_error",
+                        "source type, transform, and output must satisfy the shared compatibility matrix", error_type="invalid_transform_error",
                     )
-                elif not transform and source_semantic and target_type and result_type != target_type:
-                    issue(
-                        "incompatible_platform_output_type", path, iid,
-                        {"source_type": source_semantic, "transform": None, "result_type": source_semantic, "target_type": target_type},
-                        "direct output must already have the target semantic type; otherwise declare an allowed transform", error_type="schema_error",
-                    )
+                elif transform and transform not in allowed_transforms:
+                    issue("transform_not_allowed_by_output", f"{path}.transform", iid,
+                          transform, sorted(allowed_transforms), error_type="invalid_transform_error")
                 elif source_semantic and source_semantic not in accepted_sources:
                     issue(
                         "platform_output_source_type_rejected", path, iid,
@@ -2201,6 +2211,16 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
     deterministic_issues = collect_interface_plan_validation_issues(
         plan=parsed, function_items=frozen_function_items, platform_contract=platform_contract,
     ) if protocol_issue is None else []
+    contract_inconsistencies = [value for value in deterministic_issues
+                                if value.get("code") == "OUTPUT_CONTRACT_INCONSISTENCY"]
+    if contract_inconsistencies:
+        # A planner/contract contradiction is not repairable model feedback.
+        # Stop before semantic review or repair can oscillate between contracts.
+        raise InterfaceIntentPlanError(
+            "planner output contradicts the platform output contract",
+            code="OUTPUT_CONTRACT_INCONSISTENCY",
+            details={"issues": contract_inconsistencies},
+        )
     logger.info(
         "[Creator][interface_validation] stage=deterministic initial_issue_count=%d",
         len(deterministic_issues),
@@ -2468,6 +2488,11 @@ legal member/input domains, and repair_scope.
 
 2. TASK
 Repair the Interface Plan so all supplied blocking facts are resolved simultaneously.
+Repair MUST preserve the platform output type, member output schema, and shared
+transform compatibility matrix. It MUST NOT remove or replace a transform merely
+to bypass validation (for example, object -> text(json_serialize) may not become
+object -> text). Structured data must use a declared json sink directly or a
+declared file sink with json_serialize.
 For a platform-output validation failure, use failed_validation_reason to repair
 only the incompatible source, transform, or target contract tuple. Do not guess
 a replacement output merely from its field name and do not redesign the whole
