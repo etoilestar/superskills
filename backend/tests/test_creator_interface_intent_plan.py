@@ -228,6 +228,51 @@ async def test_platform_boundary_contract_planner_uses_semantics_with_randomized
     assert result["interfaces"][1]["kind"] == "member_to_member"
 
 
+@pytest.mark.asyncio
+async def test_graph_projection_and_platform_inputs_can_feed_distinct_slots_of_one_member():
+    items = [
+        item("scripts/script1.py", [], ["report_data"]),
+        item("scripts/script2.py", ["report_data", "font_size", "page_count"], ["result"]),
+    ]
+    graph = [{
+        "from_node": "scripts/script1.py", "from_output": "report_data",
+        "to_node": "scripts/script2.py", "to_input": "report_data",
+    }]
+
+    async def planner(messages, _model):
+        payload = json.loads(messages[1]["content"])
+        candidates = payload["semantic_mapping_candidates"]["input_mappings"]
+        assert not any(value["target_input"] == "report_data" for value in candidates)
+        assert {value["target_input"] for value in candidates} >= {"font_size", "page_count"}
+        return json.dumps({"interfaces": [
+            p2m("I1", "scripts/script2.py", "font_size", "font_size"),
+            p2m("I2", "scripts/script2.py", "page_count", "page_count"),
+            m2p("I3", "scripts/script2.py", "result", "result"),
+        ]})
+
+    contract = {"platform_skill_boundary": {
+        "input_envelope_fields": ["font_size", "page_count"],
+        "final_output_fields": ["result"], "required_final_output_fields": ["result"],
+    }}
+    result = await plan_function_item_interfaces(
+        original_user_goal="render report", frozen_function_items=items,
+        platform_contract=contract, responsibility_edges=graph,
+        planner_model="planner", model_call=planner,
+    )
+
+    bindings = {(value["kind"], value.get("target_input")) for value in result["interfaces"]}
+    assert bindings == {
+        ("member_to_member", "report_data"),
+        ("platform_to_member", "font_size"),
+        ("platform_to_member", "page_count"),
+        ("member_to_platform", None),
+    }
+    assert collect_interface_plan_validation_issues(
+        plan=result, function_items=items, platform_contract=contract,
+        responsibility_edges=graph,
+    ) == []
+
+
 def item(name, inputs, outputs):
     return {"target_file": name, "role": "script", "purpose": f"purpose {name}", "inputs": inputs, "outputs": outputs, "default_values": {}, "required_capabilities": [], "constraints": []}
 

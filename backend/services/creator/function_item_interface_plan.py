@@ -31,7 +31,8 @@ AUTHORITY_CONTRACT = """CROSS-STAGE AUTHORITY CONTRACT
 Confirmed user requirements define task intent.
 Blueprint and FunctionItem planning define frozen executable responsibilities and logical ports.
 Requirement Projection assigns requirement channels and executable ownership.
-Interface Planner owns semantic logical-port binding decisions.
+Interface Planner owns only platform-boundary logical-port binding decisions.
+Frozen Graph dependencies own member-to-member bindings, which are projected deterministically.
 Interface Planner Correction may repair only the Interface layer when a previous Planner result fails deterministic Interface acceptance.
 Interface Reviewer evaluates semantic correctness only after deterministic Interface validity has been established.
 Critic diagnoses semantic or Graph blocking facts and states only the required postcondition.
@@ -56,7 +57,7 @@ Interface Planner MUST NOT:
 - invent transformation names
 - design runtime conversion logic
 
-Interface Planner ONLY creates connections:
+Interface Planner ONLY creates platform-boundary connections:
 
 source port
     ->
@@ -65,10 +66,13 @@ target port
 Allowed decisions:
 
 1. source platform input
-2. source member output
-3. target member input
+2. target member input
+3. source member output for a platform output
 4. target platform output
 5. no conversion operation: representation adaptation belongs to runtime
+
+member_to_member is not a planner decision. It is copied port-for-port from
+the frozen ResponsibilityGraph and MUST NOT be selected or replaced by the model.
 
 The planner must not generate a transform, select an adapter, choose a
 serializer, or declare a conversion. Representation adaptation is handled by
@@ -1205,40 +1209,25 @@ def generate_provenance_candidates(
             }
         )
 
-    # Candidate 2:
-    # outputs from frozen FunctionItems
-    for item in compact_function_items:
-        source_member = item["target_file"]
-
-        for output in item.get("outputs", []):
-            output_name = output["name"]
-
-            candidates.append(
-                {
-                    "kind": "member_to_member",
-                    "source_member": source_member,
-                    "source_output": output_name,
-                    "target_member": target_member,
-                    "target_input": target_input,
-                    "evidence": "declared FunctionItem output source",
-                }
-            )
-
     return candidates
 
 
 def build_semantic_mapping_candidates(
     *, function_items: list[dict[str, Any]], platform_contract: dict[str, Any] | None,
+    responsibility_edges: list[dict[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Enumerate legal endpoints for the LLM mapping planners, without ranking them."""
+    """Enumerate boundary endpoints only; graph-owned inputs never compete."""
     compact = _compact_function_items(function_items)
     boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
     platform_inputs = {_compact_port_id(value) for value in boundary.get("input_envelope_fields") or []}
     platform_input_schemas = boundary.get("input_schemas") if isinstance(boundary.get("input_schemas"), dict) else {}
     platform_output_sinks = boundary.get("output_sinks") if isinstance(boundary.get("output_sinks"), dict) else {}
     input_candidates: list[dict[str, Any]] = []
+    locked_inputs = set(_member_dependency_bindings(responsibility_edges))
     for item in compact:
         for port in item["inputs"]:
+            if (item["target_file"], port["name"]) in locked_inputs:
+                continue
             candidates = generate_provenance_candidates(
                 target_member=item["target_file"], target_input=port["name"],
                 compact_function_items=compact, platform_inputs=platform_inputs,
@@ -1263,6 +1252,54 @@ def build_semantic_mapping_candidates(
         for target in sorted(platform_output_names(platform_contract))
     ]
     return {"input_mappings": input_candidates, "output_mappings": output_candidates}
+
+
+def _member_dependency_bindings(
+    responsibility_edges: list[dict[str, Any]] | None,
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """Project frozen member graph edges into receiving-port provenance."""
+    bindings: dict[tuple[str, str], tuple[str, str]] = {}
+    for edge in responsibility_edges or []:
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("from_node") or edge.get("producer") or "").strip()
+        source_port = str(edge.get("from_output") or edge.get("producer_port") or "").strip()
+        target = str(edge.get("to_node") or edge.get("consumer") or "").strip()
+        target_port = str(edge.get("to_input") or edge.get("consumer_port") or "").strip()
+        if not all((source, source_port, target, target_port)):
+            continue
+        if source in {"platform_input_node", "platform"} or target in {"platform_output_node", "platform"}:
+            continue
+        key, value = (target, target_port), (source, source_port)
+        if key in bindings and bindings[key] != value:
+            _raise("graph assigns multiple sources to one input", "conflicting_graph_input_sources",
+                   path="$.responsibility_edges", target_member=target, target_input=target_port)
+        bindings[key] = value
+    return bindings
+
+
+def project_member_interfaces_from_graph(
+    responsibility_edges: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Deterministically project frozen graph dependencies; no semantic selection."""
+    return [
+        {"interface_id": f"GRAPH_M2M_{index:04d}", "kind": "member_to_member",
+         "source_member": source, "source_output": source_port,
+         "target_member": target, "target_input": target_port,
+         "goal": "project frozen workflow dependency"}
+        for index, ((target, target_port), (source, source_port)) in enumerate(
+            _member_dependency_bindings(responsibility_edges).items(), start=1
+        )
+    ]
+
+
+def _compose_boundary_and_graph_interfaces(
+    plan: dict[str, Any], responsibility_edges: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Discard model-authored internal edges and append the graph projection."""
+    boundary = [value for value in plan.get("interfaces") or []
+                if isinstance(value, dict) and value.get("kind") != "member_to_member"]
+    return {"interfaces": [*boundary, *project_member_interfaces_from_graph(responsibility_edges)]}
 
 
 def _semantic_source_capabilities(contract: dict[str, Any]) -> dict[str, Any]:
@@ -1318,6 +1355,7 @@ def semantic_provenance_compatibility(
 def collect_interface_plan_validation_issues(
     *, plan: dict[str, Any], function_items: list[dict[str, Any]],
     platform_contract: dict[str, Any] | None = None,
+    responsibility_edges: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Validate declared endpoint names and types, never runtime input sourcing."""
     compact = _compact_function_items(function_items)
@@ -1344,12 +1382,18 @@ def collect_interface_plan_validation_issues(
         issue("invalid_required_platform_output", "$.platform_contract.required_final_output_fields", "", sorted(invalid_required_outputs), sorted(platform_outputs))
 
     receiving_contracts: dict[tuple[str, str], list[str]] = {}
+    graph_bindings = _member_dependency_bindings(responsibility_edges)
 
     for index, interface in enumerate(plan.get("interfaces") or []):
         path, iid, kind = f"$.interfaces[{index}]", str(interface.get("interface_id") or ""), interface.get("kind")
         if kind == "platform_to_member":
             source, target, slot = interface["source_platform_input"], interface["target_member"], interface["target_input"]
             receiving_contracts.setdefault((target, slot), []).append(iid)
+            if (target, slot) in graph_bindings:
+                issue("graph_dependency_source_replaced", path, iid,
+                      {"kind": kind, "source": source},
+                      {"kind": "member_to_member", "source": graph_bindings[(target, slot)]},
+                      error_type="provenance_error")
             if source not in platform_inputs: issue("unknown_platform_logical_input", f"{path}.source_platform_input", iid, source, sorted(platform_inputs))
             if target not in inputs or slot not in inputs.get(target, set()): issue("unknown_interface_logical_input", f"{path}.target_input", iid, slot, sorted(inputs.get(target, set())))
             else:
@@ -1372,6 +1416,10 @@ def collect_interface_plan_validation_issues(
             source, output = interface["source_member"], interface["source_output"]
             target, slot = interface["target_member"], interface["target_input"]
             receiving_contracts.setdefault((target, slot), []).append(iid)
+            expected_graph_source = graph_bindings.get((target, slot))
+            if responsibility_edges is not None and expected_graph_source != (source, output):
+                issue("member_binding_not_in_graph", path, iid, (source, output),
+                      expected_graph_source, error_type="provenance_error")
             if source not in outputs or output not in outputs.get(source, set()): issue("unknown_interface_logical_output", f"{path}.source_output", iid, output, sorted(outputs.get(source, set())))
             if target not in inputs or slot not in inputs.get(target, set()): issue("unknown_interface_logical_input", f"{path}.target_input", iid, slot, sorted(inputs.get(target, set())))
             else:
@@ -1410,6 +1458,17 @@ def collect_interface_plan_validation_issues(
             {"target_member": member, "target_input": slot},
             "one source-to-target Interface", error_type="missing_source_error",
         )
+    observed_member_bindings = {
+        (value.get("target_member"), value.get("target_input")):
+        (value.get("source_member"), value.get("source_output"))
+        for value in plan.get("interfaces") or [] if value.get("kind") == "member_to_member"
+    }
+    for target, source in graph_bindings.items():
+        if observed_member_bindings.get(target) != source:
+            issue("missing_graph_dependency_interface", "$.interfaces", "",
+                  {"target_member": target[0], "target_input": target[1]},
+                  {"source_member": source[0], "source_output": source[1]},
+                  error_type="missing_source_error")
     for (member, slot), interface_ids in sorted(receiving_contracts.items()):
         if len(interface_ids) > 1:
             issue(
@@ -1470,14 +1529,19 @@ def collect_interface_plan_validation_issues(
 def interface_contract_closure_check(
     *, interface_plan: dict[str, Any], function_items: list[dict[str, Any]],
     platform_contract: dict[str, Any] | None = None,
+    responsibility_edges: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Check that every frozen FunctionItem input has one planned interface."""
     return [
         issue for issue in collect_interface_plan_validation_issues(
             plan=interface_plan, function_items=function_items,
             platform_contract=platform_contract,
+            responsibility_edges=responsibility_edges,
         )
-        if issue.get("code") == "missing_interface_contract"
+        if issue.get("code") in {
+            "missing_interface_contract", "missing_graph_dependency_interface",
+            "graph_dependency_source_replaced", "member_binding_not_in_graph",
+        }
     ]
 
 
@@ -1690,10 +1754,13 @@ a required field because its value is empty-like; source_path=[] is the explicit
 representation of whole-slot platform binding.
 
 3. CURRENT TASK
-Produce a complete Interface Plan for all FunctionItem inputs and required
-final outputs. Bind invocation parameters from declared platform inputs or
-preceding member outputs. Optionality and defaults may defer runtime value
-validation, but never defer the source-to-target contract.
+Produce the platform-boundary portion of the Interface Plan for unlocked
+FunctionItem inputs and required final outputs. Bind invocation parameters
+from declared platform inputs. Optionality and defaults may defer runtime
+value validation, but never defer the source-to-target contract.
+Return only platform_to_member and member_to_platform records. Inputs listed
+in locked_member_interfaces already have frozen graph provenance: do not emit
+or replace their member_to_member records.
 
 4. CURRENT AUTHORITY
 You, not the backend, own and choose the semantic producer using responsibilities, port
@@ -2204,7 +2271,7 @@ A plausible goal cannot make an incorrect structured source/target binding valid
     return issues
 
 
-async def plan_function_item_interfaces(*, original_user_goal: str, frozen_function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]] | None = None, requirement_channels: dict[str, str] | None = None, system_requirements: list[dict[str, Any]] | None = None, interaction_requirements: list[dict[str, Any]] | None = None, platform_contract: dict[str, Any] | None = None, skill_name: str = "", planner_model: str, model_call: ModelCall, reviewer_model: str | None = None, reviewer_model_call: ModelCall | None = None) -> dict[str, Any]:
+async def plan_function_item_interfaces(*, original_user_goal: str, frozen_function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]] | None = None, requirement_channels: dict[str, str] | None = None, system_requirements: list[dict[str, Any]] | None = None, interaction_requirements: list[dict[str, Any]] | None = None, platform_contract: dict[str, Any] | None = None, responsibility_edges: list[dict[str, Any]] | None = None, skill_name: str = "", planner_model: str, model_call: ModelCall, reviewer_model: str | None = None, reviewer_model_call: ModelCall | None = None) -> dict[str, Any]:
     """Ask the model for interaction intents between frozen FunctionItems."""
 
     system_requirements_context = _resolve_system_requirements_context(
@@ -2231,7 +2298,9 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
         ),
         "semantic_mapping_candidates": build_semantic_mapping_candidates(
             function_items=frozen_function_items, platform_contract=platform_contract,
+            responsibility_edges=responsibility_edges,
         ),
+        "locked_member_interfaces": project_member_interfaces_from_graph(responsibility_edges),
     }
     raw_response = await model_call([{"role": "system", "content": _interface_plan_prompt()}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
     try:
@@ -2246,11 +2315,16 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
     protocol_issue: InterfaceIntentPlanError | None = None
     try:
         parsed = validate_interface_plan_protocol(transport)
+        if responsibility_edges is not None:
+            parsed = validate_interface_plan_protocol(
+                _compose_boundary_and_graph_interfaces(parsed, responsibility_edges)
+            )
     except InterfaceIntentPlanError as exc:
         protocol_issue = exc
         parsed = transport
     deterministic_issues = collect_interface_plan_validation_issues(
         plan=parsed, function_items=frozen_function_items, platform_contract=platform_contract,
+        responsibility_edges=responsibility_edges,
     ) if protocol_issue is None else []
     logger.info(
         "[Creator][interface_validation] stage=deterministic initial_issue_count=%d",
@@ -2342,6 +2416,10 @@ JSON matching INTERFACE_SCHEMA."""
         async def evaluate_correction(candidate_object: Any) -> CandidateEvaluation:
             try:
                 candidate = validate_interface_plan_protocol(candidate_object)
+                if responsibility_edges is not None:
+                    candidate = validate_interface_plan_protocol(
+                        _compose_boundary_and_graph_interfaces(candidate, responsibility_edges)
+                    )
             except InterfaceIntentPlanError as exc:
                 return CandidateEvaluation(
                     accepted=False, candidate=candidate_object,
@@ -2351,6 +2429,7 @@ JSON matching INTERFACE_SCHEMA."""
             remaining = collect_interface_plan_validation_issues(
                 plan=candidate, function_items=frozen_function_items,
                 platform_contract=platform_contract,
+                responsibility_edges=responsibility_edges,
             )
             return CandidateEvaluation(
                 accepted=not remaining, candidate=candidate,
@@ -2384,10 +2463,12 @@ JSON matching INTERFACE_SCHEMA."""
             ) from exc
     review_issues: list[dict[str, Any]] = []
     if reviewer_model:
+        review_plan = (_compose_boundary_and_graph_interfaces(parsed, [])
+                       if responsibility_edges is not None else parsed)
         review_issues = await review_interface_plan_semantically(
             original_user_goal=original_user_goal,
             frozen_function_items=frozen_function_items,
-            interface_plan=parsed,
+            interface_plan=review_plan,
             requirement_allocations=requirement_allocations,
             requirement_channels=requirement_channels,
             system_requirements=system_requirements_context,
@@ -2401,10 +2482,12 @@ JSON matching INTERFACE_SCHEMA."""
         len(deterministic_issues), len(review_issues), len(combined_issues), bool(combined_issues),
     )
     if combined_issues:
-        return await repair_interface_plan_semantically(
+        repair_plan = (_compose_boundary_and_graph_interfaces(parsed, [])
+                       if responsibility_edges is not None else parsed)
+        repaired = await repair_interface_plan_semantically(
             original_user_goal=original_user_goal,
             frozen_function_items=frozen_function_items,
-            current_interface_plan=parsed,
+            current_interface_plan=repair_plan,
             validation_issues=combined_issues,
             repair_scope=build_interface_repair_scope(combined_issues, parsed),
             requirement_allocations=requirement_allocations,
@@ -2416,6 +2499,11 @@ JSON matching INTERFACE_SCHEMA."""
             model_call=model_call,
             reviewer_model=reviewer_model,
             reviewer_model_call=reviewer_model_call,
+        )
+        if responsibility_edges is not None:
+            repaired = _compose_boundary_and_graph_interfaces(repaired, responsibility_edges)
+        return validate_interface_intent_plan(
+            plan=repaired, function_items=frozen_function_items,
         )
     return validate_interface_intent_plan(plan=parsed, function_items=frozen_function_items)
 
