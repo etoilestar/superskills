@@ -72,7 +72,8 @@ Allowed decisions:
 
 The planner must not generate a transform, select an adapter, choose a
 serializer, or declare a conversion. Representation adaptation is handled by
-runtime capability.
+the separate Runtime IO Mapping Planner after this semantic contract is frozen.
+Do not include mapping modes, operations, artifact names, or a mapping plan here.
 """
 VALID_INTERFACE_FREEZE_CONTRACT = """Interfaces without validation errors are immutable.
 

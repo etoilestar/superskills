@@ -5,6 +5,7 @@ All return a uniform dict: {action, name, success, message, path}.
 run_script additionally returns: {stdout, stderr, exit_code, filename}.
 """
 import logging
+import json
 import os
 import subprocess
 import sys
@@ -479,6 +480,26 @@ def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Pat
 
         # Detect newly created files and attach download metadata.
         if success:
+            plan_path = skill_dir / "runtime_io_mapping_plan.json"
+            if plan_path.is_file():
+                try:
+                    from .creator.runtime_io_mapping_plan import execute_runtime_io_mapping
+                    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                    payload = json.loads(stdout)
+                    for mapping in plan.get("mappings", []):
+                        source, target = mapping.get("source", {}), mapping.get("target", {})
+                        if source.get("member") != f"scripts/{safe}" or source.get("output") not in payload:
+                            continue
+                        payload[target["platform_output"]] = execute_runtime_io_mapping(
+                            member=f"scripts/{safe}", output=source["output"],
+                            platform_output=target["platform_output"], value=payload[source["output"]],
+                            mapping_plan=plan, output_dir=skill_dir / "outputs",
+                        )
+                    stdout = json.dumps(payload, ensure_ascii=False)
+                    result["stdout"] = stdout
+                except (ValueError, OSError, KeyError, TypeError) as exc:
+                    result.update({"success": False, "message": str(exc), "error": getattr(exc, "code", "runtime_io_mapping_planning_failure")})
+                    return result
             try:
                 declared_output_files = validate_stdout_file_outputs(
                     stdout,

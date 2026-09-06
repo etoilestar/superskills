@@ -244,6 +244,8 @@ def project_and_commit_platform_outputs(
     contract: dict[str, Any],
     terminal_edges: list[dict[str, Any]],
     completed_outputs: dict[str, dict[str, Any]],
+    *, runtime_io_mapping_plan: dict[str, Any] | None = None,
+    output_dir: str | None = None,
 ) -> dict[str, Any]:
     """Project successful member outputs in authoritative terminal-edge order.
 
@@ -260,9 +262,17 @@ def project_and_commit_platform_outputs(
         member_outputs = completed_outputs.get(member)
         if not isinstance(member_outputs, dict) or output not in member_outputs:
             raise ValueError(f"missing terminal emission value: edge {edge_index}")
+        value = member_outputs[output]
+        target = get_platform_output_sink(contract, sink)
+        if target is not None and not value_matches_platform_schema(value, target["value_schema"]):
+            from .creator.runtime_io_mapping_plan import execute_runtime_io_mapping
+            value = execute_runtime_io_mapping(
+                member=member, output=output, platform_output=sink, value=value,
+                mapping_plan=runtime_io_mapping_plan, output_dir=output_dir or "outputs",
+            )
         emissions.append({
             "sink": sink,
-            "value": member_outputs[output],
+            "value": value,
             "order_key": edge_index,
         })
     return commit_platform_output_emissions(contract, emissions)

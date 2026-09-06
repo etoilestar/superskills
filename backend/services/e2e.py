@@ -12,6 +12,7 @@ from .platform_io_contract import (
     normalize_platform_output_sinks,
     value_matches_platform_schema,
 )
+from .creator.runtime_io_mapping_plan import execute_runtime_io_mapping, RuntimeIOMappingError
 
 
 
@@ -371,7 +372,7 @@ def _validate_final_platform_output_contract(
     raise ValueError(
         _e2e_error(
             target=command.script_path,
-            layer="final_platform_output_contract",
+            layer="runtime_io_mapping_missing",
             message=(
                 f"第 {command.ordinal} 步 {command.script_path} 是 workflow 最后一步，"
                 "但 stdout JSON 没有包含 sandbox 可消费的最终输出字段。\n"
@@ -386,6 +387,29 @@ def _validate_final_platform_output_contract(
             ),
         )
     )
+
+
+def _apply_runtime_io_mapping_plan(*, command: E2EWorkflowCommand, stdout_json: dict[str, Any], skill_dir: Path) -> dict[str, Any]:
+    """Load and execute an approved plan before platform sink validation."""
+    plan_path = skill_dir / "runtime_io_mapping_plan.json"
+    if not plan_path.is_file():
+        return stdout_json
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        mapped = dict(stdout_json)
+        for mapping in plan.get("mappings", []):
+            source, target = mapping.get("source", {}), mapping.get("target", {})
+            if source.get("member") != command.script_path or source.get("output") not in stdout_json:
+                continue
+            mapped[target["platform_output"]] = execute_runtime_io_mapping(
+                member=command.script_path, output=source["output"],
+                platform_output=target["platform_output"], value=stdout_json[source["output"]],
+                mapping_plan=plan, output_dir=skill_dir / "outputs",
+            )
+        return mapped
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, RuntimeIOMappingError) as exc:
+        code = getattr(exc, "code", "runtime_io_mapping_planning_failure")
+        raise ValueError(_e2e_error(target=command.script_path, layer=code, message=str(exc))) from exc
 
 def _placeholder_exprs_from_value(value: Any) -> list[str]:
     exprs: list[str] = []
@@ -2764,6 +2788,11 @@ def _run_skill_workflow_e2e_once(
 
                 is_final_step = index == len(commands) - 1
                 if is_final_step:
+                    stdout_json = _apply_runtime_io_mapping_plan(
+                        command=command,
+                        stdout_json=stdout_json,
+                        skill_dir=trial_skill_dir,
+                    )
                     _validate_final_platform_output_contract(
                         command=command,
                         stdout_json=stdout_json,
@@ -4172,6 +4201,14 @@ def _targeted_e2e_repair_hint(errors: list[str]) -> str:
             "请保留最后一步脚本 stdout JSON 的原有业务字段，并额外映射到合法平台最终输出字段。"
             "如果最后一步已有可展示的主要结果值，保留原字段并额外映射到 text 或 markdown。"
             "如果最后一步产出文件，输出对应平台文件字段。"
+        )
+
+    if layer in {"runtime_io_mapping_missing", "runtime_io_mapping_planning_failure"}:
+        return (
+            "E2E repair authority is runtime_io_mapping. Repair only the approved "
+            "runtime IO mapping plan or the generated script's implementation. "
+            "Do not modify the platform IO contract, FunctionItem contract, or "
+            "semantic Interface binding."
         )
 
     if layer == "final_platform_output_value_invalid":

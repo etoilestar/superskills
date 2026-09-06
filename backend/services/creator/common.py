@@ -145,6 +145,12 @@ _MAX_HISTORY_TURNS = 6
 _MAX_FILE_REPAIR_ATTEMPTS = 10
 _EMPTY_GENERATION_PROMPT_VARIANTS: tuple[str, ...] = ("standard", "simplified", "minimal")
 _SCRIPT_TRIAL_TIMEOUT_SECONDS = 30
+FUNCTION_ITEM_OUTPUT_GENERATION_CONTRACT = """FUNCTIONITEM OUTPUT AUTHORITY
+Generated scripts must satisfy the frozen FunctionItem output contract only.
+Do not proactively produce platform file paths, reshape stdout, or wrap a value
+as an artifact to fit a platform sink. Runtime IO Mapping owns representation
+adaptation after semantic Interface binding.
+"""
 
 # Human-readable language labels indexed by file extension.
 _LANG_LABELS: dict[str, str] = {

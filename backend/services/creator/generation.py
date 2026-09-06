@@ -745,6 +745,9 @@ def _script_generation_skeleton(
         f"outputs: {json.dumps(output_keys, ensure_ascii=False)}\n"
         "Prefer these input names for strict_json_argv_guard and these output names "
         "for the final stdout object. Do not copy generic field names from examples.\n"
+        "Satisfy only the FunctionItem output contract. Do not create file paths, "
+        "reshape stdout, or wrap artifacts merely to fit a platform sink; the "
+        "approved Runtime IO Mapping Plan performs that adaptation.\n"
     )
 
     component_hint = getattr(plan_entry, "component_hint", "") or getattr(plan_entry, "role", "")

@@ -58,6 +58,7 @@ from .function_item_interface_plan import (
     plan_function_item_interfaces,
     repair_interface_intents,
 )
+from .runtime_io_mapping_plan import plan_runtime_io_mappings, runtime_capability_summary
 from .frozen_facts import (
     CANONICAL_PROJECTION_PRINCIPLE,
     FACT_OWNERS,
@@ -7139,9 +7140,18 @@ async def _bind_executable_responsibility_plan(
                 },
             ) from repair_exc
         logger.info("[Creator][interface_graph_revalidation] attempt=1 result=success")
+    runtime_io_mapping_plan = await plan_runtime_io_mappings(
+        canonical_interface_contract=interface_plan,
+        function_items=frozen_function_items,
+        platform_contract=platform_contract,
+        capabilities=runtime_capability_summary(),
+        planner_model=planner_model,
+        model_call=select_sources,
+    )
     return {
         "function_items": frozen_function_items,
         "responsibility_edges": responsibility_edges,
+        "runtime_io_mapping_plan": runtime_io_mapping_plan,
     }
 
 
