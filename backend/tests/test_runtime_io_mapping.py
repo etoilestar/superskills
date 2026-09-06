@@ -99,3 +99,78 @@ async def test_terminal_commit_maps_before_sink_validation(tmp_path):
         output_dir=str(tmp_path),
     )
     assert committed == {"file_outputs": [str(tmp_path / "report_json.json")]}
+
+
+@pytest.mark.asyncio
+async def test_structured_function_item_output_is_serialized_before_file_outputs_commit(tmp_path):
+    """Regression: a business object must not fail the terminal file sink."""
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "records": {"type": "array"},
+        },
+        "required": ["summary", "records"],
+    }
+    function_item = {
+        "target_file": "scripts/summarizer.py",
+        "outputs": [{"name": "result", "contract": output_schema}],
+    }
+    interface_plan = {
+        "interfaces": [{
+            "interface_id": "I1",
+            "kind": "member_to_platform",
+            "source_member": "scripts/summarizer.py",
+            "source_output": "result",
+            "target_platform_output": "file_outputs",
+        }],
+    }
+    contract = platform(
+        "file_outputs",
+        {"type": "array", "items": {"type": "string"}},
+    )
+
+    async def model(messages, model):
+        return json.dumps({"mappings": [{
+            "source": {
+                "member": "scripts/summarizer.py",
+                "output": "result",
+                "schema": output_schema,
+            },
+            "target": {
+                "platform_output": "file_outputs",
+                "schema": {"type": "array", "items": {"type": "string"}},
+            },
+            "mode": "serialize_to_file",
+            "operation": "serialize_json_file",
+            "artifact_name": "xxx.json",
+            "reason": "materialize the structured FunctionItem result",
+        }]})
+
+    mapping_plan = await plan_runtime_io_mappings(
+        canonical_interface_contract=interface_plan,
+        function_items=[function_item],
+        platform_contract=contract,
+        planner_model="test",
+        model_call=model,
+    )
+    assert mapping_plan["mappings"][0]["operation"] == "serialize_json_file"
+
+    output_dir = tmp_path / "output"
+    function_result = {"summary": "abc", "records": []}
+    committed = project_and_commit_platform_outputs(
+        contract,
+        [{
+            "from_node": "scripts/summarizer.py",
+            "from_output": "result",
+            "to_node": "platform_output_node",
+            "to_input": "file_outputs",
+        }],
+        {"scripts/summarizer.py": {"result": function_result}},
+        runtime_io_mapping_plan=mapping_plan,
+        output_dir=str(output_dir),
+    )
+
+    artifact_path = output_dir / "xxx.json"
+    assert committed == {"file_outputs": [str(artifact_path)]}
+    assert json.loads(artifact_path.read_text(encoding="utf-8")) == function_result
