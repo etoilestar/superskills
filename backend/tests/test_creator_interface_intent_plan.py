@@ -1,6 +1,7 @@
 import json
 import pytest
 
+from backend.services.platform_io_contract import build_platform_io_contract
 from backend.services.creator.function_item_interface_plan import (
     CRITIC_SCHEMA, MULTIMODAL_INPUT_PROVENANCE_CONTRACT, PLATFORM_BOUNDARY_CONTRACT, InterfaceIntentPlanError, _compact_function_items,
     _interface_plan_prompt, build_graph_obligations_from_interfaces,
@@ -148,12 +149,13 @@ async def test_platform_boundary_contract_reviewer_rejects_platform_as_internal_
     ]}
 
     async def reviewer(messages, _model):
-        assert PLATFORM_BOUNDARY_CONTRACT in messages[0]["content"]
+        assert "INPUT AND PROVENANCE" in messages[0]["content"]
         return json.dumps({"passed": False, "issues": [{
-            "severity": "blocking", "code": "disconnected_data_flow",
+            "error_type": "provenance_error",
             "message": "The external request does not provide A's derived alpha value.",
             "affected_interfaces": ["I3"],
             "affected_inputs": [{"target_member": "scripts/b.py", "target_input": "alpha"}],
+            "affected_outputs": [],
             "evidence": {"observed": "platform request", "expected": "alpha produced by A"},
         }]})
 
@@ -169,7 +171,7 @@ async def test_platform_boundary_contract_reviewer_rejects_platform_as_internal_
             review_mode=review_mode,
         )
         assert len(issues) == 1
-        assert issues[0]["details"]["code"] == "disconnected_data_flow"
+        assert issues[0]["error_type"] == "provenance_error"
 
 
 def test_platform_boundary_contract_allows_nested_platform_source():
@@ -713,8 +715,9 @@ async def test_generator_may_repair_declared_source_path():
     assert "source_path is part of the declared logical binding" in generator_prompts[0]
     assert "Do not add opaque endpoint IDs or Graph edges" in generator_prompts[0]
     assert "Do not add source paths" not in generator_prompts[0]
+    assert "PRESUMPTION OF VALIDITY" in reviewer_prompts[0]
+    assert "deterministic_review_facts" in reviewer_prompts[0]
     for header in ("PLATFORM OUTPUT CONTRACT", "RUNTIME INPUT PROVENANCE CONTRACT"):
-        assert header in reviewer_prompts[0]
         assert header in generator_prompts[0]
 
 @pytest.mark.asyncio
@@ -1000,6 +1003,37 @@ async def test_reviewer_protocol_repair_runs_on_reviewer_route():
     assert models == ["reviewer-test-model", "reviewer-test-model"]
     assert "final_output_fields defines the legal platform-output domain" in prompts[0]
     assert "Do not treat every legal final_output_field as required" in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_prompt_is_conservative_and_receives_legal_output_facts():
+    items = [item("scripts/unit_a.py", [], [
+        {"port_id": "report_md", "description": "Markdown report", "contract": {"type": "string"}},
+        {"port_id": "file_outputs", "description": "generated file paths", "contract": {"type": "array"}},
+    ])]
+    plan = {"interfaces": [
+        m2p("I1", "scripts/unit_a.py", "report_md", "markdown"),
+        m2p("I2", "scripts/unit_a.py", "file_outputs", "file_outputs"),
+    ]}
+
+    async def reviewer(messages, _model):
+        prompt = messages[0]["content"]
+        payload = json.loads(messages[1]["content"])
+        assert len(prompt) < 7000
+        assert "PRESUMPTION OF VALIDITY" in prompt
+        assert "Ambiguity, missing detail" in prompt
+        assert "file_outputs -> file_paths" not in prompt
+        assert set(payload["deterministic_review_facts"]["legal_platform_outputs"]) >= {
+            "markdown", "file_outputs",
+        }
+        return json.dumps({"passed": True, "issues": []})
+
+    assert await review_interface_plan_semantically(
+        original_user_goal="compare CSV files", frozen_function_items=items,
+        interface_plan=plan, requirement_allocations=[], requirement_channels={},
+        system_requirements=[], platform_contract=build_platform_io_contract(),
+        reviewer_model="reviewer-test-model", model_call=reviewer,
+    ) == []
 
 
 @pytest.mark.asyncio

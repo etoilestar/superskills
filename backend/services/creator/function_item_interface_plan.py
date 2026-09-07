@@ -1947,216 +1947,59 @@ async def review_interface_plan_semantically(
     if review_mode not in {"full", "existing_bindings_only"}:
         raise ValueError(f"unsupported Interface semantic review mode: {review_mode}")
     mode_contract = "" if review_mode == "full" else """
-
-EXISTING-BINDING-ONLY MODE
-Coverage may currently be incomplete.
-
-Do NOT report:
-- missing receiving slots
-- missing Interfaces
-- duplicate provenance
-- missing platform terminal
-- graph completeness
-
-Those are deterministic backend responsibilities. Review ONLY semantic
-correctness of Interfaces that already exist, including platform_to_member,
-member_to_member, and member_to_platform records.
-
-STRUCTURED BINDING AUTHORITY
-The semantic transfer is defined by structured binding fields. goal is
-explanatory only. If goal describes one semantic value while the structured
-source actually declares another value, judge the structured binding itself.
-A plausible goal cannot make an incorrect structured source/target binding valid.
+EXISTING-BINDING-ONLY MODE: review only Interfaces already present. Coverage,
+missing terminals, duplicate provenance, and graph completeness are out of scope.
 """
-    prompt = AUTHORITY_CONTRACT + """
-
-    """ + CANONICAL_INTERFACE_CONTRACT_RULE + """
-
-    """ + PLATFORM_OUTPUT_CONTRACT + """
-
-    """ + PLATFORM_OUTPUT_MAPPING_CONTRACT + """
-
-    """ + PLATFORM_BOUNDARY_CONTRACT + """
-
-    """ + PLATFORM_INPUT_HIERARCHY_CONTRACT + """
-
-    """ + RUNTIME_INPUT_PROVENANCE_CONTRACT + """
-
-    """ + MULTIMODAL_INPUT_PROVENANCE_CONTRACT + """
-
-    """ + SOURCE_PATH_CONTRACT + """
-
-    1. AUTHORITATIVE FACTS
-
-    The payload contains:
-
-    - confirmed user requirements
-    - frozen FunctionItems
-    - frozen logical input/output contracts
-    - runtime source facts
-    - immutable platform contract
-    - complete Interface Plan
-
-    These facts are authoritative.
-
-    The Interface Plan declares semantic bindings between logical ports.
-
-    The reviewer does not redesign the system and does not replace upstream contracts.
-
-
-    2. DETERMINISTIC VALIDITY PRECONDITION
-
-    The backend has already validated:
-
-    - Interface schema
-    - Interface kind correctness
-    - logical member references
-    - logical input existence
-    - logical output existence
-    - platform output identifier existence
-    - required structural coverage
-
-    Do NOT report deterministic validation failures as semantic defects.
-
-
-    3. PLATFORM OUTPUT IMMUTABILITY RULE
-
-    Platform output fields are external contract identifiers.
-
-    final_output_fields is the authoritative legal output domain.
-
-    The reviewer MUST NOT:
-
-    - rename platform output fields
-    - replace platform output fields
-    - prefer another output name
-    - judge whether an output field name is intuitive
-    - infer a better output field
-
-    Example:
-
-    Platform contract:
-
-    final_output_fields:
-    [
-        "file_outputs",
-        "text"
-    ]
-
-
-    Interface:
-
-    source_output:
-    file_outputs
-
-    target_platform_output:
-    file_outputs
-
-
-    This is a valid binding if the semantic value matches.
-
-    The reviewer MUST NOT suggest:
-
-    file_outputs -> file_paths
-
-    unless the platform contract explicitly defines file_paths as the target contract field.
-
-
-    4. SEMANTIC REVIEW TASK
-
-    Only review semantic compatibility.
-
-    For every Interface:
-
-    Check:
-
-    A. Does the declared source produce the semantic value required by the target?
-
-    B. Does the receiving logical port accept that semantic value?
-
-    C. Does the Interface kind match the actual provenance?
-
-    D. Does source_path select the intended semantic value when used?
-
-
-    Do NOT check:
-
-    - whether a source or target field exists (deterministic validation owns this)
-    - whether source and target schemas are structurally equal
-    - whether a field name looks natural
-    - whether another field name would be clearer
-    - whether another design would be preferred
-    - whether a valid contract field should be renamed
-
-
-    5. OUTPUT BOUNDARY REVIEW
-
-    For member_to_platform:
-
-    Evaluate:
-
-    source_member.source_output
-            ->
-    target_platform_output
-
-    Do not report a mapping as a type mismatch merely because its endpoint
-    schemas differ. Representation adaptation is resolved only at runtime.
-
-
-    The reviewer checks semantic compatibility only.
-
-    The reviewer does NOT reinterpret:
-
-    source_output names.
-
-    The reviewer does NOT create new platform outputs.
-
-    The reviewer does NOT replace declared platform outputs.
-
-
-    6. ISSUE EVIDENCE STANDARD
-
-    Only report a defect when:
-
-    - the Interface is structurally valid;
-    - the referenced ports exist;
-    - a concrete semantic mismatch exists.
-
-    A different possible design is not a defect.
-
-    A preferred naming style is not a defect.
-
-    A valid alternative mapping is not a defect.
-
-
-    7. AUTHORITY LIMIT
-
-    The reviewer MUST NOT:
-
-    - modify Interface records;
-    - generate repaired plans;
-    - propose edits;
-    - select different sources;
-    - select different targets;
-    - create Graph edges;
-    - use opaque endpoint IDs.
-
-    The reviewer only returns semantic diagnostics.
-
-
-    8. OUTPUT CONTRACT
-
-    Classify every defect by its primary failed dimension:
-    binding_error (boundary/reference), provenance_error (semantic origin),
-    missing_source_error (required source absent), or schema_error (contract structure).
-    Independently check schema correctness, boundary correctness, and
-    provenance correctness. Do not collapse these into "interface invalid".
-
-    passed=true exactly when issues is empty.
-
-    Return only strict JSON:
-
-    """ + json.dumps(INTERFACE_REVIEW_SCHEMA, ensure_ascii=False)
+    # Keep this prompt deliberately small.  The planner and repair generator need
+    # the complete cross-stage rulebook; the reviewer receives an already-valid
+    # plan and needs only a conservative semantic acceptance policy.  Repeating
+    # forbidden alternatives here used to anchor smaller reviewer models on the
+    # very replacements they were told not to propose.
+    prompt = f"""INTERFACE SEMANTIC REVIEWER
+
+The backend has already established deterministic validity: every referenced
+member and logical port exists, every target_platform_output is declared in
+final_output_fields, endpoint types passed deterministic validation, and required
+coverage is satisfied. Treat deterministic_review_facts in the payload as final.
+Do not report or re-check any of those facts.
+
+Review only whether an existing binding contradicts an explicit authoritative
+semantic fact in the payload. Use this evidence order:
+1. frozen FunctionItem port contract and description;
+2. immutable platform contract;
+3. confirmed requirements and requirement allocations;
+4. Interface structured binding fields.
+semantic_reason, naming intuition, common API conventions, and guesses about the
+eventual runtime value are not evidence of a defect.
+
+PRESUMPTION OF VALIDITY
+Accept a binding unless the authoritative evidence above proves a concrete
+semantic contradiction. Ambiguity, missing detail, a merely possible mismatch,
+or a different valid design must pass. Words such as "likely", "probably", and
+"may not" cannot support an issue. Evidence must identify the two conflicting
+authoritative declarations.
+
+OUTPUT BOUNDARY
+final_output_fields defines the legal platform-output domain. Every name listed
+in deterministic_review_facts.legal_platform_outputs is declared and legal;
+never claim otherwise. Do not treat every legal final_output_field as required.
+A member output may map directly to a legal platform output with the same or a
+different name. Representation adaptation, serialization, rendering, and schema
+conversion are runtime responsibilities and are never review defects.
+
+INPUT AND PROVENANCE
+Report only an explicit semantic-origin contradiction, such as a frozen derived
+input bound to an external value when an authoritative declaration says it must
+come from a member. Do not infer provenance from field-name similarity.
+source_path is semantic only when an authoritative declaration identifies the
+nested value it must select.
+
+{mode_contract}
+Return diagnostics only; do not propose a replacement, repair, transform, or new
+Interface. passed=true exactly when issues is empty. Every issue object must
+include every schema field, using [] for affected_inputs or affected_outputs when
+that category is not applicable. Return strict JSON matching:
+{json.dumps(INTERFACE_REVIEW_SCHEMA, ensure_ascii=False)}"""
     payload = {
         "system_goal": original_user_goal,
         "function_items": _compact_function_items(frozen_function_items),
@@ -2165,6 +2008,12 @@ A plausible goal cannot make an incorrect structured source/target binding valid
         "requirement_channels": requirement_channels or {},
         "unowned_system_requirements": system_requirements or [],
         "platform_contract": platform_contract or {},
+        "deterministic_review_facts": {
+            "plan_is_structurally_valid": True,
+            "endpoint_types_validated": True,
+            "required_coverage_validated": True,
+            "legal_platform_outputs": platform_output_names(platform_contract),
+        },
     }
     raw_response = await model_call(
             [{"role": "system", "content": prompt},
