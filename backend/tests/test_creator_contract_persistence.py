@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from backend.services.creator import api
 
 
@@ -55,3 +57,66 @@ def test_revision_context_reconstructs_baseline_for_legacy_skill(tmp_path, monke
     assert baseline["source"] == "existing_skill_artifacts"
     assert baseline["script_contents"]["scripts/run.py"] == "print('legacy')\n"
 
+
+def test_derive_mode_reads_source_but_targets_new_skill():
+    request = api.PreparePlanRequest(
+        mode="derive",
+        source_skill_name="base-skill",
+        skill_name="enhanced-skill",
+        user_request="add another output",
+    )
+
+    assert api._prepare_baseline_skill_name(request) == "base-skill"
+    blueprint = "# Plan\n- **Skill 名称**: base-skill\n"
+    assert "enhanced-skill" in api._retarget_derived_blueprint(blueprint, request)
+
+
+@pytest.mark.asyncio
+async def test_derived_initialization_copies_only_planned_baseline_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    source = tmp_path / "base"
+    (source / "scripts").mkdir(parents=True)
+    (source / "assets").mkdir()
+    (source / ".creator").mkdir()
+    (source / "SKILL.md").write_text("# Base\n", encoding="utf-8")
+    (source / "scripts" / "keep.py").write_text("print('keep')\n", encoding="utf-8")
+    (source / "scripts" / "obsolete.py").write_text("print('old')\n", encoding="utf-8")
+    (source / "assets" / "logo.txt").write_text("logo", encoding="utf-8")
+    (source / ".creator" / "contracts.json").write_text("{}", encoding="utf-8")
+
+    def fake_run_action(_payload):
+        target = tmp_path / "enhanced"
+        target.mkdir(parents=True, exist_ok=True)
+        return {"success": True, "path": str(target), "message": "ok"}
+
+    monkeypatch.setattr(api, "run_action", fake_run_action)
+    response = await api.init_skill(api.InitSkillRequest(
+        skill_name="enhanced",
+        source_skill_name="base",
+        baseline_files=["SKILL.md", "scripts/keep.py", "assets/logo.txt"],
+    ))
+
+    target = tmp_path / "enhanced"
+    assert response.success is True
+    assert (target / "scripts" / "keep.py").read_text(encoding="utf-8") == "print('keep')\n"
+    assert (target / "assets" / "logo.txt").read_text(encoding="utf-8") == "logo"
+    assert not (target / "scripts" / "obsolete.py").exists()
+    assert not (target / ".creator" / "contracts.json").exists()
+    assert (source / "scripts" / "keep.py").read_text(encoding="utf-8") == "print('keep')\n"
+    assert (source / ".creator" / "contracts.json").read_text(encoding="utf-8") == "{}"
+
+
+@pytest.mark.asyncio
+async def test_plain_creation_initialization_remains_source_independent(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+
+    def fake_run_action(_payload):
+        target = tmp_path / "brand-new"
+        target.mkdir(parents=True, exist_ok=True)
+        return {"success": True, "path": str(target), "message": "ok"}
+
+    monkeypatch.setattr(api, "run_action", fake_run_action)
+    response = await api.init_skill(api.InitSkillRequest(skill_name="brand-new"))
+
+    assert response.success is True
+    assert (tmp_path / "brand-new").is_dir()
