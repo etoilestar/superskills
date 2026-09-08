@@ -6,6 +6,36 @@
     </div>
 
     <div class="toolbar">
+      <div class="creator-skill-picker">
+        <label for="creator-existing-skill">工作方式</label>
+        <select
+          id="creator-existing-skill"
+          v-model="selectedExistingSkillName"
+          :disabled="streaming || existingSkillsLoading"
+          @change="handleExistingSkillSelection"
+        >
+          <option value="">创建新 Skill</option>
+          <option v-for="skill in existingSkills" :key="skill.name" :value="skill.name">
+            增强 {{ skill.display_name || skill.name }}
+          </option>
+        </select>
+        <button class="btn-ghost" type="button" :disabled="streaming || existingSkillsLoading" @click="loadExistingSkills">
+          {{ existingSkillsLoading ? '加载中…' : '刷新' }}
+        </button>
+        <span v-if="selectedExistingSkillName" class="revision-target">
+          将基于 <strong>{{ selectedExistingSkillName }}</strong> 的现有产物和历史合同增量修改
+        </span>
+        <span v-else class="muted">从空白需求开始</span>
+        <label v-if="selectedExistingSkillName" for="creator-derived-skill-name">新 Skill 名称</label>
+        <input
+          v-if="selectedExistingSkillName"
+          id="creator-derived-skill-name"
+          v-model.trim="derivedSkillName"
+          :disabled="streaming"
+          placeholder="例如 report-generator-pro"
+        />
+      </div>
+      <div v-if="existingSkillsError" class="skill-picker-error">{{ existingSkillsError }}</div>
       <button
         class="btn-ghost btn-thoughts"
         :class="{ active: showThoughts }"
@@ -105,6 +135,7 @@
           <SkillCreationPanel
             v-if="showCreationPanel && creationPlan"
             :skill-name="creationPlan.skill_name"
+            :source-skill-name="creationPlan.source_skill_name || selectedExistingSkillName"
             :files="creationPlan.files"
             :blueprint-text="blueprintText"
             :conversation-history="chatHistory"
@@ -257,8 +288,9 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick } from 'vue'
+import { ref, computed, nextTick, onMounted } from 'vue'
 import { streamPrepareCreationPlan, buildClarificationQuickActions, uploadCreatorContextFile } from '../composables/useCreator.js'
+import { fetchSkills } from '../composables/useSkills.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import SkillCreationPanel from '../components/SkillCreationPanel.vue'
 import CreatorExecutionPanel from '../components/CreatorExecutionPanel.vue'
@@ -330,6 +362,10 @@ const reviewSummary = ref(null)
 const showInternalBlueprint = ref(false)
 const skillName = ref('')
 const selectedExistingSkillName = ref('')
+const derivedSkillName = ref('')
+const existingSkills = ref([])
+const existingSkillsLoading = ref(false)
+const existingSkillsError = ref('')
 const pendingSupplementQuestion = ref('')
 const pendingPrepareAction = ref('none')
 const recoverablePlanningFailure = ref(null)
@@ -543,8 +579,8 @@ const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system
 function resolveCurrentSkillName() {
   return (
     creationPlan.value?.skill_name ||
+    derivedSkillName.value ||
     skillName.value ||
-    selectedExistingSkillName.value ||
     ''
   )
 }
@@ -633,6 +669,41 @@ function shouldPreparePlanRevise({
     previousBlueprintText
   )
 }
+
+async function loadExistingSkills() {
+  existingSkillsLoading.value = true
+  existingSkillsError.value = ''
+  try {
+    existingSkills.value = await fetchSkills('creator')
+  } catch (err) {
+    existingSkillsError.value = `已有 Skill 加载失败：${err?.message || err}`
+  } finally {
+    existingSkillsLoading.value = false
+  }
+}
+
+function handleExistingSkillSelection() {
+  const selected = selectedExistingSkillName.value
+  messages.value = []
+  creationPlan.value = null
+  reviewSummary.value = null
+  pendingBlueprintText.value = ''
+  pendingFunctionItems.value = []
+  pendingResponsibilityEdges.value = []
+  resolvedFunctionItems.value = null
+  resolvedResponsibilityEdges.value = null
+  resolvedRequirementGraph.value = null
+  showCreationPanel.value = false
+  error.value = ''
+  rootUserRequest.value = ''
+  derivedSkillName.value = selected ? `${selected}-enhanced` : ''
+  skillName.value = derivedSkillName.value
+  if (selected) {
+    input.value = ''
+  }
+}
+
+onMounted(loadExistingSkills)
 
 async function scrollBottom() {
   await nextTick()
@@ -912,18 +983,23 @@ async function send() {
 
     const humanFeedback = text
 
-    const mode = shouldPreparePlanRevise({
-      skillName: currentSkillName,
+    if (selectedExistingSkillName.value && !derivedSkillName.value) {
+      throw new Error('请输入新 Skill 名称。')
+    }
+    if (selectedExistingSkillName.value === derivedSkillName.value) {
+      throw new Error('新 Skill 名称不能与来源 Skill 相同。')
+    }
 
-      previousBlueprintText,
-    })
-      ? 'revise'
-      : 'create'
+    const mode = selectedExistingSkillName.value
+      ? 'derive'
+      : (shouldPreparePlanRevise({ skillName: currentSkillName, previousBlueprintText }) ? 'revise' : 'create')
 
     const payload = {
       mode,
 
       skill_name: currentSkillName,
+
+      source_skill_name: selectedExistingSkillName.value || null,
 
       user_request: (
         effectiveUserRequest
@@ -946,6 +1022,11 @@ async function send() {
       function_items: (
         creationPlan.value?.function_items ||
         pendingFunctionItems.value ||
+        []
+      ),
+
+      requirement_allocations: (
+        creationPlan.value?.requirement_allocations ||
         []
       ),
 
@@ -1436,6 +1517,7 @@ function clearChat() {
   skillName.value = ''
 
   selectedExistingSkillName.value = ''
+  derivedSkillName.value = ''
 
   pendingBlueprintText.value = ''
 
@@ -1502,6 +1584,34 @@ function clearChat() {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
+
+.creator-skill-picker {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+}
+.creator-skill-picker label { font-weight: 600; }
+.creator-skill-picker select,
+.creator-skill-picker input {
+  min-width: 220px;
+  max-width: min(380px, 45vw);
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+}
+.creator-skill-picker input { min-width: 210px; }
+.revision-target {
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.skill-picker-error { color: var(--danger, #b42318); font-size: 12px; }
 
 .btn-thoughts {
   position: relative;
