@@ -11868,49 +11868,12 @@ async def _prepare_plan_impl(
             ),
         )
 
-    if confirmed_prepare:
-        # Confirmation freezes the existing full blueprint.
-        #
-        # review_summary is never used to reconstruct it.
-        if not previous_blueprint_text:
-            return PreparePlanResponse(
-                status="blocked",
-
-                prepare_stage=(
-                    "blueprint_protocol_failed"
-                ),
-
-                clarifying_questions=[],
-
-                review_summary=(
-                    PreparePlanReviewSummary()
-                ),
-
-                blueprint_text="",
-
-                skill_name=(
-                    skill_name
-                ),
-
-                creation_blockers=[
-                    _prepare_protocol_issue(
-                        (
-                            "missing_confirmed_"
-                            "blueprint_state"
-                        ),
-                        (
-                            "用户确认创建要点时，"
-                            "previous_blueprint_text 为空。"
-                            "Creator 不允许从 review_summary "
-                            "重新生成 full blueprint。"
-                        ),
-                        field=(
-                            "previous_blueprint_text"
-                        ),
-                    )
-                ],
-            )
-
+    if confirmed_prepare and previous_blueprint_text:
+        # Confirmation freezes an existing full blueprint.  When confirmation
+        # arrives before a blueprint exists (for example, after the planner
+        # asked its final business question), continue through the planner
+        # below so it can create the first blueprint from authoritative user
+        # context.  A review_summary is never used to reconstruct one.
         if request.function_items is None:
             return PreparePlanResponse(
                 status="blocked",
@@ -12360,33 +12323,33 @@ async def _prepare_plan_impl(
                 ],
             )
 
-        # First complete blueprint:
-        #
-        # project it for display and freeze it in the
-        # response so the frontend can send it back on
-        # confirmation.
-        return await confirmation_response(
-            current_blueprint_text=(
-                blueprint_text
-            ),
+        if not confirmed_prepare:
+            # First complete blueprint: project it for display and freeze it in
+            # the response so the frontend can send it back on confirmation.
+            return await confirmation_response(
+                current_blueprint_text=(
+                    blueprint_text
+                ),
 
-            current_prepared=prepared,
+                current_prepared=prepared,
 
-            current_skill_name=(
-                skill_name
-            ),
+                current_skill_name=(
+                    skill_name
+                ),
 
-            prepare_stage=(
-                "creation_points_confirmation"
-            ),
+                prepare_stage=(
+                    "creation_points_confirmation"
+                ),
 
-            question=(
-                _PREPARE_SUPPLEMENT_QUESTION
-            ),
-        )
+                question=(
+                    _PREPARE_SUPPLEMENT_QUESTION
+                ),
+            )
 
     # ------------------------------------------------------------------
-    # From here on, the user has confirmed an existing full blueprint.
+    # From here on, the user has confirmed a full blueprint. It is either the
+    # existing frozen blueprint received from the frontend or the first full
+    # blueprint just generated after an explicit no-more-supplement answer.
     #
     # No business planner and no review_summary -> blueprint conversion.
     # ------------------------------------------------------------------
