@@ -97,6 +97,50 @@ def test_derive_hydrates_frozen_graph_instead_of_rebuilding_it(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_legacy_derive_retries_generated_skill_payload_as_fileplan_envelope(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    source = tmp_path / "csv-against"
+    (source / "scripts").mkdir(parents=True)
+    (source / "SKILL.md").write_text("# CSV Against\n", encoding="utf-8")
+    (source / "scripts" / "compare_csv.py").write_text("print('compare')\n", encoding="utf-8")
+    responses = iter([
+        json.dumps({
+            "status": "success",
+            "skill_name": "csv-against-summary",
+            "file_contents": {"SKILL.md": "generated too early"},
+        }),
+        json.dumps({
+            "status": "needs_clarification",
+            "clarifying_questions": ["请选择总结深度。A. 简要 B. 详细"],
+            "review_summary": {},
+            "internal_blueprint_text": "",
+            "skill_name": "csv-against-summary",
+            "blockers": [],
+        }),
+    ])
+    calls = []
+
+    async def fake_complete(messages, role, fallback_model):
+        calls.append(messages)
+        return next(responses)
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+    monkeypatch.setattr(api, "route_model", lambda *_args, **_kwargs: type("Route", (), {"model": "planner"})())
+
+    result = await api._generate_internal_blueprint_or_questions(api.PreparePlanRequest(
+        mode="derive",
+        source_skill_name="csv-against",
+        skill_name="csv-against-summary",
+        user_request="需要加上对表格内容的总结功能",
+    ))
+
+    assert len(calls) == 2
+    assert "FILEPLAN ENVELOPE REPAIR" in calls[1][0]["content"]
+    assert result["status"] == "needs_clarification"
+    assert result["clarifying_questions"] == ["请选择总结深度。A. 简要 B. 详细"]
+
+
+@pytest.mark.asyncio
 async def test_derived_initialization_copies_only_planned_baseline_files(tmp_path, monkeypatch):
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
     source = tmp_path / "base"

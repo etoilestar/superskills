@@ -4429,6 +4429,24 @@ def _normalize_prepare_clarifying_questions(raw_questions: Any) -> list[str]:
     return [question]
 
 
+def _prepare_fileplan_envelope_issue(data: Any) -> str:
+    """Describe an unusable first-pass planner envelope, or return empty."""
+    if not isinstance(data, dict):
+        return "response is not a JSON object"
+    status = str(data.get("status") or "").strip()
+    if status not in {"ready", "needs_clarification", "blocked"}:
+        return f"unsupported status: {status or '<empty>'}"
+    if status == "ready" and not str(
+        data.get("internal_blueprint_text") or data.get("blueprint_text") or ""
+    ).strip():
+        return "ready response is missing internal_blueprint_text"
+    if status == "needs_clarification" and not any(
+        str(question or "").strip() for question in (data.get("clarifying_questions") or [])
+    ):
+        return "needs_clarification response is missing clarifying_questions"
+    return ""
+
+
 def _prepare_feedback_wants_supplement(request: PreparePlanRequest) -> bool:
     if _prepare_has_explicit_action(request):
         return request.prepare_action == "request_supplement"
@@ -9944,27 +9962,57 @@ Blueprint Planner 只规划业务责任。
         ),
     )
 
-    text = await complete_creator_role_once(
-        [
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    default=str,
-                ),
-            },
-        ],
-        "planner", fallback_model=route.model,
-    )
+    planner_messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": json.dumps(payload, ensure_ascii=False, default=str),
+        },
+    ]
+    data: dict[str, Any] | None = None
+    envelope_issue = ""
+    for protocol_attempt in range(2):
+        messages = planner_messages
+        if protocol_attempt:
+            messages = [
+                {
+                    "role": "system",
+                    "content": system_prompt + """
 
-    data = _parse_prepare_plan_json(
-        text
-    )
+FILEPLAN ENVELOPE REPAIR
+The previous response did not satisfy the first-pass FilePlan JSON envelope.
+Return only the exact prepare-plan JSON object requested above.  Do not return
+status=success, generated file_contents, Markdown analysis, a Skill package, or
+explanatory text.  For status=ready, internal_blueprint_text must contain the
+complete Blueprint/SkillPlan.  For status=needs_clarification, provide one real
+blocking question with options.  Preserve the supplied existing_skill_context
+and apply the incremental user request; do not restart as a new Skill.
+""".strip(),
+                },
+                planner_messages[1],
+            ]
+        text = await complete_creator_role_once(
+            messages, "planner", fallback_model=route.model,
+        )
+        try:
+            candidate = _parse_prepare_plan_json(text)
+        except Exception as exc:
+            envelope_issue = f"invalid JSON transport: {type(exc).__name__}: {exc}"
+            continue
+        envelope_issue = _prepare_fileplan_envelope_issue(candidate)
+        if not envelope_issue:
+            data = candidate
+            break
+        logger.warning(
+            "[Creator][fileplan_envelope] attempt=%d issue=%s",
+            protocol_attempt + 1,
+            envelope_issue,
+        )
+    if data is None:
+        raise PreparePlanProtocolError(
+            "Blueprint Planner returned an invalid first-pass FilePlan envelope "
+            f"after one protocol retry: {envelope_issue}"
+        )
 
     data.pop(
         "tool_pool_patch",
