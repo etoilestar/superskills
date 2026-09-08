@@ -367,6 +367,7 @@ import {
 
 const props = defineProps({
   skillName: { type: String, required: true },
+  sourceSkillName: { type: String, default: '' },
   files: { type: Array, required: true },    // [{ path, purpose, required, can_skip }]
   blueprintText: { type: String, default: '' },
   conversationHistory: { type: Array, default: () => [] },
@@ -1148,7 +1149,11 @@ const skillInitialized = ref(false)
 
 async function ensureSkillInitialized() {
   if (skillInitialized.value) return
-  const r = await initSkill(localSkillName.value, { confirmedUploadedAssets: props.confirmedUploadedAssets || [] })
+  const r = await initSkill(localSkillName.value, {
+    confirmedUploadedAssets: props.confirmedUploadedAssets || [],
+    sourceSkillName: props.sourceSkillName,
+    baselineFiles: localFiles.value.map(file => file.path),
+  })
   if (!r.success) throw new Error(r.message)
   skillInitialized.value = true
 }
