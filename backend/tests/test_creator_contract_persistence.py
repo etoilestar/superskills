@@ -132,6 +132,47 @@ async def test_derived_initialization_copies_only_planned_baseline_files(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_legacy_derive_confirmation_reconstructs_blueprint_from_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    source = tmp_path / "csv-against"
+    (source / "scripts").mkdir(parents=True)
+    (source / "SKILL.md").write_text("# CSV Against\n", encoding="utf-8")
+    (source / "scripts" / "compare_csv.py").write_text("print('compare')\n", encoding="utf-8")
+
+    planner_requests = []
+
+    async def fake_generate(request):
+        planner_requests.append(request)
+        return {
+            "status": "needs_clarification",
+            "clarifying_questions": ["planner was reached"],
+            "review_summary": {},
+            "internal_blueprint_text": "",
+            "skill_name": "csv-against-summary",
+            "blockers": [],
+        }
+
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+
+    response = await api._prepare_plan_impl(api.PreparePlanRequest(
+        mode="derive",
+        source_skill_name="csv-against",
+        skill_name="csv-against-summary",
+        user_request="需要加上对表格内容的总结功能",
+        human_feedback="B. 暂时没有补充，按已有信息继续",
+        prepare_action="confirm",
+    ))
+
+    assert len(planner_requests) == 1
+    assert response.status == "needs_clarification"
+    assert response.clarifying_questions[0].startswith("planner was reached")
+    assert not any(
+        isinstance(blocker, dict) and blocker.get("code") == "missing_confirmed_blueprint_state"
+        for blocker in response.creation_blockers
+    )
+
+
+@pytest.mark.asyncio
 async def test_plain_creation_initialization_remains_source_independent(tmp_path, monkeypatch):
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
 

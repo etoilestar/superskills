@@ -11690,6 +11690,20 @@ async def _prepare_plan_impl(
         or ""
     ).strip()
 
+    if (
+        confirmed_prepare
+        and not previous_blueprint_text
+        and request.mode == "derive"
+    ):
+        # A legacy source Skill can have complete, usable artifacts without a
+        # persisted Creator blueprint.  In that case a "continue with the
+        # existing information" answer confirms that no more business input is
+        # needed; it cannot freeze blueprint state that never existed.  Keep
+        # the request in the planning path so the planner reconstructs the
+        # baseline from those artifacts and applies the incremental request.
+        # This does not reconstruct a blueprint from review_summary.
+        confirmed_prepare = False
+
     prepared: dict[
         str,
         Any,
