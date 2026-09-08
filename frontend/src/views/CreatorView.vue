@@ -26,6 +26,14 @@
           将基于 <strong>{{ selectedExistingSkillName }}</strong> 的现有产物和历史合同增量修改
         </span>
         <span v-else class="muted">从空白需求开始</span>
+        <label v-if="selectedExistingSkillName" for="creator-derived-skill-name">新 Skill 名称</label>
+        <input
+          v-if="selectedExistingSkillName"
+          id="creator-derived-skill-name"
+          v-model.trim="derivedSkillName"
+          :disabled="streaming"
+          placeholder="例如 report-generator-pro"
+        />
       </div>
       <div v-if="existingSkillsError" class="skill-picker-error">{{ existingSkillsError }}</div>
       <button
@@ -127,6 +135,7 @@
           <SkillCreationPanel
             v-if="showCreationPanel && creationPlan"
             :skill-name="creationPlan.skill_name"
+            :source-skill-name="creationPlan.source_skill_name || selectedExistingSkillName"
             :files="creationPlan.files"
             :blueprint-text="blueprintText"
             :conversation-history="chatHistory"
@@ -353,6 +362,7 @@ const reviewSummary = ref(null)
 const showInternalBlueprint = ref(false)
 const skillName = ref('')
 const selectedExistingSkillName = ref('')
+const derivedSkillName = ref('')
 const existingSkills = ref([])
 const existingSkillsLoading = ref(false)
 const existingSkillsError = ref('')
@@ -569,8 +579,8 @@ const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system
 function resolveCurrentSkillName() {
   return (
     creationPlan.value?.skill_name ||
+    derivedSkillName.value ||
     skillName.value ||
-    selectedExistingSkillName.value ||
     ''
   )
 }
@@ -686,7 +696,8 @@ function handleExistingSkillSelection() {
   showCreationPanel.value = false
   error.value = ''
   rootUserRequest.value = ''
-  skillName.value = selected
+  derivedSkillName.value = selected ? `${selected}-enhanced` : ''
+  skillName.value = derivedSkillName.value
   if (selected) {
     input.value = ''
   }
@@ -972,18 +983,23 @@ async function send() {
 
     const humanFeedback = text
 
-    const mode = shouldPreparePlanRevise({
-      skillName: currentSkillName,
+    if (selectedExistingSkillName.value && !derivedSkillName.value) {
+      throw new Error('请输入新 Skill 名称。')
+    }
+    if (selectedExistingSkillName.value === derivedSkillName.value) {
+      throw new Error('新 Skill 名称不能与来源 Skill 相同。')
+    }
 
-      previousBlueprintText,
-    })
-      ? 'revise'
-      : 'create'
+    const mode = selectedExistingSkillName.value
+      ? 'derive'
+      : (shouldPreparePlanRevise({ skillName: currentSkillName, previousBlueprintText }) ? 'revise' : 'create')
 
     const payload = {
       mode,
 
       skill_name: currentSkillName,
+
+      source_skill_name: selectedExistingSkillName.value || null,
 
       user_request: (
         effectiveUserRequest
@@ -1501,6 +1517,7 @@ function clearChat() {
   skillName.value = ''
 
   selectedExistingSkillName.value = ''
+  derivedSkillName.value = ''
 
   pendingBlueprintText.value = ''
 
@@ -1577,7 +1594,8 @@ function clearChat() {
   font-size: 13px;
 }
 .creator-skill-picker label { font-weight: 600; }
-.creator-skill-picker select {
+.creator-skill-picker select,
+.creator-skill-picker input {
   min-width: 220px;
   max-width: min(380px, 45vw);
   padding: 7px 10px;
@@ -1586,6 +1604,7 @@ function clearChat() {
   background: var(--surface);
   color: var(--text);
 }
+.creator-skill-picker input { min-width: 210px; }
 .revision-target {
   color: var(--accent);
   overflow: hidden;
