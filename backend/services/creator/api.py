@@ -8,6 +8,7 @@ import math
 import re
 import shutil
 import traceback
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass
 
 import httpx
@@ -4056,15 +4057,53 @@ def _read_prepare_existing_skill_context(skill_name: str | None) -> dict[str, An
             return []
         return sorted(p.relative_to(root).as_posix() for p in base.rglob("*") if p.is_file())
 
-    return {
+    def read_tree(rel: str, *, per_file_limit: int = 12000, total_limit: int = 50000) -> dict[str, str]:
+        """Read a bounded view of an existing product for incremental planning."""
+        result: dict[str, str] = {}
+        remaining = total_limit
+        for path in list_dir(rel):
+            if remaining <= 0:
+                break
+            candidate = root / path
+            try:
+                content = candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            excerpt = content[: min(per_file_limit, remaining)]
+            result[path] = excerpt
+            remaining -= len(excerpt)
+        return result
+
+    creator_bundle_text = read_text(".creator/contracts.json")
+    try:
+        creator_contracts = json.loads(creator_bundle_text) if creator_bundle_text else {}
+    except (TypeError, json.JSONDecodeError):
+        creator_contracts = {}
+
+    context = {
         "skill_name": safe_name,
         "skill_md": read_text("SKILL.md")[:20000],
         "scripts": list_dir("scripts"),
         "references": list_dir("references"),
         "assets": list_dir("assets"),
+        "script_contents": read_tree("scripts"),
+        "reference_contents": read_tree("references", per_file_limit=6000, total_limit=18000),
         "requirement_graph": read_text(".creator/requirement_graph.json")[:20000],
         "workflow_allocation_summary": read_text(".creator/workflow_allocation_summary.txt")[:12000],
+        "saved_creator_contracts": creator_contracts,
+        "saved_contracts_available": bool(creator_contracts),
     }
+    if not creator_contracts:
+        # Older Skills have no Creator metadata.  Give the planner an explicit
+        # reconstructed baseline rather than pretending this is a fresh build.
+        context["reconstructed_contract_baseline"] = {
+            "source": "existing_skill_artifacts",
+            "skill_md": context["skill_md"],
+            "files": ["SKILL.md", *context["scripts"], *context["references"], *context["assets"]],
+            "script_contents": context["script_contents"],
+            "reference_contents": context["reference_contents"],
+        }
+    return context
 
 
 def _parse_prepare_plan_json(raw: str) -> dict[str, Any]:
@@ -9023,6 +9062,12 @@ from the normalized structured contract.
 不要 Markdown。
 不要解释 JSON 外文本。
 
+增量增强规则：
+- mode=revise 时必须保留现有 Skill 未被用户要求修改的能力、文件和接口，禁止按全新 Skill 重建。
+- existing_skill_context.saved_contracts_available=true 时，以 saved_creator_contracts 中上次冻结的蓝图、职责图、接口合同和文件计划为增量基线。
+- 若没有 saved_creator_contracts，则先依据 reconstructed_contract_baseline、SKILL.md 和现有脚本/参考文件内容重建合同基线，再叠加本轮 user_request/human_feedback。
+- 新需求与旧合同冲突时只修改受影响的职责、接口和文件，并在 review_summary.changes 中明确列出增量变化。
+
 当前阶段是第一段 FilePlan / Blueprint planning pass，只负责：
 
 1. 判断业务需求是否已经足够明确；
@@ -11027,6 +11072,73 @@ def _persist_workflow_allocation_summary(
         encoding="utf-8",
     )
 
+
+def _persist_creator_contracts(
+    skill_name: str,
+    *,
+    blueprint_text: str,
+    requirement_graph: Any,
+    workflow_allocation_summary: str = "",
+    function_items: list[dict[str, Any]] | None = None,
+    responsibility_edges: list[dict[str, Any]] | None = None,
+    requirement_allocations: list[dict[str, Any]] | None = None,
+    files: list[Any] | None = None,
+    final_outputs: list[Any] | None = None,
+    tool_pool_summary: dict[str, Any] | None = None,
+    mode: str = "create",
+    user_request: str = "",
+    human_feedback: str = "",
+) -> dict[str, Any]:
+    """Keep Creator authorities beside the generated Skill for later revisions.
+
+    ``.creator`` is operational metadata, not a new runtime dependency.  The
+    normal generation, validation and packaging chain therefore remains
+    unchanged while a subsequent ``mode=revise`` request can reuse the exact
+    contracts that produced the current files.
+    """
+    safe_name = _validate_skill_name(skill_name)
+    metadata_dir = settings.skills_path / safe_name / ".creator"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    graph_payload = (
+        requirement_graph.model_dump(mode="json")
+        if hasattr(requirement_graph, "model_dump")
+        else dict(requirement_graph or {})
+    )
+    previous_path = metadata_dir / "contracts.json"
+    revision = 1
+    if previous_path.is_file():
+        try:
+            revision = int(json.loads(previous_path.read_text(encoding="utf-8")).get("revision", 0)) + 1
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            revision = 1
+    def serialize(value: Any) -> Any:
+        return value.model_dump(mode="json") if hasattr(value, "model_dump") else value
+
+    payload = {
+        "schema_version": 1,
+        "skill_name": safe_name,
+        "revision": revision,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "change_request": {"user_request": user_request, "human_feedback": human_feedback},
+        "blueprint_text": str(blueprint_text or ""),
+        "function_items": function_items or [],
+        "responsibility_edges": responsibility_edges or [],
+        "requirement_allocations": requirement_allocations or [],
+        "requirement_graph": graph_payload,
+        "interface_contract": graph_interface_contract(graph_payload),
+        "workflow_allocation_summary": str(workflow_allocation_summary or ""),
+        "file_plan": [serialize(value) for value in (files or [])],
+        "final_outputs": [serialize(value) for value in (final_outputs or [])],
+        "tool_pool_summary": tool_pool_summary or {},
+    }
+    previous_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    (metadata_dir / "blueprint.md").write_text(str(blueprint_text or ""), encoding="utf-8")
+    (metadata_dir / "interface_contract.json").write_text(
+        json.dumps(payload["interface_contract"], ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return payload
+
 def _load_workflow_allocation_summary(skill_name: str) -> str:
     path = settings.skills_path / _validate_skill_name(skill_name) / ".creator" / "workflow_allocation_summary.txt"
     if not path.is_file():
@@ -12922,6 +13034,28 @@ async def _prepare_plan_impl(
             "tool_pool_summary": tool_pool_summary,
         })
 
+    persisted_function_items = (
+        list(getattr(plan, "function_items", []) or [])
+        if hasattr(plan, "function_items")
+        else list(getattr(getattr(plan, "skill_plan", None), "function_items", []) or [])
+    )
+    persisted_responsibility_edges = list(getattr(plan, "responsibility_edges", []) or [])
+    _persist_creator_contracts(
+        plan.skill_name,
+        blueprint_text=final_blueprint_text,
+        requirement_graph=graph_payload,
+        workflow_allocation_summary=_load_workflow_allocation_summary(plan.skill_name),
+        function_items=persisted_function_items,
+        responsibility_edges=persisted_responsibility_edges,
+        requirement_allocations=list((prepared.get("requirement_allocations") or []) if isinstance(prepared, dict) else (request.requirement_allocations or [])),
+        files=list(plan.files or []),
+        final_outputs=list(plan.final_outputs or []),
+        tool_pool_summary=tool_pool_summary,
+        mode=request.mode,
+        user_request=request.user_request,
+        human_feedback=request.human_feedback,
+    )
+
     return PreparePlanResponse(
         status="ready",
 
@@ -12935,16 +13069,14 @@ async def _prepare_plan_impl(
 
         skill_name=plan.skill_name,
 
-        function_items=(
-            list(getattr(plan, "function_items", []) or [])
-            if hasattr(plan, "function_items")
-            else list(getattr(getattr(plan, "skill_plan", None), "function_items", []) or [])
-        ),
+        function_items=persisted_function_items,
 
-        responsibility_edges=(
-            list(getattr(plan, "responsibility_edges", []) or [])
-            if hasattr(plan, "responsibility_edges")
-            else []
+        responsibility_edges=persisted_responsibility_edges,
+
+        requirement_allocations=list(
+            (prepared.get("requirement_allocations") or [])
+            if isinstance(prepared, dict)
+            else (request.requirement_allocations or [])
         ),
 
         files=plan.files,
