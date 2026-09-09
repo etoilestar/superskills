@@ -339,9 +339,6 @@ For every FunctionItem input:
 2. If no valid source exists, leave the input unresolved.
 3. Never bind another platform input only because names are similar.
 4. Never use one platform input as a container for another logical input.
-
-Forbidden: input_files -> primary_key_field
-Correct: options.primary_key_field -> primary_key_field
 """
 
 RUNTIME_REPAIR_RESTRICTION_CONTRACT = """RUNTIME REPAIR RESTRICTION CONTRACT
@@ -933,8 +930,8 @@ def runtime_input_source_facts(raw_input: Any, default_values: dict[str, Any] | 
     port_id = _compact_port_id(raw_input)
     defaults = default_values if isinstance(default_values, dict) else {}
     inline_default = isinstance(raw_input, dict) and "default" in raw_input
-    # ``options.font`` is a field default owned by the declared structured
-    # ``options`` input; it is not a second logical port.
+    # A nested default remains owned by its declared structured input; it does
+    # not create a second logical port.
     default_present = inline_default or (
         bool(port_id)
         and any(key == port_id or key.startswith(f"{port_id}.") for key in defaults)
@@ -1751,9 +1748,9 @@ output may be reused by separate Interfaces.
 5. HARD ACCEPTANCE CONDITIONS
 FUNCTIONITEM CONTRACT BEFORE RUNTIME BINDING
 Every FunctionItem input must have exactly one Interface during creation. Keep
-structured business values such as options as one object port; never expand
-options.font or other object properties into new logical inputs. Runtime only
-validates whether an optional/defaulted value is present.
+each declared structured business value as one object port; do not expand its
+nested properties into new logical inputs. Runtime only validates whether an
+optional/defaulted value is present.
 
 Do not modify FunctionItems, requirements, channels, or logical ports. Do not
 return opaque endpoint IDs, Graph edges, or extra fields. Do not
@@ -2353,14 +2350,22 @@ semantically valid transport.
 Modify only Interfaces explicitly named by violations. Use only
 remove_interface, replace_source, or replace_target. Never
 add an Interface and never regenerate or reorder the complete contract.
+One invalid Interface may cause failures on both of its endpoints. In that
+case, return TWO operations with the same interface_id in one atomic patch:
+replace_source followed by replace_target. Replacing a source never changes the
+target, and replacing a target never changes the source. Do not claim that one
+operation changed fields which are absent from that operation.
 5. HARD ACCEPTANCE CONDITIONS
 The complete result must match INTERFACE_SCHEMA. Every supplied acceptance fact
 is independently blocking; coverage alone is insufficient.
 6. SILENT SELF-CHECK
 Silently verify that every interface present uses declared source and target
-parameter names and compatible data types. Do not repair an absent input by
-adding or changing a platform mapping; that repair belongs solely to the
-FunctionItem input contract.
+parameter names and compatible data types. Source and target ports belong to
+independent namespaces: a declared target port never expands the legal source
+domain. Select platform sources exclusively from the platform boundary's
+declared input domain. To close an uncovered frozen target port, retarget an
+editable invalid Interface when the supplied facts support that binding; never
+add an Interface or change a frozen valid one.
 An optional_runtime_input still requires declared provenance. Optionality means
 the bound platform container may carry no value for that run; it does not permit
 removing the Interface. Never substitute an unrelated platform input merely to
@@ -2368,10 +2373,15 @@ preserve coverage.
 7. OUTPUT CONTRACT
 For deterministic semantic correction return strict JSON matching
 INTERFACE_PATCH_SCHEMA only. For protocol-shape correction only, return strict
-JSON matching INTERFACE_SCHEMA."""
+JSON matching INTERFACE_SCHEMA. Output the JSON object only: no Markdown fence,
+analysis, headings, or text after the object."""
         correction_prompt = f"{correction_prompt}\n\n{REFINEMENT_FEEDBACK_CONTRACT}"
 
         async def propose_correction(previous_candidate: Any, feedback: dict[str, Any]) -> Any:
+            # Every correction attempt is an atomic patch against the same
+            # deterministically parsed plan.  A rejected patch is not itself an
+            # Interface Plan and must never become the next patch baseline.
+            patch_baseline = parsed
             correction_payload = {
                 **payload,
                 "refinement_feedback": {
@@ -2381,8 +2391,21 @@ JSON matching INTERFACE_SCHEMA."""
                 },
                 "interface_schema": INTERFACE_SCHEMA,
                 "interface_patch_schema": INTERFACE_PATCH_SCHEMA,
-                "interfaces": (previous_candidate.get("interfaces") or []) if isinstance(previous_candidate, dict) else [],
+                "interfaces": (patch_baseline.get("interfaces") or []) if isinstance(patch_baseline, dict) else [],
                 "violations": facts,
+                "namespace_rules": {
+                    "platform_source_domain": sorted({
+                        _compact_port_id(value)
+                        for value in (
+                            (platform_contract or {}).get(
+                                "platform_skill_boundary", platform_contract or {}
+                            ).get("input_envelope_fields") or []
+                        )
+                        if _compact_port_id(value)
+                    }),
+                    "endpoint_namespaces_are_independent": True,
+                    "operations_are_endpoint_scoped": True,
+                },
                 "allowed_operations": ["remove_interface", "replace_source", "replace_target"],
             }
             if _include_previous_interface_plan(feedback):
@@ -2396,15 +2419,27 @@ JSON matching INTERFACE_SCHEMA."""
                 corrected = _parse_object(corrected_text)
                 if protocol_issue is None:
                     return validate_interface_patch(
-                        plan=previous_candidate, patch=corrected,
+                        plan=patch_baseline, patch=corrected,
                         function_items=frozen_function_items,
                         platform_contract=platform_contract, violations=facts,
                     )
                 return corrected
-            except InterfaceIntentPlanError:
-                return {"__invalid_transport__": corrected_text}
+            except InterfaceIntentPlanError as exc:
+                return {
+                    "__interface_patch_failure__": {
+                        "code": exc.code,
+                        "message": str(exc),
+                        "details": exc.details,
+                    }
+                }
 
         async def evaluate_correction(candidate_object: Any) -> CandidateEvaluation:
+            if isinstance(candidate_object, dict) and "__interface_patch_failure__" in candidate_object:
+                failure = candidate_object["__interface_patch_failure__"]
+                return CandidateEvaluation(
+                    accepted=False, candidate=candidate_object,
+                    acceptance_facts=[failure], semantic_comparable=False,
+                )
             try:
                 candidate = validate_interface_plan_protocol(candidate_object)
             except InterfaceIntentPlanError as exc:

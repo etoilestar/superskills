@@ -4607,15 +4607,13 @@ def _is_legacy_derive_context(
     )
 
 
-def _canonicalize_legacy_derive_blueprint_fileplan(blueprint_text: str) -> str:
-    """Normalize a common legacy-import FilePlan presentation mistake.
+def _canonicalize_prepare_blueprint_syntax(blueprint_text: str) -> str:
+    """Canonicalize unambiguous Blueprint Markdown presentation variants.
 
-    Legacy reconstruction asks a model to translate a human-authored SKILL.md
-    into the Creator Blueprint protocol.  Models commonly render file entries
-    as Markdown labels (``- **SKILL.md**``) even though the strict parser only
-    recognizes ``- path: `SKILL.md``` blocks.  Convert only that unambiguous
-    presentation form, and only inside the SkillPlan section.  No file,
-    responsibility, port, or capability is invented here.
+    The model can express the same FilePlan with a decorated heading or bold
+    list labels even when its semantic plan is stable.  Normalize only those
+    wire-format variants before validation; do not add, remove, or reinterpret
+    any file or field value here.
     """
     text = str(blueprint_text or "")
     text = re.sub(
@@ -4642,22 +4640,28 @@ def _canonicalize_legacy_derive_blueprint_fileplan(blueprint_text: str) -> str:
         r"(?m)^(?P<indent>[ \t]*)-[ \t]+\*\*"
         r"(?P<field>[A-Za-z_][A-Za-z0-9_]*)\*\*[ \t]*:[ \t]*(?P<value>.*)$"
     )
-
     body = file_label.sub(
-        lambda match: (
-            f"{match.group('indent')}- path: `"
-            f"{match.group('path').strip()}`"
-        ),
+        lambda match: f"{match.group('indent')}- path: `{match.group('path').strip()}`",
         body,
     )
     body = field_label.sub(
-        lambda match: (
-            f"{match.group('indent')}"
-            f"{match.group('field')}: {match.group('value')}"
-        ),
+        lambda match: f"{match.group('indent')}{match.group('field')}: {match.group('value')}",
         body,
     )
-    text = text[:section.start("body")] + body + text[section.end("body"):]
+    return text[:section.start("body")] + body + text[section.end("body"):]
+
+
+def _canonicalize_legacy_derive_blueprint_fileplan(blueprint_text: str) -> str:
+    """Normalize common legacy-import FilePlan compatibility mistakes.
+
+    Legacy reconstruction asks a model to translate a human-authored SKILL.md
+    into the Creator Blueprint protocol.  Models commonly render file entries
+    as Markdown labels (``- **SKILL.md**``) even though the strict parser only
+    recognizes ``- path: `SKILL.md``` blocks.  Convert only that unambiguous
+    presentation form, and only inside the SkillPlan section.  No file,
+    responsibility, port, or capability is invented here.
+    """
+    text = _canonicalize_prepare_blueprint_syntax(blueprint_text)
 
     skill_block = re.search(
         r"(?ms)^\s*-\s*path\s*:\s*`?SKILL\.md`?\s*$"
@@ -9469,6 +9473,18 @@ Do not plan the ResponsibilityGraph in this first pass.
 
 internal_blueprint_text is the human-readable Blueprint view and must contain the complete SkillPlan file responsibility information: path, role, purpose, inputs, outputs, default_values, dependencies, required_capabilities, forbidden_capabilities, references, constraints, and existing file-local metadata. Any input decided as internal_default, constant, or creation-time fixed must be recorded in that script entry's structured default_values with its native JSON type; prose-only defaults are invalid.
 
+## Canonical Blueprint syntax (mandatory)
+
+- The first Blueprint heading is exactly `## 📋 Skill 架构蓝图`.
+- The file-plan heading is exactly `### SkillPlan / 文件职责计划`.
+- Every file entry begins with `- path: ` followed by one backtick-wrapped
+  concrete path. Never use a Markdown heading or bold label as a file entry.
+- Every entry field uses an unstyled key on an indented line, for example
+  `  role: generic_script`; never emit `- **role**:`.
+- Keep the required sections and their order stable: `### 目录结构`,
+  `### SkillPlan / 文件职责计划`, then `### 宿主执行方式`.
+- Do not wrap internal_blueprint_text itself in a Markdown code fence.
+
 ## Blueprint / SkillPlan single-source consistency
 
 internal_blueprint_text is one complete planning result. Its structured
@@ -10385,6 +10401,10 @@ and apply the incremental user request; do not restart as a new Skill.
         envelope_issue = _prepare_fileplan_envelope_issue(candidate)
         if not envelope_issue and str(candidate.get("status") or "") == "ready":
             invalid_blueprint_text = str(candidate.get("internal_blueprint_text") or "").strip()
+            invalid_blueprint_text = _canonicalize_prepare_blueprint_syntax(
+                invalid_blueprint_text
+            )
+            candidate["internal_blueprint_text"] = invalid_blueprint_text
             if legacy_derive_reconstruction:
                 invalid_blueprint_text = _canonicalize_legacy_derive_blueprint_fileplan(
                     invalid_blueprint_text

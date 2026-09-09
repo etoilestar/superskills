@@ -1,9 +1,14 @@
 """Minimal deterministic closure and edge-patch contract tests."""
 
+import json
+
+import pytest
+
 from backend.services.creator.function_item_interface_plan import (
     INTERFACE_PATCH_SCHEMA,
     collect_interface_plan_validation_issues,
     interface_contract_closure_check,
+    plan_function_item_interfaces,
     validate_interface_plan_protocol,
     validate_interface_patch,
 )
@@ -67,6 +72,62 @@ def test_replace_source_patch_restores_closure():
     )
     assert collect_interface_plan_validation_issues(
         plan=repaired, function_items=items(), platform_contract=platform()) == []
+
+
+def test_atomic_patch_can_replace_both_endpoints_of_one_invalid_interface():
+    broken = complete_plan("missing")
+    broken["interfaces"][1]["target_input"] = "left"
+    violations = collect_interface_plan_validation_issues(
+        plan=broken, function_items=items(), platform_contract=platform(),
+    )
+
+    repaired = validate_interface_patch(
+        plan=broken, function_items=items(), platform_contract=platform(),
+        violations=violations,
+        patch={"operations": [
+            {"op": "replace_source", "interface_id": "I2", "reason": "use legal source",
+             "source_platform_input": "right", "source_path": []},
+            {"op": "replace_target", "interface_id": "I2", "reason": "cover missing slot",
+             "target_member": "scripts/run.py", "target_input": "right"},
+        ]},
+    )
+
+    assert collect_interface_plan_validation_issues(
+        plan=repaired, function_items=items(), platform_contract=platform(),
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_planner_correction_keeps_endpoint_namespaces_independent():
+    calls = 0
+
+    async def model_call(messages, _model):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            broken = complete_plan("undeclared_source")
+            broken["interfaces"][1]["target_input"] = "left"
+            return json.dumps(broken)
+
+        payload = json.loads(messages[1]["content"])
+        assert payload["namespace_rules"]["platform_source_domain"] == ["left", "right"]
+        assert payload["namespace_rules"]["endpoint_namespaces_are_independent"] is True
+        return json.dumps({"operations": [
+            {"op": "replace_source", "interface_id": "I2", "reason": "use legal source",
+             "source_platform_input": "right", "source_path": []},
+            {"op": "replace_target", "interface_id": "I2", "reason": "cover missing slot",
+             "target_member": "scripts/run.py", "target_input": "right"},
+        ]})
+
+    repaired = await plan_function_item_interfaces(
+        original_user_goal="run", frozen_function_items=items(),
+        platform_contract=platform(), planner_model="planner", model_call=model_call,
+    )
+
+    assert calls == 2
+    repaired_i2 = next(value for value in repaired["interfaces"] if value["interface_id"] == "I2")
+    assert repaired_i2["source_platform_input"] == "right"
+    assert repaired_i2["target_input"] == "right"
 
 
 def test_patch_preserves_valid_interface_exactly():
