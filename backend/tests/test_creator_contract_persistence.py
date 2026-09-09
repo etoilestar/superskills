@@ -5,6 +5,62 @@ import pytest
 from backend.services.creator import api
 
 
+async def _historical_baseline(**_kwargs):
+    return {
+        "goal": "Compare CSV files",
+        "requirements": ["Compare the contents of two CSV datasets"],
+        "inputs": ["Two CSV datasets"],
+        "outputs": ["A difference report"],
+        "constraints": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_contractless_requirement_extraction_reads_package_as_evidence(monkeypatch):
+    calls = []
+
+    async def fake_complete(**kwargs):
+        calls.append(kwargs)
+        return {
+            "goal": "Compare tabular datasets",
+            "requirements": [
+                "Compare two tabular datasets",
+                "Generate structured difference statistics",
+            ],
+            "inputs": ["Two tabular datasets"],
+            "outputs": ["Structured difference statistics"],
+            "constraints": ["Align records by a primary identifier"],
+        }
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    result = await api._extract_contractless_historical_requirements(
+        existing_context={
+            "skill_name": "legacy-csv",
+            "skill_md": "# Compare CSV files\nCompare two files and report differences.",
+            "script_contents": {
+                "scripts/private_name.py": "def private_function(payload): return {'difference_count': 1}",
+            },
+            "reference_contents": {
+                "references/private_rules.md": "Align records by primary identifier.",
+            },
+        },
+        planner_model="planner",
+    )
+
+    assert result["requirements"] == [
+        "Compare two tabular datasets",
+        "Generate structured difference statistics",
+    ]
+    call = calls[0]
+    assert call["phase"] == "contractless_historical_requirement_extraction"
+    assert call["response_schema"] == api._CONTRACTLESS_REQUIREMENT_EXTRACTION_SCHEMA
+    payload = json.loads(call["messages"][1]["content"])
+    assert "private_function" in payload["historical_skill_evidence"]["script_source_excerpts"][0]
+    assert "private_name.py" not in json.dumps(payload)
+    assert "private_rules.md" not in json.dumps(payload)
+    assert "Never emit or preserve filenames" in call["messages"][0]["content"]
+
+
 def test_creator_contracts_are_persisted_and_reused_for_revision(tmp_path, monkeypatch):
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
     skill = tmp_path / "demo"
@@ -196,6 +252,7 @@ async def test_legacy_derive_adds_strict_reconstruction_contract_to_first_pass(
         }
 
     monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    monkeypatch.setattr(api, "_extract_contractless_historical_requirements", _historical_baseline)
     monkeypatch.setattr(
         api, "route_model",
         lambda *_args, **_kwargs: type("Route", (), {"model": "planner"})(),
@@ -210,7 +267,8 @@ async def test_legacy_derive_adds_strict_reconstruction_contract_to_first_pass(
     assert "LEGACY DERIVE BLUEPRINT RECONSTRUCTION" in prompts[0]
     assert "`- **SKILL.md**` are not valid path blocks" in prompts[0]
     planner_context = payloads[0]["existing_skill_context"]
-    assert planner_context["baseline_source"] == "contractless_skill_capability_extraction"
+    assert planner_context["baseline_source"] == "contractless_skill_model_requirement_extraction"
+    assert planner_context["historical_requirement_baseline"] == await _historical_baseline()
     assert raw_instruction not in json.dumps(planner_context, ensure_ascii=False)
     assert "skill_md" not in planner_context
 
@@ -290,6 +348,7 @@ async def test_legacy_derive_retries_generated_skill_payload_as_fileplan_envelop
         return next(responses)
 
     monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    monkeypatch.setattr(api, "_extract_contractless_historical_requirements", _historical_baseline)
     monkeypatch.setattr(api, "route_model", lambda *_args, **_kwargs: type("Route", (), {"model": "planner"})())
 
     result = await api._generate_internal_blueprint_or_questions(api.PreparePlanRequest(
@@ -342,6 +401,7 @@ async def test_legacy_derive_retries_ready_prose_as_a_full_blueprint(tmp_path, m
         return next(responses)
 
     monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    monkeypatch.setattr(api, "_extract_contractless_historical_requirements", _historical_baseline)
     monkeypatch.setattr(api, "route_model", lambda *_args, **_kwargs: type("Route", (), {"model": "planner"})())
 
     result = await api._generate_internal_blueprint_or_questions(api.PreparePlanRequest(

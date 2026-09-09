@@ -416,14 +416,23 @@ async def test_requirement_planner_receives_compact_clarification_context(monkey
         ],
         human_feedback="Keep the confirmed choice.",
     )
+    historical = {
+        "goal": "Preserve the legacy comparison capability",
+        "requirements": ["Compare two datasets"],
+        "inputs": ["Two datasets"],
+        "outputs": ["Difference report"],
+        "constraints": [],
+    }
     await api._plan_requirement_allocations(
         request=request, blueprint_text=_blueprint(), function_items=[], planner_model="p",
+        historical_requirement_baseline=historical,
     )
     assert captured["clarification_answers"] == [
         {"question": "Choose constraint?", "answer": "Use constraint x."}
     ]
     assert "Use constraint x." in captured["current_confirmed_goal"]
     assert captured["human_feedback"] == "Keep the confirmed choice."
+    assert captured["historical_requirement_baseline"] == historical
 
 
 @pytest.mark.asyncio
