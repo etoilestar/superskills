@@ -26,14 +26,6 @@
           将基于 <strong>{{ selectedExistingSkillName }}</strong> 的现有产物和历史合同增量修改
         </span>
         <span v-else class="muted">从空白需求开始</span>
-        <label v-if="selectedExistingSkillName" for="creator-derived-skill-name">新 Skill 名称</label>
-        <input
-          v-if="selectedExistingSkillName"
-          id="creator-derived-skill-name"
-          v-model.trim="derivedSkillName"
-          :disabled="streaming"
-          placeholder="例如 report-generator-pro"
-        />
       </div>
       <div v-if="existingSkillsError" class="skill-picker-error">{{ existingSkillsError }}</div>
       <button
@@ -982,13 +974,6 @@ async function send() {
     )
 
     const humanFeedback = text
-
-    if (selectedExistingSkillName.value && !derivedSkillName.value) {
-      throw new Error('请输入新 Skill 名称。')
-    }
-    if (selectedExistingSkillName.value === derivedSkillName.value) {
-      throw new Error('新 Skill 名称不能与来源 Skill 相同。')
-    }
 
     const mode = selectedExistingSkillName.value
       ? 'derive'
