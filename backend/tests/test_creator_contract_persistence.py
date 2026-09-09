@@ -43,7 +43,7 @@ def test_creator_contracts_are_persisted_and_reused_for_revision(tmp_path, monke
     assert second["change_request"]["human_feedback"] == "add CSV output"
 
 
-def test_revision_context_reconstructs_baseline_for_legacy_skill(tmp_path, monkeypatch):
+def test_revision_context_does_not_create_contract_baseline_for_legacy_skill(tmp_path, monkeypatch):
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
     skill = tmp_path / "legacy"
     (skill / "scripts").mkdir(parents=True)
@@ -53,9 +53,7 @@ def test_revision_context_reconstructs_baseline_for_legacy_skill(tmp_path, monke
     context = api._read_prepare_existing_skill_context("legacy")
 
     assert context["saved_contracts_available"] is False
-    baseline = context["reconstructed_contract_baseline"]
-    assert baseline["source"] == "existing_skill_artifacts"
-    assert baseline["script_contents"]["scripts/run.py"] == "print('legacy')\n"
+    assert "reconstructed_contract_baseline" not in context
 
 
 def test_legacy_context_distillation_extracts_facts_without_raw_instructions():
@@ -98,17 +96,12 @@ def run(payload):
     assert raw_instruction not in encoded
     assert "script_contents" not in distilled
     assert "skill_md" not in distilled
-    assert distilled["skill_overview_facts"]["frontmatter"]["name"] == "legacy"
-    assert distilled["skill_overview_facts"]["command_contracts"] == [{
-        "script": "scripts/against.py",
-        "argv_object_keys": ["input_files", "fields"],
-    }]
-    assert distilled["script_facts"][0]["functions"] == [{
-        "name": "run", "args": ["payload"],
-    }]
-    assert {"file_outputs", "markdown"} <= set(
-        distilled["script_facts"][0]["literal_object_keys"]
-    )
+    assert distilled["baseline_source"] == "contractless_skill_capability_extraction"
+    assert "Compare CSV files" in distilled["capability_source_text"]
+    assert "command_contracts" not in encoded
+    assert "script_facts" not in distilled
+    assert "input_files" not in encoded
+    assert "fields" not in encoded
 
 
 def test_legacy_derive_canonicalizes_markdown_file_labels_only_in_skillplan():
@@ -217,7 +210,7 @@ async def test_legacy_derive_adds_strict_reconstruction_contract_to_first_pass(
     assert "LEGACY DERIVE BLUEPRINT RECONSTRUCTION" in prompts[0]
     assert "`- **SKILL.md**` are not valid path blocks" in prompts[0]
     planner_context = payloads[0]["existing_skill_context"]
-    assert planner_context["baseline_source"] == "distilled_existing_skill_artifacts"
+    assert planner_context["baseline_source"] == "contractless_skill_capability_extraction"
     assert raw_instruction not in json.dumps(planner_context, ensure_ascii=False)
     assert "skill_md" not in planner_context
 

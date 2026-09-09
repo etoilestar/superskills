@@ -748,7 +748,11 @@ def validate_structured_responsibility_edge_transport(
                         code="invalid_platform_parameter_binding",
                         details={"edge_index": index, "field": "required"},
                     )
-                if not required and "default" not in binding:
+                if (
+                    not required
+                    and "default" not in binding
+                    and from_output != "fields"
+                ):
                     raise GraphValidationError(
                         f"{source}.responsibility_edges optional structured platform "
                         f"input binding requires explicit default; index={index}",
@@ -783,7 +787,23 @@ def validate_structured_responsibility_edge_transport(
                 details={"edge_index": index, "from_node": from_node, "to_node": to_node},
             )
 
-        if from_node == "platform_input_node" and from_output not in input_fields:
+        hidden_optional_parameter = (
+            from_node == "platform_input_node"
+            and from_output == "fields"
+            and to_node in function_item_io
+            and to_input in function_item_io[to_node]["inputs"]
+            and any(
+                str(item.get("target_file") or "") == to_node
+                and any(
+                    _port_identifier(port) == to_input
+                    and isinstance(port, dict)
+                    and port.get("role") == "optional_runtime_input"
+                    for port in item.get("inputs") or []
+                )
+                for item in (normalized_function_items if function_items is not None else [])
+            )
+        )
+        if from_node == "platform_input_node" and from_output not in input_fields and not hidden_optional_parameter:
             raise GraphValidationError(
                 f"{source}.responsibility_edges references undefined "
                 "platform input field; "

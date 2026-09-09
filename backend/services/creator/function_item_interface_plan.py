@@ -154,6 +154,12 @@ derived input accepts only a preceding FunctionItem output and never a platform 
 INPUT_PORT_ROLES = frozenset({
     "required_runtime_input", "optional_runtime_input", "derived_input",
 })
+
+# ``fields`` is a physical runtime envelope used to carry dynamically declared
+# optional parameters.  It is intentionally absent from the platform contract
+# shown to planning models: models reason about the parameter (for example
+# ``font``), while the backend alone compiles that parameter to ``fields.font``.
+_OPTIONAL_PARAMETER_RUNTIME_ROOT = "fields"
 OUTPUT_PORT_ROLES = frozenset({"runtime_output", "intermediate_output"})
 REVIEW_ERROR_TYPES = frozenset({
     "binding_error", "provenance_error", "missing_source_error",
@@ -1182,10 +1188,95 @@ def build_runtime_binding_facts(
             allowed: list[dict[str, Any]] = []
             if explicit_source in names and isinstance(explicit_path, list) and all(isinstance(x, str) for x in explicit_path):
                 allowed.append({"source_platform_input": explicit_source, "source_path": list(explicit_path)})
+            if port.get("role") == "optional_runtime_input":
+                allowed.append({
+                    "source_platform_input": _OPTIONAL_PARAMETER_RUNTIME_ROOT,
+                    "source_path": [port["name"]],
+                })
             member_facts[port["name"]] = {"allowed_sources": allowed}
         facts[item["target_file"]] = member_facts
     logger.info("[interface_runtime_binding_facts] %s", json.dumps(facts, ensure_ascii=False, sort_keys=True))
     return facts
+
+
+def _planner_function_items(function_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Hide backend-owned optional-parameter bindings from the Interface LLM."""
+    compact = _compact_function_items(function_items)
+    return [
+        {
+            **item,
+            "inputs": [
+                port for port in item["inputs"]
+                if port.get("role") != "optional_runtime_input"
+            ],
+            "required_inputs": [
+                name for name in item.get("required_inputs", [])
+                if any(
+                    port["name"] == name
+                    and port.get("role") != "optional_runtime_input"
+                    for port in item["inputs"]
+                )
+            ],
+            "defaulted_inputs": [
+                name for name in item.get("defaulted_inputs", [])
+                if any(
+                    port["name"] == name
+                    and port.get("role") != "optional_runtime_input"
+                    for port in item["inputs"]
+                )
+            ],
+        }
+        for item in compact
+    ]
+
+
+def inject_optional_parameter_interfaces(
+    plan: dict[str, Any], *, function_items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compile every unbound optional input to the hidden ``fields.<name>`` slot."""
+    optional_slots = {
+        (item["target_file"], port["name"])
+        for item in _compact_function_items(function_items)
+        for port in item["inputs"]
+        if port.get("role") == "optional_runtime_input"
+    }
+    # Optional parameter provenance is backend authority.  Ignore a model edge
+    # targeting such a slot rather than allowing the model to bind the hidden
+    # wrapper wholesale or substitute an unrelated fixed platform slot.
+    interfaces = [
+        dict(value) for value in plan.get("interfaces") or []
+        if (value.get("target_member"), value.get("target_input"))
+        not in optional_slots
+    ]
+    receiving = {
+        (value.get("target_member"), value.get("target_input"))
+        for value in interfaces
+        if value.get("kind") in {"platform_to_member", "member_to_member"}
+    }
+    used_ids = {str(value.get("interface_id") or "") for value in interfaces}
+    sequence = 1
+    for item in _compact_function_items(function_items):
+        for port in item["inputs"]:
+            slot = (item["target_file"], port["name"])
+            if port.get("role") != "optional_runtime_input" or slot in receiving:
+                continue
+            while f"IOPT{sequence:04d}" in used_ids:
+                sequence += 1
+            interface_id = f"IOPT{sequence:04d}"
+            sequence += 1
+            used_ids.add(interface_id)
+            interfaces.append({
+                "interface_id": interface_id,
+                "kind": "platform_to_member",
+                "source_type": "platform_input",
+                "source_platform_input": _OPTIONAL_PARAMETER_RUNTIME_ROOT,
+                "source_path": [port["name"]],
+                "target_member": item["target_file"],
+                "target_input": port["name"],
+                "semantic_reason": "backend-owned optional runtime parameter binding",
+            })
+            receiving.add(slot)
+    return {"interfaces": interfaces}
 
 
 def validate_runtime_binding(
@@ -1397,7 +1488,15 @@ def collect_interface_plan_validation_issues(
         if kind == "platform_to_member":
             source, target, slot = interface["source_platform_input"], interface["target_member"], interface["target_input"]
             receiving_contracts.setdefault((target, slot), []).append(iid)
-            if source not in platform_inputs: issue("unknown_platform_logical_input", f"{path}.source_platform_input", iid, source, sorted(platform_inputs))
+            hidden_optional_source = (
+                source == _OPTIONAL_PARAMETER_RUNTIME_ROOT
+                and target in inputs
+                and slot in inputs.get(target, set())
+                and input_ports[(target, slot)]["role"] == "optional_runtime_input"
+                and list(interface.get("source_path") or []) == [slot]
+            )
+            if source not in platform_inputs and not hidden_optional_source:
+                issue("unknown_platform_logical_input", f"{path}.source_platform_input", iid, source, sorted(platform_inputs))
             if target not in inputs or slot not in inputs.get(target, set()): issue("unknown_interface_logical_input", f"{path}.target_input", iid, slot, sorted(inputs.get(target, set())))
             else:
                 target_port = input_ports[(target, slot)]
@@ -2218,10 +2317,24 @@ A plausible goal cannot make an incorrect structured source/target binding valid
     Return only strict JSON:
 
     """ + json.dumps(INTERFACE_REVIEW_SCHEMA, ensure_ascii=False)
+    planner_items = _planner_function_items(frozen_function_items)
+    optional_slots = {
+        (item["target_file"], port["name"])
+        for item in _compact_function_items(frozen_function_items)
+        for port in item["inputs"]
+        if port.get("role") == "optional_runtime_input"
+    }
+    review_plan = {
+        "interfaces": [
+            value for value in interface_plan.get("interfaces") or []
+            if (value.get("target_member"), value.get("target_input"))
+            not in optional_slots
+        ]
+    }
     payload = {
         "system_goal": original_user_goal,
-        "function_items": _compact_function_items(frozen_function_items),
-        "current_interface_plan": interface_plan,
+        "function_items": planner_items,
+        "current_interface_plan": review_plan,
         "requirement_allocations": requirement_allocations or [],
         "requirement_channels": requirement_channels or {},
         "unowned_system_requirements": system_requirements or [],
@@ -2275,10 +2388,32 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
             else interaction_requirements
         ),
     )
+    planner_function_items = _planner_function_items(frozen_function_items)
+    planner_slots = build_frozen_interface_slots(
+        function_items=frozen_function_items, platform_contract=platform_contract,
+    )
+    planner_input_names = {
+        item["target_file"]: {port["name"] for port in item["inputs"]}
+        for item in planner_function_items
+    }
+    for member, slots in planner_slots["members"].items():
+        slots["inputs"] = [
+            port for port in slots["inputs"]
+            if port["name"] in planner_input_names.get(member, set())
+        ]
+    mapping_candidates = build_semantic_mapping_candidates(
+        function_items=frozen_function_items, platform_contract=platform_contract,
+    )
+    mapping_candidates["input_mappings"] = [
+        candidate for candidate in mapping_candidates.get("input_mappings", [])
+        if candidate.get("target_input") in planner_input_names.get(
+            candidate.get("target_member"), set()
+        )
+    ]
     payload = {
         "system_goal": original_user_goal,
         "skill_name": skill_name,
-        "function_items": _compact_function_items(frozen_function_items),
+        "function_items": planner_function_items,
         "executable_requirement_allocations": [
             allocation
             for allocation in (requirement_allocations or [])
@@ -2287,12 +2422,8 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
         "requirement_channels": requirement_channels or {},
         "unowned_system_requirements": system_requirements_context,
         "platform_contract": platform_contract or {},
-        "frozen_interface_slots": build_frozen_interface_slots(
-            function_items=frozen_function_items, platform_contract=platform_contract,
-        ),
-        "semantic_mapping_candidates": build_semantic_mapping_candidates(
-            function_items=frozen_function_items, platform_contract=platform_contract,
-        ),
+        "frozen_interface_slots": planner_slots,
+        "semantic_mapping_candidates": mapping_candidates,
     }
     raw_response = await model_call([{"role": "system", "content": _interface_plan_prompt()}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
     try:
@@ -2306,7 +2437,10 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
         logger.info("[Creator][interface_protocol_repair] attempt=1 result=transport_parseable")
     protocol_issue: InterfaceIntentPlanError | None = None
     try:
-        parsed = validate_interface_plan_protocol(transport)
+        parsed = inject_optional_parameter_interfaces(
+            validate_interface_plan_protocol(transport),
+            function_items=frozen_function_items,
+        )
     except InterfaceIntentPlanError as exc:
         protocol_issue = exc
         parsed = transport
@@ -2401,10 +2535,33 @@ JSON matching INTERFACE_SCHEMA."""
                         platform_contract=platform_contract, violations=facts,
                     )
                 return corrected
-            except InterfaceIntentPlanError:
-                return {"__invalid_transport__": corrected_text}
+            except InterfaceIntentPlanError as exc:
+                # Preserve the actual patch/application failure for refinement.
+                # Reclassifying a semantic patch failure as an Interface Plan
+                # transport error hides the actionable source/closure details.
+                return {
+                    "interfaces": list(
+                        previous_candidate.get("interfaces") or []
+                    ) if isinstance(previous_candidate, dict) else [],
+                    "__patch_failure__": {
+                        "code": exc.code,
+                        "message": str(exc),
+                        "details": exc.details,
+                        "raw_response": corrected_text,
+                    },
+                }
 
         async def evaluate_correction(candidate_object: Any) -> CandidateEvaluation:
+            if isinstance(candidate_object, dict) and isinstance(
+                candidate_object.get("__patch_failure__"), dict
+            ):
+                failure = candidate_object["__patch_failure__"]
+                return CandidateEvaluation(
+                    accepted=False,
+                    candidate=candidate_object,
+                    acceptance_facts=[failure],
+                    semantic_comparable=True,
+                )
             try:
                 candidate = validate_interface_plan_protocol(candidate_object)
             except InterfaceIntentPlanError as exc:

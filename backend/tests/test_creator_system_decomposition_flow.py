@@ -618,6 +618,28 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
     assert calls.count("endpoint_planner") == 0
 
 
+def test_contractless_skill_context_contains_capabilities_not_implementation():
+    context = {
+        "skill_name": "legacy",
+        "skill_md": """---\nname: legacy\ndescription: Summarize tables\n---\n# Summary\nSummarize uploaded tables.\n```bash\npython scripts/run.py '{\"fields\": {\"font\": \"Arial\"}}'\n```\n""",
+        "scripts": ["scripts/run.py"],
+        "script_contents": {"scripts/run.py": "def run(payload): return payload['fields']"},
+        "references": ["references/rules.md"],
+        "reference_contents": {"references/rules.md": "implementation rules"},
+        "assets": [],
+    }
+
+    distilled = api._distill_legacy_prepare_context(context)
+
+    assert distilled["baseline_source"] == "contractless_skill_capability_extraction"
+    assert "Summarize uploaded tables" in distilled["capability_source_text"]
+    serialized = json.dumps(distilled)
+    assert "script_facts" not in distilled
+    assert "command_contracts" not in serialized
+    assert "payload['fields']" not in serialized
+    assert "python scripts/run.py" not in serialized
+
+
 @pytest.mark.asyncio
 async def test_bind_plan_repairs_overcomplete_interface_once(monkeypatch):
     initial_plan = {"interfaces": [{"interface_id": "I0003"}]}
