@@ -4429,6 +4429,61 @@ def _normalize_prepare_clarifying_questions(raw_questions: Any) -> list[str]:
     return [question]
 
 
+def _prepare_fileplan_envelope_issue(data: Any) -> str:
+    """Describe an unusable first-pass planner envelope, or return empty."""
+    if not isinstance(data, dict):
+        return "response is not a JSON object"
+    status = str(data.get("status") or "").strip()
+    if status not in {"ready", "needs_clarification", "blocked"}:
+        return f"unsupported status: {status or '<empty>'}"
+    if status == "ready" and not str(
+        data.get("internal_blueprint_text") or data.get("blueprint_text") or ""
+    ).strip():
+        return "ready response is missing internal_blueprint_text"
+    if status == "needs_clarification" and not any(
+        str(question or "").strip() for question in (data.get("clarifying_questions") or [])
+    ):
+        return "needs_clarification response is missing clarifying_questions"
+    return ""
+
+
+_PREPARE_FILEPLAN_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "status", "clarifying_questions", "review_summary",
+        "internal_blueprint_text", "skill_name", "blockers",
+    ],
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": ["ready", "needs_clarification", "blocked"],
+        },
+        "clarifying_questions": {
+            "type": "array",
+            "maxItems": 1,
+            "items": {"type": "string"},
+        },
+        "review_summary": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["goal", "input", "output", "workflow", "risks", "changes"],
+            "properties": {
+                "goal": {"type": "string"},
+                "input": {"type": "string"},
+                "output": {"type": "string"},
+                "workflow": {"type": "array", "items": {"type": "string"}},
+                "risks": {"type": "array", "items": {"type": "string"}},
+                "changes": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        "internal_blueprint_text": {"type": "string"},
+        "skill_name": {"type": "string"},
+        "blockers": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+
 def _prepare_feedback_wants_supplement(request: PreparePlanRequest) -> bool:
     if _prepare_has_explicit_action(request):
         return request.prepare_action == "request_supplement"
@@ -9944,27 +9999,96 @@ Blueprint Planner 只规划业务责任。
         ),
     )
 
-    text = await complete_creator_role_once(
-        [
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    default=str,
-                ),
-            },
-        ],
-        "planner", fallback_model=route.model,
-    )
+    planner_messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": json.dumps(payload, ensure_ascii=False, default=str),
+        },
+    ]
+    data: dict[str, Any] | None = None
+    envelope_issue = ""
+    invalid_blueprint_text = ""
+    blueprint_protocol_errors: list[dict[str, Any]] = []
+    for protocol_attempt in range(2):
+        messages = planner_messages
+        if protocol_attempt:
+            messages = [
+                {
+                    "role": "system",
+                    "content": system_prompt + """
 
-    data = _parse_prepare_plan_json(
-        text
-    )
+FILEPLAN ENVELOPE REPAIR
+The previous response did not satisfy the first-pass FilePlan JSON envelope.
+Return only the exact prepare-plan JSON object requested above.  Do not return
+status=success, generated file_contents, Markdown analysis, a Skill package, or
+explanatory text.  For status=ready, internal_blueprint_text must contain the
+complete Blueprint/SkillPlan.  For status=needs_clarification, provide one real
+blocking question with options.  Preserve the supplied existing_skill_context
+and apply the incremental user request; do not restart as a new Skill.
+""".strip(),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            **payload,
+                            "invalid_internal_blueprint_text": invalid_blueprint_text,
+                            "fileplan_protocol_errors": blueprint_protocol_errors,
+                            "repair_instruction": (
+                                "Regenerate the complete Blueprint from the existing Skill "
+                                "artifact context plus the incremental user request. Return "
+                                "planning only; do not generate file contents."
+                            ),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                },
+            ]
+        try:
+            candidate = await _complete_creator_json_object_once(
+                messages=messages,
+                model=route.model,
+                phase="creator_prepare_fileplan",
+                response_schema=_PREPARE_FILEPLAN_RESPONSE_SCHEMA,
+            )
+        except Exception as exc:
+            envelope_issue = f"invalid structured transport: {type(exc).__name__}: {exc}"
+            continue
+        envelope_issue = _prepare_fileplan_envelope_issue(candidate)
+        if not envelope_issue and str(candidate.get("status") or "") == "ready":
+            invalid_blueprint_text = str(candidate.get("internal_blueprint_text") or "").strip()
+            candidate_allowed_resources = _build_prepare_allowed_resource_paths(
+                request=request,
+                review_summary=candidate.get("review_summary"),
+                existing_skill_context=existing_context,
+            )
+            blueprint_protocol_errors = _collect_prepare_blueprint_protocol_issues(
+                invalid_blueprint_text,
+                candidate_allowed_resources,
+            )
+            if blueprint_protocol_errors:
+                envelope_issue = (
+                    "ready response contains an invalid Blueprint: "
+                    + "; ".join(
+                        str(issue.get("message") or issue.get("code") or "invalid blueprint")
+                        for issue in blueprint_protocol_errors
+                    )
+                )
+        if not envelope_issue:
+            data = candidate
+            break
+        logger.warning(
+            "[Creator][fileplan_envelope] attempt=%d issue=%s",
+            protocol_attempt + 1,
+            envelope_issue,
+        )
+    if data is None:
+        raise PreparePlanProtocolError(
+            "Blueprint Planner returned an invalid first-pass FilePlan envelope "
+            f"after one protocol retry: {envelope_issue}"
+        )
 
     data.pop(
         "tool_pool_patch",
@@ -10014,12 +10138,25 @@ Blueprint Planner 只规划业务责任。
         )
         data["responsibility_edges"] = normalized_edges
     elif status == "ready":
-        frozen_blueprint_text = await _final_blueprint_cleanup(
+        pre_cleanup_blueprint_text = frozen_blueprint_text
+        cleaned_blueprint_text = await _final_blueprint_cleanup(
             request=request,
             blueprint_text=frozen_blueprint_text,
             existing_resource_facts=existing_context,
             planner_model=route.model,
         )
+        cleanup_protocol_errors = _collect_prepare_blueprint_protocol_issues(
+            cleaned_blueprint_text,
+            allowed_resource_paths,
+        )
+        if cleanup_protocol_errors:
+            logger.warning(
+                "[Creator][final_blueprint_cleanup][discarded] errors=%s",
+                cleanup_protocol_errors,
+            )
+            frozen_blueprint_text = pre_cleanup_blueprint_text
+        else:
+            frozen_blueprint_text = cleaned_blueprint_text
         first_planner_result = {
             **first_planner_result,
             "internal_blueprint_text": frozen_blueprint_text,
@@ -11689,6 +11826,20 @@ async def _prepare_plan_impl(
         request.previous_blueprint_text
         or ""
     ).strip()
+
+    if (
+        confirmed_prepare
+        and not previous_blueprint_text
+        and request.mode == "derive"
+    ):
+        # A legacy source Skill can have complete, usable artifacts without a
+        # persisted Creator blueprint.  In that case a "continue with the
+        # existing information" answer confirms that no more business input is
+        # needed; it cannot freeze blueprint state that never existed.  Keep
+        # the request in the planning path so the planner reconstructs the
+        # baseline from those artifacts and applies the incremental request.
+        # This does not reconstruct a blueprint from review_summary.
+        confirmed_prepare = False
 
     prepared: dict[
         str,
