@@ -39,6 +39,28 @@ def test_all_derived_contracts_are_exact_graph_projections():
         validate_graph_interface_projection(graph(), "scripts/compare_csvs.py", {**projected, "stdout_schema": {}})
 
 
+def test_graph_projection_preserves_and_passes_optional_default():
+    value = graph()
+    value["requirements"][0]["inputs"].append({
+        "name": "limit", "type": "integer", "required": False,
+    })
+    value["requirements"][0]["default_values"] = {"limit": 3}
+    value["dataflow_edges"].insert(1, {
+        "from_node": "platform_input_node", "from_output": "options",
+        "to_node": "scripts/compare_csvs.py", "to_input": "limit",
+        "purpose": "optional input", "constraints": [],
+        "mapping": {"source": "options", "target": "limit", "type": "integer"},
+    })
+
+    contract = graph_interface_contract(value)
+    limit = next(port for port in contract["input_ports"] if port["name"] == "limit")
+    projected = project_script_interface_contract(value, "scripts/compare_csvs.py")
+
+    assert limit["default"] == 3
+    assert projected["argv_schema"]["properties"]["limit"]["default"] == 3
+    assert projected["command_payload"]["limit"] == 3
+
+
 def test_member_stdout_ports_are_not_collapsed_into_platform_output_field():
     value = graph()
     value["requirements"][0]["outputs"] = [

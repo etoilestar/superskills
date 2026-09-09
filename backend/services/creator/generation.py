@@ -530,6 +530,11 @@ def _platform_skill_md_command_sections(
         role = str(getattr(entry, "role", "") or "script")
         inputs = ", ".join(str(value) for value in (getattr(entry, "inputs", []) or [])) or "无"
         outputs = ", ".join(str(value) for value in (getattr(entry, "outputs", []) or [])) or "无"
+        defaults = dict(getattr(entry, "default_values", {}) or {})
+        defaults_line = (
+            f'- defaults: {json.dumps(defaults, ensure_ascii=False, sort_keys=True)}\n\n'
+            if defaults else ""
+        )
         portable_output_mapping = {}
         if responsibility_graph is not None:
             portable_output_mapping = project_script_interface_contract(
@@ -543,6 +548,7 @@ def _platform_skill_md_command_sections(
             f"- role: `{role}`\n"
             f"- inputs: {inputs}\n"
             f"- outputs: {outputs}\n\n"
+            f"{defaults_line}"
             f"{output_mapping_record}\n"
             "<!-- generated_by=contract_renderer -->\n"
             "```bash\n"
@@ -3606,6 +3612,8 @@ def _build_generate_file_prompt(
             "argv JSON、placeholder 或参数拼接示例。命令区是平台根据 Graph Contract、"
             "SkillPlan 与 Script Contract 生成的编译产物，会在模型返回后确定性注入。\n"
             "可以在自然语言中提及已声明脚本路径，但不要描述命令行拼装方式。\n"
+            "若 authoritative SkillPlan 声明了 default_values，必须在对应参数说明中写出其真实默认值；"
+            "没有默认值时不要编造。平台会把已声明默认值确定性写入命令参数。\n"
             "不要复制 Creator 创建流程、内部合同、确认清单或平台实现细节。\n"
             "只使用 authoritative SkillPlan 已声明的文件，不要从 prose 或示例发明文件。\n\n"
             "Markdown 结构要完整：frontmatter 后至少包含一个正文标题和可执行流程说明。\n\n"

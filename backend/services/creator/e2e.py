@@ -6103,7 +6103,7 @@ def _run_e2e_step_argument_effect_review(
                 "- 当 canonical command argv 与 script 入口接口不一致时，必须修改当前脚本去对齐合同；禁止修改 command、placeholder 或上游值去迁就脚本。\n"
                 "- script 语法、入口/JSON argv、guard 与 run/main、参数消费、stdout/artifact 以及跨步骤字段实现错误，都 target_file=当前脚本。\n"
                 "- 上游 stdout key 和下游冻结 binding 不一致时，应修复产生或消费该字段的脚本；不得修改 command binding。通过默认值绕过真实传参，应失败。\n"
-                "- 允许脚本通过 payload、input、fields、options、统一对象、别名字段或等价结构接收参数，但必须能证明实际传入的 key 被读取并影响输出。\n"
+                "- 允许脚本通过 payload、input、options、统一对象、别名字段或等价结构接收参数，但必须能证明实际传入的 key 被读取并影响输出。\n"
                 "- 如果 rendered_payload 缺少合同要求的信息，报告合同投影基础设施问题；不得提出修改 SKILL.md command。\n"
                 "- 如果 SKILL.md 已传对但脚本没有读取、读取了不同 key、或被默认值覆盖，failure_kind=script_not_consuming_payload，target_file=当前脚本。\n"
                 "- 如果当前 step 输出了内容但后续冻结字段映射接不上，failure_kind=output_mapping_mismatch，并定位未遵守字段合同的脚本。\n"
@@ -9797,7 +9797,7 @@ async def _repair_existing_file_for_e2e_failure(
         "不得重新选择、扩展、删除或重排 ToolPool，不得请求工具探索或 tool_pool_patch。",
         "",
         "Parameter provenance rules: platform/runtime input uses its exact runtime placeholder; previous-step output uses a graph-backed placeholder; only a user/frozen-contract constant may use a literal; a script-local optional default should preferably be omitted. A literal appearing only in the failing SKILL.md command is not provenance.",
-        "Every placeholder introduced in NEW must have current runtime provenance from a platform input, previous successful stdout, frozen graph provenance, or another explicitly supplied runtime field. Do not invent options.*, fields.*, payload.*, or config.* unless that exact path exists in runtime evidence. A syntactically valid placeholder with no runtime producer is invalid.",
+        "Every placeholder introduced in NEW must have current runtime provenance from a platform input, previous successful stdout, frozen graph provenance, or another explicitly supplied runtime value. Do not invent an undeclared nested path or wrapper. A syntactically valid placeholder with no runtime producer is invalid.",
         "The patch must concretely implement the supplied repair instruction. Before returning compare OLD and NEW, confirm they differ, materially change the diagnosed behavior, and correct the failing expression/interface. Do not return no-op, comments-only, logging-only, or diagnostic-only edits.",
         "Repair authority rule: "
         "when repair_authority.mode == 'deterministic', "

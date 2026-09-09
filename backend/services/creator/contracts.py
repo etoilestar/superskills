@@ -935,7 +935,7 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "- 命令必须在脚本路径后直接传入一个完整、shell-quoted 的 JSON object 位置参数。",
         "- 该 JSON object 必须能被 json.loads 解析为 object；动态 placeholder 必须作为 JSON 字符串值出现。",
         "- 外部已有脚本若使用其它 CLI 风格，应先由包装脚本适配为上述输入 JSON 形式，再在 SKILL.md 调用该包装入口。",
-        "- 不得固定套用 payload/user_request/fields/options/input_files 等模板字段。",
+        "- 不得固定套用 payload/user_request/options/input_files 等模板字段。",
         "- 禁止在 ```bash block 内直接写 JSON 配置对象。",
         "- 禁止在 ```bash block 内写 runner/script/输入 JSON 伪命令对象。",
         "- 禁止在 ```bash block 内写说明文字、列表、多条命令或 `<真实参数>` 这类占位说明。",
@@ -944,7 +944,7 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "- SKILL.md 应说明 Skill 用途、真实脚本调用顺序（如有）和最终产物类型，第一轮必须保留已有确定性 provenance；只有无法在生成阶段确定的真实运行行为和 stdout 内容由第二轮 E2E 验证。。",
         "- 用户输入要区分必需项和可选项：依据蓝图语义中的可选、建议、若不指定、可以提供、默认等表达判断，不写固定业务字段词表。",
         "- 第一条 workflow command 不能引用平台输入 envelope 中不存在的 placeholder；只能引用 guaranteed input envelope 字段，或传入通用 user_request/input payload/envelope 由入口脚本解析。",
-        "- 蓝图可选用户参数若平台 payload 没有同名字段，不应写成必填 placeholder；应由入口脚本内部提供默认值，或从 fields/options/payload 中存在则读取、不存在则默认。",
+        "- 蓝图可选用户参数若平台 payload 没有同名字段，不应写成必填 placeholder；应由入口脚本内部提供默认值，或从已声明的 options/payload 路径中存在则读取、不存在则默认。",
         "- 命令 placeholder 应从用户输入、显式字段、默认值、上传文件、前序 stdout 中选择当前脚本真正需要的值。",
         "- argv key 以目标脚本真实 strict_json_argv_guard / run(args) 接口为准；已有字段 identity 和 frozen binding 不得重新命名或用示例值替代。",
         "- 不要固定特定中间字段名；内部脚本流转只在第二轮 E2E 真实执行时验证。",
@@ -988,7 +988,7 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "- 每个 fence 内只放一条命令；命令必须直接调用 scripts/ 路径。",
         "- 脚本路径后直接传入一个完整、shell-quoted、json.loads 可解析为 object 的 JSON 位置参数；所有动态 {{placeholder}} 必须作为 JSON 字符串值出现。",
         "- 第一条命令只能引用平台 guaranteed input envelope 中存在的字段；结构化业务参数必须使用平台结构化输入 root 与图谱/schema 派生的目标字段组成整值占位符。",
-        "- 命令 placeholder 优先引用 external envelope 字段：user_request、input、text、payload、input_files、files、resources、fields、options，或显式 input_binding。",
+        "- 命令 placeholder 优先引用 external envelope 字段：user_request、input、text、payload、input_files、files、resources、options，或显式 input_binding。",
         "- 禁止在命令输入 JSON 中写动态用户内容、前序产物内容、运行时文件路径或 E2E seed 值；这些动态数据只能由图谱边派生的占位符表达。",
         "- 允许写入图谱/schema 明确声明为静态配置的 literal 常量；不得用 literal 冒充用户输入、stdout 或产物路径。",
         "- 蓝图语义为可选/建议/若不指定/可以提供/默认的用户参数，不要写成必填 placeholder；入口脚本应存在则读，不存在则默认化。",
@@ -2660,7 +2660,7 @@ def _available_source_fields_for_block_review(
         if text and text not in fields:
             fields.append(text)
 
-    for field in ("user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources"):
+    for field in ("user_request", "input", "text", "payload", "options", "input_files", "files", "resources"):
         add(field)
     for field in prior_stdout or []:
         add(field)
@@ -3142,11 +3142,11 @@ def _build_script_file_contract_text(
         "",
         "B. 参数接口（输入宽松）:",
         "- 脚本必须能读取一个 JSON argv object。",
-        "- 可以宽松兼容 payload / user_request / input / text / fields / options / input_files / files / 上游 stdout 字段。",
+        "- 可以宽松兼容 payload / user_request / input / text / options / input_files / files / 上游 stdout 字段。",
         "- 当前脚本只实现自己的单步职责；不要在脚本内调用、编排或转发执行其它 scripts/*.py；SKILL.md 只能说明静态入口，不能承担运行时 dataflow。",
         "- 不要求第一轮读取所有 input_sources 或 SkillPlan inputs；不因可选输入未使用而失败。",
         "- 但是，脚本不得用与任务无关的默认 prompt、固定示例值、固定模板或常量结果替代核心业务输入。",
-        "- 如果核心输入缺失，可以从 payload/user_request/input/text/fields/options/input_files 或上游 stdout 中选择最合理来源；不要静默退回到无关任务。",
+        "- 如果核心输入缺失，可以从 payload/user_request/input/text/options/input_files 或上游 stdout 中选择最合理来源；不要静默退回到无关任务。",
         "",
         "C. stdout 字段语义:",
         "- declared_stdout_fields 只表示 stdout JSON 中应出现的业务字段，不等于文件路径字段。",
@@ -5182,7 +5182,7 @@ def _validate_command_is_single_shell_json_invocation(
             "脚本路径后必须传一个 json.loads 可解析的 JSON object argv。"
         ),
         minimal_edit=(
-            "只修当前命令参数。不要固定套用 payload/user_request/fields/options/input_files。"
+            "只修当前命令参数。不要固定套用 payload/user_request/options/input_files。"
         ),
         details=_command_block_failure_details(
             block=block, skill_md_content=skill_md_content, script_path=script_path,

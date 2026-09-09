@@ -6828,8 +6828,8 @@ can report that upstream replanning is required.
 A repair must preserve full declared-input provenance. Never repair an invalid
 platform source merely by deleting the edge while leaving its FunctionItem input
 unresolved. Bind each dynamic runtime input directly from its declared top-level
-platform input; do not create a synthetic fields/parameters/request/config
-container. Creation-time fixed configuration is an upstream Blueprint decision.
+platform input; do not create a synthetic wrapper or input hierarchy.
+Creation-time fixed configuration is an upstream Blueprint decision.
 Do not remove an input during localized graph repair.
 If a FunctionItem input has an explicit frozen/default value, it is locally
 resolved. Do not create a platform_input_node edge for it and do not externalize
@@ -9775,6 +9775,17 @@ implementation has a valid fallback, declare that a default is present and put
 its value in default_values. Do not mark an input optional merely because it
 sounds like a preference; judge only from the confirmed user goal and proposed
 runtime contract. Do not infer optionality from the input field name.
+
+Optionality stated anywhere in the confirmed Blueprint must also be encoded in
+the structured FunctionItem port. A plain string input is legacy-compatible but
+means required; it must not be used for an input described as optional. Encode
+that port as an object with required=false and role=optional_runtime_input, and
+record any real fallback in default_values. Prose-only optionality is an invalid
+cross-stage contract because Interface planning consumes the structured port.
+Optional runtime inputs still require provenance. Bind each one only to an exact
+source slot already declared by the upstream platform contract; do not invent a
+wrapper, hierarchy, or new platform top-level input, and do not treat optionality
+as permission to omit the Interface.
 
 FUNCTIONITEM PORT ROLE CONTRACT
 

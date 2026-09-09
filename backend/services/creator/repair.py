@@ -4741,7 +4741,7 @@ def _python_static_evidence(script_content: str) -> dict[str, Any]:
     except Exception:
         return evidence
     generic_container_names = {"blocks", "items", "sections", "pages", "slides", "rows", "options", "config", "parameters", "styles"}
-    generic_input_names = {"payload", "input", "inputs", "fields", "options", "config", "parameters"}
+    generic_input_names = {"payload", "input", "inputs", "options", "config", "parameters"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
             if node.id in generic_input_names:
