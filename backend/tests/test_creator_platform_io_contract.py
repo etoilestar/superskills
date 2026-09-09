@@ -63,7 +63,7 @@ def test_intermediate_or_untyped_output_cannot_expand_platform_boundary():
 def test_platform_input_source_families_are_optional_and_have_no_structured_wrapper():
     boundary = build_platform_io_contract()["platform_skill_boundary"]
     assert boundary["input_envelope_fields"] == [
-        "user_request", "input", "text", "payload", "fields", "options",
+        "user_request", "input", "text", "payload", "options",
         "input_files", "files", "resources",
     ]
     semantics = boundary["input_source_semantics"]
@@ -74,7 +74,6 @@ def test_platform_input_source_families_are_optional_and_have_no_structured_wrap
     }
     assert semantics["runtime_files"]["canonical"] == "input_files"
     assert semantics["runtime_files"]["representations"] == ["input_files", "files"]
-    assert semantics["runtime_fields"]["canonical"] == "fields"
     assert "structured_parameters" not in semantics
     assert "preferred_structured_input_root" not in boundary
     assert all(not family["globally_required"] for family in semantics.values())

@@ -7,7 +7,6 @@ from backend.services.creator.function_item_interface_plan import (
     validate_interface_plan_protocol,
     validate_interface_patch,
 )
-from backend.services.platform_io_contract import build_platform_io_contract
 
 
 def items():
@@ -105,35 +104,6 @@ def test_defaulted_runtime_input_still_requires_declared_provenance():
         plan=plan, function_items=function_items, platform_contract=platform(),
     )
     assert any(issue["code"] == "missing_interface_contract" for issue in issues)
-
-
-def test_generic_optional_fields_container_has_a_platform_interface():
-    function_items = [{
-        "target_file": "scripts/run.py", "role": "worker", "purpose": "run",
-        "inputs": [{
-            "port_id": "fields", "role": "optional_runtime_input",
-            "required": False, "contract": {"type": "object"},
-        }],
-        "outputs": [{
-            "port_id": "report", "role": "runtime_output",
-            "contract": {"type": "string"},
-        }],
-        "constraints": [], "required_capabilities": [],
-    }]
-    plan = {"interfaces": [{
-        "interface_id": "I1", "kind": "platform_to_member",
-        "source_platform_input": "fields", "source_path": [],
-        "target_member": "scripts/run.py", "target_input": "fields",
-    }, {
-        "interface_id": "I2", "kind": "member_to_platform",
-        "source_member": "scripts/run.py", "source_output": "report",
-        "target_platform_output": "text",
-    }]}
-
-    assert collect_interface_plan_validation_issues(
-        plan=plan, function_items=function_items,
-        platform_contract=build_platform_io_contract(),
-    ) == []
 
 
 def test_required_and_derived_inputs_still_require_bindings():

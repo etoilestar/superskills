@@ -393,7 +393,7 @@ def build_platform_io_contract() -> dict[str, Any]:
             "OUTPUT_DIR": "already points to the final outputs directory for the current skill workspace",
         },
         "platform_skill_boundary": {
-            "input_envelope_fields": ["user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources"],
+            "input_envelope_fields": ["user_request", "input", "text", "payload", "options", "input_files", "files", "resources"],
             "input_source_semantics": {
                 "freeform_request": {
                     "canonical": "user_request",
@@ -406,7 +406,6 @@ def build_platform_io_contract() -> dict[str, Any]:
                     "globally_required": False,
                 },
                 "runtime_options": {"canonical": "options", "globally_required": False},
-                "runtime_fields": {"canonical": "fields", "globally_required": False},
                 "runtime_resources": {"canonical": "resources", "globally_required": False},
             },
             "final_output_fields": [

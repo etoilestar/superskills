@@ -9782,11 +9782,10 @@ means required; it must not be used for an input described as optional. Encode
 that port as an object with required=false and role=optional_runtime_input, and
 record any real fallback in default_values. Prose-only optionality is an invalid
 cross-stage contract because Interface planning consumes the structured port.
-Optional runtime inputs still require provenance. Prefer a platform-declared
-generic structured input such as fields or options as the FunctionItem port when
-several optional business values travel together; keep individual defaults in
-default_values using qualified keys. Do not invent a new platform top-level
-field or treat optionality as permission to omit the Interface.
+Optional runtime inputs still require provenance. Bind each one only to an exact
+source slot already declared by the upstream platform contract; do not recreate
+legacy generic field wrappers, invent a new platform top-level field, or treat
+optionality as permission to omit the Interface.
 
 FUNCTIONITEM PORT ROLE CONTRACT
 
