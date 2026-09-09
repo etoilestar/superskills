@@ -1,6 +1,7 @@
 """Creator FastAPI endpoint handlers and response assembly."""
 
 import asyncio
+import ast
 import copy
 import hashlib
 import json
@@ -4143,6 +4144,153 @@ def _read_prepare_existing_skill_context(skill_name: str | None) -> dict[str, An
     return context
 
 
+def _legacy_python_artifact_facts(path: str, source: str) -> dict[str, Any]:
+    """Extract bounded structural facts without exposing source code to Planner."""
+    facts: dict[str, Any] = {
+        "path": path,
+        "language": "python",
+        "bytes": len(source.encode("utf-8")),
+        "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "functions": [],
+        "imports": [],
+        "literal_object_keys": [],
+        "referenced_skill_paths": [],
+    }
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        facts["parse_error"] = f"SyntaxError at line {exc.lineno or 0}"
+        return facts
+
+    functions: list[dict[str, Any]] = []
+    imports: list[str] = []
+    object_keys: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            args = [arg.arg for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]]
+            functions.append({"name": node.name, "args": args[:20]})
+        elif isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.append(node.module)
+        elif isinstance(node, ast.Dict):
+            for key in node.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    value = key.value.strip()
+                    if value and value not in object_keys:
+                        object_keys.append(value)
+
+    facts["functions"] = functions[:80]
+    facts["imports"] = list(dict.fromkeys(imports))[:80]
+    facts["literal_object_keys"] = object_keys[:120]
+    facts["referenced_skill_paths"] = list(dict.fromkeys(re.findall(
+        r"(?<![\w/])(?:scripts|references|assets)/[A-Za-z0-9_.@+\-/]+",
+        source,
+    )))[:80]
+    return facts
+
+
+def _legacy_skill_md_artifact_facts(source: str) -> dict[str, Any]:
+    """Extract runtime/document structure while discarding instructional prose."""
+    frontmatter: dict[str, str] = {}
+    match = re.match(r"^---\s*\n(?P<body>.*?)\n---\s*(?:\n|$)", source, re.S)
+    if match:
+        for line in match.group("body").splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key.strip() in {"name", "description"}:
+                frontmatter[key.strip()] = value.strip()[:1000]
+
+    headings = [
+        re.sub(r"\s+", " ", item).strip()[:300]
+        for item in re.findall(r"(?m)^#{1,6}\s+(.+?)\s*$", source)
+    ][:80]
+    referenced_paths = list(dict.fromkeys(re.findall(
+        r"(?<![\w/])(?:scripts|references|assets)/[A-Za-z0-9_.@+\-/]+",
+        source,
+    )))[:100]
+    command_contracts: list[dict[str, Any]] = []
+    for block in re.findall(r"(?ms)```(?:bash|sh)\s*\n(.*?)```", source):
+        for script in re.findall(r"(?<![\w/])(scripts/[A-Za-z0-9_.@+\-/]+)", block):
+            keys = list(dict.fromkeys(re.findall(r'["\']([A-Za-z_][A-Za-z0-9_]*)["\']\s*:', block)))
+            item = {"script": script, "argv_object_keys": keys[:40]}
+            if item not in command_contracts:
+                command_contracts.append(item)
+
+    return {
+        "frontmatter": frontmatter,
+        "headings": headings,
+        "referenced_skill_paths": referenced_paths,
+        "command_contracts": command_contracts[:30],
+        "bytes": len(source.encode("utf-8")),
+        "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+    }
+
+
+def _distill_legacy_prepare_context(existing_context: dict[str, Any]) -> dict[str, Any]:
+    """Produce non-instructional facts for no-contract derive planning.
+
+    Raw SKILL.md, script bodies, reference prose, and stale Creator metadata are
+    intentionally excluded. They are evidence for this deterministic import
+    step, not instructions or formatting examples for the Blueprint Planner.
+    """
+    script_contents = existing_context.get("script_contents") or {}
+    script_facts: list[dict[str, Any]] = []
+    for path in existing_context.get("scripts") or []:
+        source = str(script_contents.get(path) or "")
+        if path.endswith(".py"):
+            script_facts.append(_legacy_python_artifact_facts(path, source))
+        else:
+            script_facts.append({
+                "path": path,
+                "language": Path(path).suffix.lstrip(".") or "unknown",
+                "bytes": len(source.encode("utf-8")),
+                "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                "referenced_skill_paths": list(dict.fromkeys(re.findall(
+                    r"(?<![\w/])(?:scripts|references|assets)/[A-Za-z0-9_.@+\-/]+",
+                    source,
+                )))[:80],
+            })
+
+    reference_contents = existing_context.get("reference_contents") or {}
+    reference_facts = [
+        {
+            "path": path,
+            "headings": [
+                re.sub(r"\s+", " ", heading).strip()[:300]
+                for heading in re.findall(
+                    r"(?m)^#{1,6}\s+(.+?)\s*$",
+                    str(reference_contents.get(path) or ""),
+                )
+            ][:50],
+            "bytes": len(str(reference_contents.get(path) or "").encode("utf-8")),
+        }
+        for path in existing_context.get("references") or []
+    ]
+    return {
+        "skill_name": str(existing_context.get("skill_name") or ""),
+        "saved_contracts_available": False,
+        "baseline_source": "distilled_existing_skill_artifacts",
+        "artifact_inventory": {
+            "files": [
+                "SKILL.md",
+                *(existing_context.get("scripts") or []),
+                *(existing_context.get("references") or []),
+                *(existing_context.get("assets") or []),
+            ],
+            "assets": list(existing_context.get("assets") or []),
+        },
+        "skill_overview_facts": _legacy_skill_md_artifact_facts(
+            str(existing_context.get("skill_md") or "")
+        ),
+        "script_facts": script_facts,
+        "reference_facts": reference_facts,
+        "content_policy": (
+            "This object contains extracted evidence only. Original artifact prose/code "
+            "is not present and must not be reconstructed as instructions or formatting."
+        ),
+    }
+
+
 def _parse_prepare_plan_json(raw: str) -> dict[str, Any]:
     return parse_structured_output(raw, phase="requirement_analysis")
 
@@ -4470,6 +4618,12 @@ def _canonicalize_legacy_derive_blueprint_fileplan(blueprint_text: str) -> str:
     responsibility, port, or capability is invented here.
     """
     text = str(blueprint_text or "")
+    text = re.sub(
+        r"(?m)^\s*#+(?:\s+#+)*\s*📋\s*Skill\s+架构蓝图\s*$",
+        "## 📋 Skill 架构蓝图",
+        text,
+        count=1,
+    )
     section = re.search(
         r"(?ms)^(?P<header>\s*###\s+SkillPlan / 文件职责计划\s*$)"
         r"(?P<body>.*?)(?=^\s*###\s+|\Z)",
@@ -4503,7 +4657,48 @@ def _canonicalize_legacy_derive_blueprint_fileplan(blueprint_text: str) -> str:
         ),
         body,
     )
-    return text[:section.start("body")] + body + text[section.end("body"):]
+    text = text[:section.start("body")] + body + text[section.end("body"):]
+
+    skill_block = re.search(
+        r"(?ms)^\s*-\s*path\s*:\s*`?SKILL\.md`?\s*$"
+        r"(?P<body>.*?)(?=^\s*-\s*path\s*:|^\s*###\s+|\Z)",
+        text,
+    )
+    if skill_block:
+        normalized_skill_body = skill_block.group("body")
+        normalized_skill_body = re.sub(
+            r"(?m)^(\s*)role\s*:\s*.*$",
+            r"\1role: skill_overview",
+            normalized_skill_body,
+            count=1,
+        )
+        normalized_skill_body = re.sub(
+            r"(?m)^(\s*)required_capabilities\s*:\s*.*$",
+            r"\1required_capabilities: []",
+            normalized_skill_body,
+            count=1,
+        )
+        text = (
+            text[:skill_block.start("body")]
+            + normalized_skill_body
+            + text[skill_block.end("body"):]
+        )
+
+    if (
+        any(
+            path.startswith("scripts/")
+            for path in exact_file_plan_paths_from_strict_skillplan(text)
+        )
+        and "```bash" not in text
+        and "需要脚本/命令" not in text
+    ):
+        text = re.sub(
+            r"(?m)^(\s*###\s+宿主执行方式\s*)$",
+            r"\1\n- **需要脚本/命令**: 最终 SKILL.md 根据冻结后的责任图输出标准 ```bash fenced code block；Blueprint 不提前冻结命令参数。",
+            text,
+            count=1,
+        )
+    return text
 
 
 _PREPARE_FILEPLAN_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -9209,6 +9404,11 @@ async def _generate_internal_blueprint_or_questions(
         request,
         existing_context,
     )
+    planner_existing_context = (
+        _distill_legacy_prepare_context(existing_context)
+        if legacy_derive_reconstruction
+        else existing_context
+    )
     legacy_derive_planning_contract = (
         """
 
@@ -10032,7 +10232,7 @@ Blueprint Planner 只规划业务责任。
         ),
 
         "existing_skill_context": (
-            existing_context
+            planner_existing_context
         ),
 
         "clarification_rounds": (
