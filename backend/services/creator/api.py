@@ -4447,6 +4447,43 @@ def _prepare_fileplan_envelope_issue(data: Any) -> str:
     return ""
 
 
+_PREPARE_FILEPLAN_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "status", "clarifying_questions", "review_summary",
+        "internal_blueprint_text", "skill_name", "blockers",
+    ],
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": ["ready", "needs_clarification", "blocked"],
+        },
+        "clarifying_questions": {
+            "type": "array",
+            "maxItems": 1,
+            "items": {"type": "string"},
+        },
+        "review_summary": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["goal", "input", "output", "workflow", "risks", "changes"],
+            "properties": {
+                "goal": {"type": "string"},
+                "input": {"type": "string"},
+                "output": {"type": "string"},
+                "workflow": {"type": "array", "items": {"type": "string"}},
+                "risks": {"type": "array", "items": {"type": "string"}},
+                "changes": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        "internal_blueprint_text": {"type": "string"},
+        "skill_name": {"type": "string"},
+        "blockers": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+
 def _prepare_feedback_wants_supplement(request: PreparePlanRequest) -> bool:
     if _prepare_has_explicit_action(request):
         return request.prepare_action == "request_supplement"
@@ -9991,13 +10028,15 @@ and apply the incremental user request; do not restart as a new Skill.
                 },
                 planner_messages[1],
             ]
-        text = await complete_creator_role_once(
-            messages, "planner", fallback_model=route.model,
-        )
         try:
-            candidate = _parse_prepare_plan_json(text)
+            candidate = await _complete_creator_json_object_once(
+                messages=messages,
+                model=route.model,
+                phase="creator_prepare_fileplan",
+                response_schema=_PREPARE_FILEPLAN_RESPONSE_SCHEMA,
+            )
         except Exception as exc:
-            envelope_issue = f"invalid JSON transport: {type(exc).__name__}: {exc}"
+            envelope_issue = f"invalid structured transport: {type(exc).__name__}: {exc}"
             continue
         envelope_issue = _prepare_fileplan_envelope_issue(candidate)
         if not envelope_issue:

@@ -104,27 +104,35 @@ async def test_legacy_derive_retries_generated_skill_payload_as_fileplan_envelop
     (source / "SKILL.md").write_text("# CSV Against\n", encoding="utf-8")
     (source / "scripts" / "compare_csv.py").write_text("print('compare')\n", encoding="utf-8")
     responses = iter([
-        json.dumps({
+        {
             "status": "success",
             "skill_name": "csv-against-summary",
             "file_contents": {"SKILL.md": "generated too early"},
-        }),
-        json.dumps({
+        },
+        {
             "status": "needs_clarification",
             "clarifying_questions": ["请选择总结深度。A. 简要 B. 详细"],
-            "review_summary": {},
+            "review_summary": {
+                "goal": "", "input": "", "output": "",
+                "workflow": [], "risks": [], "changes": [],
+            },
             "internal_blueprint_text": "",
             "skill_name": "csv-against-summary",
             "blockers": [],
-        }),
+        },
     ])
     calls = []
 
-    async def fake_complete(messages, role, fallback_model):
+    async def fake_complete(*, messages, model, phase, response_schema):
         calls.append(messages)
+        assert response_schema["properties"]["status"]["enum"] == [
+            "ready", "needs_clarification", "blocked",
+        ]
+        assert response_schema["additionalProperties"] is False
+        assert "file_contents" not in response_schema["properties"]
         return next(responses)
 
-    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
     monkeypatch.setattr(api, "route_model", lambda *_args, **_kwargs: type("Route", (), {"model": "planner"})())
 
     result = await api._generate_internal_blueprint_or_questions(api.PreparePlanRequest(
