@@ -97,6 +97,58 @@ def test_derive_hydrates_frozen_graph_instead_of_rebuilding_it(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_legacy_derive_retries_generated_skill_payload_as_fileplan_envelope(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    source = tmp_path / "csv-against"
+    (source / "scripts").mkdir(parents=True)
+    (source / "SKILL.md").write_text("# CSV Against\n", encoding="utf-8")
+    (source / "scripts" / "compare_csv.py").write_text("print('compare')\n", encoding="utf-8")
+    responses = iter([
+        {
+            "status": "success",
+            "skill_name": "csv-against-summary",
+            "file_contents": {"SKILL.md": "generated too early"},
+        },
+        {
+            "status": "needs_clarification",
+            "clarifying_questions": ["请选择总结深度。A. 简要 B. 详细"],
+            "review_summary": {
+                "goal": "", "input": "", "output": "",
+                "workflow": [], "risks": [], "changes": [],
+            },
+            "internal_blueprint_text": "",
+            "skill_name": "csv-against-summary",
+            "blockers": [],
+        },
+    ])
+    calls = []
+
+    async def fake_complete(*, messages, model, phase, response_schema):
+        calls.append(messages)
+        assert response_schema["properties"]["status"]["enum"] == [
+            "ready", "needs_clarification", "blocked",
+        ]
+        assert response_schema["additionalProperties"] is False
+        assert "file_contents" not in response_schema["properties"]
+        return next(responses)
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    monkeypatch.setattr(api, "route_model", lambda *_args, **_kwargs: type("Route", (), {"model": "planner"})())
+
+    result = await api._generate_internal_blueprint_or_questions(api.PreparePlanRequest(
+        mode="derive",
+        source_skill_name="csv-against",
+        skill_name="csv-against-summary",
+        user_request="需要加上对表格内容的总结功能",
+    ))
+
+    assert len(calls) == 2
+    assert "FILEPLAN ENVELOPE REPAIR" in calls[1][0]["content"]
+    assert result["status"] == "needs_clarification"
+    assert result["clarifying_questions"] == ["请选择总结深度。A. 简要 B. 详细"]
+
+
+@pytest.mark.asyncio
 async def test_derived_initialization_copies_only_planned_baseline_files(tmp_path, monkeypatch):
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
     source = tmp_path / "base"
@@ -129,6 +181,47 @@ async def test_derived_initialization_copies_only_planned_baseline_files(tmp_pat
     assert not (target / ".creator" / "contracts.json").exists()
     assert (source / "scripts" / "keep.py").read_text(encoding="utf-8") == "print('keep')\n"
     assert (source / ".creator" / "contracts.json").read_text(encoding="utf-8") == "{}"
+
+
+@pytest.mark.asyncio
+async def test_legacy_derive_confirmation_reconstructs_blueprint_from_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    source = tmp_path / "csv-against"
+    (source / "scripts").mkdir(parents=True)
+    (source / "SKILL.md").write_text("# CSV Against\n", encoding="utf-8")
+    (source / "scripts" / "compare_csv.py").write_text("print('compare')\n", encoding="utf-8")
+
+    planner_requests = []
+
+    async def fake_generate(request):
+        planner_requests.append(request)
+        return {
+            "status": "needs_clarification",
+            "clarifying_questions": ["planner was reached"],
+            "review_summary": {},
+            "internal_blueprint_text": "",
+            "skill_name": "csv-against-summary",
+            "blockers": [],
+        }
+
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+
+    response = await api._prepare_plan_impl(api.PreparePlanRequest(
+        mode="derive",
+        source_skill_name="csv-against",
+        skill_name="csv-against-summary",
+        user_request="需要加上对表格内容的总结功能",
+        human_feedback="B. 暂时没有补充，按已有信息继续",
+        prepare_action="confirm",
+    ))
+
+    assert len(planner_requests) == 1
+    assert response.status == "needs_clarification"
+    assert response.clarifying_questions[0].startswith("planner was reached")
+    assert not any(
+        isinstance(blocker, dict) and blocker.get("code") == "missing_confirmed_blueprint_state"
+        for blocker in response.creation_blockers
+    )
 
 
 @pytest.mark.asyncio
