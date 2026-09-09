@@ -145,8 +145,10 @@ evidence of that fact.  Never create a binding merely to close coverage.
 
 Compatibility is evaluated from the declared source role, source origin, and
 target role. Representation conversion is a runtime capability, not interface
-planning information. An optional input with no valid source remains unbound. A derived
-input accepts only a preceding FunctionItem output and never a platform input.
+planning information. Every declared runtime input, including an optional one,
+must have declared provenance. Optionality controls whether the source value may
+be empty or omitted at execution time; it never removes the Interface itself. A
+derived input accepts only a preceding FunctionItem output and never a platform input.
 """
 
 INPUT_PORT_ROLES = frozenset({
@@ -519,23 +521,48 @@ INTERFACE_SCHEMA: dict[str, Any] = {
     ]}}},
 }
 
+_PATCH_COMMON_PROPERTIES: dict[str, Any] = {
+    "interface_id": {"type": "string", "minLength": 1},
+    "reason": {"type": "string", "minLength": 1, "maxLength": 200},
+}
+
+
+def _patch_operation_schema(
+    op: str, properties: dict[str, Any], required: list[str],
+) -> dict[str, Any]:
+    """Describe exactly the same operation shape enforced by the validator."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["op", "interface_id", "reason", *required],
+        "properties": {
+            "op": {"const": op},
+            **_PATCH_COMMON_PROPERTIES,
+            **properties,
+        },
+    }
+
+
 INTERFACE_PATCH_SCHEMA: dict[str, Any] = {
     "type": "object", "additionalProperties": False, "required": ["operations"],
-    "properties": {"operations": {"type": "array", "items": {
-        "type": "object", "required": ["op", "interface_id", "reason"],
-        "properties": {
-            "op": {"enum": ["remove_interface", "replace_source", "replace_target"]},
-            "interface_id": {"type": "string", "minLength": 1},
-            "reason": {"type": "string", "minLength": 1, "maxLength": 200},
+    "properties": {"operations": {"type": "array", "items": {"oneOf": [
+        _patch_operation_schema("remove_interface", {}, []),
+        _patch_operation_schema("replace_source", {
             "source_platform_input": {"type": "string", "minLength": 1},
             "source_path": {"type": "array", "items": {"type": "string"}},
+        }, ["source_platform_input", "source_path"]),
+        _patch_operation_schema("replace_source", {
             "source_member": {"type": "string", "minLength": 1},
             "source_output": {"type": "string", "minLength": 1},
+        }, ["source_member", "source_output"]),
+        _patch_operation_schema("replace_target", {
             "target_member": {"type": "string", "minLength": 1},
             "target_input": {"type": "string", "minLength": 1},
+        }, ["target_member", "target_input"]),
+        _patch_operation_schema("replace_target", {
             "target_platform_output": {"type": "string", "minLength": 1},
-        }, "additionalProperties": False,
-    }}},
+        }, ["target_platform_output"]),
+    ]}}},
 }
 
 
@@ -961,6 +988,10 @@ def _compact_function_items(function_items: list[dict[str, Any]]) -> list[dict[s
                 "contract": contract,
                 "required": facts["required"],
                 "optional": not facts["required"],
+                "runtime_source_required": (
+                    role == "derived_input"
+                    or (role != "optional_runtime_input" and facts["runtime_source_required"])
+                ),
             }
             if facts["default_present"]:
                 if isinstance(raw_input, dict) and "default" in raw_input:
@@ -1480,7 +1511,7 @@ def interface_contract_closure_check(
     *, interface_plan: dict[str, Any], function_items: list[dict[str, Any]],
     platform_contract: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Check that every frozen FunctionItem input has one planned interface."""
+    """Check that every frozen FunctionItem input has an interface."""
     return [
         issue for issue in collect_interface_plan_validation_issues(
             plan=interface_plan, function_items=function_items,
@@ -2331,6 +2362,10 @@ Silently verify that every interface present uses declared source and target
 parameter names and compatible data types. Do not repair an absent input by
 adding or changing a platform mapping; that repair belongs solely to the
 FunctionItem input contract.
+An optional_runtime_input still requires declared provenance. Optionality means
+the bound platform container may carry no value for that run; it does not permit
+removing the Interface. Never substitute an unrelated platform input merely to
+preserve coverage.
 7. OUTPUT CONTRACT
 For deterministic semantic correction return strict JSON matching
 INTERFACE_PATCH_SCHEMA only. For protocol-shape correction only, return strict

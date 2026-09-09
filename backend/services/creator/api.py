@@ -9776,6 +9776,18 @@ its value in default_values. Do not mark an input optional merely because it
 sounds like a preference; judge only from the confirmed user goal and proposed
 runtime contract. Do not infer optionality from the input field name.
 
+Optionality stated anywhere in the confirmed Blueprint must also be encoded in
+the structured FunctionItem port. A plain string input is legacy-compatible but
+means required; it must not be used for an input described as optional. Encode
+that port as an object with required=false and role=optional_runtime_input, and
+record any real fallback in default_values. Prose-only optionality is an invalid
+cross-stage contract because Interface planning consumes the structured port.
+Optional runtime inputs still require provenance. Prefer a platform-declared
+generic structured input such as fields or options as the FunctionItem port when
+several optional business values travel together; keep individual defaults in
+default_values using qualified keys. Do not invent a new platform top-level
+field or treat optionality as permission to omit the Interface.
+
 FUNCTIONITEM PORT ROLE CONTRACT
 
 Every structured input and output port MUST contain an explicit role. Input
