@@ -492,6 +492,8 @@ def _graph_port(raw: Any, *, direction: str, node: str) -> dict[str, Any]:
     type_name = str(value.get("type") or contract.get("type") or "unknown")
     shape = value.get("shape", contract.get("shape", "list" if type_name.startswith("list[") else "scalar"))
     port = {"name": name, "direction": direction, "type": type_name, "shape": shape, "required": bool(value.get("required", contract.get("required", True)))}
+    if "default" in value:
+        port["default"] = value.get("default")
     if direction == "input":
         port.update({"source": value.get("source", contract.get("source", "graph_edge")), "consumer": node})
     else:
@@ -512,7 +514,12 @@ def graph_interface_contract(graph: Any) -> dict[str, Any]:
     terminal = {(str(e.get("from_node")), str(e.get("from_output"))) for e in normalized.dataflow_edges if str(e.get("to_node")) == "platform_output_node"}
     for item in normalized.function_items:
         node = str(item.target_file)
-        inputs.extend(_graph_port(port, direction="input", node=node) for port in item.inputs)
+        defaults = dict(item.default_values or {})
+        for raw in item.inputs:
+            port = _graph_port(raw, direction="input", node=node)
+            if "default" not in port and port["name"] in defaults:
+                port["default"] = defaults[port["name"]]
+            inputs.append(port)
         for raw in item.outputs:
             port = _graph_port(raw, direction="output", node=node)
             port["terminal"] = (node, port["name"]) in terminal
@@ -545,7 +552,14 @@ def project_script_interface_contract(graph: Any, target_file: str) -> dict[str,
             "source_platform_input": binding["producer_port"],
             "source_path": source_path,
         }
-    properties = {p["name"]: {"type": "array" if str(p["type"]).startswith("list[") else p["type"], "x-graph-type": p["type"], "x-shape": p["shape"]} for p in inputs}
+    properties = {
+        p["name"]: {
+            "type": "array" if str(p["type"]).startswith("list[") else p["type"],
+            "x-graph-type": p["type"], "x-shape": p["shape"],
+            **({"default": p["default"]} if "default" in p else {}),
+        }
+        for p in inputs
+    }
     stdout_properties = {p["name"]: {"type": "array" if str(p["type"]).startswith("list[") else p["type"], "x-graph-type": p["type"], "x-shape": p["shape"]} for p in outputs}
     platform_output_mapping: dict[str, list[str]] = {}
     for edge in bindings:
@@ -557,7 +571,10 @@ def project_script_interface_contract(graph: Any, target_file: str) -> dict[str,
         "stdout_schema": {"type": "object", "properties": stdout_properties, "required": [p["name"] for p in outputs if p["required"]], "additionalProperties": False},
         "runtime_binding": bindings,
         "platform_output_mapping": platform_output_mapping,
-        "command_payload": {p["name"]: "{{" + p["name"] + "}}" for p in inputs},
+        "command_payload": {
+            p["name"]: p["default"] if "default" in p else "{{" + p["name"] + "}}"
+            for p in inputs
+        },
     }
 
 

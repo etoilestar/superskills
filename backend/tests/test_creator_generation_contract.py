@@ -68,6 +68,7 @@ def test_platform_materializes_skill_md_commands_from_upstream_facts(monkeypatch
 
     entry = _entry(
         command_template="python scripts/main.py '{\"payload\":\"{{input}}\",\"limit\":3}'",
+        default_values={"limit": 3},
     )
     monkeypatch.setattr(
         generation,
@@ -103,6 +104,7 @@ def test_platform_materializes_skill_md_commands_from_upstream_facts(monkeypatch
     assert result.count("<!-- generated_by=contract_renderer -->") == 1
     assert "<!-- generated_by=contract_renderer -->\n```bash" in result
     assert "python scripts/main.py '{\"payload\":\"{{input}}\",\"limit\":3}'" in result
+    assert '- defaults: {"limit": 3}' in result
     assert "## 运行命令" in result
     assert _materialize_platform_skill_md_commands(
         result,
