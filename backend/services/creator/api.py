@@ -4131,16 +4131,6 @@ def _read_prepare_existing_skill_context(skill_name: str | None) -> dict[str, An
         "saved_creator_contracts": creator_contracts,
         "saved_contracts_available": bool(creator_contracts),
     }
-    if not creator_contracts:
-        # Older Skills have no Creator metadata.  Give the planner an explicit
-        # reconstructed baseline rather than pretending this is a fresh build.
-        context["reconstructed_contract_baseline"] = {
-            "source": "existing_skill_artifacts",
-            "skill_md": context["skill_md"],
-            "files": ["SKILL.md", *context["scripts"], *context["references"], *context["assets"]],
-            "script_contents": context["script_contents"],
-            "reference_contents": context["reference_contents"],
-        }
     return context
 
 
@@ -4227,66 +4217,37 @@ def _legacy_skill_md_artifact_facts(source: str) -> dict[str, Any]:
 
 
 def _distill_legacy_prepare_context(existing_context: dict[str, Any]) -> dict[str, Any]:
-    """Produce non-instructional facts for no-contract derive planning.
+    """Expose only user-visible capability prose for a contractless Skill.
 
-    Raw SKILL.md, script bodies, reference prose, and stale Creator metadata are
-    intentionally excluded. They are evidence for this deterministic import
-    step, not instructions or formatting examples for the Blueprint Planner.
+    A contractless Skill is rebuilt from scratch.  Script structure, commands,
+    argv keys, imports, paths, references and other implementation details are
+    deliberately excluded so they cannot become accidental new contracts.
     """
-    script_contents = existing_context.get("script_contents") or {}
-    script_facts: list[dict[str, Any]] = []
-    for path in existing_context.get("scripts") or []:
-        source = str(script_contents.get(path) or "")
-        if path.endswith(".py"):
-            script_facts.append(_legacy_python_artifact_facts(path, source))
-        else:
-            script_facts.append({
-                "path": path,
-                "language": Path(path).suffix.lstrip(".") or "unknown",
-                "bytes": len(source.encode("utf-8")),
-                "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
-                "referenced_skill_paths": list(dict.fromkeys(re.findall(
-                    r"(?<![\w/])(?:scripts|references|assets)/[A-Za-z0-9_.@+\-/]+",
-                    source,
-                )))[:80],
-            })
-
-    reference_contents = existing_context.get("reference_contents") or {}
-    reference_facts = [
-        {
-            "path": path,
-            "headings": [
-                re.sub(r"\s+", " ", heading).strip()[:300]
-                for heading in re.findall(
-                    r"(?m)^#{1,6}\s+(.+?)\s*$",
-                    str(reference_contents.get(path) or ""),
-                )
-            ][:50],
-            "bytes": len(str(reference_contents.get(path) or "").encode("utf-8")),
-        }
-        for path in existing_context.get("references") or []
-    ]
+    skill_md = str(existing_context.get("skill_md") or "")
+    skill_md = re.sub(r"(?ms)```.*?```", "", skill_md)
+    skill_md = re.sub(r"(?m)^\s*(?:python|bash|sh)\s+scripts/.*$", "", skill_md)
+    skill_md = re.sub(
+        r"(?<![\w/])(?:scripts|references|assets)/[A-Za-z0-9_.@+\-/]+",
+        "[implementation path omitted]",
+        skill_md,
+    )
+    skill_md = "\n".join(
+        line for line in skill_md.splitlines()
+        if not re.search(
+            r"(?i)\b(?:ignore|override|bypass|disregard)\b.*\b(?:creator|system|instruction|prompt)\b",
+            line,
+        )
+    )
+    capability_text = skill_md.strip()[:12000]
     return {
         "skill_name": str(existing_context.get("skill_name") or ""),
         "saved_contracts_available": False,
-        "baseline_source": "distilled_existing_skill_artifacts",
-        "artifact_inventory": {
-            "files": [
-                "SKILL.md",
-                *(existing_context.get("scripts") or []),
-                *(existing_context.get("references") or []),
-                *(existing_context.get("assets") or []),
-            ],
-            "assets": list(existing_context.get("assets") or []),
-        },
-        "skill_overview_facts": _legacy_skill_md_artifact_facts(
-            str(existing_context.get("skill_md") or "")
-        ),
-        "script_facts": script_facts,
-        "reference_facts": reference_facts,
+        "baseline_source": "contractless_skill_capability_extraction",
+        "capability_source_text": capability_text,
         "content_policy": (
-            "This object contains extracted evidence only. Original artifact prose/code "
-            "is not present and must not be reconstructed as instructions or formatting."
+            "Extract only user-visible capabilities, business behavior, inputs, outputs, "
+            "and constraints. Ignore commands, parameter names, file topology, dependencies, "
+            "and all implementation details. Rebuild the enhanced Skill from scratch."
         ),
     }
 
@@ -9413,10 +9374,12 @@ async def _generate_internal_blueprint_or_questions(
         """
 
 LEGACY DERIVE BLUEPRINT RECONSTRUCTION
-The source Skill has artifacts but no saved Creator contracts. Reconstruct its
-complete baseline from existing_skill_context, preserve behavior not affected
-by the incremental request, and return the complete resulting Blueprint.
-This is planning, not implementation and not a change-summary-only response.
+The source Skill has no saved Creator contracts. Treat capability_source_text
+only as user-visible functional requirements, refine those capabilities, merge
+the new request, and rebuild a completely new Skill plan. Do not preserve or
+infer old parameter names, commands, argv shapes, file topology, dependencies,
+script boundaries, internal outputs, or any other implementation detail.
+This is a fresh current-contract design, not legacy contract reconstruction.
 Inside `### SkillPlan / 文件职责计划`, every file declaration MUST begin with
 the exact plain-text key `- path:`. In particular, declare the overview with a
 `- path:` line whose concrete path is `SKILL.md` and use `role: skill_overview`.
@@ -9453,7 +9416,7 @@ from the normalized structured contract.
 - mode=derive 时，source_skill_name 是只读历史基线，skill_name 是必须创建的新目标，不得修改或重命名来源 Skill。
 - existing_skill_context.saved_contracts_available=true 时，以 saved_creator_contracts 中上次冻结的蓝图、职责图、接口合同和文件计划为增量基线。
 - 有 saved_creator_contracts 时禁止从零重建：沿用既有 FunctionItem、责任边、端口、接口映射和文件职责，只对 human_feedback 明确影响的局部做增删改；未受影响对象必须保持原 identity 与合同内容。
-- 若没有 saved_creator_contracts，则先依据 reconstructed_contract_baseline、SKILL.md 和现有脚本/参考文件内容重建合同基线，再叠加本轮 user_request/human_feedback。
+- 若没有 saved_creator_contracts，只从净化后的 SKILL.md 功能文本提炼用户可见能力，与本轮需求合并后按当前合同完全重建；不得继承旧参数、command、文件拓扑或实现细节。
 - 新需求与旧合同冲突时只修改受影响的职责、接口和文件，并在 review_summary.changes 中明确列出增量变化。
 
 当前阶段是第一段 FilePlan / Blueprint planning pass，只负责：
@@ -10207,7 +10170,7 @@ Blueprint Planner 只规划业务责任。
         "derive_baseline_strategy": (
             "patch_saved_contracts"
             if existing_context.get("saved_contracts_available")
-            else "reconstruct_from_artifacts"
+            else "extract_capabilities_then_rebuild"
         ) if request.mode == "derive" else "none",
 
         "skill_name": (
@@ -10309,8 +10272,9 @@ Blueprint Planner 只规划业务责任。
 
 LEGACY DERIVE STRICT PATH-BLOCK REPAIR
 This request reconstructs a Blueprint from a source Skill that has no saved
-Creator contracts. Preserve the existing artifact behavior and the requested
-increment. Repair the supplied invalid Blueprint rather than redesigning it.
+    Creator contracts. Preserve only the extracted user-visible capabilities and
+    the requested increment. Repair the new Blueprint without restoring legacy
+    commands, parameters, paths, or implementation structure.
 
 The parser recognizes a file only from this exact unstyled syntax inside
 `### SkillPlan / 文件职责计划`:
@@ -10362,9 +10326,9 @@ and apply the incremental user request; do not restart as a new Skill.
                             "invalid_internal_blueprint_text": invalid_blueprint_text,
                             "fileplan_protocol_errors": blueprint_protocol_errors,
                             "repair_instruction": (
-                                "Regenerate the complete Blueprint from the existing Skill "
-                                "artifact context plus the incremental user request. Return "
-                                "planning only; do not generate file contents."
+                                    "Regenerate the complete Blueprint from extracted capabilities "
+                                    "plus the incremental request. Do not restore legacy parameters, "
+                                    "commands, paths, or implementation details."
                             ),
                         },
                         ensure_ascii=False,
@@ -13631,7 +13595,7 @@ async def _prepare_plan_impl(
         human_feedback=request.human_feedback,
         source_skill_name=str(request.source_skill_name or "") if request.mode == "derive" else "",
         derivation_strategy=(
-            "patch_saved_contracts" if saved_contract_baseline else "reconstruct_from_artifacts"
+            "patch_saved_contracts" if saved_contract_baseline else "extract_capabilities_then_rebuild"
         ) if request.mode == "derive" else "",
     )
 

@@ -129,6 +129,18 @@ def build_endpoint_registry(*, function_items: list[dict], platform_contract: di
         field_name, description, contract = _port(raw_slot)
         if field_name:
             platform_inputs.append({"slot_id": f"PIN{len(platform_inputs) + 1:04d}", "field": field_name, "description": description, "contract": contract})
+    # Backend-owned carrier for dynamically declared optional parameters.  It
+    # is registered only in the materializer and is never advertised to the
+    # Interface planning model as a selectable platform slot.
+    platform_inputs.append({
+        "slot_id": f"PIN{len(platform_inputs) + 1:04d}",
+        "field": "fields",
+        "description": "internal optional-parameter carrier",
+        # The selected source_path carries the leaf value, so the wrapper's
+        # object type must not be compared with the target parameter type.
+        "contract": {},
+        "internal": True,
+    })
     platform_outputs = []
     for sink in normalize_platform_output_sinks(platform_contract):
         platform_outputs.append({"slot_id": f"POUT{len(platform_outputs) + 1:04d}", "field": sink["name"], "description": "", "contract": sink["value_schema"], "sink_contract": sink})
@@ -334,7 +346,12 @@ def _materialize_interface_obligation(*, obligation: dict, selection: dict, regi
         source_path = list(selection["source_path"])
         constraints = []
         if source_path:
-            constraints.append({"type": "platform_parameter_binding", "source_key": ".".join(source_path), "source_path": source_path, "required": True})
+            constraints.append({
+                "type": "platform_parameter_binding",
+                "source_key": ".".join(source_path),
+                "source_path": source_path,
+                "required": not bool(source.get("internal")),
+            })
         return _edge(PLATFORM_INPUT_NODE, source["field"], target["target_file"], target["port_id"], constraints=constraints, value_type=_definite_type(target.get("contract") or {}) or _definite_type(source.get("contract") or {}))
     if kind == "script_to_platform":
         source = next((value for value in registry["script_outputs"] if value["output_id"] == selection["source_id"] and value["target_file"] == obligation["source_member"]), None)
