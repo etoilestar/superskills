@@ -9797,7 +9797,7 @@ async def _repair_existing_file_for_e2e_failure(
         "不得重新选择、扩展、删除或重排 ToolPool，不得请求工具探索或 tool_pool_patch。",
         "",
         "Parameter provenance rules: platform/runtime input uses its exact runtime placeholder; previous-step output uses a graph-backed placeholder; only a user/frozen-contract constant may use a literal; a script-local optional default should preferably be omitted. A literal appearing only in the failing SKILL.md command is not provenance.",
-        "Every placeholder introduced in NEW must have current runtime provenance from a platform input, previous successful stdout, frozen graph provenance, or another explicitly supplied runtime field. Do not invent options.*, fields.*, payload.*, or config.* unless that exact path exists in runtime evidence. A syntactically valid placeholder with no runtime producer is invalid.",
+        "Every placeholder introduced in NEW must have current runtime provenance from a platform input, previous successful stdout, frozen graph provenance, or another explicitly supplied runtime value. Do not invent an undeclared nested path or wrapper. A syntactically valid placeholder with no runtime producer is invalid.",
         "The patch must concretely implement the supplied repair instruction. Before returning compare OLD and NEW, confirm they differ, materially change the diagnosed behavior, and correct the failing expression/interface. Do not return no-op, comments-only, logging-only, or diagnostic-only edits.",
         "Repair authority rule: "
         "when repair_authority.mode == 'deterministic', "

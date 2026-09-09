@@ -378,10 +378,9 @@ PLATFORM_INPUT_HIERARCHY_CONTRACT = """PLATFORM INPUT HIERARCHY CONTRACT
 Platform input hierarchy is frozen by the upstream Blueprint and runtime contract.
 
 Platform inputs are flat semantic slots. Each declared top-level platform input
-is an independent source slot. Bind a declared business input directly: for
-example, source_platform_input="primary_key" with source_path=[] is valid when
-primary_key is declared. Do not instead bind source_platform_input="fields" with
-source_path=["primary_key"].
+is an independent source slot. Bind each declared business input directly to its
+exact upstream source. Do not move it beneath a different source slot or create
+a source_path merely to make the target name reachable.
 
 Interface Planner consumes the existing platform input structure.
 It does not redesign, normalize, reorganize, or introduce a new input hierarchy.
@@ -402,8 +401,8 @@ Do not infer additional nesting from:
 - common parameter grouping patterns
 - expected convenience structures
 
-Do not create synthetic containers such as fields, parameters, request, or
-config unless that exact container is explicitly declared as a platform input.
+Do not create synthetic containers or convenience wrappers. A container may be
+used only when that exact hierarchy is explicitly declared as a platform input.
 
 Only use nested source paths when the upstream platform contract explicitly
 declares that nested structure.

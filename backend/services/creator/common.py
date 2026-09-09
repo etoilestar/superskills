@@ -115,7 +115,7 @@ _SKILL_MD_MARKDOWN_EXECUTION_GUIDE = """
 - 每个 ```bash block 内只能有一条真实 shell 命令。
 - 脚本命令必须直接调用 scripts/ 下的真实脚本，例如 `python scripts/example.py ...`。
 - 命令输入形态必须由脚本真实接口决定：如果脚本读取输入 JSON，则在脚本路径后直接传入一个完整、shell-quoted、json.loads 可解析为 object 的 JSON 位置参数；如果脚本使用 argparse，则使用对应 flags；如果脚本无需输入，可以不传参数。
-- 不得固定套用 payload/user_request/fields/options/input_files 等模板字段。
+- 不得固定套用任何预设 envelope 或业务参数名；只使用当前冻结合同声明的输入。
 - 禁止在 ```bash block 内直接写 JSON 配置对象、runner/script/输入 JSON 伪命令对象、说明文字、列表、多条命令或 `<真实参数>` 这类占位说明。
 - 机器可读 JSON 示例、配置、stdout 示例如果需要展示，必须使用 ```json fenced code block，不得伪装成 ```bash。
 - 命令示例必须与脚本真实接口一致：脚本读输入 JSON 时，示例就传 JSON；脚本读 stdin 时，正文就说明 stdin 内容。禁止让运行时主模型根据脚本名临时猜 CLI flags。
