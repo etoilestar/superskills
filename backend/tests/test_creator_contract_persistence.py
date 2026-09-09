@@ -149,6 +149,57 @@ async def test_legacy_derive_retries_generated_skill_payload_as_fileplan_envelop
 
 
 @pytest.mark.asyncio
+async def test_legacy_derive_retries_ready_prose_as_a_full_blueprint(tmp_path, monkeypatch):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    source = tmp_path / "csv-against"
+    (source / "scripts").mkdir(parents=True)
+    (source / "SKILL.md").write_text("# CSV Against\n", encoding="utf-8")
+    responses = iter([
+        {
+            "status": "ready",
+            "clarifying_questions": [],
+            "review_summary": {
+                "goal": "add summary", "input": "CSV", "output": "report",
+                "workflow": [], "risks": [], "changes": ["add summary"],
+            },
+            "internal_blueprint_text": "The skill now includes a summary.",
+            "skill_name": "csv-against-summary",
+            "blockers": [],
+        },
+        {
+            "status": "needs_clarification",
+            "clarifying_questions": ["请选择总结深度。A. 简要 B. 详细"],
+            "review_summary": {
+                "goal": "", "input": "", "output": "",
+                "workflow": [], "risks": [], "changes": [],
+            },
+            "internal_blueprint_text": "",
+            "skill_name": "csv-against-summary",
+            "blockers": [],
+        },
+    ])
+    requests = []
+
+    async def fake_complete(**kwargs):
+        requests.append(json.loads(kwargs["messages"][1]["content"]))
+        return next(responses)
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    monkeypatch.setattr(api, "route_model", lambda *_args, **_kwargs: type("Route", (), {"model": "planner"})())
+
+    result = await api._generate_internal_blueprint_or_questions(api.PreparePlanRequest(
+        mode="derive", source_skill_name="csv-against",
+        skill_name="csv-against-summary", user_request="增加表格内容总结",
+    ))
+
+    assert len(requests) == 2
+    assert requests[1]["invalid_internal_blueprint_text"] == "The skill now includes a summary."
+    assert requests[1]["fileplan_protocol_errors"]
+    assert "existing_skill_context" in requests[1]
+    assert result["status"] == "needs_clarification"
+
+
+@pytest.mark.asyncio
 async def test_derived_initialization_copies_only_planned_baseline_files(tmp_path, monkeypatch):
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
     source = tmp_path / "base"

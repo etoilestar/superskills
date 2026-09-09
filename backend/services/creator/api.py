@@ -10008,6 +10008,8 @@ Blueprint Planner 只规划业务责任。
     ]
     data: dict[str, Any] | None = None
     envelope_issue = ""
+    invalid_blueprint_text = ""
+    blueprint_protocol_errors: list[dict[str, Any]] = []
     for protocol_attempt in range(2):
         messages = planner_messages
         if protocol_attempt:
@@ -10026,7 +10028,23 @@ blocking question with options.  Preserve the supplied existing_skill_context
 and apply the incremental user request; do not restart as a new Skill.
 """.strip(),
                 },
-                planner_messages[1],
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            **payload,
+                            "invalid_internal_blueprint_text": invalid_blueprint_text,
+                            "fileplan_protocol_errors": blueprint_protocol_errors,
+                            "repair_instruction": (
+                                "Regenerate the complete Blueprint from the existing Skill "
+                                "artifact context plus the incremental user request. Return "
+                                "planning only; do not generate file contents."
+                            ),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                },
             ]
         try:
             candidate = await _complete_creator_json_object_once(
@@ -10039,6 +10057,25 @@ and apply the incremental user request; do not restart as a new Skill.
             envelope_issue = f"invalid structured transport: {type(exc).__name__}: {exc}"
             continue
         envelope_issue = _prepare_fileplan_envelope_issue(candidate)
+        if not envelope_issue and str(candidate.get("status") or "") == "ready":
+            invalid_blueprint_text = str(candidate.get("internal_blueprint_text") or "").strip()
+            candidate_allowed_resources = _build_prepare_allowed_resource_paths(
+                request=request,
+                review_summary=candidate.get("review_summary"),
+                existing_skill_context=existing_context,
+            )
+            blueprint_protocol_errors = _collect_prepare_blueprint_protocol_issues(
+                invalid_blueprint_text,
+                candidate_allowed_resources,
+            )
+            if blueprint_protocol_errors:
+                envelope_issue = (
+                    "ready response contains an invalid Blueprint: "
+                    + "; ".join(
+                        str(issue.get("message") or issue.get("code") or "invalid blueprint")
+                        for issue in blueprint_protocol_errors
+                    )
+                )
         if not envelope_issue:
             data = candidate
             break
@@ -10101,12 +10138,25 @@ and apply the incremental user request; do not restart as a new Skill.
         )
         data["responsibility_edges"] = normalized_edges
     elif status == "ready":
-        frozen_blueprint_text = await _final_blueprint_cleanup(
+        pre_cleanup_blueprint_text = frozen_blueprint_text
+        cleaned_blueprint_text = await _final_blueprint_cleanup(
             request=request,
             blueprint_text=frozen_blueprint_text,
             existing_resource_facts=existing_context,
             planner_model=route.model,
         )
+        cleanup_protocol_errors = _collect_prepare_blueprint_protocol_issues(
+            cleaned_blueprint_text,
+            allowed_resource_paths,
+        )
+        if cleanup_protocol_errors:
+            logger.warning(
+                "[Creator][final_blueprint_cleanup][discarded] errors=%s",
+                cleanup_protocol_errors,
+            )
+            frozen_blueprint_text = pre_cleanup_blueprint_text
+        else:
+            frozen_blueprint_text = cleaned_blueprint_text
         first_planner_result = {
             **first_planner_result,
             "internal_blueprint_text": frozen_blueprint_text,
