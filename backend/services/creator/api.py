@@ -4447,6 +4447,65 @@ def _prepare_fileplan_envelope_issue(data: Any) -> str:
     return ""
 
 
+def _is_legacy_derive_context(
+    request: PreparePlanRequest,
+    existing_context: dict[str, Any] | None,
+) -> bool:
+    """Return whether derive must reconstruct contracts from legacy artifacts."""
+    return bool(
+        request.mode == "derive"
+        and request.source_skill_name
+        and not bool((existing_context or {}).get("saved_contracts_available"))
+    )
+
+
+def _canonicalize_legacy_derive_blueprint_fileplan(blueprint_text: str) -> str:
+    """Normalize a common legacy-import FilePlan presentation mistake.
+
+    Legacy reconstruction asks a model to translate a human-authored SKILL.md
+    into the Creator Blueprint protocol.  Models commonly render file entries
+    as Markdown labels (``- **SKILL.md**``) even though the strict parser only
+    recognizes ``- path: `SKILL.md``` blocks.  Convert only that unambiguous
+    presentation form, and only inside the SkillPlan section.  No file,
+    responsibility, port, or capability is invented here.
+    """
+    text = str(blueprint_text or "")
+    section = re.search(
+        r"(?ms)^(?P<header>\s*###\s+SkillPlan / 文件职责计划\s*$)"
+        r"(?P<body>.*?)(?=^\s*###\s+|\Z)",
+        text,
+    )
+    if not section:
+        return text
+
+    body = section.group("body")
+    file_label = re.compile(
+        r"(?m)^(?P<indent>[ \t]*)-[ \t]+\*\*"
+        r"(?P<path>SKILL\.md|scripts/[^*`\n]+|references/[^*`\n]+|assets/[^*`\n]+)"
+        r"\*\*[ \t]*$"
+    )
+    field_label = re.compile(
+        r"(?m)^(?P<indent>[ \t]*)-[ \t]+\*\*"
+        r"(?P<field>[A-Za-z_][A-Za-z0-9_]*)\*\*[ \t]*:[ \t]*(?P<value>.*)$"
+    )
+
+    body = file_label.sub(
+        lambda match: (
+            f"{match.group('indent')}- path: `"
+            f"{match.group('path').strip()}`"
+        ),
+        body,
+    )
+    body = field_label.sub(
+        lambda match: (
+            f"{match.group('indent')}"
+            f"{match.group('field')}: {match.group('value')}"
+        ),
+        body,
+    )
+    return text[:section.start("body")] + body + text[section.end("body"):]
+
+
 _PREPARE_FILEPLAN_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -9146,6 +9205,27 @@ async def _generate_internal_blueprint_or_questions(
         if _prepare_baseline_skill_name(request)
         else {}
     )
+    legacy_derive_reconstruction = _is_legacy_derive_context(
+        request,
+        existing_context,
+    )
+    legacy_derive_planning_contract = (
+        """
+
+LEGACY DERIVE BLUEPRINT RECONSTRUCTION
+The source Skill has artifacts but no saved Creator contracts. Reconstruct its
+complete baseline from existing_skill_context, preserve behavior not affected
+by the incremental request, and return the complete resulting Blueprint.
+This is planning, not implementation and not a change-summary-only response.
+Inside `### SkillPlan / 文件职责计划`, every file declaration MUST begin with
+the exact plain-text key `- path:`. In particular, declare the overview with a
+`- path:` line whose concrete path is `SKILL.md` and use `role: skill_overview`.
+Markdown labels such as `- **SKILL.md**` are not valid path blocks. Use plain
+unstyled field keys.
+""".rstrip()
+        if legacy_derive_reconstruction
+        else ""
+    )
 
     system_prompt = (
         load_kernel_creator_for_phase(
@@ -9898,7 +9978,7 @@ Blueprint Planner 只规划业务责任。
 
 - 具体 Registry Tool 选择
   由后续 Final Tool Selector 完成。
-"""
+""" + legacy_derive_planning_contract
     )
 
     (
@@ -10013,6 +10093,41 @@ Blueprint Planner 只规划业务责任。
     for protocol_attempt in range(2):
         messages = planner_messages
         if protocol_attempt:
+            legacy_repair_contract = (
+                """
+
+LEGACY DERIVE STRICT PATH-BLOCK REPAIR
+This request reconstructs a Blueprint from a source Skill that has no saved
+Creator contracts. Preserve the existing artifact behavior and the requested
+increment. Repair the supplied invalid Blueprint rather than redesigning it.
+
+The parser recognizes a file only from this exact unstyled syntax inside
+`### SkillPlan / 文件职责计划`:
+
+- path: `SKILL.md`
+  role: skill_overview
+  inputs: [user_request]
+  outputs: [workflow, script_order, resource_references]
+  dependencies: []
+  required_capabilities: []
+  forbidden_capabilities: [hidden_runtime_protocol]
+  references: []
+
+Every script/resource entry must likewise start with the literal key `- path:`
+followed by one concrete backtick-wrapped path.
+`- **SKILL.md**`, `- **scripts/name.py**`, headings, directory-tree lines, and
+ordinary prose are NOT file declarations. Field names must be plain unstyled
+keys such as `role:`, not nested Markdown bullets such as `- **role**:`.
+Use only roles listed in the supplied Blueprint protocol; use `generic_script`
+for an ordinary deterministic data-processing script. `dependencies` contains
+only declared references/assets read before execution, never another script.
+Do not place final bash/JSON argv examples or concrete runtime helper names in
+the Blueprint; those are decided after the ResponsibilityGraph is frozen.
+Do not change the requested target skill_name while repairing syntax.
+""".rstrip()
+                if legacy_derive_reconstruction
+                else ""
+            )
             messages = [
                 {
                     "role": "system",
@@ -10026,7 +10141,7 @@ explanatory text.  For status=ready, internal_blueprint_text must contain the
 complete Blueprint/SkillPlan.  For status=needs_clarification, provide one real
 blocking question with options.  Preserve the supplied existing_skill_context
 and apply the incremental user request; do not restart as a new Skill.
-""".strip(),
+""".strip() + legacy_repair_contract,
                 },
                 {
                     "role": "user",
@@ -10059,6 +10174,11 @@ and apply the incremental user request; do not restart as a new Skill.
         envelope_issue = _prepare_fileplan_envelope_issue(candidate)
         if not envelope_issue and str(candidate.get("status") or "") == "ready":
             invalid_blueprint_text = str(candidate.get("internal_blueprint_text") or "").strip()
+            if legacy_derive_reconstruction:
+                invalid_blueprint_text = _canonicalize_legacy_derive_blueprint_fileplan(
+                    invalid_blueprint_text
+                )
+                candidate["internal_blueprint_text"] = invalid_blueprint_text
             candidate_allowed_resources = _build_prepare_allowed_resource_paths(
                 request=request,
                 review_summary=candidate.get("review_summary"),

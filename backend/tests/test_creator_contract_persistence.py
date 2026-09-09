@@ -58,6 +58,105 @@ def test_revision_context_reconstructs_baseline_for_legacy_skill(tmp_path, monke
     assert baseline["script_contents"]["scripts/run.py"] == "print('legacy')\n"
 
 
+def test_legacy_derive_canonicalizes_markdown_file_labels_only_in_skillplan():
+    blueprint = """## 📋 Skill 架构蓝图
+### 目录结构
+SKILL.md
+scripts/
+### SkillPlan / 文件职责计划
+- **SKILL.md**
+  - **role**: `skill_overview`
+  - **inputs**: [user_request]
+  - **outputs**: [workflow, script_order, resource_references]
+  - **dependencies**: []
+  - **required_capabilities**: []
+  - **forbidden_capabilities**: [hidden_runtime_protocol]
+  - **references**: []
+- **scripts/against.py**
+  - **role**: `generic_script`
+  - **purpose**: Compare CSV data.
+  - **inputs**: [input_files]
+  - **outputs**: [result]
+  - **dependencies**: []
+  - **required_capabilities**: [deterministic_execution]
+  - **forbidden_capabilities**: []
+  - **references**: []
+### 宿主执行方式
+- **需要脚本/命令**: 最终 SKILL.md 使用标准 bash fenced code block。
+- **SKILL.md** in prose is not a FilePlan entry.
+"""
+
+    normalized = api._canonicalize_legacy_derive_blueprint_fileplan(blueprint)
+
+    assert "- path: `SKILL.md`" in normalized
+    assert "- path: `scripts/against.py`" in normalized
+    assert "  role: `skill_overview`" in normalized
+    assert "- **SKILL.md** in prose is not a FilePlan entry." in normalized
+    assert api._collect_prepare_blueprint_protocol_issues(normalized) == []
+
+
+def test_legacy_derive_detection_does_not_affect_other_prepare_modes():
+    legacy_context = {"saved_contracts_available": False}
+    saved_context = {"saved_contracts_available": True}
+
+    assert api._is_legacy_derive_context(
+        api.PreparePlanRequest(
+            mode="derive", source_skill_name="base", skill_name="enhanced"
+        ),
+        legacy_context,
+    ) is True
+    assert api._is_legacy_derive_context(
+        api.PreparePlanRequest(
+            mode="derive", source_skill_name="base", skill_name="enhanced"
+        ),
+        saved_context,
+    ) is False
+    assert api._is_legacy_derive_context(
+        api.PreparePlanRequest(mode="create", skill_name="new"),
+        legacy_context,
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_legacy_derive_adds_strict_reconstruction_contract_to_first_pass(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    source = tmp_path / "base"
+    source.mkdir()
+    (source / "SKILL.md").write_text("# Base\n", encoding="utf-8")
+    prompts = []
+
+    async def fake_complete(**kwargs):
+        prompts.append(kwargs["messages"][0]["content"])
+        return {
+            "status": "needs_clarification",
+            "clarifying_questions": ["请选择摘要范围。A. 全表 B. 仅差异行"],
+            "review_summary": {
+                "goal": "", "input": "", "output": "", "workflow": [],
+                "risks": [], "changes": [],
+            },
+            "internal_blueprint_text": "",
+            "skill_name": "enhanced",
+            "blockers": [],
+        }
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    monkeypatch.setattr(
+        api, "route_model",
+        lambda *_args, **_kwargs: type("Route", (), {"model": "planner"})(),
+    )
+
+    await api._generate_internal_blueprint_or_questions(api.PreparePlanRequest(
+        mode="derive", source_skill_name="base", skill_name="enhanced",
+        user_request="add summary",
+    ))
+
+    assert len(prompts) == 1
+    assert "LEGACY DERIVE BLUEPRINT RECONSTRUCTION" in prompts[0]
+    assert "`- **SKILL.md**` are not valid path blocks" in prompts[0]
+
+
 def test_derive_mode_reads_source_but_targets_new_skill():
     request = api.PreparePlanRequest(
         mode="derive",
