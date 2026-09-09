@@ -9,6 +9,7 @@ import re
 import shutil
 import traceback
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 
 import httpx
 from fastapi.encoders import jsonable_encoder
@@ -4064,6 +4065,9 @@ def _read_prepare_existing_skill_context(skill_name: str | None) -> dict[str, An
         "assets": list_dir("assets"),
         "requirement_graph": read_text(".creator/requirement_graph.json")[:20000],
         "workflow_allocation_summary": read_text(".creator/workflow_allocation_summary.txt")[:12000],
+        "blueprint": read_text(".creator/blueprint.md")[:30000],
+        "creation_plan": read_text(".creator/creation_plan.json")[:50000],
+        "interface_contracts": read_text(".creator/interface_contracts.json")[:30000],
     }
 
 
@@ -11027,6 +11031,67 @@ def _persist_workflow_allocation_summary(
         encoding="utf-8",
     )
 
+
+def _write_creator_artifact(path: Path, content: str) -> None:
+    """Atomically replace a Creator artifact so interrupted saves stay readable."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
+
+
+def _persist_creator_edit_snapshot(
+    *, skill_name: str, blueprint_text: str, response: "PreparePlanResponse",
+) -> None:
+    """Keep the editable design inputs beside every generated Skill."""
+    metadata_dir = settings.skills_path / _validate_skill_name(skill_name) / ".creator"
+    response_payload = response.model_dump(mode="json")
+    saved_at = datetime.now(timezone.utc).isoformat()
+    function_items = list(response_payload.get("function_items") or [])
+    contracts = {
+        "schema_version": 1,
+        "saved_at": saved_at,
+        "function_items": function_items,
+        "responsibility_edges": list(response_payload.get("responsibility_edges") or []),
+        "interfaces": [
+            {
+                "target_file": item.get("target_file", ""),
+                "inputs": item.get("inputs") or [],
+                "outputs": item.get("outputs") or [],
+                "runtime_contract": item.get("runtime_contract") or {},
+            }
+            for item in function_items
+            if isinstance(item, dict)
+        ],
+        "final_outputs": list(response_payload.get("final_outputs") or []),
+    }
+    snapshot = {
+        "schema_version": 1,
+        "saved_at": saved_at,
+        "lifecycle": "planned",
+        "skill_name": skill_name,
+        "blueprint_file": "blueprint.md",
+        "graph_file": "requirement_graph.json",
+        "contracts_file": "interface_contracts.json",
+        "plan": response_payload,
+    }
+    _write_creator_artifact(metadata_dir / "blueprint.md", str(blueprint_text or "").strip() + "\n")
+    _write_creator_artifact(metadata_dir / "interface_contracts.json", json.dumps(contracts, ensure_ascii=False, indent=2) + "\n")
+    _write_creator_artifact(metadata_dir / "creation_plan.json", json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n")
+
+
+def _mark_creator_snapshot_completed(skill_name: str) -> None:
+    """Record successful packaging without discarding the editable plan."""
+    path = settings.skills_path / _validate_skill_name(skill_name) / ".creator" / "creation_plan.json"
+    if not path.is_file():
+        return
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return
+    payload["lifecycle"] = "completed"
+    payload["completed_at"] = datetime.now(timezone.utc).isoformat()
+    _write_creator_artifact(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
 def _load_workflow_allocation_summary(skill_name: str) -> str:
     path = settings.skills_path / _validate_skill_name(skill_name) / ".creator" / "workflow_allocation_summary.txt"
     if not path.is_file():
@@ -12922,7 +12987,7 @@ async def _prepare_plan_impl(
             "tool_pool_summary": tool_pool_summary,
         })
 
-    return PreparePlanResponse(
+    response = PreparePlanResponse(
         status="ready",
 
         prepare_stage="ready",
@@ -13004,6 +13069,12 @@ async def _prepare_plan_impl(
             unselected_uploaded_files
         ),
     )
+    _persist_creator_edit_snapshot(
+        skill_name=plan.skill_name,
+        blueprint_text=final_blueprint_text,
+        response=response,
+    )
+    return response
 
 
 @router.post(
@@ -17183,6 +17254,8 @@ async def package_skill(request: PackageSkillRequest):
             path=result.get("path"),
             message=result["message"],
         )
+
+    _mark_creator_snapshot_completed(skill_name)
 
     return SkillActionResponse(
         success=True,
