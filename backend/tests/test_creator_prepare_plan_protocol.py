@@ -9,6 +9,24 @@ from backend.services.creator import api
 from backend.services.creator.common import AnalyzeBlueprintResponse, AssetRequirementOut, FileSpecOut
 
 
+def test_prepare_blueprint_syntax_canonicalizes_markdown_decorations():
+    decorated = """# ## 📋 Skill 架构蓝图
+### SkillPlan / 文件职责计划
+- **SKILL.md**
+  - **role**: skill_overview
+- **scripts/run.py**
+  - **role**: generic_script
+### 宿主执行方式
+none
+"""
+
+    normalized = api._canonicalize_prepare_blueprint_syntax(decorated)
+
+    assert normalized.startswith("## 📋 Skill 架构蓝图\n")
+    assert "- path: `SKILL.md`\n  role: skill_overview" in normalized
+    assert "- path: `scripts/run.py`\n  role: generic_script" in normalized
+
+
 def _request(**kwargs):
     data = {"user_request": "做一个工具", "human_feedback": "", "model": None}
     data.update(kwargs)

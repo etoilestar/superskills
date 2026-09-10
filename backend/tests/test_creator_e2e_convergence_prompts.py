@@ -29,7 +29,7 @@ def test_repair_prompt_requires_provenance_and_allows_optional_omission():
     source = Path("backend/services/creator/e2e.py").read_text(encoding="utf-8")
     assert "script-local optional default should preferably be omitted" in source
     assert "A literal appearing only in the failing SKILL.md command is not provenance" in source
-    assert "Do not invent options.*, fields.*, payload.*, or config.*" in source
+    assert "Do not invent an undeclared nested path or wrapper" in source
     assert "The previous patch was rejected because it did not materially change" in source
 
 

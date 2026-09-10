@@ -1,6 +1,7 @@
 """Creator FastAPI endpoint handlers and response assembly."""
 
 import asyncio
+import ast
 import copy
 import hashlib
 import json
@@ -8,6 +9,7 @@ import math
 import re
 import shutil
 import traceback
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass
 
 import httpx
@@ -3853,8 +3855,9 @@ def _e2e_advisory_status_from_warnings(warnings: list[Any]) -> str:
 
 
 class PreparePlanRequest(BaseModel):
-    mode: Literal["create", "revise"] = "create"
+    mode: Literal["create", "revise", "derive"] = "create"
     skill_name: str | None = None
+    source_skill_name: str | None = None
     user_request: str = ""
     conversation_history: list[dict[str, Any]] = []
     uploaded_files: list[dict[str, Any]] = []
@@ -3865,6 +3868,41 @@ class PreparePlanRequest(BaseModel):
     responsibility_edges: list[dict[str, Any]] | None = None
     function_items: list[dict[str, Any]] | None = None
     requirement_allocations: list[dict[str, Any]] | None = None
+
+
+def _prepare_baseline_skill_name(request: PreparePlanRequest) -> str | None:
+    """Return the read-only baseline identity, separate from the output Skill."""
+    if request.mode == "derive":
+        return request.source_skill_name
+    if request.mode == "revise":
+        return request.skill_name
+    return None
+
+
+def _hydrate_derive_request_from_saved_contracts(
+    request: PreparePlanRequest,
+) -> tuple[PreparePlanRequest, bool]:
+    """Seed a derive request from frozen source contracts when available.
+
+    Saved structured authorities are the baseline to patch, not merely context
+    from which a planner should invent a replacement graph.  Legacy Skills
+    without a contract bundle deliberately keep the reconstruction path.
+    """
+    if request.mode != "derive" or not request.source_skill_name:
+        return request, False
+    context = _read_prepare_existing_skill_context(request.source_skill_name)
+    saved = context.get("saved_creator_contracts")
+    if not isinstance(saved, dict) or not saved:
+        return request, False
+    updates: dict[str, Any] = {}
+    if not str(request.previous_blueprint_text or "").strip():
+        updates["previous_blueprint_text"] = str(saved.get("blueprint_text") or "")
+    for field_name in ("function_items", "responsibility_edges", "requirement_allocations"):
+        if not getattr(request, field_name):
+            value = saved.get(field_name)
+            if isinstance(value, list):
+                updates[field_name] = copy.deepcopy(value)
+    return (request.model_copy(update=updates) if updates else request), True
 
 
 class PreparePlanReviewSummary(BaseModel):
@@ -3910,6 +3948,7 @@ class PreparePlanResponse(BaseModel):
 
     blueprint_text: str = ""
     skill_name: str = ""
+    source_skill_name: str = ""
     function_items: list[dict[str, Any]] = Field(default_factory=list)
     responsibility_edges: list[dict[str, Any]] = Field(default_factory=list)
     requirement_allocations: list[dict[str, Any]] = Field(default_factory=list)
@@ -4056,19 +4095,217 @@ def _read_prepare_existing_skill_context(skill_name: str | None) -> dict[str, An
             return []
         return sorted(p.relative_to(root).as_posix() for p in base.rglob("*") if p.is_file())
 
-    return {
+    def read_tree(rel: str, *, per_file_limit: int = 12000, total_limit: int = 50000) -> dict[str, str]:
+        """Read a bounded view of an existing product for incremental planning."""
+        result: dict[str, str] = {}
+        remaining = total_limit
+        for path in list_dir(rel):
+            if remaining <= 0:
+                break
+            candidate = root / path
+            try:
+                content = candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            excerpt = content[: min(per_file_limit, remaining)]
+            result[path] = excerpt
+            remaining -= len(excerpt)
+        return result
+
+    creator_bundle_text = read_text(".creator/contracts.json")
+    try:
+        creator_contracts = json.loads(creator_bundle_text) if creator_bundle_text else {}
+    except (TypeError, json.JSONDecodeError):
+        creator_contracts = {}
+
+    context = {
         "skill_name": safe_name,
         "skill_md": read_text("SKILL.md")[:20000],
         "scripts": list_dir("scripts"),
         "references": list_dir("references"),
         "assets": list_dir("assets"),
+        "script_contents": read_tree("scripts"),
+        "reference_contents": read_tree("references", per_file_limit=6000, total_limit=18000),
         "requirement_graph": read_text(".creator/requirement_graph.json")[:20000],
         "workflow_allocation_summary": read_text(".creator/workflow_allocation_summary.txt")[:12000],
+        "saved_creator_contracts": creator_contracts,
+        "saved_contracts_available": bool(creator_contracts),
+    }
+    if not creator_contracts:
+        # Older Skills have no Creator metadata.  Give the planner an explicit
+        # reconstructed baseline rather than pretending this is a fresh build.
+        context["reconstructed_contract_baseline"] = {
+            "source": "existing_skill_artifacts",
+            "skill_md": context["skill_md"],
+            "files": ["SKILL.md", *context["scripts"], *context["references"], *context["assets"]],
+            "script_contents": context["script_contents"],
+            "reference_contents": context["reference_contents"],
+        }
+    return context
+
+
+def _legacy_python_artifact_facts(path: str, source: str) -> dict[str, Any]:
+    """Extract bounded structural facts without exposing source code to Planner."""
+    facts: dict[str, Any] = {
+        "path": path,
+        "language": "python",
+        "bytes": len(source.encode("utf-8")),
+        "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "functions": [],
+        "imports": [],
+        "literal_object_keys": [],
+        "referenced_skill_paths": [],
+    }
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        facts["parse_error"] = f"SyntaxError at line {exc.lineno or 0}"
+        return facts
+
+    functions: list[dict[str, Any]] = []
+    imports: list[str] = []
+    object_keys: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            args = [arg.arg for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]]
+            functions.append({"name": node.name, "args": args[:20]})
+        elif isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.append(node.module)
+        elif isinstance(node, ast.Dict):
+            for key in node.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    value = key.value.strip()
+                    if value and value not in object_keys:
+                        object_keys.append(value)
+
+    facts["functions"] = functions[:80]
+    facts["imports"] = list(dict.fromkeys(imports))[:80]
+    facts["literal_object_keys"] = object_keys[:120]
+    facts["referenced_skill_paths"] = list(dict.fromkeys(re.findall(
+        r"(?<![\w/])(?:scripts|references|assets)/[A-Za-z0-9_.@+\-/]+",
+        source,
+    )))[:80]
+    return facts
+
+
+def _legacy_skill_md_artifact_facts(source: str) -> dict[str, Any]:
+    """Extract runtime/document structure while discarding instructional prose."""
+    frontmatter: dict[str, str] = {}
+    match = re.match(r"^---\s*\n(?P<body>.*?)\n---\s*(?:\n|$)", source, re.S)
+    if match:
+        for line in match.group("body").splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key.strip() in {"name", "description"}:
+                frontmatter[key.strip()] = value.strip()[:1000]
+
+    headings = [
+        re.sub(r"\s+", " ", item).strip()[:300]
+        for item in re.findall(r"(?m)^#{1,6}\s+(.+?)\s*$", source)
+    ][:80]
+    referenced_paths = list(dict.fromkeys(re.findall(
+        r"(?<![\w/])(?:scripts|references|assets)/[A-Za-z0-9_.@+\-/]+",
+        source,
+    )))[:100]
+    command_contracts: list[dict[str, Any]] = []
+    for block in re.findall(r"(?ms)```(?:bash|sh)\s*\n(.*?)```", source):
+        for script in re.findall(r"(?<![\w/])(scripts/[A-Za-z0-9_.@+\-/]+)", block):
+            keys = list(dict.fromkeys(re.findall(r'["\']([A-Za-z_][A-Za-z0-9_]*)["\']\s*:', block)))
+            item = {"script": script, "argv_object_keys": keys[:40]}
+            if item not in command_contracts:
+                command_contracts.append(item)
+
+    return {
+        "frontmatter": frontmatter,
+        "headings": headings,
+        "referenced_skill_paths": referenced_paths,
+        "command_contracts": command_contracts[:30],
+        "bytes": len(source.encode("utf-8")),
+        "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+    }
+
+
+def _distill_legacy_prepare_context(existing_context: dict[str, Any]) -> dict[str, Any]:
+    """Produce non-instructional facts for no-contract derive planning.
+
+    Raw SKILL.md, script bodies, reference prose, and stale Creator metadata are
+    intentionally excluded. They are evidence for this deterministic import
+    step, not instructions or formatting examples for the Blueprint Planner.
+    """
+    script_contents = existing_context.get("script_contents") or {}
+    script_facts: list[dict[str, Any]] = []
+    for path in existing_context.get("scripts") or []:
+        source = str(script_contents.get(path) or "")
+        if path.endswith(".py"):
+            script_facts.append(_legacy_python_artifact_facts(path, source))
+        else:
+            script_facts.append({
+                "path": path,
+                "language": Path(path).suffix.lstrip(".") or "unknown",
+                "bytes": len(source.encode("utf-8")),
+                "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                "referenced_skill_paths": list(dict.fromkeys(re.findall(
+                    r"(?<![\w/])(?:scripts|references|assets)/[A-Za-z0-9_.@+\-/]+",
+                    source,
+                )))[:80],
+            })
+
+    reference_contents = existing_context.get("reference_contents") or {}
+    reference_facts = [
+        {
+            "path": path,
+            "headings": [
+                re.sub(r"\s+", " ", heading).strip()[:300]
+                for heading in re.findall(
+                    r"(?m)^#{1,6}\s+(.+?)\s*$",
+                    str(reference_contents.get(path) or ""),
+                )
+            ][:50],
+            "bytes": len(str(reference_contents.get(path) or "").encode("utf-8")),
+        }
+        for path in existing_context.get("references") or []
+    ]
+    return {
+        "skill_name": str(existing_context.get("skill_name") or ""),
+        "saved_contracts_available": False,
+        "baseline_source": "distilled_existing_skill_artifacts",
+        "artifact_inventory": {
+            "files": [
+                "SKILL.md",
+                *(existing_context.get("scripts") or []),
+                *(existing_context.get("references") or []),
+                *(existing_context.get("assets") or []),
+            ],
+            "assets": list(existing_context.get("assets") or []),
+        },
+        "skill_overview_facts": _legacy_skill_md_artifact_facts(
+            str(existing_context.get("skill_md") or "")
+        ),
+        "script_facts": script_facts,
+        "reference_facts": reference_facts,
+        "content_policy": (
+            "This object contains extracted evidence only. Original artifact prose/code "
+            "is not present and must not be reconstructed as instructions or formatting."
+        ),
     }
 
 
 def _parse_prepare_plan_json(raw: str) -> dict[str, Any]:
     return parse_structured_output(raw, phase="requirement_analysis")
+
+
+def _retarget_derived_blueprint(blueprint_text: str, request: PreparePlanRequest) -> str:
+    """Keep the user-owned derived target identity authoritative in Blueprint text."""
+    if request.mode != "derive" or not request.skill_name:
+        return blueprint_text
+    target = _validate_skill_name(request.skill_name)
+    return re.sub(
+        r"(?im)^(\s*-\s*\*\*Skill\s*名称\*\*\s*:\s*)[^\n]+$",
+        lambda match: f"{match.group(1)}{target}",
+        blueprint_text,
+        count=1,
+    )
 
 
 def _strip_prepare_summary_risks(summary: PreparePlanReviewSummary) -> PreparePlanReviewSummary:
@@ -4338,6 +4575,171 @@ def _normalize_prepare_clarifying_questions(raw_questions: Any) -> list[str]:
     if not _prepare_questions_have_options([question]):
         question = f"{question} A. 按推荐方式继续 B. 我补充说明"
     return [question]
+
+
+def _prepare_fileplan_envelope_issue(data: Any) -> str:
+    """Describe an unusable first-pass planner envelope, or return empty."""
+    if not isinstance(data, dict):
+        return "response is not a JSON object"
+    status = str(data.get("status") or "").strip()
+    if status not in {"ready", "needs_clarification", "blocked"}:
+        return f"unsupported status: {status or '<empty>'}"
+    if status == "ready" and not str(
+        data.get("internal_blueprint_text") or data.get("blueprint_text") or ""
+    ).strip():
+        return "ready response is missing internal_blueprint_text"
+    if status == "needs_clarification" and not any(
+        str(question or "").strip() for question in (data.get("clarifying_questions") or [])
+    ):
+        return "needs_clarification response is missing clarifying_questions"
+    return ""
+
+
+def _is_legacy_derive_context(
+    request: PreparePlanRequest,
+    existing_context: dict[str, Any] | None,
+) -> bool:
+    """Return whether derive must reconstruct contracts from legacy artifacts."""
+    return bool(
+        request.mode == "derive"
+        and request.source_skill_name
+        and not bool((existing_context or {}).get("saved_contracts_available"))
+    )
+
+
+def _canonicalize_prepare_blueprint_syntax(blueprint_text: str) -> str:
+    """Canonicalize unambiguous Blueprint Markdown presentation variants.
+
+    The model can express the same FilePlan with a decorated heading or bold
+    list labels even when its semantic plan is stable.  Normalize only those
+    wire-format variants before validation; do not add, remove, or reinterpret
+    any file or field value here.
+    """
+    text = str(blueprint_text or "")
+    text = re.sub(
+        r"(?m)^\s*#+(?:\s+#+)*\s*📋\s*Skill\s+架构蓝图\s*$",
+        "## 📋 Skill 架构蓝图",
+        text,
+        count=1,
+    )
+    section = re.search(
+        r"(?ms)^(?P<header>\s*###\s+SkillPlan / 文件职责计划\s*$)"
+        r"(?P<body>.*?)(?=^\s*###\s+|\Z)",
+        text,
+    )
+    if not section:
+        return text
+
+    body = section.group("body")
+    file_label = re.compile(
+        r"(?m)^(?P<indent>[ \t]*)-[ \t]+\*\*"
+        r"(?P<path>SKILL\.md|scripts/[^*`\n]+|references/[^*`\n]+|assets/[^*`\n]+)"
+        r"\*\*[ \t]*$"
+    )
+    field_label = re.compile(
+        r"(?m)^(?P<indent>[ \t]*)-[ \t]+\*\*"
+        r"(?P<field>[A-Za-z_][A-Za-z0-9_]*)\*\*[ \t]*:[ \t]*(?P<value>.*)$"
+    )
+    body = file_label.sub(
+        lambda match: f"{match.group('indent')}- path: `{match.group('path').strip()}`",
+        body,
+    )
+    body = field_label.sub(
+        lambda match: f"{match.group('indent')}{match.group('field')}: {match.group('value')}",
+        body,
+    )
+    return text[:section.start("body")] + body + text[section.end("body"):]
+
+
+def _canonicalize_legacy_derive_blueprint_fileplan(blueprint_text: str) -> str:
+    """Normalize common legacy-import FilePlan compatibility mistakes.
+
+    Legacy reconstruction asks a model to translate a human-authored SKILL.md
+    into the Creator Blueprint protocol.  Models commonly render file entries
+    as Markdown labels (``- **SKILL.md**``) even though the strict parser only
+    recognizes ``- path: `SKILL.md``` blocks.  Convert only that unambiguous
+    presentation form, and only inside the SkillPlan section.  No file,
+    responsibility, port, or capability is invented here.
+    """
+    text = _canonicalize_prepare_blueprint_syntax(blueprint_text)
+
+    skill_block = re.search(
+        r"(?ms)^\s*-\s*path\s*:\s*`?SKILL\.md`?\s*$"
+        r"(?P<body>.*?)(?=^\s*-\s*path\s*:|^\s*###\s+|\Z)",
+        text,
+    )
+    if skill_block:
+        normalized_skill_body = skill_block.group("body")
+        normalized_skill_body = re.sub(
+            r"(?m)^(\s*)role\s*:\s*.*$",
+            r"\1role: skill_overview",
+            normalized_skill_body,
+            count=1,
+        )
+        normalized_skill_body = re.sub(
+            r"(?m)^(\s*)required_capabilities\s*:\s*.*$",
+            r"\1required_capabilities: []",
+            normalized_skill_body,
+            count=1,
+        )
+        text = (
+            text[:skill_block.start("body")]
+            + normalized_skill_body
+            + text[skill_block.end("body"):]
+        )
+
+    if (
+        any(
+            path.startswith("scripts/")
+            for path in exact_file_plan_paths_from_strict_skillplan(text)
+        )
+        and "```bash" not in text
+        and "需要脚本/命令" not in text
+    ):
+        text = re.sub(
+            r"(?m)^(\s*###\s+宿主执行方式\s*)$",
+            r"\1\n- **需要脚本/命令**: 最终 SKILL.md 根据冻结后的责任图输出标准 ```bash fenced code block；Blueprint 不提前冻结命令参数。",
+            text,
+            count=1,
+        )
+    return text
+
+
+_PREPARE_FILEPLAN_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "status", "clarifying_questions", "review_summary",
+        "internal_blueprint_text", "skill_name", "blockers",
+    ],
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": ["ready", "needs_clarification", "blocked"],
+        },
+        "clarifying_questions": {
+            "type": "array",
+            "maxItems": 1,
+            "items": {"type": "string"},
+        },
+        "review_summary": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["goal", "input", "output", "workflow", "risks", "changes"],
+            "properties": {
+                "goal": {"type": "string"},
+                "input": {"type": "string"},
+                "output": {"type": "string"},
+                "workflow": {"type": "array", "items": {"type": "string"}},
+                "risks": {"type": "array", "items": {"type": "string"}},
+                "changes": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        "internal_blueprint_text": {"type": "string"},
+        "skill_name": {"type": "string"},
+        "blockers": {"type": "array", "items": {"type": "string"}},
+    },
+}
 
 
 def _prepare_feedback_wants_supplement(request: PreparePlanRequest) -> bool:
@@ -6430,8 +6832,8 @@ can report that upstream replanning is required.
 A repair must preserve full declared-input provenance. Never repair an invalid
 platform source merely by deleting the edge while leaving its FunctionItem input
 unresolved. Bind each dynamic runtime input directly from its declared top-level
-platform input; do not create a synthetic fields/parameters/request/config
-container. Creation-time fixed configuration is an upstream Blueprint decision.
+platform input; do not create a synthetic wrapper or input hierarchy.
+Creation-time fixed configuration is an upstream Blueprint decision.
 Do not remove an input during localized graph repair.
 If a FunctionItem input has an explicit frozen/default value, it is locally
 resolved. Do not create a platform_input_node edge for it and do not externalize
@@ -8404,8 +8806,8 @@ empty repair_guidance. Return no explanation outside the JSON object.
         _split_uploaded_asset_decisions(request.uploaded_files)
     )
     existing_resource_facts = (
-        _read_prepare_existing_skill_context(request.skill_name)
-        if request.mode == "revise"
+        _read_prepare_existing_skill_context(_prepare_baseline_skill_name(request))
+        if _prepare_baseline_skill_name(request)
         else {}
     )
     payload = {
@@ -8593,8 +8995,8 @@ upload is still pending.
         _split_uploaded_asset_decisions(request.uploaded_files)
     )
     existing_resource_facts = (
-        _read_prepare_existing_skill_context(request.skill_name)
-        if request.mode == "revise"
+        _read_prepare_existing_skill_context(_prepare_baseline_skill_name(request))
+        if _prepare_baseline_skill_name(request)
         else {}
     )
     payload = {"original_user_requirement": request.user_request, "current_blueprint": blueprint_text,
@@ -8925,9 +9327,10 @@ Return the complete corrected Blueprint only.
         request.uploaded_files
     )
     bundled_resource_facts: list[str] = []
-    if request.skill_name:
+    baseline_skill_name = _prepare_baseline_skill_name(request)
+    if baseline_skill_name:
         bundled_root = settings.bundled_skills_path / _validate_skill_name(
-            request.skill_name
+            baseline_skill_name
         )
         if bundled_root.is_dir():
             bundled_resource_facts = sorted(
@@ -8996,10 +9399,36 @@ async def _generate_internal_blueprint_or_questions(
 
     existing_context = (
         _read_prepare_existing_skill_context(
-            request.skill_name
+            _prepare_baseline_skill_name(request)
         )
-        if request.mode == "revise"
+        if _prepare_baseline_skill_name(request)
         else {}
+    )
+    legacy_derive_reconstruction = _is_legacy_derive_context(
+        request,
+        existing_context,
+    )
+    planner_existing_context = (
+        _distill_legacy_prepare_context(existing_context)
+        if legacy_derive_reconstruction
+        else existing_context
+    )
+    legacy_derive_planning_contract = (
+        """
+
+LEGACY DERIVE BLUEPRINT RECONSTRUCTION
+The source Skill has artifacts but no saved Creator contracts. Reconstruct its
+complete baseline from existing_skill_context, preserve behavior not affected
+by the incremental request, and return the complete resulting Blueprint.
+This is planning, not implementation and not a change-summary-only response.
+Inside `### SkillPlan / 文件职责计划`, every file declaration MUST begin with
+the exact plain-text key `- path:`. In particular, declare the overview with a
+`- path:` line whose concrete path is `SKILL.md` and use `role: skill_overview`.
+Markdown labels such as `- **SKILL.md**` are not valid path blocks. Use plain
+unstyled field keys.
+""".rstrip()
+        if legacy_derive_reconstruction
+        else ""
     )
 
     system_prompt = (
@@ -9023,6 +9452,14 @@ from the normalized structured contract.
 不要 Markdown。
 不要解释 JSON 外文本。
 
+增量增强规则：
+- mode=revise 时必须保留现有 Skill 未被用户要求修改的能力、文件和接口，禁止按全新 Skill 重建。
+- mode=derive 时，source_skill_name 是只读历史基线，skill_name 是必须创建的新目标，不得修改或重命名来源 Skill。
+- existing_skill_context.saved_contracts_available=true 时，以 saved_creator_contracts 中上次冻结的蓝图、职责图、接口合同和文件计划为增量基线。
+- 有 saved_creator_contracts 时禁止从零重建：沿用既有 FunctionItem、责任边、端口、接口映射和文件职责，只对 human_feedback 明确影响的局部做增删改；未受影响对象必须保持原 identity 与合同内容。
+- 若没有 saved_creator_contracts，则先依据 reconstructed_contract_baseline、SKILL.md 和现有脚本/参考文件内容重建合同基线，再叠加本轮 user_request/human_feedback。
+- 新需求与旧合同冲突时只修改受影响的职责、接口和文件，并在 review_summary.changes 中明确列出增量变化。
+
 当前阶段是第一段 FilePlan / Blueprint planning pass，只负责：
 
 1. 判断业务需求是否已经足够明确；
@@ -9035,6 +9472,18 @@ Do not emit ResponsibilityEdges in this first pass.
 Do not plan the ResponsibilityGraph in this first pass.
 
 internal_blueprint_text is the human-readable Blueprint view and must contain the complete SkillPlan file responsibility information: path, role, purpose, inputs, outputs, default_values, dependencies, required_capabilities, forbidden_capabilities, references, constraints, and existing file-local metadata. Any input decided as internal_default, constant, or creation-time fixed must be recorded in that script entry's structured default_values with its native JSON type; prose-only defaults are invalid.
+
+## Canonical Blueprint syntax (mandatory)
+
+- The first Blueprint heading is exactly `## 📋 Skill 架构蓝图`.
+- The file-plan heading is exactly `### SkillPlan / 文件职责计划`.
+- Every file entry begins with `- path: ` followed by one backtick-wrapped
+  concrete path. Never use a Markdown heading or bold label as a file entry.
+- Every entry field uses an unstyled key on an indented line, for example
+  `  role: generic_script`; never emit `- **role**:`.
+- Keep the required sections and their order stable: `### 目录结构`,
+  `### SkillPlan / 文件职责计划`, then `### 宿主执行方式`.
+- Do not wrap internal_blueprint_text itself in a Markdown code fence.
 
 ## Blueprint / SkillPlan single-source consistency
 
@@ -9342,6 +9791,17 @@ implementation has a valid fallback, declare that a default is present and put
 its value in default_values. Do not mark an input optional merely because it
 sounds like a preference; judge only from the confirmed user goal and proposed
 runtime contract. Do not infer optionality from the input field name.
+
+Optionality stated anywhere in the confirmed Blueprint must also be encoded in
+the structured FunctionItem port. A plain string input is legacy-compatible but
+means required; it must not be used for an input described as optional. Encode
+that port as an object with required=false and role=optional_runtime_input, and
+record any real fallback in default_values. Prose-only optionality is an invalid
+cross-stage contract because Interface planning consumes the structured port.
+Optional runtime inputs still require provenance. Bind each one only to an exact
+source slot already declared by the upstream platform contract; do not invent a
+wrapper, hierarchy, or new platform top-level input, and do not treat optionality
+as permission to omit the Interface.
 
 FUNCTIONITEM PORT ROLE CONTRACT
 
@@ -9745,7 +10205,7 @@ Blueprint Planner 只规划业务责任。
 
 - 具体 Registry Tool 选择
   由后续 Final Tool Selector 完成。
-"""
+""" + legacy_derive_planning_contract
     )
 
     (
@@ -9757,6 +10217,14 @@ Blueprint Planner 只规划业务责任。
 
     payload = {
         "mode": request.mode,
+
+        "source_skill_name": request.source_skill_name,
+
+        "derive_baseline_strategy": (
+            "patch_saved_contracts"
+            if existing_context.get("saved_contracts_available")
+            else "reconstruct_from_artifacts"
+        ) if request.mode == "derive" else "none",
 
         "skill_name": (
             request.skill_name
@@ -9791,7 +10259,7 @@ Blueprint Planner 只规划业务责任。
         ),
 
         "existing_skill_context": (
-            existing_context
+            planner_existing_context
         ),
 
         "clarification_rounds": (
@@ -9838,27 +10306,140 @@ Blueprint Planner 只规划业务责任。
         ),
     )
 
-    text = await complete_creator_role_once(
-        [
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    default=str,
-                ),
-            },
-        ],
-        "planner", fallback_model=route.model,
-    )
+    planner_messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": json.dumps(payload, ensure_ascii=False, default=str),
+        },
+    ]
+    data: dict[str, Any] | None = None
+    envelope_issue = ""
+    invalid_blueprint_text = ""
+    blueprint_protocol_errors: list[dict[str, Any]] = []
+    for protocol_attempt in range(2):
+        messages = planner_messages
+        if protocol_attempt:
+            legacy_repair_contract = (
+                """
 
-    data = _parse_prepare_plan_json(
-        text
-    )
+LEGACY DERIVE STRICT PATH-BLOCK REPAIR
+This request reconstructs a Blueprint from a source Skill that has no saved
+Creator contracts. Preserve the existing artifact behavior and the requested
+increment. Repair the supplied invalid Blueprint rather than redesigning it.
+
+The parser recognizes a file only from this exact unstyled syntax inside
+`### SkillPlan / 文件职责计划`:
+
+- path: `SKILL.md`
+  role: skill_overview
+  inputs: [user_request]
+  outputs: [workflow, script_order, resource_references]
+  dependencies: []
+  required_capabilities: []
+  forbidden_capabilities: [hidden_runtime_protocol]
+  references: []
+
+Every script/resource entry must likewise start with the literal key `- path:`
+followed by one concrete backtick-wrapped path.
+`- **SKILL.md**`, `- **scripts/name.py**`, headings, directory-tree lines, and
+ordinary prose are NOT file declarations. Field names must be plain unstyled
+keys such as `role:`, not nested Markdown bullets such as `- **role**:`.
+Use only roles listed in the supplied Blueprint protocol; use `generic_script`
+for an ordinary deterministic data-processing script. `dependencies` contains
+only declared references/assets read before execution, never another script.
+Do not place final bash/JSON argv examples or concrete runtime helper names in
+the Blueprint; those are decided after the ResponsibilityGraph is frozen.
+Do not change the requested target skill_name while repairing syntax.
+""".rstrip()
+                if legacy_derive_reconstruction
+                else ""
+            )
+            messages = [
+                {
+                    "role": "system",
+                    "content": system_prompt + """
+
+FILEPLAN ENVELOPE REPAIR
+The previous response did not satisfy the first-pass FilePlan JSON envelope.
+Return only the exact prepare-plan JSON object requested above.  Do not return
+status=success, generated file_contents, Markdown analysis, a Skill package, or
+explanatory text.  For status=ready, internal_blueprint_text must contain the
+complete Blueprint/SkillPlan.  For status=needs_clarification, provide one real
+blocking question with options.  Preserve the supplied existing_skill_context
+and apply the incremental user request; do not restart as a new Skill.
+""".strip() + legacy_repair_contract,
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            **payload,
+                            "invalid_internal_blueprint_text": invalid_blueprint_text,
+                            "fileplan_protocol_errors": blueprint_protocol_errors,
+                            "repair_instruction": (
+                                "Regenerate the complete Blueprint from the existing Skill "
+                                "artifact context plus the incremental user request. Return "
+                                "planning only; do not generate file contents."
+                            ),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                },
+            ]
+        try:
+            candidate = await _complete_creator_json_object_once(
+                messages=messages,
+                model=route.model,
+                phase="creator_prepare_fileplan",
+                response_schema=_PREPARE_FILEPLAN_RESPONSE_SCHEMA,
+            )
+        except Exception as exc:
+            envelope_issue = f"invalid structured transport: {type(exc).__name__}: {exc}"
+            continue
+        envelope_issue = _prepare_fileplan_envelope_issue(candidate)
+        if not envelope_issue and str(candidate.get("status") or "") == "ready":
+            invalid_blueprint_text = str(candidate.get("internal_blueprint_text") or "").strip()
+            invalid_blueprint_text = _canonicalize_prepare_blueprint_syntax(
+                invalid_blueprint_text
+            )
+            candidate["internal_blueprint_text"] = invalid_blueprint_text
+            if legacy_derive_reconstruction:
+                invalid_blueprint_text = _canonicalize_legacy_derive_blueprint_fileplan(
+                    invalid_blueprint_text
+                )
+                candidate["internal_blueprint_text"] = invalid_blueprint_text
+            candidate_allowed_resources = _build_prepare_allowed_resource_paths(
+                request=request,
+                review_summary=candidate.get("review_summary"),
+                existing_skill_context=existing_context,
+            )
+            blueprint_protocol_errors = _collect_prepare_blueprint_protocol_issues(
+                invalid_blueprint_text,
+                candidate_allowed_resources,
+            )
+            if blueprint_protocol_errors:
+                envelope_issue = (
+                    "ready response contains an invalid Blueprint: "
+                    + "; ".join(
+                        str(issue.get("message") or issue.get("code") or "invalid blueprint")
+                        for issue in blueprint_protocol_errors
+                    )
+                )
+        if not envelope_issue:
+            data = candidate
+            break
+        logger.warning(
+            "[Creator][fileplan_envelope] attempt=%d issue=%s",
+            protocol_attempt + 1,
+            envelope_issue,
+        )
+    if data is None:
+        raise PreparePlanProtocolError(
+            "Blueprint Planner returned an invalid first-pass FilePlan envelope "
+            f"after one protocol retry: {envelope_issue}"
+        )
 
     data.pop(
         "tool_pool_patch",
@@ -9908,12 +10489,25 @@ Blueprint Planner 只规划业务责任。
         )
         data["responsibility_edges"] = normalized_edges
     elif status == "ready":
-        frozen_blueprint_text = await _final_blueprint_cleanup(
+        pre_cleanup_blueprint_text = frozen_blueprint_text
+        cleaned_blueprint_text = await _final_blueprint_cleanup(
             request=request,
             blueprint_text=frozen_blueprint_text,
             existing_resource_facts=existing_context,
             planner_model=route.model,
         )
+        cleanup_protocol_errors = _collect_prepare_blueprint_protocol_issues(
+            cleaned_blueprint_text,
+            allowed_resource_paths,
+        )
+        if cleanup_protocol_errors:
+            logger.warning(
+                "[Creator][final_blueprint_cleanup][discarded] errors=%s",
+                cleanup_protocol_errors,
+            )
+            frozen_blueprint_text = pre_cleanup_blueprint_text
+        else:
+            frozen_blueprint_text = cleaned_blueprint_text
         first_planner_result = {
             **first_planner_result,
             "internal_blueprint_text": frozen_blueprint_text,
@@ -11027,6 +11621,82 @@ def _persist_workflow_allocation_summary(
         encoding="utf-8",
     )
 
+
+def _persist_creator_contracts(
+    skill_name: str,
+    *,
+    blueprint_text: str,
+    requirement_graph: Any,
+    workflow_allocation_summary: str = "",
+    function_items: list[dict[str, Any]] | None = None,
+    responsibility_edges: list[dict[str, Any]] | None = None,
+    requirement_allocations: list[dict[str, Any]] | None = None,
+    files: list[Any] | None = None,
+    final_outputs: list[Any] | None = None,
+    tool_pool_summary: dict[str, Any] | None = None,
+    mode: str = "create",
+    user_request: str = "",
+    human_feedback: str = "",
+    source_skill_name: str = "",
+    derivation_strategy: str = "",
+) -> dict[str, Any]:
+    """Keep Creator authorities beside the generated Skill for later revisions.
+
+    ``.creator`` is operational metadata, not a new runtime dependency.  The
+    normal generation, validation and packaging chain therefore remains
+    unchanged while a subsequent ``mode=revise`` request can reuse the exact
+    contracts that produced the current files.
+    """
+    safe_name = _validate_skill_name(skill_name)
+    metadata_dir = settings.skills_path / safe_name / ".creator"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    graph_payload = (
+        requirement_graph.model_dump(mode="json")
+        if hasattr(requirement_graph, "model_dump")
+        else dict(requirement_graph or {})
+    )
+    previous_path = metadata_dir / "contracts.json"
+    revision = 1
+    if previous_path.is_file():
+        try:
+            revision = int(json.loads(previous_path.read_text(encoding="utf-8")).get("revision", 0)) + 1
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            revision = 1
+    def serialize(value: Any) -> Any:
+        return value.model_dump(mode="json") if hasattr(value, "model_dump") else value
+
+    payload = {
+        "schema_version": 1,
+        "skill_name": safe_name,
+        "revision": revision,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "change_request": {"user_request": user_request, "human_feedback": human_feedback},
+        "derivation": (
+            {
+                "source_skill_name": source_skill_name,
+                "strategy": derivation_strategy or "patch_saved_contracts",
+            }
+            if source_skill_name else None
+        ),
+        "blueprint_text": str(blueprint_text or ""),
+        "function_items": function_items or [],
+        "responsibility_edges": responsibility_edges or [],
+        "requirement_allocations": requirement_allocations or [],
+        "requirement_graph": graph_payload,
+        "interface_contract": graph_interface_contract(graph_payload),
+        "workflow_allocation_summary": str(workflow_allocation_summary or ""),
+        "file_plan": [serialize(value) for value in (files or [])],
+        "final_outputs": [serialize(value) for value in (final_outputs or [])],
+        "tool_pool_summary": tool_pool_summary or {},
+    }
+    previous_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    (metadata_dir / "blueprint.md").write_text(str(blueprint_text or ""), encoding="utf-8")
+    (metadata_dir / "interface_contract.json").write_text(
+        json.dumps(payload["interface_contract"], ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return payload
+
 def _load_workflow_allocation_summary(skill_name: str) -> str:
     path = settings.skills_path / _validate_skill_name(skill_name) / ".creator" / "workflow_allocation_summary.txt"
     if not path.is_file():
@@ -11473,6 +12143,22 @@ async def _prepare_plan_impl(
     request: PreparePlanRequest,
     event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> PreparePlanResponse:
+    saved_contract_baseline = False
+    if request.mode == "derive":
+        source_name = _validate_skill_name(str(request.source_skill_name or ""))
+        target_name = _validate_skill_name(str(request.skill_name or ""))
+        if source_name == target_name:
+            raise HTTPException(status_code=400, detail="派生增强的新 Skill 名称不能与来源 Skill 相同。")
+        if not (settings.skills_path / source_name).is_dir():
+            raise HTTPException(status_code=404, detail=f"来源 Skill 不存在：{source_name}")
+        target_root = settings.skills_path / target_name
+        if target_root.is_dir() and any(
+            path.relative_to(target_root).parts[0] != ".creator"
+            for path in target_root.rglob("*")
+        ):
+            raise HTTPException(status_code=409, detail=f"目标 Skill 已存在：{target_name}")
+        request, saved_contract_baseline = _hydrate_derive_request_from_saved_contracts(request)
+
     prepare_action = str(
         request.prepare_action
         or "none"
@@ -11491,6 +12177,20 @@ async def _prepare_plan_impl(
         request.previous_blueprint_text
         or ""
     ).strip()
+
+    if (
+        confirmed_prepare
+        and not previous_blueprint_text
+        and request.mode == "derive"
+    ):
+        # A legacy source Skill can have complete, usable artifacts without a
+        # persisted Creator blueprint.  In that case a "continue with the
+        # existing information" answer confirms that no more business input is
+        # needed; it cannot freeze blueprint state that never existed.  Keep
+        # the request in the planning path so the planner reconstructs the
+        # baseline from those artifacts and applies the incremental request.
+        # This does not reconstruct a blueprint from review_summary.
+        confirmed_prepare = False
 
     prepared: dict[
         str,
@@ -11838,6 +12538,11 @@ async def _prepare_plan_impl(
             or request.skill_name
             or ""
         )
+        if request.mode == "derive":
+            # Target identity is user-owned and must never be replaced with the
+            # source name by a model-authored blueprint.
+            skill_name = _validate_skill_name(str(request.skill_name or ""))
+            prepared["skill_name"] = skill_name
 
         blueprint_text = str(
             prepared.get(
@@ -12191,8 +12896,8 @@ async def _prepare_plan_impl(
     allowed_resource_paths = _build_prepare_allowed_resource_paths(
         request=request,
         existing_skill_context=(
-            _read_prepare_existing_skill_context(skill_name)
-            if request.mode == "revise"
+            _read_prepare_existing_skill_context(_prepare_baseline_skill_name(request))
+            if _prepare_baseline_skill_name(request)
             else {}
         ),
     )
@@ -12203,6 +12908,7 @@ async def _prepare_plan_impl(
             allowed_resource_paths,
         )
     )
+    blueprint_text = _retarget_derived_blueprint(blueprint_text, request)
 
     protocol_errors = _preflight_prepare_blueprint_text(
         blueprint_text,
@@ -12226,6 +12932,7 @@ async def _prepare_plan_impl(
         blueprint_text = _normalize_prepare_blueprint_references(
             blueprint_text, allowed_resource_paths
         )
+        blueprint_text = _retarget_derived_blueprint(blueprint_text, request)
         protocol_errors = _preflight_prepare_blueprint_text(
             blueprint_text,
             allowed_resource_paths,
@@ -12922,6 +13629,32 @@ async def _prepare_plan_impl(
             "tool_pool_summary": tool_pool_summary,
         })
 
+    persisted_function_items = (
+        list(getattr(plan, "function_items", []) or [])
+        if hasattr(plan, "function_items")
+        else list(getattr(getattr(plan, "skill_plan", None), "function_items", []) or [])
+    )
+    persisted_responsibility_edges = list(getattr(plan, "responsibility_edges", []) or [])
+    _persist_creator_contracts(
+        plan.skill_name,
+        blueprint_text=final_blueprint_text,
+        requirement_graph=graph_payload,
+        workflow_allocation_summary=_load_workflow_allocation_summary(plan.skill_name),
+        function_items=persisted_function_items,
+        responsibility_edges=persisted_responsibility_edges,
+        requirement_allocations=list((prepared.get("requirement_allocations") or []) if isinstance(prepared, dict) else (request.requirement_allocations or [])),
+        files=list(plan.files or []),
+        final_outputs=list(plan.final_outputs or []),
+        tool_pool_summary=tool_pool_summary,
+        mode=request.mode,
+        user_request=request.user_request,
+        human_feedback=request.human_feedback,
+        source_skill_name=str(request.source_skill_name or "") if request.mode == "derive" else "",
+        derivation_strategy=(
+            "patch_saved_contracts" if saved_contract_baseline else "reconstruct_from_artifacts"
+        ) if request.mode == "derive" else "",
+    )
+
     return PreparePlanResponse(
         status="ready",
 
@@ -12935,16 +13668,16 @@ async def _prepare_plan_impl(
 
         skill_name=plan.skill_name,
 
-        function_items=(
-            list(getattr(plan, "function_items", []) or [])
-            if hasattr(plan, "function_items")
-            else list(getattr(getattr(plan, "skill_plan", None), "function_items", []) or [])
-        ),
+        source_skill_name=str(request.source_skill_name or "") if request.mode == "derive" else "",
 
-        responsibility_edges=(
-            list(getattr(plan, "responsibility_edges", []) or [])
-            if hasattr(plan, "responsibility_edges")
-            else []
+        function_items=persisted_function_items,
+
+        responsibility_edges=persisted_responsibility_edges,
+
+        requirement_allocations=list(
+            (prepared.get("requirement_allocations") or [])
+            if isinstance(prepared, dict)
+            else (request.requirement_allocations or [])
         ),
 
         files=plan.files,
@@ -13516,6 +14249,15 @@ async def init_skill(request: InitSkillRequest):
     skill_name = _validate_skill_name(request.skill_name)
     skill_dir = settings.skills_path / skill_name
 
+    source_dir: Path | None = None
+    if request.source_skill_name:
+        source_name = _validate_skill_name(request.source_skill_name)
+        if source_name == skill_name:
+            raise HTTPException(status_code=400, detail="派生目标不能与来源 Skill 相同。")
+        source_dir = settings.skills_path / source_name
+        if not source_dir.is_dir():
+            raise HTTPException(status_code=404, detail=f"来源 Skill 不存在：{source_name}")
+
     before_allowed: list[str] = []
     before_digest = ""
     try:
@@ -13535,6 +14277,20 @@ async def init_skill(request: InitSkillRequest):
 
     result = run_action({"action": "init", "name": skill_name})
     if result.get("success"):
+        if source_dir is not None:
+            for raw_path in request.baseline_files:
+                rel_path = _normalize_skill_path(raw_path)
+                if rel_path != "SKILL.md" and not rel_path.startswith(("scripts/", "references/", "assets/")):
+                    continue
+                _validate_file_path(rel_path)
+                source_path = (source_dir / rel_path).resolve()
+                target_path = (skill_dir / rel_path).resolve()
+                if not source_path.is_relative_to(source_dir.resolve()) or not source_path.is_file():
+                    continue
+                if not target_path.is_relative_to(skill_dir.resolve()):
+                    continue
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_path, target_path)
         _copy_confirmed_uploaded_assets_to_skill(skill_name, request.confirmed_uploaded_assets)
 
     after_allowed: list[str] = []

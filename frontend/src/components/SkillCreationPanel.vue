@@ -60,6 +60,25 @@
       </div>
     </div>
 
+    <div v-if="phase === 'idle'" class="name-confirmation">
+      <label for="skill-name-before-generation">生成文件前确认 Skill 名称</label>
+      <input
+        id="skill-name-before-generation"
+        ref="generationNameInputRef"
+        v-model="localSkillName"
+        class="name-input generation-name-input"
+        :class="{ error: nameError }"
+        aria-describedby="skill-name-before-generation-hint"
+        @input="validateName"
+        @blur="commitName"
+        @keyup.enter="commitName"
+      />
+      <small id="skill-name-before-generation-hint">
+        {{ props.sourceSkillName ? `新名称不能与来源 Skill「${props.sourceSkillName}」相同。` : '名称将在点击“开始创建”后用于创建文件目录。' }}
+      </small>
+      <span v-if="nameError" class="name-error inline-name-error">{{ nameError }}</span>
+    </div>
+
     <!-- File list -->
     <ul class="file-list">
       <li
@@ -367,6 +386,7 @@ import {
 
 const props = defineProps({
   skillName: { type: String, required: true },
+  sourceSkillName: { type: String, default: '' },
   files: { type: Array, required: true },    // [{ path, purpose, required, can_skip }]
   blueprintText: { type: String, default: '' },
   conversationHistory: { type: Array, default: () => [] },
@@ -503,6 +523,7 @@ const localSkillName = ref(props.skillName)
 const editingName = ref(false)
 const nameError = ref('')
 const nameInputRef = ref(null)
+const generationNameInputRef = ref(null)
 
 const hasCreationBlockers = computed(() =>
   (props.creationBlockers || []).some(item => item.blocking !== false)
@@ -824,18 +845,27 @@ function startEditName() {
 }
 
 function commitName() {
+  if (!validateName()) return
+  localSkillName.value = localSkillName.value.trim()
+  editingName.value = false
+}
+
+function validateName() {
   const raw = localSkillName.value.trim()
   if (!raw) {
     nameError.value = '名称不能为空'
-    return
+    return false
   }
   if (!/^[a-z0-9][a-z0-9-]*$/.test(raw)) {
     nameError.value = '只能包含小写字母、数字和连字符'
-    return
+    return false
+  }
+  if (props.sourceSkillName && raw === props.sourceSkillName) {
+    nameError.value = '新 Skill 名称不能与来源 Skill 相同'
+    return false
   }
   nameError.value = ''
-  localSkillName.value = raw
-  editingName.value = false
+  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,13 +1178,22 @@ const skillInitialized = ref(false)
 
 async function ensureSkillInitialized() {
   if (skillInitialized.value) return
-  const r = await initSkill(localSkillName.value, { confirmedUploadedAssets: props.confirmedUploadedAssets || [] })
+  const r = await initSkill(localSkillName.value, {
+    confirmedUploadedAssets: props.confirmedUploadedAssets || [],
+    sourceSkillName: props.sourceSkillName,
+    baselineFiles: localFiles.value.map(file => file.path),
+  })
   if (!r.success) throw new Error(r.message)
   skillInitialized.value = true
 }
 
 async function startCreation() {
-  if (nameError.value) return
+  if (!validateName()) {
+    await nextTick()
+    generationNameInputRef.value?.focus()
+    return
+  }
+  localSkillName.value = localSkillName.value.trim()
   currentIndex.value = 0
   emitExecutionEvent({ phase: 'file_generation_start', label: '文件开始生成', detail: `准备生成 ${localFiles.value.length} 个文件`, content: localFiles.value.map(file => file.path) })
   validateResult.value = null
@@ -1401,6 +1440,30 @@ function openInSandbox() {
 }
 .name-input.error { border-color: #e05c5c; }
 .name-error { color: #e05c5c; font-size: 12px; }
+.name-confirmation {
+  display: grid;
+  grid-template-columns: max-content minmax(180px, 320px);
+  align-items: center;
+  gap: 6px 10px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid #3a5570;
+  border-radius: 6px;
+  background: #202a34;
+}
+.name-confirmation label { font-weight: 600; }
+.name-confirmation small {
+  grid-column: 2;
+  color: #9aa8b5;
+}
+.generation-name-input { width: 100%; box-sizing: border-box; }
+.inline-name-error { grid-column: 2; }
+
+@media (max-width: 600px) {
+  .name-confirmation { grid-template-columns: 1fr; }
+  .name-confirmation small,
+  .inline-name-error { grid-column: 1; }
+}
 
 /* Progress */
 .progress-bar-wrap {
