@@ -177,11 +177,16 @@ export async function analyzeBlueprintPlan(messages, model = null) {
  * @param {string} skillName
  * @returns {Promise<{success:boolean, path:string|null, message:string}>}
  */
-export async function initSkill(skillName, { confirmedUploadedAssets = [] } = {}) {
+export async function initSkill(skillName, { confirmedUploadedAssets = [], sourceSkillName = '', baselineFiles = [] } = {}) {
   const resp = await fetch('/api/creator/init-skill', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ skill_name: skillName, confirmed_uploaded_assets: confirmedUploadedAssets }),
+    body: JSON.stringify({
+      skill_name: skillName,
+      confirmed_uploaded_assets: confirmedUploadedAssets,
+      source_skill_name: sourceSkillName || null,
+      baseline_files: baselineFiles,
+    }),
   })
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }))
