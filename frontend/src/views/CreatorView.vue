@@ -6,6 +6,18 @@
     </div>
 
     <div class="toolbar">
+      <label class="existing-skill-picker">
+        <span>选择 Skill</span>
+        <select v-model="selectedExistingSkillName" :disabled="streaming" @change="selectExistingSkill">
+          <option value="">新建 Skill</option>
+          <option v-for="skill in existingSkills" :key="skill.skill_name" :value="skill.skill_name">
+            {{ skill.skill_name }}
+          </option>
+        </select>
+      </label>
+      <span v-if="selectedExistingSkill" class="existing-skill-hint">
+        已选择已有 Skill，请输入需要调整的新需求
+      </span>
       <button
         class="btn-ghost btn-thoughts"
         :class="{ active: showThoughts }"
@@ -257,8 +269,8 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick } from 'vue'
-import { streamPrepareCreationPlan, buildClarificationQuickActions, uploadCreatorContextFile } from '../composables/useCreator.js'
+import { ref, computed, nextTick, onMounted } from 'vue'
+import { streamPrepareCreationPlan, buildClarificationQuickActions, uploadCreatorContextFile, listCreatorExistingSkills } from '../composables/useCreator.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import SkillCreationPanel from '../components/SkillCreationPanel.vue'
 import CreatorExecutionPanel from '../components/CreatorExecutionPanel.vue'
@@ -330,6 +342,8 @@ const reviewSummary = ref(null)
 const showInternalBlueprint = ref(false)
 const skillName = ref('')
 const selectedExistingSkillName = ref('')
+const existingSkills = ref([])
+const selectedExistingSkill = computed(() => existingSkills.value.find(item => item.skill_name === selectedExistingSkillName.value) || null)
 const pendingSupplementQuestion = ref('')
 const pendingPrepareAction = ref('none')
 const recoverablePlanningFailure = ref(null)
@@ -548,6 +562,35 @@ function resolveCurrentSkillName() {
     ''
   )
 }
+
+function parseSnapshotJson(value, fallback) {
+  try { return value ? JSON.parse(value) : fallback } catch { return fallback }
+}
+
+function selectExistingSkill() {
+  const selected = selectedExistingSkill.value
+  // Switching back to "from scratch" retains the exact original empty-state
+  // behavior. Existing persisted state is loaded only after an explicit choice.
+  clearChat()
+  if (!selected) return
+  selectedExistingSkillName.value = selected.skill_name
+  skillName.value = selected.skill_name
+  if (!selected.has_saved_contracts) return
+  pendingBlueprintText.value = selected.blueprint_text || ''
+  const snapshot = parseSnapshotJson(selected.creation_plan, {})
+  const graph = parseSnapshotJson(selected.requirement_graph, {})
+  const savedPlan = snapshot.plan || snapshot
+  pendingFunctionItems.value = savedPlan.function_items || graph.function_items || []
+  pendingResponsibilityEdges.value = savedPlan.responsibility_edges || graph.responsibility_edges || []
+  resolvedFunctionItems.value = pendingFunctionItems.value
+  resolvedResponsibilityEdges.value = pendingResponsibilityEdges.value
+  resolvedRequirementGraph.value = graph
+  showInternalBlueprint.value = Boolean(pendingBlueprintText.value)
+}
+
+onMounted(async () => {
+  try { existingSkills.value = await listCreatorExistingSkills() } catch (e) { uploadError.value = e.message }
+})
 
 function collectUploadedFileMetadata() {
   return uploadedContextFiles.value.map(file => ({
@@ -1502,6 +1545,9 @@ function clearChat() {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
+.existing-skill-picker { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.existing-skill-picker select { max-width: 360px; padding: 6px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); }
+.existing-skill-hint { color: var(--muted); font-size: 12px; }
 
 .btn-thoughts {
   position: relative;

@@ -4057,7 +4057,7 @@ def _read_prepare_existing_skill_context(skill_name: str | None) -> dict[str, An
             return []
         return sorted(p.relative_to(root).as_posix() for p in base.rglob("*") if p.is_file())
 
-    return {
+    context = {
         "skill_name": safe_name,
         "skill_md": read_text("SKILL.md")[:20000],
         "scripts": list_dir("scripts"),
@@ -4069,6 +4069,46 @@ def _read_prepare_existing_skill_context(skill_name: str | None) -> dict[str, An
         "creation_plan": read_text(".creator/creation_plan.json")[:50000],
         "interface_contracts": read_text(".creator/interface_contracts.json")[:30000],
     }
+    # A Creator edit is resumable only when the persisted planning authority is
+    # present.  SKILL.md by itself is useful evidence, but it is not a frozen
+    # contract and must never be silently treated as one.
+    context["has_saved_contracts"] = bool(
+        context["blueprint"]
+        and context["creation_plan"]
+        and context["interface_contracts"]
+    )
+    context["edit_strategy"] = (
+        "resume_saved_contracts"
+        if context["has_saved_contracts"]
+        else "rebuild_from_skill_md"
+    )
+    return context
+
+
+@router.get("/existing-skills")
+async def list_creator_existing_skills() -> list[dict[str, Any]]:
+    """Return editable Skill choices and their resumable Creator snapshot.
+
+    This endpoint deliberately does not alter the original create entrypoint;
+    choosing an existing Skill is an explicit UI action.
+    """
+    if not settings.skills_path.is_dir():
+        return []
+    result: list[dict[str, Any]] = []
+    for path in sorted(settings.skills_path.iterdir(), key=lambda item: item.name.lower()):
+        if not path.is_dir() or path.name.startswith(".") or not (path / "SKILL.md").is_file():
+            continue
+        context = _read_prepare_existing_skill_context(path.name)
+        result.append({
+            "skill_name": path.name,
+            "has_saved_contracts": bool(context.get("has_saved_contracts")),
+            "edit_strategy": context.get("edit_strategy"),
+            "blueprint_text": context.get("blueprint", ""),
+            "creation_plan": context.get("creation_plan", ""),
+            "requirement_graph": context.get("requirement_graph", ""),
+            "interface_contracts": context.get("interface_contracts", ""),
+        })
+    return result
 
 
 def _parse_prepare_plan_json(raw: str) -> dict[str, Any]:
@@ -9022,6 +9062,19 @@ dependency, or runtime-ownership identities. Downstream stages freeze ports only
 from the normalized structured contract.
 
 你现在服务 /api/creator/prepare-plan。
+
+## 已有 Skill 的两种修订策略
+
+当 existing_skill_context.edit_strategy=resume_saved_contracts 时，已有 blueprint、
+creation_plan、requirement_graph 与 interface_contracts 是本次追加修订的基线。
+把 human_feedback/user_request 作为增量需求合并进去，只调整受影响的蓝图条目、
+职责、图谱合同和接口；保留所有不冲突的既有文件、能力、端口和合同。输出仍须是
+完整蓝图，以便后续沿用原有合同、文件生成和 E2E runtime 流程。
+
+当 existing_skill_context.edit_strategy=rebuild_from_skill_md 时，不得假装存在已保存
+合同。先从 existing_skill_context.skill_md 提炼该 Skill 已完成的功能、输入、输出、
+工作流和文件职责，再与新需求合并，像新建 Skill 一样重建完整 Blueprint、合同和
+后续文件计划。SKILL.md 中没有证据的旧合同不得臆造。
 
 只输出严格 JSON object。
 不要 Markdown。

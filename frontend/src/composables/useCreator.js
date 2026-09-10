@@ -88,6 +88,12 @@ export async function prepareCreationPlan(payload) {
   return resp.json()
 }
 
+export async function listCreatorExistingSkills() {
+  const resp = await fetch('/api/creator/existing-skills')
+  if (!resp.ok) throw new Error('已有 Skill 列表加载失败')
+  return resp.json()
+}
+
 export async function streamPrepareCreationPlan(payload, onEvent) {
   const resp = await fetch('/api/creator/prepare-plan/stream', {
     method: 'POST',
