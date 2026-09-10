@@ -3875,6 +3875,41 @@ _CREATOR_DESIGN_FILES = (
     "interface_contracts.json",
 )
 
+_CONTRACTLESS_REVISE_MARKERS = (
+    "修改已有 skill",
+    "修改已有skill",
+    "保留原有实现",
+    "保留旧实现",
+    "保留旧功能",
+    "基于原实现",
+    "增量调整",
+    "patch",
+    "resume",
+    "existing contract",
+)
+
+
+def _contains_contractless_revise_semantics(requirement: str) -> bool:
+    normalized = requirement.casefold()
+    return any(marker in normalized for marker in _CONTRACTLESS_REVISE_MARKERS)
+
+
+async def _clean_contractless_complete_requirement(requirement: str, *, model: str) -> str:
+    """Rewrite a leaked edit-oriented requirement as a standalone create request."""
+    if not _contains_contractless_revise_semantics(requirement):
+        return requirement
+    prompt = """将输入改写为可直接用于新建 Skill 的完整、独立业务需求，只描述目标、能力、输入和输出。
+不得提及或暗示编辑、增量修改、历史实现或历史合同。禁止出现：修改已有 Skill、保留原有实现、保留旧实现、保留旧功能、基于原实现、增量调整、patch、resume、existing contract。
+输出严格 JSON，仅包含 complete_requirement；不要输出 Markdown。"""
+    raw = await complete_creator_role_once(
+        [{"role": "system", "content": prompt}, {"role": "user", "content": requirement}],
+        "planner", fallback_model=model, stage="contractless_requirement_cleanup",
+    )
+    cleaned = str(_parse_prepare_plan_json(raw).get("complete_requirement") or "").strip()
+    if not cleaned or _contains_contractless_revise_semantics(cleaned):
+        raise PreparePlanProtocolError("无合同 Skill 的完整需求仍包含历史修改语义")
+    return cleaned
+
 
 def _load_existing_skill_design(skill_name: str) -> dict[str, Any]:
     """Load an edit source without guessing whether its contract is complete."""
@@ -3929,15 +3964,12 @@ complete_requirement 必须是可交给从零 Creator 流程的完整需求描�
         }
     else:
         prompt = """你是 Creator 的独立已有能力提取器，不是 Blueprint Planner。
-只依据给出的 SKILL.md 提取已完成业务能力，并与新增需求合并。输出严格 JSON：skill_summary（目标、核心功能、输入、输出、已完成能力、可确认的文件职责）和 complete_requirement。
-complete_requirement 必须是完整需求描述；不得假设任何历史设计合同。不要输出 Markdown。"""
+SKILL.md 只作为历史功能说明。只依据 SKILL.md 和当前新增需求，输出可直接用于新建 Skill 的完整业务需求，而不是编辑方案。
+输出严格 JSON，格式为：skill_summary（仅含 goal、capabilities、inputs、outputs）和 complete_requirement（一段可以直接用于新建 Skill 的完整需求）。
+不要输出编辑策略、增量修改策略、保留旧实现、修改已有文件或兼容历史合同；complete_requirement 不得提及或暗示修改已有 Skill、保留原有实现、保留旧实现、保留旧功能、基于原实现、增量调整、patch、resume 或 existing contract。不要输出 Markdown。"""
         payload = {
             "skill_md": design["skill_md"],
             "new_requirement": request.user_request,
-            "new_requirement_context": {
-                "conversation_history": request.conversation_history,
-                "human_feedback": request.human_feedback,
-            },
         }
     raw = await complete_creator_role_once(
         [{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
@@ -3947,6 +3979,10 @@ complete_requirement 必须是完整需求描述；不得假设任何历史设�
     complete_requirement = str(data.get("complete_requirement") or "").strip()
     if not complete_requirement:
         raise PreparePlanProtocolError("已有 Skill 前置需求处理未返回 complete_requirement")
+    if not design["contract_complete"]:
+        complete_requirement = await _clean_contractless_complete_requirement(
+            complete_requirement, model=route.model,
+        )
     # Deliberately cross the boundary as an ordinary create request.  No saved
     # contract, SKILL.md, edit strategy, or existing_skill_context crosses it.
     return request.model_copy(update={
