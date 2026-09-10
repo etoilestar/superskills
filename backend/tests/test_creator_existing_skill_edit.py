@@ -46,6 +46,74 @@ def test_edit_preprocessor_crosses_into_clean_create_request(monkeypatch, tmp_pa
     assert result.interface_contracts is None
 
 
+def test_contractless_skill_becomes_standalone_requirement_without_history(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    skill = _write_skill(tmp_path, complete=False)
+    (skill / "SKILL.md").write_text("该工具可以比较两个CSV并输出报告", encoding="utf-8")
+    calls = []
+
+    async def fake_call(messages, role, **kwargs):
+        calls.append((messages, kwargs))
+        if kwargs["stage"] == "existing_skill_preprocess":
+            payload = json.loads(messages[1]["content"])
+            assert payload == {
+                "skill_md": "该工具可以比较两个CSV并输出报告",
+                "new_requirement": "增加差异总结",
+            }
+            return json.dumps({
+                "skill_summary": {
+                    "goal": "比较 CSV",
+                    "capabilities": ["比较并报告"],
+                    "inputs": ["两个 CSV"],
+                    "outputs": ["比较报告"],
+                },
+                "complete_requirement": "基于原实现增加差异总结并保留旧功能",
+            })
+        assert kwargs["stage"] == "contractless_requirement_cleanup"
+        return json.dumps({
+            "complete_requirement": "实现一个 CSV 比较工具：接收两个 CSV 文件，比较数据，输出比较报告和差异总结。"
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_call)
+    request = api.PreparePlanRequest(
+        mode="revise",
+        skill_name="demo",
+        user_request="增加差异总结",
+        conversation_history=[{"role": "user", "content": "不要这样"}],
+        human_feedback="继续",
+        previous_blueprint_text="旧蓝图",
+    )
+    result = asyncio.run(api._preprocess_existing_skill_request(request))
+
+    expected = api.PreparePlanRequest(
+        mode="create",
+        skill_name="demo",
+        user_request="实现一个 CSV 比较工具：接收两个 CSV 文件，比较数据，输出比较报告和差异总结。",
+    )
+    assert result.user_request == expected.user_request
+    assert result.mode == expected.mode
+    assert result.conversation_history == expected.conversation_history == []
+    assert result.human_feedback == expected.human_feedback == ""
+    assert result.previous_blueprint_text == expected.previous_blueprint_text == ""
+    assert len(calls) == 2
+    for forbidden in ("修改已有Skill", "保留旧功能", "基于原实现"):
+        assert forbidden not in result.user_request
+
+
+def test_contractless_clean_requirement_does_not_need_extra_model_call(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    _write_skill(tmp_path, complete=False)
+
+    async def fake_call(messages, role, **kwargs):
+        assert kwargs["stage"] == "existing_skill_preprocess"
+        return json.dumps({"complete_requirement": "实现 CSV 比较、报告生成和差异总结能力。"})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_call)
+    request = api.PreparePlanRequest(mode="revise", skill_name="demo", user_request="增加差异总结")
+    result = asyncio.run(api._preprocess_existing_skill_request(request))
+    assert result.user_request == "实现 CSV 比较、报告生成和差异总结能力。"
+
+
 def test_blueprint_planner_rejects_unprocessed_edit_request():
     request = api.PreparePlanRequest(mode="revise", skill_name="demo", user_request="增加导出")
     try:
