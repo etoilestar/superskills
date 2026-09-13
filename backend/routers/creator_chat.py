@@ -31,10 +31,6 @@ from .chat_utils import (
     _thought,
     _validate_skill_md,
 )
-from .creator import (
-    AnalyzeBlueprintRequest,
-    analyze_blueprint,
-)
 from .sandbox_chat import (
     plan_and_execute_generated_output as _plan_and_execute_generated_output,
 )
@@ -523,70 +519,6 @@ def _creator_conversation_retry_messages(base_messages: list[dict], *, previous_
     })
     return retry_messages
 
-async def _refine_phase2_blueprint_before_display(
-    *,
-    assistant_text: str,
-    request: ChatRequest,
-    model: str,
-) -> tuple[str, dict | None]:
-    """Refine Phase2 blueprint before it is ever shown to the user.
-
-    这里不重新定义蓝图规则。
-    只复用 /api/creator/analyze-blueprint 的既有蓝图解析、合同检查和修复能力。
-    """
-
-    if "📋 Skill 架构蓝图" not in str(assistant_text or ""):
-        return assistant_text, None
-
-    blueprint_messages = [
-        *[
-            {
-                "role": _message_role_content(message)[0],
-                "content": _message_role_content(message)[1],
-            }
-            for message in (getattr(request, "messages", []) or [])
-            if _message_role_content(message)[0] in {"user", "assistant"}
-        ],
-        {
-            "role": "assistant",
-            "content": assistant_text,
-        },
-    ]
-
-    try:
-        response = await analyze_blueprint(
-            AnalyzeBlueprintRequest(
-                messages=blueprint_messages,
-                model=model,
-                strict=True,
-                refine_contract=True,
-                refine_rounds=3,
-            )
-        )
-    except Exception as exc:
-        logger.warning(
-            "Phase2 blueprint pre-display refinement failed; using draft blueprint: %s",
-            exc,
-        )
-        return assistant_text, {
-            "success": False,
-            "error": str(exc),
-        }
-
-    refined_text = str(getattr(response, "blueprint_text", "") or "").strip()
-    if not refined_text:
-        return assistant_text, {
-            "success": False,
-            "error": "analyze_blueprint returned empty blueprint_text",
-        }
-
-    return refined_text, {
-        "success": True,
-        "skill_name": getattr(response, "skill_name", ""),
-        "blueprint_refined": bool(getattr(response, "blueprint_refined", False)),
-        "warnings": getattr(response, "warnings", []) or [],
-    }
-
 @_safe_async_generator
 async def _execute_conversation_mode(
     final_messages: list[dict],
@@ -654,36 +586,6 @@ async def _execute_conversation_mode(
         })
         yield "data: [DONE]\n\n"
         return
-
-    if current_phase == "phase2" and "📋 Skill 架构蓝图" in assistant_text:
-        yield _sse({
-            "status": {
-                "phase": "blueprint_contract_refine",
-                "message": "正在校验并修正蓝图与合同…",
-            }
-        })
-
-        refined_text, refine_report = await _refine_phase2_blueprint_before_display(
-            assistant_text=assistant_text,
-            request=request,
-            model=model,
-        )
-
-        if refine_report:
-            yield _thought(
-                "blueprint_contract_refine",
-                "蓝图合同校验",
-                (
-                    "已完成蓝图合同校验"
-                    if refine_report.get("success")
-                    else "蓝图合同校验失败，保留模型草稿"
-                ),
-                refine_report,
-            )
-
-        assistant_text = refined_text
-
-        yield _sse({"status": None})
 
     yield _sse({"content": assistant_text})
 
