@@ -9145,6 +9145,9 @@ Return the complete corrected Blueprint only.
 async def _generate_internal_blueprint_or_questions(
     request: PreparePlanRequest,
     event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    *,
+    build_execution_design: bool = False,
+    confirmed_blueprint_text: str | None = None,
 ) -> dict[str, Any]:
     """Judge business requirement maturity and produce the provisional blueprint.
 
@@ -9990,27 +9993,26 @@ Blueprint Planner 只规划业务责任。
         ),
     )
 
-    text = await complete_creator_role_once(
-        [
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    default=str,
-                ),
-            },
-        ],
-        "planner", fallback_model=route.model,
-    )
-
-    data = _parse_prepare_plan_json(
-        text
-    )
+    if confirmed_blueprint_text is not None:
+        # Confirmation bypasses Blueprint generation completely.  The exact
+        # user-reviewed text is the sole input to all downstream planning.
+        data = {
+            "status": "ready",
+            "internal_blueprint_text": confirmed_blueprint_text,
+            "skill_name": request.skill_name,
+        }
+    else:
+        text = await complete_creator_role_once(
+            [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False, default=str),
+                },
+            ],
+            "planner", fallback_model=route.model,
+        )
+        data = _parse_prepare_plan_json(text)
 
     data.pop(
         "tool_pool_patch",
@@ -10059,12 +10061,28 @@ Blueprint Planner 只规划业务责任。
         )
         data["responsibility_edges"] = normalized_edges
     elif status == "ready":
-        frozen_blueprint_text = await _final_blueprint_cleanup(
-            request=request,
-            blueprint_text=frozen_blueprint_text,
-            existing_resource_facts={},
-            planner_model=route.model,
-        )
+        # A ready first-pass Blueprint is still a user-facing proposal.  Do
+        # not run resource authority, semantic closure, graph, or interface
+        # contract checks yet: candidate resource needs are not facts until
+        # the user confirms or edits this text.
+        if not build_execution_design:
+            return {
+                **first_planner_result,
+                "internal_blueprint_text": frozen_blueprint_text,
+                "function_items": [],
+                "responsibility_edges": [],
+                "requirement_allocations": [],
+                "requirement_channels": {},
+                "interface_plan": {},
+            }
+
+        if confirmed_blueprint_text is None:
+            frozen_blueprint_text = await _final_blueprint_cleanup(
+                request=request,
+                blueprint_text=frozen_blueprint_text,
+                existing_resource_facts={},
+                planner_model=route.model,
+            )
         first_planner_result = {
             **first_planner_result,
             "internal_blueprint_text": frozen_blueprint_text,
@@ -11889,64 +11907,15 @@ async def _prepare_plan_impl(
                 ],
             )
 
-        if request.function_items is None:
-            return PreparePlanResponse(
-                status="blocked",
-                prepare_stage="blueprint_protocol_failed",
-                clarifying_questions=[],
-                review_summary=PreparePlanReviewSummary(),
-                blueprint_text=previous_blueprint_text,
-                skill_name=skill_name,
-                creation_blockers=[
-                    _prepare_protocol_issue(
-                        "missing_structured_function_items",
-                        "用户确认创建要点时缺少 structured function_items；Creator 不允许从 blueprint text legacy fallback 恢复 ready graph。",
-                        field="function_items",
-                    )
-                ],
-                recoverable=True,
-                retry_stage="blueprint",
-            )
-
-        if request.responsibility_edges is None:
-            return PreparePlanResponse(
-                status="blocked",
-                prepare_stage="blueprint_protocol_failed",
-                clarifying_questions=[],
-                review_summary=PreparePlanReviewSummary(),
-                blueprint_text=previous_blueprint_text,
-                skill_name=skill_name,
-                creation_blockers=[
-                    _prepare_protocol_issue(
-                        "missing_structured_responsibility_edges",
-                        "用户确认创建要点时缺少 structured responsibility_edges；Creator 不允许从 blueprint text legacy fallback 恢复 ready graph。",
-                        field="responsibility_edges",
-                    )
-                ],
-                recoverable=True,
-                retry_stage="blueprint",
-            )
-
-        prepared = {
-            "status": "ready",
-
-            "internal_blueprint_text": (
-                previous_blueprint_text
-            ),
-
-            "skill_name": skill_name,
-            "function_items": request.function_items,
-            "requirement_allocations": request.requirement_allocations or [],
-
-            "responsibility_edges": (
-                request.responsibility_edges
-                if request.responsibility_edges is not None
-                else None
-            ),
-            "interface_plan": _carry_frozen_interface_contracts(
-                request.interface_contracts
-            ),
-        }
+        # Rebuild every execution-design artifact from the Blueprint the user
+        # just confirmed.  Client-carried graph/contract values describe an
+        # older proposal at best and are deliberately ignored.
+        prepared = await _generate_internal_blueprint_or_questions(
+            request,
+            event_emitter=event_emitter,
+            build_execution_design=True,
+            confirmed_blueprint_text=previous_blueprint_text,
+        )
 
         blueprint_text = (
             previous_blueprint_text
