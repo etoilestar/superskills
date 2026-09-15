@@ -7256,6 +7256,7 @@ async def _bind_executable_responsibility_plan(
         requirement_channels=requirement_channels or {},
         system_requirements=system_requirements_context,
         platform_contract=platform_contract,
+        responsibility_edges=list(current_planner_result.get("responsibility_edges") or []),
         skill_name=str(current_planner_result.get("skill_name") or ""),
         planner_model=planner_model,
         model_call=select_sources,
